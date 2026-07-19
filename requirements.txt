@@ -11,3 +11,4 @@ deep-translator>=1.11,<2
 google-api-python-client>=2,<3
 google-auth>=2,<3
 google-auth-oauthlib>=1,<2
+edge-tts>=7,<8

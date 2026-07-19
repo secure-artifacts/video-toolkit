@@ -29,9 +29,14 @@ qt.setStyleSheet(toolkit.STYLE)
 window = toolkit.MainWindow()
 window.resize(1600, 920)
 
-assert window.pages.count() == 10
-assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 6
-assert window.nav_buttons[-1].text() == "帮助与说明"
+assert window.pages.count() == 11
+assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 7
+assert window.nav_buttons[-1].text() == "帮助"
+reels_index = window.watermark_tabs.indexOf(window.dynamic_caption_page)
+assert reels_index >= 0 and not window.watermark_tabs.isTabVisible(reels_index)
+assert window.watermark_tabs.tabText(window.watermark_tabs.currentIndex()) == "视频 / 图片水印"
+pipeline_step_labels = [label.text() for label in window.pages.widget(8).findChildren(toolkit.QLabel)]
+assert any("⑤ 批量上传" in text and "⑥ 批量填表" in text for text in pipeline_step_labels)
 assert not any(button.text() == "开始智能提取字幕" for button in window.pages.widget(0).findChildren(toolkit.QPushButton))
 assert window.subtitle_resume_check.isChecked()
 assert window.pipeline_resume_check.isChecked()
@@ -115,6 +120,17 @@ toolkit.QMessageBox.information = original_information
 assert len(list(export_dir.glob("*.srt"))) == 2
 assert toolkit.column_to_index("A") == 0 and toolkit.column_to_index("W") == 22
 assert toolkit.index_to_column(22) == "W"
+word_srt = ("1\n00:00:04,040 --> 00:00:04,440\npasse\n\n"
+            "2\n00:00:04,440 --> 00:00:04,640\npor\n\n"
+            "3\n00:00:04,640 --> 00:00:05,100\naí.\n")
+phrase_srt = toolkit.group_word_srt(word_srt)
+assert phrase_srt.count("-->") == 1 and "00:00:04,040" in phrase_srt and "passe por aí." in phrase_srt
+ass_path = Path(root) / "moving_highlight.ass"
+toolkit.write_ass(ass_path, phrase_srt, {"preset":"背景跟读","font":"Arial","font_size":48,
+    "line_length":30,"outline_width":2,"position":"底部","margin_v":180,
+    "text_color":"#FFFFFF","outline_color":"#111827","highlight_color":"#2563EB"}, word_srt)
+ass_text = ass_path.read_text(encoding="utf-8-sig")
+assert ass_text.count("Dialogue: 0") == 1 and ass_text.count("Dialogue: 1") == 3
 cloud_final = Path(root) / "cloud_final"; cloud_final.mkdir()
 (cloud_final / "001-final.mp4").write_bytes(b"final1")
 (cloud_final / "002-final.mp4").write_bytes(b"final2")
@@ -190,4 +206,7 @@ window.grab().save("subtitle_layout_preview.png")
 window._show_page(8)
 qt.processEvents()
 window.grab().save("pipeline_layout_preview.png")
-print("OK pages=10 auto=enabled fallback=local key_diagnostics=passed")
+window._show_page(3)
+qt.processEvents()
+window.grab().save("reels_layout_preview.png")
+print("OK pages=11 auto=enabled fallback=local key_diagnostics=passed")

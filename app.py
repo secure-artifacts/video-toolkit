@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import asyncio
 import mimetypes
 import os
 import re
@@ -31,14 +32,14 @@ def _startup_trace(message):
 _startup_trace("standard imports ready")
 import requests
 _startup_trace("requests ready")
-from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QInputDialog,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
-    QScrollArea, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QScrollArea, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 _startup_trace("PySide6 ready")
 
@@ -47,6 +48,8 @@ from modules.screenshot_page import VideoTool as ScreenshotPage
 from modules.settings_page import SettingsPage, component_bin
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
+from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
+from modules.metadata_page import MetadataPage
 from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name
 _startup_trace("tool modules ready")
 
@@ -147,13 +150,16 @@ class ConfigStore:
                 "enabled": False, "json_path": "", "parent_folder": "",
                 "folder_mode": "视频名称", "custom_folder_name": "", "public_link": False,
                 "write_sheet": False, "spreadsheet_id": "", "sheet_name": "",
+                "available_sheet_names": [], "option_sheet_name": "", "option_start_row": 2,
                 "insert_row": 4, "date_column": "A", "file_column": "B",
                 "chinese_column": "K", "original_column": "L", "folder_column": "W",
                 "static_columns": "C=\nD=\nE=\nF=\nG=\nH=\nI=\nJ=",
                 "sheet_mappings": [dict(item) for item in DEFAULT_SHEET_MAPPINGS],
                 "sheet_profiles": {}, "active_sheet_profile": "",
+                "sync_profiles": {}, "active_sync_profile": "",
+                "auth_ok": False, "auth_identity": "", "auth_checked": "",
                 "variable_fields": [dict(item) for item in DEFAULT_VARIABLE_FIELDS],
-                "mapping_ui_version": 2,
+                "mapping_ui_version": 3,
             },
         }
 
@@ -746,7 +752,9 @@ class TranscribeWorker(QObject):
             for item in stream:
                 if self.cancelled:
                     raise RuntimeError("任务已取消")
-                segments.append({"start": item.start, "end": item.end, "text": item.text.strip()})
+                words = [{"start": word.start, "end": word.end, "text": word.word.strip()}
+                         for word in (getattr(item, "words", None) or []) if word.word.strip()]
+                segments.append({"start": item.start, "end": item.end, "text": item.text.strip(), "words": words})
                 if len(segments) % 10 == 0:
                     self.log.emit(f"本地识别中：已生成 {len(segments)} 条字幕 …")
             return segments, info
@@ -760,14 +768,14 @@ class TranscribeWorker(QObject):
                 self.log.emit("未检测到 ONNX Runtime，已自动关闭 VAD 静音过滤并继续识别。")
             try:
                 stream, info = model.transcribe(str(audio), language=language, beam_size=5,
-                                                vad_filter=use_vad, word_timestamps=False)
+                                                vad_filter=use_vad, word_timestamps=True)
                 return collect_segments(stream, info)
             except RuntimeError as exc:
                 if not use_vad or "onnxruntime" not in str(exc).lower():
                     raise
                 self.log.emit("VAD 组件不可用，已关闭静音过滤并自动重试当前视频。")
                 stream, info = model.transcribe(str(audio), language=language, beam_size=5,
-                                                vad_filter=False, word_timestamps=False)
+                                                vad_filter=False, word_timestamps=True)
                 return collect_segments(stream, info)
         try:
             segments, info = transcribe_with(self._local_model)
@@ -781,7 +789,8 @@ class TranscribeWorker(QObject):
             segments, info = transcribe_with(self._local_model)
         plain = "\n".join(x["text"] for x in segments)
         raw = {"provider": "Local Whisper", "model": self.model,
-               "language": getattr(info, "language", language), "segments": segments}
+               "language": getattr(info, "language", language), "segments": segments,
+               "words": [word for segment in segments for word in segment.get("words", [])]}
         return segments_to_srt(segments), plain, raw
 
     def _groq(self, audio: Path, key: str, temp: Path):
@@ -805,7 +814,7 @@ class TranscribeWorker(QObject):
             self.log.emit(f"断点续接：复用 {len(chunks)} 个长音频分段。")
         cache_path = temp / "groq_chunk_results.json"
         cache = read_json_file(cache_path, {})
-        all_segments, texts, raw_items, offset = [], [], [], 0.0
+        all_segments, all_words, texts, raw_items, offset = [], [], [], [], 0.0
         for number, chunk in enumerate(chunks, 1):
             payload = cache.get(chunk.name)
             if payload:
@@ -813,7 +822,7 @@ class TranscribeWorker(QObject):
             else:
                 self.log.emit(f"Groq 转写分段 {number}/{len(chunks)} …")
                 data = {"model": self.model, "response_format": "verbose_json",
-                        "timestamp_granularities[]": "segment", "temperature": "0"}
+                        "timestamp_granularities[]": ["word", "segment"], "temperature": "0"}
                 if self.language and self.language != "auto":
                     data["language"] = self.language
                 with chunk.open("rb") as handle:
@@ -833,13 +842,19 @@ class TranscribeWorker(QObject):
                 all_segments.append({"start": float(seg.get("start", 0)) + offset,
                                      "end": float(seg.get("end", 0)) + offset,
                                      "text": seg.get("text", "")})
+            for word in payload.get("words") or []:
+                word_text = str(word.get("word") or word.get("text") or "").strip()
+                if word_text:
+                    all_words.append({"start": float(word.get("start", 0)) + offset,
+                                      "end": float(word.get("end", 0)) + offset, "text": word_text})
             try:
                 offset += video_duration(self.ffmpeg_path, str(chunk))
             except Exception:
                 offset += segment_seconds
         if not all_segments:
             all_segments = [{"start": 0, "end": max(2, offset), "text": "\n".join(texts)}]
-        return segments_to_srt(all_segments), "\n".join(texts), {"provider": "Groq", "chunks": raw_items}
+        return segments_to_srt(all_segments), "\n".join(texts), {"provider": "Groq", "chunks": raw_items,
+                                                                 "words": all_words}
 
     def _gemini(self, audio: Path, key: str):
         size = audio.stat().st_size
@@ -1056,6 +1071,13 @@ def test_google_authorization(config, interactive=True):
     return identity
 
 
+class SheetWritePendingError(RuntimeError):
+    def __init__(self, folder_url, uploaded, cause):
+        super().__init__(f"视频已上传成功，但写入表格失败：{cause}")
+        self.folder_url=folder_url
+        self.uploaded=[{**dict(item),"path":str(item.get("path",""))} for item in uploaded]
+
+
 class GoogleCloudSync:
     def __init__(self, config, log_callback=None, cancel_callback=None):
         self.config = config
@@ -1135,12 +1157,13 @@ class GoogleCloudSync:
         existing_response = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id, range=f"{quoted_sheet}!{file_col}{insert_row}:{file_col}",
             valueRenderOption="FORMULA").execute()
+        # 文件链接是唯一值；同名文件可以存在，但同一个云端链接不会重复写入。
         existing = {}
         for offset, values in enumerate(existing_response.get("values", [])):
             value = str(values[0]) if values else ""
-            match = re.search(r'HYPERLINK\(\s*"[^"]+"\s*[,;]\s*"([^"]*)"', value, re.I)
-            name = match.group(1) if match else value
-            if name: existing[re.sub(r"\s+", "", name).casefold()] = insert_row + offset
+            match = re.search(r'HYPERLINK\(\s*"([^"]+)"\s*[,;]\s*"[^"]*"', value, re.I)
+            link = match.group(1) if match else (value if value.lower().startswith(("http://","https://")) else "")
+            if link: existing[link.strip().casefold()] = insert_row + offset
 
         new_rows, update_data = [], []
         for item in uploaded:
@@ -1161,13 +1184,9 @@ class GoogleCloudSync:
                     try: cell_value = template.format(**context)
                     except (KeyError, ValueError): cell_value = template
                 values[column_index] = cell_value
-            key = re.sub(r"\s+", "", path.name).casefold()
+            key = url.strip().casefold()
             if key in existing:
-                row = existing[key]
-                for column in (file_col, folder_mapping["column"] if folder_mapping else ""):
-                    if column:
-                        update_data.append({"range": f"{quoted_sheet}!{column}{row}",
-                                            "values": [[values[column_to_index(column)]]]})
+                self.log(f"表格已存在该文件链接，跳过：{path.name}")
             else:
                 new_rows.append(values)
         if update_data:
@@ -1224,9 +1243,21 @@ class GoogleCloudSync:
             self.log(f"云端上传完成 {number}/{len(final_files)}：{path.name}")
         sheet_note = "未开启表格写入"
         if self.config.get("write_sheet"):
-            added, updated = self._write_sheet(sheets, uploaded, folder_url)
-            sheet_note = f"表格新增 {added} 行，更新/跳过 {updated} 行"
+            try:
+                added, updated = self._write_sheet(sheets, uploaded, folder_url)
+                sheet_note = f"表格新增 {added} 行，跳过已存在链接 {updated} 行"
+            except Exception as exc:
+                raise SheetWritePendingError(folder_url, uploaded, exc) from exc
         return folder_url, f"上传 {len(uploaded)} 个重命名成品；{sheet_note}"
+
+    def write_sheet_only(self, uploaded, folder_url):
+        _drive, sheets, email = self._services()
+        self.log(f"复用已上传文件，不重新上传视频（{email}）")
+        normalized=[]
+        for item in uploaded:
+            value=dict(item); value["path"]=Path(value.get("path","")); normalized.append(value)
+        added, skipped=self._write_sheet(sheets,normalized,folder_url)
+        return f"继续填表完成：新增 {added} 行，跳过已存在链接 {skipped} 行"
 
 
 class PipelineWorker(QObject):
@@ -1236,6 +1267,7 @@ class PipelineWorker(QObject):
     titles_ready = Signal(str, list)
     cloud_ready = Signal(str, str)
     cloud_failed = Signal(str, str)
+    cloud_sheet_pending = Signal(str, object, str)
     finished = Signal(bool, str)
 
     def __init__(self, store, sources, output, threshold, provider, model, language,
@@ -1446,6 +1478,13 @@ class PipelineWorker(QObject):
                     self.state["status"] = "completed"
                     self.state["cloud_url"] = folder_url
                     self._save_checkpoint()
+                except SheetWritePendingError as cloud_exc:
+                    folder_url = cloud_exc.folder_url
+                    cloud_summary = str(cloud_exc)
+                    self.log.emit(cloud_summary); self.cloud_sheet_pending.emit(folder_url, cloud_exc.uploaded, str(cloud_exc))
+                    self.state["status"] = "sheet_pending"; self.state["cloud_url"] = folder_url
+                    self.state["pending_sheet_uploads"] = cloud_exc.uploaded; self.state["last_error"] = str(cloud_exc)
+                    self._save_checkpoint()
                 except Exception as cloud_exc:
                     folder_url = ""
                     cloud_summary = f"本地视频已全部处理；云同步失败：{cloud_exc}"
@@ -1475,6 +1514,7 @@ class PipelineWorker(QObject):
 class CloudUploadWorker(QObject):
     log = Signal(str)
     finished = Signal(bool, str, str)
+    sheet_pending = Signal(str, object, str)
 
     def __init__(self, config, files, records=None, source_paths=None):
         super().__init__(); self.config = config; self.files = [Path(path) for path in files]
@@ -1490,8 +1530,25 @@ class CloudUploadWorker(QObject):
                 self.config, self.log.emit, lambda: self.cancelled).run(
                 self.files[0].parent, self.records, self.source_paths, self.files)
             self.finished.emit(True, folder_url, summary)
+        except SheetWritePendingError as exc:
+            self.sheet_pending.emit(exc.folder_url,exc.uploaded,str(exc))
+            self.finished.emit(False,exc.folder_url,str(exc))
         except Exception as exc:
             self.finished.emit(False, "", str(exc))
+
+
+class SheetFillWorker(QObject):
+    log=Signal(str); finished=Signal(bool,str,str)
+
+    def __init__(self,config,uploaded,folder_url):
+        super().__init__(); self.config=config; self.uploaded=uploaded; self.folder_url=folder_url
+
+    def run(self):
+        try:
+            summary=GoogleCloudSync(self.config,self.log.emit).write_sheet_only(self.uploaded,self.folder_url)
+            self.finished.emit(True,self.folder_url,summary)
+        except Exception as exc:
+            self.finished.emit(False,self.folder_url,str(exc))
 
 
 class ToolCard(QFrame):
@@ -1527,6 +1584,344 @@ class ToolCard(QFrame):
         layout.addWidget(button)
 
 
+class GoogleAuthWorker(QObject):
+    finished = Signal(bool, str)
+
+    def __init__(self, config, interactive=True):
+        super().__init__(); self.config = config; self.interactive = interactive
+
+    def run(self):
+        try:
+            self.finished.emit(True, test_google_authorization(self.config, interactive=self.interactive))
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
+
+
+class GoogleSheetReadWorker(QObject):
+    """读取工作表名称，或按配置表列读取去重后的下拉选项。"""
+    finished = Signal(bool, object, str)
+
+    def __init__(self, config, mode):
+        super().__init__(); self.config = config; self.mode = mode
+
+    def run(self):
+        try:
+            from googleapiclient.discovery import build
+            credentials, identity = load_google_credentials(self.config, interactive=False)
+            service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+            spreadsheet_id = extract_google_id(self.config.get("spreadsheet_id", ""))
+            if not spreadsheet_id: raise RuntimeError("请先填写有效的 Google 表格 ID 或链接。")
+            metadata = service.spreadsheets().get(
+                spreadsheetId=spreadsheet_id, fields="sheets.properties.title").execute()
+            sheet_names = [item.get("properties", {}).get("title", "") for item in metadata.get("sheets", [])]
+            sheet_names = [name for name in sheet_names if name]
+            if self.mode == "sheets":
+                self.finished.emit(True, sheet_names, f"已读取 {len(sheet_names)} 个 Sheet（{identity}）")
+                return
+            source_sheet = self.config.get("option_sheet_name", "").strip()
+            if not source_sheet: raise RuntimeError("请选择用于读取下拉选项的配置 Sheet。")
+            if source_sheet not in sheet_names: raise RuntimeError(f"表格中没有找到配置 Sheet：{source_sheet}")
+            start_row = max(1, int(self.config.get("option_start_row", 2)))
+            quoted = "'" + source_sheet.replace("'", "''") + "'"
+            result = {}
+            for item in self.config.get("variable_fields", []):
+                source_column = str(item.get("source_column", "")).strip().upper()
+                if not source_column: continue
+                column_to_index(source_column)
+                response = service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{quoted}!{source_column}{start_row}:{source_column}").execute()
+                values=[]; seen=set()
+                for row in response.get("values", []):
+                    value=str(row[0]).strip() if row else ""
+                    key=value.casefold()
+                    if value and key not in seen: values.append(value); seen.add(key)
+                result[item.get("field", source_column)] = values
+            self.finished.emit(True, result, f"已从“{source_sheet}”读取 {sum(len(v) for v in result.values())} 个去重选项")
+        except Exception as exc:
+            self.finished.emit(False, {}, str(exc))
+
+
+class PasteOptionsTable(QTableWidget):
+    """支持把 Excel/Google Sheets 的多行、多列内容直接粘贴进选项网格。"""
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Paste):
+            text=QApplication.clipboard().text().replace("\r\n","\n").replace("\r","\n")
+            rows=[line.split("\t") for line in text.split("\n") if line or "\t" in line]
+            if not rows: return
+            start_row=max(0,self.currentRow()); start_col=max(0,self.currentColumn())
+            needed_rows=start_row+len(rows)
+            if needed_rows>self.rowCount(): self.setRowCount(needed_rows)
+            for row_offset,values in enumerate(rows):
+                for col_offset,value in enumerate(values):
+                    column=start_col+col_offset
+                    if column>=self.columnCount(): break
+                    self.setItem(start_row+row_offset,column,QTableWidgetItem(value.strip()))
+            return
+        super().keyPressEvent(event)
+
+
+class NoWheelComboBox(QComboBox):
+    """下拉框仍可点击和键盘选择，但页面滚动时不会误切换值。"""
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class VariableOptionsDialog(QDialog):
+    """以“字段为列、选项为行”的方式批量维护本地上传选项。"""
+    def __init__(self, fields, parent=None):
+        super().__init__(parent); self.fields=[dict(item) for item in fields]
+        self.setWindowTitle("配置下拉字段和选项"); self.resize(1040,620)
+        root=QVBoxLayout(self); root.setContentsMargins(12,12,12,10); root.setSpacing(8)
+        hint=QLabel("每一列对应一个上传字段。选中列下方的第一个空格后，可直接粘贴多行数据；也支持一次粘贴多列。保存时会自动删除空白和重复项。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;"); root.addWidget(hint)
+        max_rows=max([len(item.get("options",[])) for item in self.fields]+[8])
+        self.table=PasteOptionsTable(max_rows+3,len(self.fields))
+        self.table.setHorizontalHeaderLabels([f"{item.get('field','字段')}\n（写入 {item.get('column','')} 列）" for item in self.fields])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.setAlternatingRowColors(False); self.table.setSelectionMode(QAbstractItemView.SelectionMode.ContiguousSelection)
+        self.table.setStyleSheet("""
+            QTableWidget { background:#0b1424; color:#f1f5f9; gridline-color:#334155; border:1px solid #334155; }
+            QTableWidget::item { background:#0b1424; color:#f1f5f9; padding:4px; }
+            QTableWidget::item:selected { background:#2563eb; color:#ffffff; }
+            QHeaderView::section { background:#1b2a41; color:#e2e8f0; border:1px solid #334155; padding:5px; font-weight:700; }
+        """)
+        for column,item in enumerate(self.fields):
+            for row,value in enumerate(item.get("options",[])):
+                self.table.setItem(row,column,QTableWidgetItem(str(value)))
+        root.addWidget(self.table,1)
+        actions=QHBoxLayout(); add_rows=QPushButton("增加 10 行"); add_rows.clicked.connect(lambda:self.table.setRowCount(self.table.rowCount()+10))
+        clear_column=QPushButton("清空选中列"); clear_column.clicked.connect(self._clear_selected_columns)
+        actions.addWidget(add_rows); actions.addWidget(clear_column); actions.addStretch(); root.addLayout(actions)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存选项")
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); root.addWidget(buttons)
+
+    def _clear_selected_columns(self):
+        columns={index.column() for index in self.table.selectedIndexes()}
+        for column in columns:
+            for row in range(self.table.rowCount()): self.table.takeItem(row,column)
+
+    def result_fields(self):
+        result=[]
+        for column,item in enumerate(self.fields):
+            values=[]; seen=set()
+            for row in range(self.table.rowCount()):
+                cell=self.table.item(row,column); value=cell.text().strip() if cell else ""; key=value.casefold()
+                if value and key not in seen: values.append(value); seen.add(key)
+            updated=dict(item); updated["options"]=values
+            if updated.get("selected") not in values: updated["selected"]=""
+            result.append(updated)
+        return result
+
+
+class GoogleSettingsPanel(QWidget):
+    """常驻的 Google Drive / Sheets 多方案编辑器。"""
+    profiles_changed = Signal()
+
+    def __init__(self, store):
+        super().__init__(); self.store = store; self.auth_thread = None; self.auth_worker = None
+        self.sheet_thread = None; self.sheet_worker = None; self._loaded_options = {}; self._variable_selected = {}; self._available_sheet_names = []
+        self._build(); self.load_current()
+        # 授权成功后直接复用本地 OAuth token / 服务账号，不要求每次启动重新点击检查。
+
+    def _build(self):
+        root = QVBoxLayout(self); root.setContentsMargins(14, 12, 14, 12); root.setSpacing(7)
+        top = QHBoxLayout(); title = QLabel("Google Drive / Sheets 授权与同步方案"); title.setObjectName("heading")
+        top.addWidget(title); top.addStretch(); self.profile = QComboBox(); self.profile.setEditable(True); self.profile.setMinimumWidth(210)
+        self.profile.currentTextChanged.connect(self.load_profile)
+        save = QPushButton("保存为当前方案"); save.setObjectName("primary"); save.clicked.connect(self.save_profile)
+        delete = QPushButton("删除方案"); delete.clicked.connect(self.delete_profile)
+        top.addWidget(QLabel("方案")); top.addWidget(self.profile); top.addWidget(save); top.addWidget(delete); root.addLayout(top)
+        hint = QLabel("把授权、Drive 文件夹、表格、Sheet、固定列和上传时选择项保存在同一方案。流水线开始前只需选择方案。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;"); root.addWidget(hint)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter|Qt.AlignmentFlag.AlignTop)
+        body = QWidget(); body.setMaximumWidth(1180); body_layout = QVBoxLayout(body)
+        auth = QGroupBox("授权与 Drive"); auth_form = QFormLayout(auth)
+        json_row = QHBoxLayout(); self.json_path = QLineEdit(); json_row.addWidget(self.json_path); browse = QPushButton("选择 JSON…")
+        browse.clicked.connect(self.choose_json); json_row.addWidget(browse); auth_form.addRow("服务账号 / OAuth JSON", json_row)
+        self.parent_folder = QLineEdit(); self.parent_folder.setPlaceholderText("Drive 父文件夹 ID 或链接"); auth_form.addRow("父文件夹", self.parent_folder)
+        self.folder_mode = QComboBox(); self.folder_mode.addItems(["视频名称", "自定义名称"]); self.custom_folder = QLineEdit()
+        mode_row = QHBoxLayout(); mode_row.addWidget(self.folder_mode); mode_row.addWidget(self.custom_folder, 1); auth_form.addRow("云端目录命名", mode_row)
+        auth_row = QHBoxLayout(); self.auth_status = QLabel("尚未检查"); self.auth_status.setWordWrap(True); self.auth_button = QPushButton("授权 / 重新检查")
+        self.auth_button.clicked.connect(lambda: self.check_auth(True)); auth_row.addWidget(self.auth_status, 1); auth_row.addWidget(self.auth_button); auth_form.addRow("权限状态", auth_row)
+        self.public_link = QCheckBox("允许知道链接的用户查看任务文件夹"); auth_form.addRow("共享", self.public_link); body_layout.addWidget(auth)
+        sheet = QGroupBox("Google Sheets 写入"); sheet_form = QFormLayout(sheet)
+        self.write_sheet = QCheckBox("上传完成后写入表格"); sheet_form.addRow("启用", self.write_sheet)
+        self.spreadsheet = QLineEdit(); self.spreadsheet.setPlaceholderText("表格 ID 或完整链接")
+        spreadsheet_row = QHBoxLayout(); spreadsheet_row.addWidget(self.spreadsheet, 1)
+        self.read_sheets_button = QPushButton("读取 Sheet 名称"); self.read_sheets_button.clicked.connect(self.read_sheet_names); spreadsheet_row.addWidget(self.read_sheets_button)
+        self.sheet_name = QComboBox(); self.sheet_name.setEditable(True); self.sheet_name.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.sheet_name.lineEdit().setPlaceholderText("选择或直接输入写入目标 Sheet")
+        self.insert_row = QSpinBox(); self.insert_row.setRange(1,100000); self.insert_row.setValue(4)
+        sheet_form.addRow("表格 ID", spreadsheet_row); sheet_form.addRow("写入 Sheet", self.sheet_name); sheet_form.addRow("数据起始行", self.insert_row)
+        body_layout.addWidget(sheet)
+        mapping_group = QGroupBox("固定字段与列映射"); mapping_layout = QVBoxLayout(mapping_group)
+        self.mapping_table = QTableWidget(0, 4); self.mapping_table.setHorizontalHeaderLabels(["字段名称", "写入列", "类型", "固定内容"])
+        self.mapping_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch); self.mapping_table.setMinimumHeight(210)
+        mapping_layout.addWidget(self.mapping_table); mbuttons = QHBoxLayout(); madd = QPushButton("新增固定字段"); madd.clicked.connect(self.add_mapping)
+        mdel = QPushButton("删除选中"); mdel.clicked.connect(lambda: self.remove_rows(self.mapping_table)); mbuttons.addWidget(madd); mbuttons.addWidget(mdel); mbuttons.addStretch(); mapping_layout.addLayout(mbuttons)
+        body_layout.addWidget(mapping_group)
+        variable_group = QGroupBox("本次上传可选择字段"); variable_layout = QVBoxLayout(variable_group)
+        variable_hint=QLabel("字段名称和写入列在下表维护；具体选项在独立窗口中按列批量粘贴。")
+        variable_hint.setStyleSheet("color:#7dd3fc;"); variable_layout.addWidget(variable_hint)
+        self.variable_table = QTableWidget(0, 3); self.variable_table.setHorizontalHeaderLabels(["字段名称", "写入列", "可选项数量"])
+        self.variable_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        self.variable_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.ResizeToContents)
+        self.variable_table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeMode.ResizeToContents); self.variable_table.setMinimumHeight(180)
+        variable_layout.addWidget(self.variable_table); vbuttons = QHBoxLayout(); configure=QPushButton("配置下拉字段和选项"); configure.setObjectName("primary"); configure.clicked.connect(self.configure_variable_options)
+        vadd = QPushButton("新增字段"); vadd.clicked.connect(self.add_variable)
+        vdel = QPushButton("删除选中"); vdel.clicked.connect(lambda: self.remove_rows(self.variable_table)); vbuttons.addWidget(configure); vbuttons.addWidget(vadd); vbuttons.addWidget(vdel); vbuttons.addStretch(); variable_layout.addLayout(vbuttons)
+        body_layout.addWidget(variable_group); body_layout.addStretch(); scroll.setWidget(body); root.addWidget(scroll, 1)
+        bottom = QHBoxLayout(); self.enabled = QCheckBox("允许流水线使用此方案"); bottom.addWidget(self.enabled); bottom.addStretch()
+        apply = QPushButton("保存当前修改"); apply.clicked.connect(self.save_current); bottom.addWidget(apply); root.addLayout(bottom)
+
+    def choose_json(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 Google 授权 JSON", "", "JSON (*.json)")
+        if path: self.json_path.setText(path); self.auth_status.setText("授权文件已变更，等待检查")
+
+    def read_sheet_names(self):
+        self._start_sheet_read("sheets")
+
+    def _start_sheet_read(self, mode="sheets", config=None):
+        if self.sheet_thread and self.sheet_thread.isRunning(): return
+        config=config or self.read_ui(); self._sheet_read_mode=mode
+        self.read_sheets_button.setEnabled(False); self.read_sheets_button.setText("正在读取…")
+        self.sheet_thread=QThread(self); self.sheet_worker=GoogleSheetReadWorker(config,mode); self.sheet_worker.moveToThread(self.sheet_thread)
+        self.sheet_thread.started.connect(self.sheet_worker.run); self.sheet_worker.finished.connect(self._sheet_read_done); self.sheet_worker.finished.connect(self.sheet_thread.quit)
+        self.sheet_thread.finished.connect(self._sheet_read_ended); self.sheet_thread.finished.connect(self.sheet_thread.deleteLater); self.sheet_thread.start()
+
+    def _sheet_read_done(self, ok, data, message):
+        self.read_sheets_button.setEnabled(True); self.read_sheets_button.setText("读取 Sheet 名称")
+        if not ok:
+            QMessageBox.warning(self,"读取 Google 表格失败",message); return
+        target=self.sheet_name.currentText(); self.sheet_name.blockSignals(True); self.sheet_name.clear(); self.sheet_name.addItems(data)
+        self.sheet_name.setCurrentText(target or (data[0] if data else "")); self.sheet_name.blockSignals(False)
+        self._available_sheet_names=list(data); self.save_current(silent=True)
+        QMessageBox.information(self,"读取完成",message)
+
+    def _sheet_read_ended(self):
+        self.sheet_worker=None; self.sheet_thread=None
+
+    def add_mapping(self, item=None):
+        item = item or {"field":"自定义字段","column":"","source":"static","value":""}; row = self.mapping_table.rowCount(); self.mapping_table.insertRow(row)
+        for col, value in enumerate((item.get("field",""), item.get("column",""), item.get("source","static"), item.get("value",""))): self.mapping_table.setItem(row,col,QTableWidgetItem(str(value)))
+
+    def add_variable(self, item=None):
+        item = item or {"field":"选择项","column":"","options":[],"selected":""}; row = self.variable_table.rowCount(); self.variable_table.insertRow(row)
+        field=item.get("field",""); options=list(item.get("options",[])); self._loaded_options[field]=options; self._variable_selected[field]=item.get("selected","")
+        self.variable_table.setItem(row,0,QTableWidgetItem(str(field))); self.variable_table.setItem(row,1,QTableWidgetItem(str(item.get("column",""))))
+        count=QTableWidgetItem(str(len(options))); count.setFlags(count.flags()&~Qt.ItemFlag.ItemIsEditable); self.variable_table.setItem(row,2,count)
+
+    def configure_variable_options(self):
+        fields=[]
+        for row in range(self.variable_table.rowCount()):
+            field=self.variable_table.item(row,0).text().strip() if self.variable_table.item(row,0) else ""
+            column=self.variable_table.item(row,1).text().strip().upper() if self.variable_table.item(row,1) else ""
+            if field and column:
+                fields.append({"field":field,"column":column,"options":list(self._loaded_options.get(field,[])),"selected":self._variable_selected.get(field,"")})
+        if not fields:
+            QMessageBox.information(self,"没有字段","请先添加字段名称和写入列。")
+            return
+        dialog=VariableOptionsDialog(fields,self)
+        if dialog.exec()!=QDialog.DialogCode.Accepted: return
+        updated=dialog.result_fields(); self.variable_table.setRowCount(0); self._loaded_options={}; self._variable_selected={}
+        for item in updated: self.add_variable(item)
+        self.save_current(silent=True)
+
+    def remove_rows(self, table):
+        for row in sorted({idx.row() for idx in table.selectedIndexes()}, reverse=True): table.removeRow(row)
+
+    def read_ui(self):
+        mappings=[]
+        for row in range(self.mapping_table.rowCount()):
+            values=[self.mapping_table.item(row,c).text().strip() if self.mapping_table.item(row,c) else "" for c in range(4)]
+            if values[1]: mappings.append({"field":values[0] or "自定义字段","column":values[1].upper(),"source":values[2] or "static","value":values[3]})
+        variables=[]
+        for row in range(self.variable_table.rowCount()):
+            values=[self.variable_table.item(row,c).text().strip() if self.variable_table.item(row,c) else "" for c in range(2)]
+            if values[0] and values[1]: variables.append({"field":values[0],"column":values[1].upper(),"options":list(self._loaded_options.get(values[0],[])),"selected":self._variable_selected.get(values[0],"")})
+        base = dict(self.store.data.get("google_sync", {}))
+        base.update({"enabled":self.enabled.isChecked(),"json_path":self.json_path.text().strip(),"parent_folder":self.parent_folder.text().strip(),
+                     "folder_mode":self.folder_mode.currentText(),"custom_folder_name":self.custom_folder.text().strip(),"public_link":self.public_link.isChecked(),
+                     "write_sheet":self.write_sheet.isChecked(),"spreadsheet_id":self.spreadsheet.text().strip(),"sheet_name":self.sheet_name.currentText().strip(),
+                     "available_sheet_names":list(self._available_sheet_names),"insert_row":self.insert_row.value(),"sheet_mappings":mappings,"variable_fields":variables,"mapping_ui_version":3})
+        return base
+
+    def apply(self, config):
+        self.json_path.setText(config.get("json_path","")); self.parent_folder.setText(config.get("parent_folder","")); self.folder_mode.setCurrentText(config.get("folder_mode","视频名称"))
+        self.custom_folder.setText(config.get("custom_folder_name","")); self.public_link.setChecked(config.get("public_link",False)); self.write_sheet.setChecked(config.get("write_sheet",False))
+        self.spreadsheet.setText(config.get("spreadsheet_id","")); self._available_sheet_names=list(config.get("available_sheet_names",[]))
+        current_sheet=config.get("sheet_name",""); self.sheet_name.blockSignals(True); self.sheet_name.clear(); self.sheet_name.addItems(self._available_sheet_names); self.sheet_name.setCurrentText(current_sheet); self.sheet_name.blockSignals(False)
+        self.insert_row.setValue(int(config.get("insert_row",4))); self.enabled.setChecked(config.get("enabled",False))
+        self.mapping_table.setRowCount(0)
+        for item in config.get("sheet_mappings",DEFAULT_SHEET_MAPPINGS): self.add_mapping(item)
+        self.variable_table.setRowCount(0); self._loaded_options={}; self._variable_selected={}
+        for item in config.get("variable_fields",DEFAULT_VARIABLE_FIELDS): self.add_variable(item)
+        if config.get("auth_ok"):
+            self.auth_status.setText(f"已授权：{config.get('auth_identity','Google 账号')}（启动后自动复用）"); self.auth_status.setStyleSheet("color:#86efac;")
+        else: self.auth_status.setText("尚未授权或需要重新检查"); self.auth_status.setStyleSheet("color:#fbbf24;")
+
+    def load_current(self):
+        config = self.store.data["google_sync"]; profiles = config.get("sync_profiles",{})
+        self.profile.blockSignals(True); self.profile.clear(); self.profile.addItems(profiles.keys()); self.profile.blockSignals(False)
+        active = config.get("active_sync_profile","")
+        if active in profiles: self.profile.setCurrentText(active); self.apply(profiles[active])
+        else: self.apply(config)
+
+    def load_profile(self, name):
+        profile = self.store.data["google_sync"].get("sync_profiles",{}).get(name)
+        if profile: self.apply(profile)
+
+    def save_current(self, silent=False):
+        config = self.read_ui(); profiles = dict(self.store.data["google_sync"].get("sync_profiles",{}))
+        profile_name=self.profile.currentText().strip()
+        if profile_name in profiles:
+            profile_data=dict(config); profile_data.pop("sync_profiles",None); profile_data.pop("active_sync_profile",None); profiles[profile_name]=profile_data
+        config["sync_profiles"] = profiles; config["active_sync_profile"] = profile_name if profile_name in profiles else ""
+        self.store.data["google_sync"] = config; self.store.save(); self.profiles_changed.emit()
+        if not silent: QMessageBox.information(self,"配置已保存","Google 同步配置已保存。")
+
+    def save_profile(self):
+        name = self.profile.currentText().strip()
+        if not name:
+            name, ok = QInputDialog.getText(self,"保存同步方案","方案名称（例如：方案1）：")
+            if not ok or not name.strip(): return
+            name = name.strip()
+        config = self.read_ui(); profiles = dict(self.store.data["google_sync"].get("sync_profiles",{})); config.pop("sync_profiles",None)
+        profiles[name] = config; current = dict(config); current["sync_profiles"] = profiles; current["active_sync_profile"] = name
+        self.store.data["google_sync"] = current; self.store.save(); self.load_current(); self.profile.setCurrentText(name); self.profiles_changed.emit()
+        QMessageBox.information(self,"方案已保存",f"同步方案“{name}”已保存并设为当前方案。")
+
+    def delete_profile(self):
+        name=self.profile.currentText().strip(); profiles=dict(self.store.data["google_sync"].get("sync_profiles",{}))
+        if name not in profiles: return
+        del profiles[name]; self.store.data["google_sync"]["sync_profiles"]=profiles; self.store.data["google_sync"]["active_sync_profile"]=""; self.store.save(); self.load_current(); self.profiles_changed.emit()
+
+    def check_auth(self, interactive=True):
+        if self.auth_thread and self.auth_thread.isRunning(): return
+        config=self.read_ui(); self.auth_status.setText("正在检查 Google 权限…"); self.auth_button.setEnabled(False)
+        self.auth_thread=QThread(self); self.auth_worker=GoogleAuthWorker(config, interactive); self.auth_worker.moveToThread(self.auth_thread)
+        self.auth_thread.started.connect(self.auth_worker.run); self.auth_worker.finished.connect(self.auth_done); self.auth_worker.finished.connect(self.auth_thread.quit)
+        self.auth_thread.finished.connect(self.auth_ended); self.auth_thread.finished.connect(self.auth_thread.deleteLater); self.auth_thread.start()
+
+    def auth_done(self, ok, message):
+        self.auth_button.setEnabled(True); config=self.read_ui(); config["auth_ok"]=ok; config["auth_identity"]=message if ok else ""; config["auth_checked"]=datetime.now().isoformat(timespec="seconds")
+        profiles=dict(self.store.data["google_sync"].get("sync_profiles",{})); profile_name=self.profile.currentText().strip()
+        if profile_name in profiles:
+            profile_data=dict(config); profile_data.pop("sync_profiles",None); profile_data.pop("active_sync_profile",None); profiles[profile_name]=profile_data
+        config["sync_profiles"]=profiles; config["active_sync_profile"]=profile_name if profile_name in profiles else ""
+        self.store.data["google_sync"]=config; self.store.save(); self.profiles_changed.emit()
+        self.auth_status.setText(("授权成功：" if ok else "授权失败：")+message); self.auth_status.setStyleSheet("color:#86efac;" if ok else "color:#fca5a5;")
+        if not ok: QMessageBox.warning(self,"Google 授权失败",message)
+
+    def auth_ended(self): self.auth_worker=None; self.auth_thread=None
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1548,6 +1943,7 @@ class MainWindow(QMainWindow):
         self.cloud_thread = None
         self.cloud_worker = None
         self.pending_upload_files = []
+        self.pending_sheet_uploads = []; self.pending_sheet_folder_url = ""
         self.setWindowTitle(APP_NAME)
         self.resize(1380, 820)
         self.setMinimumSize(1080, 680)
@@ -1578,14 +1974,15 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(brand)
         nav_layout.addSpacing(16)
         self.nav_buttons = []
-        nav_items = ("首页", "批量截图", "智能剪辑", "水印添加",
-                     "批量重命名", "字幕提取", "密钥管理", "设置与组件", "自动流水线",
-                     "帮助与说明")
-        for i, text in enumerate(nav_items):
+        nav_items = (("首页", 0), ("批量截图", 1), ("智能剪辑", 2), ("动态文案/水印", 3),
+                     ("批量重命名", 4), ("清除元数据", 10), ("字幕提取", 5), ("自动流水线", 8),
+                     ("密钥管理", 6), ("设置与组件", 7), ("帮助", 9))
+        for text, page_index in nav_items:
             btn = QPushButton(text)
             btn.setCheckable(True)
             btn.setObjectName("navButton")
-            btn.clicked.connect(lambda checked=False, idx=i: self._show_page(idx))
+            btn.setProperty("pageIndex", page_index)
+            btn.clicked.connect(lambda checked=False, idx=page_index: self._show_page(idx))
             nav_layout.addWidget(btn)
             self.nav_buttons.append(btn)
         nav_layout.addStretch()
@@ -1601,25 +1998,43 @@ class MainWindow(QMainWindow):
         _startup_trace("screenshot page ready")
         self.smartcut_page = SmartCutPage()
         _startup_trace("smartcut page ready")
+        self.watermark_tabs = QTabWidget()
         self.watermark_page = WatermarkPage()
+        self.dynamic_caption_page = DynamicCaptionPage(
+            self._caption_transcribe, self._text_to_speech, self._find_ffmpeg,
+            TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER)
+        reels_tab_index = self.watermark_tabs.addTab(self.dynamic_caption_page, "动态 Reels 流水线")
+        # Reels 功能代码暂时保留，当前稳定发布版不向用户开放入口。
+        self.watermark_tabs.setTabVisible(reels_tab_index, False)
+        watermark_tab_index = self.watermark_tabs.addTab(self.watermark_page, "视频 / 图片水印")
+        self.watermark_tabs.addTab(MetadataPage(), "素材元数据清理")
+        self.watermark_tabs.setCurrentIndex(watermark_tab_index)
         _startup_trace("watermark page ready")
         self.rename_page = RenamePage()
         _startup_trace("rename page ready")
         self.pages.addWidget(self.screenshot_page)
         self.pages.addWidget(self.smartcut_page)
-        self.pages.addWidget(self.watermark_page)
+        self.pages.addWidget(self.watermark_tabs)
         self.pages.addWidget(self.rename_page)
         self.pages.addWidget(self._subtitle_page())
         _startup_trace("subtitle page ready")
         self.pages.addWidget(self._keys_page())
         _startup_trace("keys page ready")
-        self.settings_page = SettingsPage()
+        self.settings_page = QTabWidget()
+        self.component_settings_page = SettingsPage()
+        self.google_settings_page = GoogleSettingsPanel(self.store)
+        self.settings_page.addTab(self.component_settings_page, "组件检测与安装")
+        self.settings_page.addTab(self.google_settings_page, "Google 授权与同步方案")
         _startup_trace("settings page ready")
         self.pages.addWidget(self.settings_page)
         self.pages.addWidget(self._pipeline_page())
+        self.google_settings_page.profiles_changed.connect(self._refresh_pipeline_profiles)
         _startup_trace("pipeline page ready")
         self.pages.addWidget(self._help_page())
         _startup_trace("help page ready")
+        self.metadata_page = MetadataPage()
+        self.pages.addWidget(self.metadata_page)
+        _startup_trace("metadata page ready")
         outer.addWidget(self.pages, 1)
         self._show_page(0)
 
@@ -1647,7 +2062,7 @@ class MainWindow(QMainWindow):
              "• 根据画面变化自动检测视频场景\n• 支持自定义片段时长和批量切分\n• 多视频、文件夹拖拽和任务队列\n• 输出成品并保留视频原有立体声音频",
              "#a78bfa", "page:2"),
             ("◉", "视频 / 图片水印",
-             "• 视频与图片统一批量添加文字水印\n• 多层水印、字体、描边和透明度设置\n• 模板保存、位置网格及实时效果预览\n• 支持 CPU 和平台硬件视频编码",
+             "• 批量添加文字水印与图片水印\n• 支持多层水印、模板保存和快速复用\n• 可调整位置、透明度、边距与预览比例\n• 视频和图片素材均可批量处理",
              "#34d399", "page:3"),
             ("A↔", "视频 / 文件重命名",
              "• 文件自然排序及 Windows 安全名称处理\n• 标题、日期、前后缀和连续编号组合\n• 执行前完整预览新旧文件名\n• 多套前缀与后缀方案保存和快速切换",
@@ -1656,10 +2071,13 @@ class MainWindow(QMainWindow):
              "• 本地 Whisper 无需密钥即可识别\n• 在线服务支持多密钥检测与轮询\n• 批量处理网络链接、本地视频或音频\n• 中外文对照、全部复制及批量导出字幕",
              "#fb7185", "page:5"),
             ("⇢", "自动流水线",
-             "• 智能剪辑 → 字幕提取 → 批量重命名\n• 自动把每段字幕引用为对应视频标题\n• 中间结果与重命名成品分别保留\n• 可选同步 Google Drive 和 Google Sheets",
+             "• 智能剪辑 → 字幕提取 → 标题生成 → 批量重命名\n• 批量上传重命名成品并填写 Google Sheets\n• 上传成功、填表失败时可单独继续填表\n• 支持断点续接、方案保存和重复链接跳过",
              "#22d3ee", "page:8"),
+            ("⌫", "批量清除素材元数据",
+             "• 无损清除视频/音频的标题、作者、设备和章节信息\n• 清除图片 EXIF、XMP、拍摄时间和位置数据\n• 文件与文件夹拖拽、父目录和子目录批量选择\n• 可作为自动流水线的素材预处理步骤",
+             "#60a5fa", "page:10"),
         ]
-        rows = [QHBoxLayout(), QHBoxLayout(), QHBoxLayout()]
+        rows = [QHBoxLayout() for _ in range((len(tools) + 1) // 2)]
         for idx, item in enumerate(tools):
             card = ToolCard(*item)
             card.clicked.connect(self._launch_tool)
@@ -1681,7 +2099,9 @@ class MainWindow(QMainWindow):
             ("快速开始", "1. 在顶部选择需要的工具。\n2. 拖入视频、音频、文件夹，或点击按钮选择素材。\n3. 检查输出目录和处理参数。\n4. 先预览，再开始批量执行。\n5. 完成后从日志或结果区查看输出位置。"),
             ("素材添加与拖拽", "需要选择素材的页面均支持拖入文件或文件夹。选择父目录后，可以从子文件夹列表继续添加指定目录。批量截图和字幕提取还支持 YouTube、Facebook、Instagram、TikTok 链接，每行填写一个。"),
             ("字幕提取", "可以使用“本地 Whisper（无需密钥）”，也可以配置 Groq、Gemini、ElevenLabs、Gladia。批量结果可查看当前项目或全部项目，并支持复制全部原文、复制全部中外文对照及批量导出字幕。"),
-            ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕作为标题 → 批量重命名”执行。处理完成后可选择只上传重命名成品，并按已保存的 Google Drive / Sheets 方案写入表格。"),
+            ("视频 / 图片水印", "保留原有静态水印功能，可为视频和图片批量添加多层文字或图片水印，并保存、应用水印模板。动态 Reels 功能本版本暂不开放。"),
+            ("素材元数据清理", "可从顶部“清除元数据”直接进入，也可在“视频 / 图片水印”中打开对应子页。程序会显示清理前后的元数据信息；视频和音频使用无损流复制且保留原声道，图片重新保存干净副本以移除 EXIF/XMP，原文件不会修改。"),
+            ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕生成标题 → 批量重命名成品 → 批量上传 → 批量填表”执行。只上传重命名成品；支持断点续接、保存同步方案、继续上传和继续填表，并按云端文件链接唯一值跳过已经填写的记录。"),
             ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
             ("组件检查与常见问题", "FFmpeg、FFprobe 或 Python 组件异常时，进入“设置与组件”统一检测并一键恢复。网络链接无法解析时可更新 yt-dlp。macOS 首次打开若被系统拦截，请在 Finder 中右键应用并选择“打开”。"),
             ("长视频与断点续接", "字幕提取和自动流水线默认开启“自动续接”。同一批素材再次执行时，程序会跳过已成功的视频；流水线还会跳过已经完成的剪辑和重命名。请保留流水线输出目录及其中的 pipeline_checkpoint.json。需要全部重做时，取消勾选自动续接。"),
@@ -1698,7 +2118,7 @@ class MainWindow(QMainWindow):
             text.setStyleSheet("color:#b7c5d8;line-height:1.55;")
             group_layout.addWidget(text)
             grid.addWidget(group, index // 2, index % 2)
-        for row in range(4):
+        for row in range(5):
             grid.setRowStretch(row, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -1882,13 +2302,24 @@ class MainWindow(QMainWindow):
         number_widget = QWidget(); number_widget.setLayout(number_line); form.addRow("编号", number_widget)
         left_layout.addWidget(settings)
         cloud_group = QGroupBox("3. Google 云端同步（只上传重命名成品）")
-        cloud_layout = QHBoxLayout(cloud_group); cloud_layout.setContentsMargins(10, 9, 10, 9)
+        cloud_layout = QVBoxLayout(cloud_group); cloud_layout.setContentsMargins(10, 9, 10, 9)
+        cloud_top = QHBoxLayout()
         self.pipeline_cloud_check = QCheckBox("流水线完成后自动上传并写入表格")
         self.pipeline_cloud_check.setChecked(self.store.data["google_sync"].get("enabled", False))
         self.pipeline_cloud_check.toggled.connect(self._pipeline_cloud_toggled)
-        cloud_config = QPushButton("配置 Google JSON / Drive / Sheets")
-        cloud_config.clicked.connect(self._open_google_sync_dialog)
-        cloud_layout.addWidget(self.pipeline_cloud_check); cloud_layout.addStretch(); cloud_layout.addWidget(cloud_config)
+        cloud_config = QPushButton("打开设置与组件")
+        cloud_config.clicked.connect(self._open_google_settings)
+        cloud_top.addWidget(self.pipeline_cloud_check); cloud_top.addStretch(); cloud_top.addWidget(cloud_config); cloud_layout.addLayout(cloud_top)
+        profile_row = QHBoxLayout(); profile_row.addWidget(QLabel("同步方案")); self.pipeline_sync_profile = NoWheelComboBox()
+        self.pipeline_sync_profile.currentTextChanged.connect(self._pipeline_profile_changed)
+        self.pipeline_save_profile=QPushButton("保存方案"); self.pipeline_save_profile.clicked.connect(self._save_pipeline_sync_profile)
+        profile_row.addWidget(self.pipeline_sync_profile, 1); profile_row.addWidget(self.pipeline_save_profile); cloud_layout.addLayout(profile_row)
+        self.pipeline_profile_hint = QLabel("未选择同步方案"); self.pipeline_profile_hint.setWordWrap(True); self.pipeline_profile_hint.setStyleSheet("color:#94a3b8;")
+        self.pipeline_profile_hint.setVisible(False)
+        self.pipeline_variable_group = QGroupBox("本次上传选择（每次可重新选择）")
+        self.pipeline_variable_form = QFormLayout(self.pipeline_variable_group); self.pipeline_variable_form.setVerticalSpacing(6)
+        self.pipeline_runtime_values = {}; self.pipeline_runtime_sheet = ""; self._pipeline_runtime_profile = None
+        cloud_layout.addWidget(self.pipeline_variable_group)
         left_layout.addWidget(cloud_group)
         self.pipeline_resume_check = QCheckBox("自动续接未完成任务（跳过已完成的剪辑、字幕和重命名）")
         self.pipeline_resume_check.setChecked(True)
@@ -1903,7 +2334,8 @@ class MainWindow(QMainWindow):
 
         right = QFrame(); right.setObjectName("panel"); right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(12, 10, 12, 10); right_layout.setSpacing(7)
-        step_text = QLabel("① 智能剪辑   →   ② 提取字幕   →   ③ 字幕生成标题   →   ④ 批量重命名成品")
+        step_text = QLabel("① 智能剪辑   →   ② 提取字幕   →   ③ 字幕生成标题   →   ④ 批量重命名成品   →   ⑤ 批量上传   →   ⑥ 批量填表")
+        step_text.setWordWrap(True)
         step_text.setStyleSheet("color:#7dd3fc;font-size:14px;font-weight:700;padding:8px;")
         right_layout.addWidget(step_text)
         self.pipeline_cloud_result = QLabel("云端同步：等待执行")
@@ -1922,10 +2354,12 @@ class MainWindow(QMainWindow):
         upload_folder = QPushButton("选择成品目录上传"); upload_folder.clicked.connect(self._manual_upload_folder)
         self.pipeline_retry_upload = QPushButton("继续上传"); self.pipeline_retry_upload.setEnabled(False)
         self.pipeline_retry_upload.clicked.connect(self._retry_cloud_upload)
+        self.pipeline_continue_sheet = QPushButton("继续填表"); self.pipeline_continue_sheet.setEnabled(False)
+        self.pipeline_continue_sheet.clicked.connect(self._continue_sheet_write)
         self.pipeline_stop_upload = QPushButton("停止上传"); self.pipeline_stop_upload.setEnabled(False)
         self.pipeline_stop_upload.clicked.connect(self._stop_cloud_upload)
         upload_actions.addWidget(upload_files); upload_actions.addWidget(upload_folder)
-        upload_actions.addWidget(self.pipeline_retry_upload); upload_actions.addWidget(self.pipeline_stop_upload)
+        upload_actions.addWidget(self.pipeline_retry_upload); upload_actions.addWidget(self.pipeline_continue_sheet); upload_actions.addWidget(self.pipeline_stop_upload)
         upload_actions.addStretch(); right_layout.addLayout(upload_actions)
         handoff = QHBoxLayout(); handoff.addStretch()
         to_subtitle = QPushButton("查看全部字幕"); to_subtitle.clicked.connect(lambda: self._show_page(5))
@@ -1934,7 +2368,24 @@ class MainWindow(QMainWindow):
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True); left_scroll.setWidget(left)
         split.addWidget(left_scroll); split.addWidget(right); split.setSizes([620, 850])
         layout.addWidget(split, 1)
+        self._refresh_pipeline_profiles()
+        QTimer.singleShot(0,self._restore_pending_sheet_checkpoint)
         return page
+
+    def _restore_pending_sheet_checkpoint(self):
+        try:
+            root=Path(self.pipeline_output.text())
+            checkpoints=sorted(root.rglob("pipeline_checkpoint.json"),key=lambda path:path.stat().st_mtime,reverse=True) if root.is_dir() else []
+            for checkpoint in checkpoints:
+                state=read_json_file(checkpoint,{})
+                uploads=state.get("pending_sheet_uploads",[]); folder_url=state.get("cloud_url","")
+                if state.get("status")=="sheet_pending" and uploads and folder_url:
+                    self.pending_sheet_uploads=list(uploads); self.pending_sheet_folder_url=folder_url; self.pipeline_continue_sheet.setEnabled(True)
+                    self.pipeline_cloud_result.setStyleSheet("color:#fbbf24;padding:4px;")
+                    self.pipeline_cloud_result.setText("检测到上次视频已上传但表格未完成，可直接点击“继续填表”。")
+                    break
+        except Exception:
+            pass
 
     def _keys_page(self):
         page, layout = self._page_shell("API 密钥管理", "每个服务可添加多枚密钥；调用时轮询，失效或额度受限会自动切换。")
@@ -1988,8 +2439,8 @@ class MainWindow(QMainWindow):
 
     def _show_page(self, index):
         self.pages.setCurrentIndex(index)
-        for i, btn in enumerate(self.nav_buttons):
-            btn.setChecked(i == index)
+        for btn in self.nav_buttons:
+            btn.setChecked(int(btn.property("pageIndex")) == index)
 
     def _launch_tool(self, relative):
         if relative.startswith("page:"):
@@ -2116,6 +2567,98 @@ class MainWindow(QMainWindow):
         self.store.data["google_sync"]["enabled"] = bool(checked)
         self.store.save()
         self.pipeline_cloud_result.setText("云端同步：已开启" if checked else "云端同步：已关闭")
+
+    def _save_pipeline_sync_profile(self):
+        current_name=self.pipeline_sync_profile.currentData()
+        if current_name:
+            name=current_name
+        else:
+            name,ok=QInputDialog.getText(self,"保存同步方案","方案名称：",text="方案1")
+            if not ok or not name.strip(): return
+            name=name.strip()
+        config=self._selected_sync_config(); config["enabled"]=self.pipeline_cloud_check.isChecked()
+        config.pop("sync_profiles",None); config.pop("active_sync_profile",None)
+        root=self.store.data.setdefault("google_sync",{}); profiles=dict(root.get("sync_profiles",{})); profiles[name]=config
+        root["sync_profiles"]=profiles; root["active_sync_profile"]=name; self.store.save()
+        if hasattr(self,"google_settings_page"): self.google_settings_page.load_current()
+        self._refresh_pipeline_profiles(); index=self.pipeline_sync_profile.findData(name)
+        if index>=0: self.pipeline_sync_profile.setCurrentIndex(index)
+        QMessageBox.information(self,"方案已保存",f"当前写入 Sheet 和本次选择已同步保存到方案“{name}”。")
+
+    def _open_google_settings(self):
+        self._show_page(7)
+        self.settings_page.setCurrentWidget(self.google_settings_page)
+
+    def _refresh_pipeline_profiles(self):
+        if not hasattr(self, "pipeline_sync_profile"): return
+        config = self.store.data.get("google_sync", {}); profiles = config.get("sync_profiles", {})
+        current = self.pipeline_sync_profile.currentText() or config.get("active_sync_profile", "")
+        self.pipeline_sync_profile.blockSignals(True); self.pipeline_sync_profile.clear()
+        self.pipeline_sync_profile.addItem("使用当前设置", "")
+        for name in profiles: self.pipeline_sync_profile.addItem(name, name)
+        index = self.pipeline_sync_profile.findData(current)
+        if index < 0: index = self.pipeline_sync_profile.findData(config.get("active_sync_profile", ""))
+        self.pipeline_sync_profile.setCurrentIndex(max(0, index)); self.pipeline_sync_profile.blockSignals(False)
+        self._pipeline_profile_changed(self.pipeline_sync_profile.currentText())
+
+    def _selected_sync_config(self):
+        base = dict(self.store.data.get("google_sync", {})); name = self.pipeline_sync_profile.currentData() if hasattr(self, "pipeline_sync_profile") else ""
+        profile = base.get("sync_profiles", {}).get(name)
+        if profile:
+            preserved_profiles = base.get("sync_profiles", {}); base.update(dict(profile)); base["sync_profiles"] = preserved_profiles; base["active_sync_profile"] = name
+        profile_key=name or "__current__"
+        if getattr(self,"_pipeline_runtime_profile",None)==profile_key:
+            if getattr(self,"pipeline_runtime_sheet",""): base["sheet_name"]=self.pipeline_runtime_sheet
+            fields=[]
+            for item in base.get("variable_fields",[]):
+                updated=dict(item); updated["selected"]=self.pipeline_runtime_values.get(item.get("field",""),item.get("selected","")); fields.append(updated)
+            base["variable_fields"]=fields
+        return base
+
+    def _pipeline_profile_changed(self, _text):
+        if not hasattr(self, "pipeline_profile_hint"): return
+        name=self.pipeline_sync_profile.currentData(); profile_key=name or "__current__"
+        base=dict(self.store.data.get("google_sync",{})); profile_config=base.get("sync_profiles",{}).get(name)
+        if profile_config: base.update(dict(profile_config))
+        self._pipeline_runtime_profile=profile_key
+        self.pipeline_runtime_sheet=base.get("sheet_name","")
+        self.pipeline_runtime_values={item.get("field",""):item.get("selected","") for item in base.get("variable_fields",[])}
+        while self.pipeline_variable_form.count():
+            item=self.pipeline_variable_form.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.pipeline_target_sheet=NoWheelComboBox(); self.pipeline_target_sheet.setEditable(True); self.pipeline_target_sheet.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        sheet_names=[str(value) for value in base.get("available_sheet_names",[]) if str(value).strip()]
+        current_sheet=base.get("sheet_name","")
+        if current_sheet and current_sheet not in sheet_names: sheet_names.insert(0,current_sheet)
+        self.pipeline_target_sheet.addItems(sheet_names); self.pipeline_target_sheet.setCurrentText(current_sheet)
+        self.pipeline_target_sheet.lineEdit().setPlaceholderText("选择或输入写入 Sheet 名称")
+        self.pipeline_target_sheet.currentTextChanged.connect(self._pipeline_sheet_changed)
+        self.pipeline_variable_form.addRow("写入 Sheet",self.pipeline_target_sheet)
+        for item in base.get("variable_fields",[]):
+            field=item.get("field","选择项"); options=[str(v) for v in item.get("options",[]) if str(v).strip()]
+            combo=NoWheelComboBox(); combo.setEditable(False); combo.addItem("请选择…",""); combo.addItems(options)
+            selected=item.get("selected",""); index=combo.findText(selected); combo.setCurrentIndex(index if index>=0 else 0)
+            combo.currentTextChanged.connect(lambda value,f=field:self._pipeline_variable_changed(f,value))
+            combo.setEnabled(bool(options)); combo.setToolTip("选项来自 Google 配置 Sheet" if options else "请先在设置与组件中从配置 Sheet 刷新选项")
+            self.pipeline_variable_form.addRow(f"{field}（{item.get('column','')}列）",combo)
+        self.pipeline_variable_group.setVisible(bool(base.get("write_sheet") or base.get("variable_fields",[])))
+        self._update_pipeline_profile_hint()
+
+    def _pipeline_variable_changed(self, field, value):
+        self.pipeline_runtime_values[field]="" if value=="请选择…" else value
+        self._update_pipeline_profile_hint()
+
+    def _pipeline_sheet_changed(self, value):
+        self.pipeline_runtime_sheet=value.strip()
+        self._update_pipeline_profile_hint()
+
+    def _update_pipeline_profile_hint(self):
+        config = self._selected_sync_config(); profile = self.pipeline_sync_profile.currentData() or "当前设置"
+        sheet = config.get("sheet_name", "") or "未填写 Sheet"
+        table_id = extract_google_id(config.get("spreadsheet_id", "")) or "未填写表格"
+        selected = [f"{item.get('field')}={item.get('selected')}" for item in config.get("variable_fields", []) if item.get("selected")]
+        extra = "；" + "，".join(selected) if selected else ""
+        self.pipeline_profile_hint.setText(f"{profile} → 表格 {table_id} / Sheet：{sheet}{extra}")
 
     def _open_google_sync_dialog(self):
         config = dict(self.store.data["google_sync"])
@@ -2374,17 +2917,17 @@ class MainWindow(QMainWindow):
             self._show_page(6); return
         try: ffmpeg = self._find_ffmpeg()
         except Exception as exc: QMessageBox.critical(self, "缺少组件", str(exc)); return
-        cloud_config = dict(self.store.data["google_sync"])
+        cloud_config = self._selected_sync_config()
         cloud_config["enabled"] = self.pipeline_cloud_check.isChecked()
         if cloud_config["enabled"]:
             if not Path(cloud_config.get("json_path", "")).is_file() or not extract_google_id(cloud_config.get("parent_folder", "")):
                 QMessageBox.warning(self, "Google 同步配置不完整",
                                     "请配置有效的服务账号 JSON 和 Drive 父文件夹 ID/链接。")
-                self._open_google_sync_dialog(); return
+                self._open_google_settings(); return
             if cloud_config.get("write_sheet") and (not extract_google_id(cloud_config.get("spreadsheet_id", ""))
                                                      or not cloud_config.get("sheet_name", "").strip()):
                 QMessageBox.warning(self, "表格配置不完整", "请填写 Google 表格 ID 和 Sheet 名称。")
-                self._open_google_sync_dialog(); return
+                self._open_google_settings(); return
         model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
         self.subtitle_results.clear(); self.result_combo.clear(); self.result_combo.addItem(ALL_RESULTS_LABEL)
         self.pipeline_titles.clear(); self.pipeline_log.clear(); self.pipeline_progress.setValue(0)
@@ -2402,6 +2945,7 @@ class MainWindow(QMainWindow):
         self.worker.titles_ready.connect(self._pipeline_titles_ready)
         self.worker.cloud_ready.connect(self._pipeline_cloud_ready)
         self.worker.cloud_failed.connect(self._pipeline_cloud_failed)
+        self.worker.cloud_sheet_pending.connect(self._pipeline_sheet_pending)
         self.worker.finished.connect(self._pipeline_done); self.worker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self._thread_ended); self.thread.finished.connect(self.thread.deleteLater)
         self.pipeline_start_btn.setEnabled(False); self.pipeline_stop.setEnabled(True); self.thread.start()
@@ -2419,10 +2963,20 @@ class MainWindow(QMainWindow):
 
     def _pipeline_cloud_ready(self, folder_url, summary):
         self.pending_upload_files = []; self.pipeline_retry_upload.setEnabled(False)
+        self.pending_sheet_uploads=[]; self.pending_sheet_folder_url=""; self.pipeline_continue_sheet.setEnabled(False)
         self.pipeline_cloud_result.setText(
             f'云端同步完成：{summary}<br><a href="{folder_url}">打开 Google Drive 文件夹</a>')
 
+    def _pipeline_sheet_pending(self, folder_url, uploaded, error):
+        self.pending_upload_files=[]; self.pipeline_retry_upload.setEnabled(False)
+        self.pending_sheet_uploads=list(uploaded); self.pending_sheet_folder_url=folder_url
+        self.pipeline_continue_sheet.setEnabled(bool(self.pending_sheet_uploads))
+        self.pipeline_cloud_result.setStyleSheet("color:#fbbf24;padding:4px;")
+        self.pipeline_cloud_result.setText(
+            f'视频已上传成功，但写入表格失败：{error}<br><a href="{folder_url}">打开 Google Drive 文件夹</a><br>修正配置后点击“继续填表”，不会重新上传视频。')
+
     def _pipeline_cloud_failed(self, final_dir, error):
+        self.pending_sheet_uploads=[]; self.pending_sheet_folder_url=""; self.pipeline_continue_sheet.setEnabled(False)
         video_extensions = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v", ".flv", ".ts"}
         self.pending_upload_files = [str(path) for path in sorted(Path(final_dir).iterdir(),
                                       key=lambda path: natural_path_key(path.name))
@@ -2455,6 +3009,47 @@ class MainWindow(QMainWindow):
     def _retry_cloud_upload(self):
         if self.pending_upload_files: self._start_cloud_upload(self.pending_upload_files)
 
+    def _continue_sheet_write(self):
+        if not self.pending_sheet_uploads or not self.pending_sheet_folder_url: return
+        if self.cloud_thread:
+            try:
+                if self.cloud_thread.isRunning():
+                    QMessageBox.information(self,"任务进行中","请等待当前云端任务结束。")
+                    return
+            except RuntimeError: self.cloud_thread=None
+        config=self._selected_sync_config(); config["enabled"]=True; config["write_sheet"]=True
+        if not extract_google_id(config.get("spreadsheet_id","")) or not config.get("sheet_name","").strip():
+            QMessageBox.warning(self,"表格配置不完整","请选择写入 Sheet 并确认表格 ID。")
+            return
+        self.cloud_thread=QThread(self); self.cloud_worker=SheetFillWorker(config,list(self.pending_sheet_uploads),self.pending_sheet_folder_url)
+        self.cloud_worker.moveToThread(self.cloud_thread); self.cloud_thread.started.connect(self.cloud_worker.run)
+        self.cloud_worker.log.connect(self.pipeline_log.appendPlainText); self.cloud_worker.finished.connect(self._sheet_fill_done)
+        self.cloud_worker.finished.connect(self.cloud_thread.quit); self.cloud_thread.finished.connect(self._cloud_thread_ended); self.cloud_thread.finished.connect(self.cloud_thread.deleteLater)
+        self.pipeline_continue_sheet.setEnabled(False); self.pipeline_stop_upload.setEnabled(False)
+        self.pipeline_cloud_result.setStyleSheet("color:#7dd3fc;padding:4px;"); self.pipeline_cloud_result.setText("正在继续填写 Google Sheets，不会重新上传视频…")
+        self.cloud_thread.start()
+
+    def _sheet_fill_done(self, ok, folder_url, message):
+        if ok:
+            self._mark_pending_sheet_complete(folder_url)
+            self.pending_sheet_uploads=[]; self.pending_sheet_folder_url=""; self.pipeline_continue_sheet.setEnabled(False)
+            self.pipeline_cloud_result.setStyleSheet("color:#86efac;padding:4px;")
+            self.pipeline_cloud_result.setText(f'{message}<br><a href="{folder_url}">打开 Google Drive 文件夹</a>')
+        else:
+            self.pipeline_continue_sheet.setEnabled(bool(self.pending_sheet_uploads))
+            self.pipeline_cloud_result.setStyleSheet("color:#fca5a5;padding:4px;")
+            self.pipeline_cloud_result.setText(f"继续填表失败：{message}<br>修正配置后可以再次点击继续填表。")
+
+    def _mark_pending_sheet_complete(self, folder_url):
+        try:
+            root=Path(self.pipeline_output.text())
+            for checkpoint in root.rglob("pipeline_checkpoint.json") if root.is_dir() else []:
+                state=read_json_file(checkpoint,{})
+                if state.get("status")=="sheet_pending" and state.get("cloud_url")==folder_url:
+                    state["status"]="completed"; state.pop("pending_sheet_uploads",None); state.pop("last_error",None); atomic_write_json(checkpoint,state)
+        except Exception:
+            pass
+
     def _start_cloud_upload(self, files):
         if self.cloud_thread:
             try:
@@ -2462,10 +3057,10 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(self, "正在上传", "请等待当前上传结束，或点击停止上传。")
                     return
             except RuntimeError: self.cloud_thread = None
-        config = dict(self.store.data["google_sync"]); config["enabled"] = True
+        config = self._selected_sync_config(); config["enabled"] = True
         if not Path(config.get("json_path", "")).is_file() or not extract_google_id(config.get("parent_folder", "")):
             QMessageBox.warning(self, "Google 配置不完整", "请先配置授权 JSON 和 Drive 父文件夹。")
-            self._open_google_sync_dialog(); return
+            self._open_google_settings(); return
         results = list(self.subtitle_results.values())
         records = []
         for index, path in enumerate(files):
@@ -2476,6 +3071,7 @@ class MainWindow(QMainWindow):
         self.cloud_thread = QThread(self); self.cloud_worker = CloudUploadWorker(config, files, records, files)
         self.cloud_worker.moveToThread(self.cloud_thread); self.cloud_thread.started.connect(self.cloud_worker.run)
         self.cloud_worker.log.connect(self.pipeline_log.appendPlainText)
+        self.cloud_worker.sheet_pending.connect(self._pipeline_sheet_pending)
         self.cloud_worker.finished.connect(self._cloud_upload_done); self.cloud_worker.finished.connect(self.cloud_thread.quit)
         self.cloud_thread.finished.connect(self._cloud_thread_ended); self.cloud_thread.finished.connect(self.cloud_thread.deleteLater)
         self.pipeline_stop_upload.setEnabled(True); self.pipeline_retry_upload.setEnabled(False)
@@ -2491,6 +3087,8 @@ class MainWindow(QMainWindow):
         if ok:
             self.pending_upload_files = []; self.pipeline_retry_upload.setEnabled(False)
             self._pipeline_cloud_ready(folder_url, message)
+        elif self.pending_sheet_uploads:
+            self.pipeline_retry_upload.setEnabled(False)
         else:
             self.pipeline_retry_upload.setEnabled(bool(self.pending_upload_files))
             self.pipeline_cloud_result.setStyleSheet("color:#fca5a5;padding:4px;")
@@ -2558,6 +3156,81 @@ class MainWindow(QMainWindow):
             if any(x.get("enabled", True) and x.get("status", "未检测") in ("未检测", "有效") for x in keys):
                 return provider
         return LOCAL_PROVIDER
+
+    def _caption_transcribe(self, media_path, selected_provider):
+        """在动态文案工作线程中复用同一套识别、翻译和密钥轮询逻辑。"""
+        provider = self._resolve_provider() if selected_provider == AUTO_PROVIDER else selected_provider
+        if provider != LOCAL_PROVIDER and not self.store.has_candidates(provider):
+            raise RuntimeError(f"{provider} 没有可用密钥，请先到“密钥管理”添加并检测。")
+        model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
+        worker = TranscribeWorker(self.store, provider, model, [media_path], "", "auto", False,
+                                  self._find_ffmpeg(), True)
+        result = worker._process_one(media_path)
+        raw = result.get("raw") or {}; words = raw.get("words") or (raw.get("response") or {}).get("words") or []
+        timed_words = []
+        for word in words:
+            text = str(word.get("text") or word.get("word") or "").strip()
+            if text and word.get("start") is not None:
+                timed_words.append({"start": float(word.get("start", 0)),
+                                    "end": float(word.get("end", word.get("start", 0) + .25)), "text": text})
+        precise_srt = segments_to_srt(timed_words) if timed_words else result["srt"]
+        return result["original"], result["chinese"], precise_srt
+
+    def _text_to_speech(self, text, service, voice, destination):
+        """生成配音；ElevenLabs 失败时自动轮换下一枚可用密钥。"""
+        target = Path(destination); target.parent.mkdir(parents=True, exist_ok=True)
+        if service == "微软文字转语音":
+            try:
+                import edge_tts
+            except ImportError as exc:
+                raise RuntimeError("缺少微软语音组件 edge-tts，请到“设置与组件”点击一键安装。") from exc
+            selected_voice = voice or "zh-CN-XiaoxiaoNeural"
+            async def generate():
+                boundaries = []
+                with target.open("wb") as audio_handle:
+                    async for chunk in edge_tts.Communicate(text, selected_voice).stream():
+                        if chunk.get("type") == "audio":
+                            audio_handle.write(chunk["data"])
+                        elif chunk.get("type") == "WordBoundary":
+                            start = float(chunk.get("offset", 0)) / 10_000_000
+                            duration = float(chunk.get("duration", 0)) / 10_000_000
+                            boundaries.append({"start": start, "end": start + max(.08, duration),
+                                               "text": str(chunk.get("text", "")).strip()})
+                if boundaries:
+                    target.with_suffix(".srt").write_text(segments_to_srt(boundaries), encoding="utf-8-sig")
+            asyncio.run(generate())
+            if not target.exists() or target.stat().st_size == 0:
+                raise RuntimeError("微软文字转语音没有生成有效音频。")
+            return target
+
+        voice_id = voice.strip()
+        if not voice_id or voice_id.endswith("Neural"):
+            raise RuntimeError("使用 ElevenLabs 时，请在音色框输入 ElevenLabs Voice ID。")
+        candidates = self.store.candidates("ElevenLabs")
+        if not candidates:
+            raise RuntimeError("没有可用的 ElevenLabs 密钥，请先到密钥管理添加并检测。")
+        last_error = ""
+        for item in candidates:
+            try:
+                response = requests.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                    headers={"xi-api-key": item["key"], "Content-Type": "application/json",
+                             "Accept": "audio/mpeg"},
+                    json={"text": text, "model_id": "eleven_multilingual_v2",
+                          "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}, timeout=180)
+                if response.status_code >= 400:
+                    last_error = response_error(response)
+                    self.store.mark_use("ElevenLabs", item["id"],
+                                        "失效" if response.status_code in (401, 403) else
+                                        "额度受限" if response.status_code == 429 else "异常", last_error)
+                    continue
+                target.write_bytes(response.content)
+                self.store.mark_use("ElevenLabs", item["id"], "有效", "")
+                return target
+            except requests.RequestException as exc:
+                last_error = f"网络请求失败：{exc}"
+                self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
+        raise RuntimeError(f"ElevenLabs 可用密钥均生成失败。最后错误：{last_error}")
 
     def _find_ffmpeg(self):
         executable = media_tool_name("ffmpeg")
@@ -2847,6 +3520,10 @@ QHeaderView::section { background:#17243a; color:#cbd5e1; border:none; padding:6
 QProgressBar { background:#17243a; border:none; border-radius:5px; text-align:center; min-height:16px; }
 QProgressBar::chunk { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #06b6d4,stop:1 #6366f1); border-radius:5px; }
 QScrollArea { border:none; }
+QTabWidget::pane { border:1px solid #2b3d58; background:#0b1322; top:-1px; }
+QTabBar::tab { background:#17243a; color:#cbd5e1; border:1px solid #30445f; padding:8px 16px; min-width:90px; }
+QTabBar::tab:hover { background:#223654; color:white; }
+QTabBar::tab:selected { background:#2563eb; color:white; border-color:#60a5fa; font-weight:700; }
 QToolBar { background:#0d1627; border-bottom:1px solid #263957; spacing:6px; padding:4px; }
 QScrollBar:vertical { background:#091221; width:14px; margin:2px; border-radius:7px; }
 QScrollBar::handle:vertical { background:#46658d; min-height:34px; margin:1px; border-radius:6px; }

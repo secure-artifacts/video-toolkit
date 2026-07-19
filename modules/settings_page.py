@@ -33,6 +33,7 @@ PYTHON_COMPONENTS = [
     ("无密钥翻译", "deep_translator", "deep-translator"),
     ("Google Drive / Sheets", "googleapiclient", "google-api-python-client google-auth"),
     ("Google OAuth 授权", "google_auth_oauthlib", "google-auth-oauthlib"),
+    ("微软文字转语音", "edge_tts", "edge-tts"),
 ]
 
 
