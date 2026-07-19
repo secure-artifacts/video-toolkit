@@ -29,6 +29,7 @@ PYTHON_COMPONENTS = [
     ("MoviePy", "moviepy", "moviepy"),
     ("Requests", "requests", "requests"),
     ("本地 Whisper", "faster_whisper", "faster-whisper"),
+    ("ONNX Runtime / VAD", "onnxruntime", "onnxruntime"),
     ("无密钥翻译", "deep_translator", "deep-translator"),
     ("Google Drive / Sheets", "googleapiclient", "google-api-python-client google-auth"),
     ("Google OAuth 授权", "google_auth_oauthlib", "google-auth-oauthlib"),

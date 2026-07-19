@@ -46,6 +46,14 @@ jobs:
         shell: pwsh
         run: .\build.ps1
 
+      - name: Verify local Whisper VAD runtime
+        shell: pwsh
+        run: |
+          $runtime = Get-ChildItem -LiteralPath 'dist_folder\VideoToolkit' -Recurse -File |
+            Where-Object { $_.Name -match 'onnxruntime' } | Select-Object -First 1
+          if (-not $runtime) { throw 'ONNX Runtime was not bundled for local Whisper VAD.' }
+          Write-Host "Bundled ONNX Runtime: $($runtime.FullName)"
+
       - name: Package final artifact
         shell: pwsh
         run: |
@@ -139,6 +147,13 @@ jobs:
           test -n "$FFMPEG" && test -n "$FFPROBE"
           "$FFMPEG" -version
           "$FFPROBE" -version
+
+      - name: Verify local Whisper VAD runtime
+        run: |
+          APP="dist_macos/视频工具合集.app"
+          ONNX_RUNTIME="$(find "$APP" -iname '*onnxruntime*' | head -1)"
+          test -n "$ONNX_RUNTIME"
+          echo "Bundled ONNX Runtime: $ONNX_RUNTIME"
 
       - name: Package final artifact
         run: |

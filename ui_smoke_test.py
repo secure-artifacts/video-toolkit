@@ -33,6 +33,8 @@ assert window.pages.count() == 10
 assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 6
 assert window.nav_buttons[-1].text() == "帮助与说明"
 assert not any(button.text() == "开始智能提取字幕" for button in window.pages.widget(0).findChildren(toolkit.QPushButton))
+assert window.subtitle_resume_check.isChecked()
+assert window.pipeline_resume_check.isChecked()
 assert window.provider_combo.itemText(0) == toolkit.AUTO_PROVIDER
 assert window._resolve_provider() == toolkit.LOCAL_PROVIDER
 assert window.key_table.columnCount() == 7

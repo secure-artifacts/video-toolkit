@@ -19,6 +19,7 @@ watermark_outputs/
 流水线输出/
 rename_regression_*/
 .rename_mac_compat_test/
+.rename_resume_regression/
 VideoToolkit.spec
 *_preview.png
 execution_detailed.log

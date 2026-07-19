@@ -17,12 +17,14 @@ python -m PyInstaller --noconfirm --windowed --onedir --contents-directory 'inte
   --add-binary ((Join-Path $mediaBin 'ffprobe.exe') + ';.') `
   --collect-data 'faster_whisper' `
   --collect-binaries 'ctranslate2' `
+  --collect-data 'onnxruntime' `
+  --collect-binaries 'onnxruntime' `
   --hidden-import 'faster_whisper' `
+  --hidden-import 'onnxruntime' `
   --exclude-module 'torch' `
   --exclude-module 'torchvision' `
   --exclude-module 'torchaudio' `
   --exclude-module 'tensorflow' `
-  --exclude-module 'onnxruntime' `
   --exclude-module 'numba' `
   --exclude-module 'llvmlite' `
   --exclude-module 'IPython' `

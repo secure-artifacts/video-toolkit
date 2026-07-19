@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 import os
 import re
@@ -95,6 +96,39 @@ def resource_path(name: str) -> Path:
 
 def config_dir() -> Path:
     return app_data_dir()
+
+
+def atomic_write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def read_json_file(path: Path, default=None):
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded
+    except (OSError, ValueError, TypeError):
+        return {} if default is None else default
+
+
+def source_signature(source: str):
+    if is_supported_video_url(source):
+        return {"kind": "url", "value": source.strip()}
+    path = Path(source).expanduser()
+    try:
+        resolved = path.resolve()
+        stat = resolved.stat()
+        return {"kind": "file", "path": str(resolved), "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns}
+    except OSError:
+        return {"kind": "file", "path": str(path.absolute()), "missing": True}
+
+
+def stable_key(payload) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 class ConfigStore:
@@ -426,34 +460,92 @@ class TranscribeWorker(QObject):
     finished = Signal(bool, str)
 
     def __init__(self, store: ConfigStore, provider: str, model: str, files: list[str],
-                 output_dir: str, language: str, diarize: bool, ffmpeg_path: str):
+                 output_dir: str, language: str, diarize: bool, ffmpeg_path: str,
+                 resume_existing: bool = True):
         super().__init__()
         self.store = store
         self.provider = provider
         self.model = model
         self.files = files
-        self.output_dir = Path(output_dir)
         self.language = language.strip()
         self.diarize = diarize
         self.ffmpeg_path = ffmpeg_path
         self.cancelled = False
         self._local_model = None
+        self._local_device = None
+        self.resume_existing = resume_existing
+        task_payload = {
+            "version": 2, "provider": provider, "model": model,
+            "language": self.language, "diarize": bool(diarize),
+            "sources": [source_signature(source) for source in files],
+        }
+        self.task_id = stable_key(task_payload)
+        self.output_dir = (Path(output_dir) if output_dir
+                           else app_data_dir() / "subtitle_tasks" / self.task_id)
+        self.checkpoint_path = self.output_dir / "checkpoint.json"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def cancel(self):
         self.cancelled = True
 
     def run(self):
         try:
+            if not self.resume_existing:
+                shutil.rmtree(self.output_dir / ".work", ignore_errors=True)
+            state = read_json_file(self.checkpoint_path, {}) if self.resume_existing else {}
+            if state.get("task_id") != self.task_id:
+                state = {}
+            state.setdefault("task_id", self.task_id)
+            state.setdefault("results", {})
+            state["status"] = "running"
+            atomic_write_json(self.checkpoint_path, state)
             for index, source in enumerate(self.files):
                 if self.cancelled:
                     raise RuntimeError("任务已取消")
+                source_key = stable_key(source_signature(source))
+                cached = state["results"].get(source_key)
+                if cached:
+                    self.log.emit(f"断点续接：跳过已完成字幕 {index + 1}/{len(self.files)}：{cached['name']}")
+                    self.result_ready.emit(cached["name"], cached.get("original", ""),
+                                           cached.get("chinese", ""), cached.get("srt", ""))
+                    self.progress.emit(round((index + 1) / len(self.files) * 100))
+                    continue
                 display = source if is_supported_video_url(source) else Path(source).name
-                self.log.emit(f"正在处理：{display}")
-                self._process_one(source)
+                self.log.emit(f"正在处理 {index + 1}/{len(self.files)}：{display}")
+                result = self._process_one(source)
+                state["results"][source_key] = {
+                    "source": source, "name": result["name"], "original": result["original"],
+                    "chinese": result["chinese"], "srt": result["srt"],
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                atomic_write_json(self.checkpoint_path, state)
+                self._cleanup_source_work(source)
                 self.progress.emit(round((index + 1) / len(self.files) * 100))
+            state["status"] = "completed"
+            atomic_write_json(self.checkpoint_path, state)
             self.finished.emit(True, "完成，字幕与中文对照已显示在当前窗口")
         except Exception as exc:
+            try:
+                state["status"] = "failed"
+                state["last_error"] = str(exc)
+                atomic_write_json(self.checkpoint_path, state)
+            except Exception:
+                pass
             self.finished.emit(False, str(exc))
+
+    def _source_work_dir(self, source_value: str) -> Path:
+        path = self.output_dir / ".work" / self._source_work_key(source_value)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _source_work_key(self, source_value: str) -> str:
+        return stable_key({"source": source_signature(source_value), "provider": self.provider,
+                           "model": self.model, "language": self.language})[:20]
+
+    def _cleanup_source_work(self, source_value: str):
+        work = self.output_dir / ".work" / self._source_work_key(source_value)
+        if work.exists():
+            shutil.rmtree(work, ignore_errors=True)
 
     def _download_online_media(self, url: str, temp: Path):
         try:
@@ -501,50 +593,76 @@ class TranscribeWorker(QObject):
                       else self.store.candidates(self.provider))
         if not candidates:
             raise RuntimeError(f"{self.provider} 没有可用密钥，请先到“密钥管理”添加并检测。")
-        with tempfile.TemporaryDirectory(prefix="video_toolkit_") as tmp_name:
-            temp = Path(tmp_name)
-            if is_supported_video_url(source_value):
-                source, result_name = self._download_online_media(source_value, temp)
+        temp = self._source_work_dir(source_value)
+        if is_supported_video_url(source_value):
+            metadata_path = temp / "online_source.json"
+            metadata = read_json_file(metadata_path, {})
+            saved_path = Path(metadata.get("path", "")) if metadata.get("path") else None
+            if saved_path and saved_path.exists():
+                source = saved_path
+                result_name = metadata.get("title") or source.name
+                self.log.emit("断点续接：复用已下载的网络媒体。")
             else:
-                source = Path(source_value)
-                result_name = source.name
-            audio = temp / "audio.wav"
-            self.log.emit("创建临时 PCM 无损识别副本（保留原声道；不会修改视频音轨）…")
-            cmd = [self.ffmpeg_path, "-y", "-i", str(source), "-map", "0:a:0", "-vn",
-                   "-c:a", "pcm_s16le", str(audio)]
-            creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                  creationflags=creation, text=True, encoding="utf-8", errors="replace")
-            if proc.returncode != 0 or not audio.exists():
-                raise RuntimeError("无法提取音频，请确认视频包含音轨。\n" + proc.stderr[-800:])
+                source, result_name = self._download_online_media(source_value, temp)
+                atomic_write_json(metadata_path, {"path": str(source), "title": result_name})
+        else:
+            source = Path(source_value)
+            result_name = source.name
 
-            last_error = ""
-            for item in candidates:
-                if self.cancelled:
-                    raise RuntimeError("任务已取消")
-                if self.provider == LOCAL_PROVIDER:
-                    self.log.emit("使用本地 Whisper 模型，无需上传媒体或 API 密钥 …")
+        if self.provider == LOCAL_PROVIDER:
+            recognition_input = source
+            self.log.emit("本地 Whisper 直接流式读取媒体，不创建整段 PCM 副本。")
+        elif self.provider == "Groq":
+            recognition_input = source
+            self.log.emit("Groq 将直接从媒体生成 90 秒分段，不创建整段 PCM 副本。")
+        else:
+            audio = temp / "audio.wav"
+            if not audio.exists() or audio.stat().st_size == 0:
+                self.log.emit("创建临时 PCM 无损识别副本（保留原声道；不会修改视频音轨）…")
+                cmd = [self.ffmpeg_path, "-y", "-i", str(source), "-map", "0:a:0", "-vn",
+                       "-c:a", "pcm_s16le", str(audio)]
+                creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                      creationflags=creation, text=True, encoding="utf-8", errors="replace")
+                if proc.returncode != 0 or not audio.exists():
+                    raise RuntimeError("无法提取音频，请确认视频包含音轨。\n" + proc.stderr[-800:])
+            else:
+                self.log.emit("断点续接：复用已提取的识别音频。")
+            recognition_input = audio
+
+        last_error = ""
+        for item in candidates:
+            if self.cancelled:
+                raise RuntimeError("任务已取消")
+            if self.provider == LOCAL_PROVIDER:
+                self.log.emit("使用本地 Whisper 模型，无需上传媒体或 API 密钥 …")
+            else:
+                self.log.emit(f"使用 {self.provider} 密钥 {masked_key(item['key'])} …")
+            try:
+                srt, plain, raw = self._call_provider(recognition_input, item["key"], temp)
+                chinese = self._translate_chinese(plain)
+                self.result_ready.emit(result_name, plain, chinese, srt)
+                if self.provider != LOCAL_PROVIDER:
+                    self.store.mark_use(self.provider, item["id"], "有效", "")
+                self.log.emit(f"已在当前窗口生成中外文对照：{result_name}")
+                return {"name": result_name, "original": plain, "chinese": chinese,
+                        "srt": srt, "raw": raw}
+            except ApiFailure as exc:
+                last_error = str(exc)
+                if exc.status in (401, 403):
+                    status = "失效"
+                elif exc.status == 429:
+                    status = "额度受限"
                 else:
-                    self.log.emit(f"使用 {self.provider} 密钥 {masked_key(item['key'])} …")
-                try:
-                    srt, plain, raw = self._call_provider(audio, item["key"], temp)
-                    chinese = self._translate_chinese(plain)
-                    self.result_ready.emit(result_name, plain, chinese, srt)
-                    if self.provider != LOCAL_PROVIDER:
-                        self.store.mark_use(self.provider, item["id"], "有效", "")
-                    self.log.emit(f"已在当前窗口生成中外文对照：{result_name}")
-                    return
-                except ApiFailure as exc:
-                    last_error = str(exc)
-                    if exc.status in (401, 403):
-                        status = "失效"
-                    elif exc.status == 429:
-                        status = "额度受限"
-                    else:
-                        status = "异常"
-                    self.store.mark_use(self.provider, item["id"], status, last_error)
-                    self.log.emit(f"密钥 {masked_key(item['key'])} 失败（{status}），自动轮换下一枚。")
-            raise RuntimeError(f"{self.provider} 的可用密钥均调用失败。最后错误：{last_error}")
+                    status = "异常"
+                self.store.mark_use(self.provider, item["id"], status, last_error)
+                self.log.emit(f"密钥 {masked_key(item['key'])} 失败（{status}），自动轮换下一枚。")
+            except requests.RequestException as exc:
+                last_error = f"网络请求失败：{exc}"
+                if self.provider != LOCAL_PROVIDER:
+                    self.store.mark_use(self.provider, item["id"], "异常", last_error)
+                    self.log.emit(f"密钥 {masked_key(item['key'])} 网络失败，保留分段进度并轮换下一枚。")
+        raise RuntimeError(f"{self.provider} 的可用密钥均调用失败。最后错误：{last_error}")
 
     def _translate_chinese(self, text: str) -> str:
         text = text.strip()
@@ -612,23 +730,55 @@ class TranscribeWorker(QObject):
             try:
                 self._local_model = WhisperModel(self.model or "small",
                                                  device="cuda" if has_cuda else "cpu",
-                                                 compute_type="float16" if has_cuda else "int8")
+                                                 compute_type="auto" if has_cuda else "int8",
+                                                 cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+                self._local_device = "cuda" if has_cuda else "cpu"
             except (ValueError, RuntimeError) as exc:
                 if not has_cuda:
                     raise
                 self.log.emit(f"当前 GPU 模式不可用，自动切换 CPU INT8：{exc}")
-                self._local_model = WhisperModel(self.model or "small", device="cpu", compute_type="int8")
-        model = self._local_model
+                self._local_model = WhisperModel(self.model or "small", device="cpu", compute_type="int8",
+                                                 cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+                self._local_device = "cpu"
         language = None if not self.language or self.language == "auto" else self.language
-        stream, info = model.transcribe(str(audio), language=language, beam_size=5,
-                                        vad_filter=True, word_timestamps=False)
-        segments = []
-        for item in stream:
-            if self.cancelled:
-                raise RuntimeError("任务已取消")
-            segments.append({"start": item.start, "end": item.end, "text": item.text.strip()})
-            if len(segments) % 10 == 0:
-                self.log.emit(f"本地识别中：已生成 {len(segments)} 条字幕 …")
+        def collect_segments(stream, info):
+            segments = []
+            for item in stream:
+                if self.cancelled:
+                    raise RuntimeError("任务已取消")
+                segments.append({"start": item.start, "end": item.end, "text": item.text.strip()})
+                if len(segments) % 10 == 0:
+                    self.log.emit(f"本地识别中：已生成 {len(segments)} 条字幕 …")
+            return segments, info
+
+        def transcribe_with(model):
+            try:
+                import onnxruntime  # noqa: F401
+                use_vad = True
+            except ImportError:
+                use_vad = False
+                self.log.emit("未检测到 ONNX Runtime，已自动关闭 VAD 静音过滤并继续识别。")
+            try:
+                stream, info = model.transcribe(str(audio), language=language, beam_size=5,
+                                                vad_filter=use_vad, word_timestamps=False)
+                return collect_segments(stream, info)
+            except RuntimeError as exc:
+                if not use_vad or "onnxruntime" not in str(exc).lower():
+                    raise
+                self.log.emit("VAD 组件不可用，已关闭静音过滤并自动重试当前视频。")
+                stream, info = model.transcribe(str(audio), language=language, beam_size=5,
+                                                vad_filter=False, word_timestamps=False)
+                return collect_segments(stream, info)
+        try:
+            segments, info = transcribe_with(self._local_model)
+        except RuntimeError as exc:
+            if self._local_device != "cuda" or self.cancelled:
+                raise
+            self.log.emit(f"GPU 长视频识别中断，自动改用 CPU INT8 从当前视频重试：{exc}")
+            self._local_model = WhisperModel(self.model or "small", device="cpu", compute_type="int8",
+                                             cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+            self._local_device = "cpu"
+            segments, info = transcribe_with(self._local_model)
         plain = "\n".join(x["text"] for x in segments)
         raw = {"provider": "Local Whisper", "model": self.model,
                "language": getattr(info, "language", language), "segments": segments}
@@ -636,28 +786,45 @@ class TranscribeWorker(QObject):
 
     def _groq(self, audio: Path, key: str, temp: Path):
         chunks_dir = temp / "chunks"
-        chunks_dir.mkdir()
+        chunks_dir.mkdir(parents=True, exist_ok=True)
         pattern = chunks_dir / "chunk_%03d.wav"
         creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         segment_seconds = 90
-        cmd = [self.ffmpeg_path, "-y", "-i", str(audio), "-f", "segment", "-segment_time", str(segment_seconds),
-               "-reset_timestamps", "1", "-c", "copy", str(pattern)]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation)
-        chunks = sorted(chunks_dir.glob("chunk_*.mp3")) or [audio]
+        chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda path: rename_natural_key(path.name))
+        if not chunks:
+            self.log.emit("正在把长音频切成 90 秒无损识别分段 …")
+            cmd = [self.ffmpeg_path, "-y", "-i", str(audio), "-map", "0:a:0", "-vn", "-f", "segment",
+                   "-segment_time", str(segment_seconds), "-reset_timestamps", "1",
+                   "-c:a", "pcm_s16le", str(pattern)]
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    creationflags=creation, text=True, encoding="utf-8", errors="replace")
+            chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda path: rename_natural_key(path.name))
+            if result.returncode != 0 or not chunks:
+                raise RuntimeError("Groq 长音频分段失败。\n" + result.stderr[-800:])
+        else:
+            self.log.emit(f"断点续接：复用 {len(chunks)} 个长音频分段。")
+        cache_path = temp / "groq_chunk_results.json"
+        cache = read_json_file(cache_path, {})
         all_segments, texts, raw_items, offset = [], [], [], 0.0
         for number, chunk in enumerate(chunks, 1):
-            self.log.emit(f"Groq 转写分段 {number}/{len(chunks)} …")
-            data = {"model": self.model, "response_format": "verbose_json",
-                    "timestamp_granularities[]": "segment", "temperature": "0"}
-            if self.language and self.language != "auto":
-                data["language"] = self.language
-            with chunk.open("rb") as handle:
-                resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
-                                     headers={"Authorization": f"Bearer {key}"}, data=data,
-                                     files={"file": (chunk.name, handle, "audio/wav")}, timeout=900)
-            if resp.status_code >= 300:
-                raise ApiFailure(response_error(resp), resp.status_code)
-            payload = resp.json()
+            payload = cache.get(chunk.name)
+            if payload:
+                self.log.emit(f"Groq 断点续接：跳过已完成分段 {number}/{len(chunks)}")
+            else:
+                self.log.emit(f"Groq 转写分段 {number}/{len(chunks)} …")
+                data = {"model": self.model, "response_format": "verbose_json",
+                        "timestamp_granularities[]": "segment", "temperature": "0"}
+                if self.language and self.language != "auto":
+                    data["language"] = self.language
+                with chunk.open("rb") as handle:
+                    resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                                         headers={"Authorization": f"Bearer {key}"}, data=data,
+                                         files={"file": (chunk.name, handle, "audio/wav")}, timeout=900)
+                if resp.status_code >= 300:
+                    raise ApiFailure(response_error(resp), resp.status_code)
+                payload = resp.json()
+                cache[chunk.name] = payload
+                atomic_write_json(cache_path, cache)
             raw_items.append(payload)
             text = payload.get("text", "").strip()
             texts.append(text)
@@ -666,9 +833,9 @@ class TranscribeWorker(QObject):
                 all_segments.append({"start": float(seg.get("start", 0)) + offset,
                                      "end": float(seg.get("end", 0)) + offset,
                                      "text": seg.get("text", "")})
-            if local:
-                offset += max(float(x.get("end", 0)) for x in local)
-            else:
+            try:
+                offset += video_duration(self.ffmpeg_path, str(chunk))
+            except Exception:
                 offset += segment_seconds
         if not all_segments:
             all_segments = [{"start": 0, "end": max(2, offset), "text": "\n".join(texts)}]
@@ -1072,7 +1239,8 @@ class PipelineWorker(QObject):
     finished = Signal(bool, str)
 
     def __init__(self, store, sources, output, threshold, provider, model, language,
-                 ffmpeg, prefix, date_text, suffix, start_index, padding, cloud_config=None):
+                 ffmpeg, prefix, date_text, suffix, start_index, padding, cloud_config=None,
+                 resume_existing=True):
         super().__init__()
         self.store = store; self.sources = sources; self.output = Path(output)
         self.threshold = threshold; self.provider = provider; self.model = model
@@ -1080,9 +1248,53 @@ class PipelineWorker(QObject):
         self.date_text = date_text; self.suffix = suffix
         self.start_index = start_index; self.padding = padding; self.cancelled = False
         self.cloud_config = cloud_config or {}
+        self.resume_existing = resume_existing
+        self.state = {}
+        self.checkpoint_path = None
 
     def cancel(self):
         self.cancelled = True
+
+    def _pipeline_key(self):
+        return stable_key({
+            "version": 2,
+            "sources": [source_signature(source) for source in self.sources],
+            "threshold": self.threshold,
+            "rename": {"prefix": self.prefix, "date": self.date_text, "suffix": self.suffix,
+                       "start": self.start_index, "padding": self.padding},
+        })
+
+    def _open_run(self):
+        pipeline_key = self._pipeline_key()
+        if self.resume_existing and self.output.exists():
+            candidates = sorted((path for path in self.output.glob("流水线_*") if path.is_dir()),
+                                key=lambda path: path.stat().st_mtime, reverse=True)
+            for candidate in candidates:
+                checkpoint = candidate / "pipeline_checkpoint.json"
+                state = read_json_file(checkpoint, {})
+                if state.get("pipeline_key") == pipeline_key and state.get("status") != "completed":
+                    self.state = state
+                    self.checkpoint_path = checkpoint
+                    self.log.emit(f"发现未完成任务，自动断点续接：{candidate.name}")
+                    return candidate
+        run_root = self.output / f"流水线_{datetime.now():%Y%m%d_%H%M%S}"
+        suffix = 1
+        while run_root.exists():
+            run_root = self.output / f"流水线_{datetime.now():%Y%m%d_%H%M%S}_{suffix}"
+            suffix += 1
+        run_root.mkdir(parents=True, exist_ok=False)
+        self.checkpoint_path = run_root / "pipeline_checkpoint.json"
+        self.state = {
+            "version": 2, "pipeline_key": pipeline_key, "status": "running",
+            "sources": self.sources, "clips": [], "transcripts": {}, "renamed": {},
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_checkpoint()
+        return run_root
+
+    def _save_checkpoint(self):
+        self.state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        atomic_write_json(self.checkpoint_path, self.state)
 
     def _cut_sources(self, clips_dir):
         try:
@@ -1094,6 +1306,19 @@ class PipelineWorker(QObject):
         for source_number, source_text in enumerate(self.sources, 1):
             source = Path(source_text)
             if self.cancelled: raise RuntimeError("任务已取消")
+            source_key = stable_key(source_signature(source_text))
+            completed_names = self.state.setdefault("cut_completed", {}).get(source_key, [])
+            completed_paths = [clips_dir / name for name in completed_names]
+            if completed_paths and all(path.exists() for path in completed_paths):
+                clips.extend(completed_paths)
+                self.log.emit(f"断点续接：跳过已完成剪辑 {source_number}/{len(self.sources)}：{source.name}")
+                self.progress.emit(round(source_number / max(1, len(self.sources)) * 30))
+                continue
+            for partial in clips_dir.glob(f"{source_number:03d}_*.mp4"):
+                try:
+                    partial.unlink()
+                except OSError:
+                    pass
             self.log.emit(f"分析画面切换：{source.name}")
             source_audio = probe_audio_layout(self.ffmpeg, str(source))
             scenes = detect(str(source), ContentDetector(threshold=self.threshold), show_progress=False)
@@ -1119,20 +1344,32 @@ class PipelineWorker(QObject):
                 clips.append(destination)
                 audio_note = f"；音轨保持 {output_audio[1]} / {output_audio[0]}Hz" if output_audio else ""
                 self.log.emit(f"已生成片段：{destination.name}{audio_note}")
+            source_clips = [path.name for path in clips if path.name.startswith(f"{source_number:03d}_")]
+            self.state["cut_completed"][source_key] = source_clips
+            self._save_checkpoint()
             self.progress.emit(round(source_number / max(1, len(self.sources)) * 30))
         return clips
 
     def run(self):
         try:
             self.output.mkdir(parents=True, exist_ok=True)
-            run_root = self.output / f"流水线_{datetime.now():%Y%m%d_%H%M%S}"
-            run_root.mkdir(parents=True, exist_ok=False)
-            clips_dir = run_root / "01_智能剪辑片段"; clips_dir.mkdir()
-            subtitles_dir = run_root / "02_字幕"; subtitles_dir.mkdir()
-            clips = self._cut_sources(clips_dir)
+            run_root = self._open_run()
+            clips_dir = run_root / "01_智能剪辑片段"; clips_dir.mkdir(exist_ok=True)
+            subtitles_dir = run_root / "02_字幕"; subtitles_dir.mkdir(exist_ok=True)
+            saved_clips = [clips_dir / name for name in self.state.get("clips", [])]
+            if saved_clips and all(path.exists() for path in saved_clips):
+                clips = saved_clips
+                self.log.emit(f"断点续接：剪辑阶段已完成，直接使用 {len(clips)} 个片段。")
+                self.progress.emit(30)
+            else:
+                clips = self._cut_sources(clips_dir)
+                self.state["clips"] = [path.name for path in clips]
+                self.state["stage"] = "subtitles"
+                self._save_checkpoint()
             if not clips: raise RuntimeError("没有生成任何视频片段。")
-            transcriber = TranscribeWorker(self.store, self.provider, self.model, [], "",
-                                           self.language, False, self.ffmpeg)
+            transcriber = TranscribeWorker(self.store, self.provider, self.model, [],
+                                           str(run_root / ".transcription_work"),
+                                           self.language, False, self.ffmpeg, True)
             transcriber.log.connect(self.log.emit)
             captured = {}
             def capture(name, original, chinese, srt):
@@ -1141,9 +1378,24 @@ class PipelineWorker(QObject):
             titles, transcript_records = [], []
             for index, clip in enumerate(clips, 1):
                 if self.cancelled: raise RuntimeError("任务已取消")
-                captured.clear(); self.log.emit(f"提取字幕 {index}/{len(clips)}：{clip.name}")
-                transcriber._process_one(str(clip))
-                if not captured: raise RuntimeError(f"未收到字幕结果：{clip.name}")
+                cached = self.state.setdefault("transcripts", {}).get(clip.name)
+                if cached:
+                    captured.clear(); captured.update(name=clip.name, original=cached.get("original", ""),
+                                                      chinese=cached.get("chinese", ""), srt=cached.get("srt", ""))
+                    self.log.emit(f"断点续接：跳过已完成字幕 {index}/{len(clips)}：{clip.name}")
+                else:
+                    captured.clear(); self.log.emit(f"提取字幕 {index}/{len(clips)}：{clip.name}")
+                    result = transcriber._process_one(str(clip))
+                    if result and not captured:
+                        captured.update(name=result["name"], original=result["original"],
+                                        chinese=result["chinese"], srt=result["srt"])
+                    if not captured: raise RuntimeError(f"未收到字幕结果：{clip.name}")
+                    self.state["transcripts"][clip.name] = {
+                        "original": captured["original"], "chinese": captured["chinese"],
+                        "srt": captured["srt"], "provider": self.provider,
+                    }
+                    self._save_checkpoint()
+                    transcriber._cleanup_source_work(str(clip))
                 title = re.sub(r"\s+", " ", captured.get("chinese") or captured.get("original") or clip.stem).strip()
                 titles.append(title)
                 transcript_records.append({"clip_name": clip.name, "original": captured["original"],
@@ -1154,6 +1406,9 @@ class PipelineWorker(QObject):
                 self.result_ready.emit(clip.name, captured["original"], captured["chinese"], captured["srt"])
                 self.progress.emit(30 + round(index / len(clips) * 60))
 
+            self.state["stage"] = "rename"
+            self._save_checkpoint()
+
             task = RenameTask(str(clips_dir), str(run_root), "03_重命名成品", self.prefix,
                               "\n".join(titles), self.date_text, self.suffix,
                               self.start_index, self.padding, True)
@@ -1163,11 +1418,23 @@ class PipelineWorker(QObject):
             final_records = []
             for offset, source in enumerate(ordered):
                 destination = final_dir / task.render_name(source.name, self.start_index + offset)
-                if destination.exists(): raise FileExistsError(f"目标文件已存在：{destination.name}")
-                shutil.copy2(source, destination)
-                transcript = transcript_records[offset] if offset < len(transcript_records) else {}
+                saved_destination = self.state.setdefault("renamed", {}).get(source.name)
+                if saved_destination and (final_dir / saved_destination).exists():
+                    destination = final_dir / saved_destination
+                    self.log.emit(f"断点续接：跳过已完成重命名 {offset + 1}/{len(ordered)}：{destination.name}")
+                elif destination.exists():
+                    self.log.emit(f"断点续接：检测到已复制成品，登记并跳过：{destination.name}")
+                    self.state["renamed"][source.name] = destination.name
+                    self._save_checkpoint()
+                else:
+                    shutil.copy2(source, destination)
+                    self.state["renamed"][source.name] = destination.name
+                    self._save_checkpoint()
+                transcript = self.state["transcripts"].get(source.name, {})
                 final_records.append({"path": str(destination), "original": transcript.get("original", ""),
                                       "chinese": transcript.get("chinese", "")})
+            self.state["stage"] = "cloud" if self.cloud_config.get("enabled") else "completed"
+            self._save_checkpoint()
             self.titles_ready.emit(str(clips_dir), titles)
             if self.cloud_config.get("enabled"):
                 self.progress.emit(92); self.log.emit("开始 Google 云端同步（仅重命名成品）…")
@@ -1176,17 +1443,32 @@ class PipelineWorker(QObject):
                         self.cloud_config, self.log.emit, lambda: self.cancelled).run(
                         final_dir, final_records, self.sources)
                     self.cloud_ready.emit(folder_url, cloud_summary)
+                    self.state["status"] = "completed"
+                    self.state["cloud_url"] = folder_url
+                    self._save_checkpoint()
                 except Exception as cloud_exc:
                     folder_url = ""
                     cloud_summary = f"本地视频已全部处理；云同步失败：{cloud_exc}"
                     self.log.emit(cloud_summary); self.cloud_failed.emit(str(final_dir), str(cloud_exc))
+                    self.state["status"] = "cloud_failed"
+                    self.state["last_error"] = str(cloud_exc)
+                    self._save_checkpoint()
             else:
                 folder_url = ""; cloud_summary = "云端同步已关闭"
+                self.state["status"] = "completed"
+                self._save_checkpoint()
             self.progress.emit(100)
             message = f"流水线完成：生成 {len(clips)} 个片段和成品\n{final_dir}\n{cloud_summary}"
             if folder_url: message += f"\n{folder_url}"
             self.finished.emit(True, message)
         except Exception as exc:
+            if self.checkpoint_path:
+                try:
+                    self.state["status"] = "failed"
+                    self.state["last_error"] = str(exc)
+                    self._save_checkpoint()
+                except Exception:
+                    pass
             self.finished.emit(False, str(exc))
 
 
@@ -1402,6 +1684,8 @@ class MainWindow(QMainWindow):
             ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕作为标题 → 批量重命名”执行。处理完成后可选择只上传重命名成品，并按已保存的 Google Drive / Sheets 方案写入表格。"),
             ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
             ("组件检查与常见问题", "FFmpeg、FFprobe 或 Python 组件异常时，进入“设置与组件”统一检测并一键恢复。网络链接无法解析时可更新 yt-dlp。macOS 首次打开若被系统拦截，请在 Finder 中右键应用并选择“打开”。"),
+            ("长视频与断点续接", "字幕提取和自动流水线默认开启“自动续接”。同一批素材再次执行时，程序会跳过已成功的视频；流水线还会跳过已经完成的剪辑和重命名。请保留流水线输出目录及其中的 pipeline_checkpoint.json。需要全部重做时，取消勾选自动续接。"),
+            ("提高本地识别效率", "本地 Whisper 会直接流式读取媒体，避免先生成整段超大 WAV。建议普通电脑使用 small 模型；GPU 不适合 FP16 时会自动选择可用计算模式或回退 CPU INT8。ONNX Runtime 用于 VAD 静音过滤，缺失时程序会自动关闭 VAD 继续运行。Groq 长视频会自动拆成 90 秒分段并逐段保存进度。"),
         ]
         for index, (title, body) in enumerate(sections):
             group = QGroupBox(title)
@@ -1414,7 +1698,7 @@ class MainWindow(QMainWindow):
             text.setStyleSheet("color:#b7c5d8;line-height:1.55;")
             group_layout.addWidget(text)
             grid.addWidget(group, index // 2, index % 2)
-        for row in range(3):
+        for row in range(4):
             grid.setRowStretch(row, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -1508,10 +1792,14 @@ class MainWindow(QMainWindow):
         self.transcribe_progress = QProgressBar(); self.transcribe_progress.setValue(0)
         control_layout.addWidget(self.transcribe_progress)
         actions = QHBoxLayout()
+        self.subtitle_resume_check = QCheckBox("自动续接上次进度")
+        self.subtitle_resume_check.setChecked(True)
+        self.subtitle_resume_check.setToolTip("同一批素材和识别设置再次执行时，自动跳过已成功的视频")
         self.start_btn = QPushButton("开始提取字幕"); self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self._start_transcription)
         self.cancel_btn = QPushButton("取消"); self.cancel_btn.setEnabled(False); self.cancel_btn.clicked.connect(self._cancel_transcription)
-        actions.addStretch(); actions.addWidget(self.cancel_btn); actions.addWidget(self.start_btn)
+        actions.addWidget(self.subtitle_resume_check); actions.addStretch()
+        actions.addWidget(self.cancel_btn); actions.addWidget(self.start_btn)
         control_layout.addLayout(actions)
         control_layout.addWidget(QLabel("运行日志"))
         self.log_box = QPlainTextEdit(); self.log_box.setReadOnly(True)
@@ -1602,6 +1890,10 @@ class MainWindow(QMainWindow):
         cloud_config.clicked.connect(self._open_google_sync_dialog)
         cloud_layout.addWidget(self.pipeline_cloud_check); cloud_layout.addStretch(); cloud_layout.addWidget(cloud_config)
         left_layout.addWidget(cloud_group)
+        self.pipeline_resume_check = QCheckBox("自动续接未完成任务（跳过已完成的剪辑、字幕和重命名）")
+        self.pipeline_resume_check.setChecked(True)
+        self.pipeline_resume_check.setToolTip("取消勾选后会创建一个全新的流水线任务")
+        left_layout.addWidget(self.pipeline_resume_check)
         self.pipeline_progress = QProgressBar(); left_layout.addWidget(self.pipeline_progress)
         actions = QHBoxLayout(); actions.addStretch()
         self.pipeline_stop = QPushButton("停止"); self.pipeline_stop.setEnabled(False); self.pipeline_stop.clicked.connect(self._pipeline_cancel)
@@ -2101,7 +2393,8 @@ class MainWindow(QMainWindow):
             self.store, sources, self.pipeline_output.text(), self.pipeline_threshold.value(),
             provider, model, self.pipeline_language.text(), ffmpeg,
             self.pipeline_prefix.text(), self.pipeline_date.text(), self.pipeline_suffix.text(),
-            self.pipeline_start.value(), self.pipeline_padding.value(), cloud_config)
+            self.pipeline_start.value(), self.pipeline_padding.value(), cloud_config,
+            self.pipeline_resume_check.isChecked())
         self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.pipeline_log.appendPlainText)
         self.worker.progress.connect(self.pipeline_progress.setValue)
@@ -2310,7 +2603,8 @@ class MainWindow(QMainWindow):
         self.original_result.clear(); self.chinese_result.clear()
         self.thread = QThread(self)
         self.worker = TranscribeWorker(self.store, provider, model, files, "",
-                                       self.language_edit.text(), self.diarize_check.isChecked(), ffmpeg)
+                                       self.language_edit.text(), self.diarize_check.isChecked(), ffmpeg,
+                                       self.subtitle_resume_check.isChecked())
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self._append_log)

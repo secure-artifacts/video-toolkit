@@ -22,7 +22,10 @@ python -m PyInstaller \
   --add-binary "$MEDIA_BIN/ffprobe:." \
   --collect-data faster_whisper \
   --collect-binaries ctranslate2 \
+  --collect-data onnxruntime \
+  --collect-binaries onnxruntime \
   --hidden-import faster_whisper \
+  --hidden-import onnxruntime \
   --hidden-import google_auth_oauthlib \
   --hidden-import googleapiclient.discovery \
   --exclude-module torch \
