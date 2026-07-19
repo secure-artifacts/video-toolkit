@@ -66,8 +66,102 @@ jobs:
           path: dist_final/*.zip
           if-no-files-found: error
 
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Install media components
+        run: |
+          brew install ffmpeg
+          echo "VIDEO_TOOLKIT_MEDIA_BIN=$(dirname "$(command -v ffmpeg)")" >> "$GITHUB_ENV"
+
+      - name: Create macOS application icon
+        run: |
+          mkdir -p logo.iconset
+          sips -z 16 16 logo.png --out logo.iconset/icon_16x16.png
+          sips -z 32 32 logo.png --out logo.iconset/icon_16x16@2x.png
+          sips -z 32 32 logo.png --out logo.iconset/icon_32x32.png
+          sips -z 64 64 logo.png --out logo.iconset/icon_32x32@2x.png
+          sips -z 128 128 logo.png --out logo.iconset/icon_128x128.png
+          sips -z 256 256 logo.png --out logo.iconset/icon_128x128@2x.png
+          sips -z 256 256 logo.png --out logo.iconset/icon_256x256.png
+          sips -z 512 512 logo.png --out logo.iconset/icon_256x256@2x.png
+          sips -z 512 512 logo.png --out logo.iconset/icon_512x512.png
+          sips -z 1024 1024 logo.png --out logo.iconset/icon_512x512@2x.png
+          iconutil -c icns logo.iconset -o logo.icns
+
+      - name: Build macOS application
+        run: |
+          chmod +x build_macos.sh
+          ./build_macos.sh
+
+      - name: Set application metadata and sign locally
+        run: |
+          APP="dist_macos/VideoToolkit.app"
+          VERSION="${GITHUB_REF_NAME#v}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName 视频工具合集" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 视频工具合集" "$APP/Contents/Info.plist" || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 视频工具合集" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist" || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist" || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+          mv "$APP" "dist_macos/视频工具合集.app"
+          codesign --force --deep --sign - "dist_macos/视频工具合集.app"
+          codesign --verify --deep --strict --verbose=2 "dist_macos/视频工具合集.app"
+
+      - name: Verify bundled FFmpeg and FFprobe
+        run: |
+          APP="dist_macos/视频工具合集.app"
+          FFMPEG="$(find "$APP" -type f -name ffmpeg | head -1)"
+          FFPROBE="$(find "$APP" -type f -name ffprobe | head -1)"
+          test -n "$FFMPEG" && test -n "$FFPROBE"
+          "$FFMPEG" -version
+          "$FFPROBE" -version
+
+      - name: Package final artifact
+        run: |
+          mkdir -p dist_final
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist_macos/视频工具合集.app" \
+            "dist_final/video-toolkit-macos-${{ matrix.arch }}-${{ github.ref_name }}.zip"
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist_final/*.zip'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-toolkit-macos-${{ matrix.arch }}
+          path: dist_final/*.zip
+          if-no-files-found: error
+
   release:
-    needs: build-windows
+    needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
 
     steps:

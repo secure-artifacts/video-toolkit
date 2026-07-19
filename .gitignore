@@ -6,7 +6,9 @@ __pycache__/
 .watermark_studio/
 .pytest_cache/
 build/
+build_macos/
 dist/
+dist_macos/
 dist_debug/
 dist_folder/
 work/
@@ -16,12 +18,16 @@ test_shots/
 watermark_outputs/
 流水线输出/
 rename_regression_*/
+.rename_mac_compat_test/
 VideoToolkit.spec
 *_preview.png
 execution_detailed.log
 tools/ffmpeg/
 *.zip
 *.exe
+*.app/
+*.icns
+*.iconset/
 config.json
 rename_presets.json
 client_secret*.json

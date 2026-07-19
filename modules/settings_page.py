@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+from .platform_utils import app_data_dir, bundled_media_tool, media_tool_name
 
 
 PYTHON_COMPONENTS = [
@@ -35,10 +36,7 @@ PYTHON_COMPONENTS = [
 
 
 def toolkit_dir() -> Path:
-    base = Path(os.environ.get("LOCALAPPDATA", os.environ.get("APPDATA", Path.home())))
-    path = base / "VideoToolkit"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return app_data_dir()
 
 
 def component_bin() -> Path:
@@ -54,9 +52,11 @@ def hidden_kwargs():
 
 
 def find_media_tool(name: str):
-    suffix = ".exe" if os.name == "nt" else ""
-    local = component_bin() / f"{name}{suffix}"
-    return str(local) if local.exists() else shutil.which(name)
+    local = component_bin() / media_tool_name(name)
+    bundled = bundled_media_tool(name)
+    if local.exists(): return str(local)
+    if bundled.exists(): return str(bundled)
+    return shutil.which(name)
 
 
 def component_rows():
@@ -115,6 +115,29 @@ class InstallWorker(QObject):
             self.finished.emit(False, str(exc))
 
     def _install_ffmpeg(self):
+        if sys.platform == "darwin":
+            self.log.emit("正在从应用内置组件恢复 FFmpeg / FFprobe …")
+            restored = True
+            for name in ("ffmpeg", "ffprobe"):
+                source = bundled_media_tool(name)
+                target = component_bin() / media_tool_name(name)
+                if not source.exists():
+                    restored = False
+                    break
+                shutil.copy2(source, target)
+                target.chmod(target.stat().st_mode | 0o111)
+            if restored:
+                return
+            brew = shutil.which("brew")
+            if not brew:
+                raise RuntimeError("应用内置媒体组件不可用，且未检测到 Homebrew。请重新安装完整应用包。")
+            self.log.emit("正在通过 Homebrew 安装 FFmpeg / FFprobe …")
+            result = subprocess.run([brew, "install", "ffmpeg"], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            self.log.emit(result.stdout[-5000:])
+            if result.returncode != 0:
+                raise RuntimeError("Homebrew 安装 FFmpeg 失败，请查看日志")
+            return
         url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
         self.log.emit("正在下载 FFmpeg Essentials（包含 FFmpeg 与 FFprobe）…")
         with tempfile.TemporaryDirectory(prefix="video_toolkit_ffmpeg_") as temp_name:

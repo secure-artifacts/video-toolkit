@@ -42,9 +42,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from .path_picker import DropTableWidget, collect_files, load_subfolders
+from .platform_utils import app_data_dir, media_tool_name
 
 
-APP_DIR = Path.home() / ".watermark_studio"
+APP_DIR = app_data_dir() / "watermark_studio"
 TEMPLATE_FILE = APP_DIR / "templates.json"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".m4v"}
@@ -194,10 +195,14 @@ def find_font_file(family: str):
     candidates = [
         Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts",
         Path.home() / "AppData/Local/Microsoft/Windows/Fonts",
+        Path("/System/Library/Fonts"),
+        Path("/System/Library/Fonts/Supplemental"),
+        Path("/Library/Fonts"),
+        Path.home() / "Library/Fonts",
     ]
     known = {
-        "microsoftyaheiui": ["msyh.ttc", "msyhbd.ttc"],
-        "microsoftyahei": ["msyh.ttc", "msyhbd.ttc"],
+        "microsoftyaheiui": ["msyh.ttc", "msyhbd.ttc", "PingFang.ttc", "Hiragino Sans GB.ttc"],
+        "microsoftyahei": ["msyh.ttc", "msyhbd.ttc", "PingFang.ttc", "Hiragino Sans GB.ttc"],
         "simsun": ["simsun.ttc"],
         "simhei": ["simhei.ttf"],
         "arial": ["arial.ttf"],
@@ -220,13 +225,18 @@ def find_font_file(family: str):
             item = folder / name
             if item.exists():
                 return str(item)
-    fallback = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf"
-    return str(fallback) if fallback.exists() else None
+    for fallback in (
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf",
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+        Path("/System/Library/Fonts/Helvetica.ttc"),
+    ):
+        if fallback.exists(): return str(fallback)
+    return None
 
 
 def find_executable(name: str):
     # 优先检查本地bundled文件夹中的ffmpeg
-    bundled = bundled_path(f"{name}.exe")
+    bundled = bundled_path(media_tool_name(name))
     if bundled.exists():
         return str(bundled)
     
@@ -238,7 +248,7 @@ def find_executable(name: str):
     # 最后检查ffmpeg同级目录中是否有其他工具
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
-        sibling = Path(ffmpeg_path).with_name(f"{name}.exe")
+        sibling = Path(ffmpeg_path).with_name(media_tool_name(name))
         if sibling.exists():
             return str(sibling)
     return None
@@ -339,6 +349,8 @@ class RenderWorker(QThread):
             cmd += ["-vf", vf]
         if self.encoder == "自动/高质量":
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+        elif self.encoder == "Apple VideoToolbox":
+            cmd += ["-c:v", "h264_videotoolbox", "-b:v", "8M"]
         elif self.encoder == "NVIDIA NVENC":
             cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "18", "-b:v", "0"]
         elif self.encoder == "AMD AMF":
@@ -406,8 +418,10 @@ class InstallWorker(QThread):
         commands = []
         if "PySide6" in self.missing or "Pillow" in self.missing:
             commands.append([sys.executable, "-m", "pip", "install", "-U", "PySide6", "Pillow"])
-        if not shutil.which("ffmpeg"):
-            if shutil.which("winget"):
+        if not find_executable("ffmpeg"):
+            if sys.platform == "darwin" and shutil.which("brew"):
+                commands.append([shutil.which("brew"), "install", "ffmpeg"])
+            elif shutil.which("winget"):
                 commands.append(
                     [
                         "winget",
@@ -420,8 +434,8 @@ class InstallWorker(QThread):
                     ]
                 )
             else:
-                self.log.emit("未找到 winget，无法自动安装 FFmpeg。请手动安装 FFmpeg 后重启软件。")
-                self.finished.emit(False, "缺少 winget，FFmpeg 需要手动安装")
+                self.log.emit("未找到可用的组件安装器。请使用顶部“设置与组件”恢复 FFmpeg。")
+                self.finished.emit(False, "FFmpeg 需要通过“设置与组件”恢复")
                 return
         if not commands:
             self.log.emit("没有发现缺失依赖。")
@@ -565,7 +579,10 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self.output_edit)
         out_row.addWidget(out_btn)
         self.encoder_combo = QComboBox()
-        self.encoder_combo.addItems(["自动/高质量", "NVIDIA NVENC", "AMD AMF", "Intel QSV", "CPU x264"])
+        if sys.platform == "darwin":
+            self.encoder_combo.addItems(["自动/高质量", "Apple VideoToolbox", "CPU x264"])
+        else:
+            self.encoder_combo.addItems(["自动/高质量", "NVIDIA NVENC", "AMD AMF", "Intel QSV", "CPU x264"])
         self.audio_check = QCheckBox("保留原音频")
         self.audio_check.setChecked(True)
         output_layout.addRow("输出文件夹", out_row)

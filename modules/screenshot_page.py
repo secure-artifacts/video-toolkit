@@ -14,10 +14,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QIcon
 from .path_picker import DropTextEdit, VIDEO_EXTENSIONS, collect_files, load_subfolders
+from .platform_utils import app_data_dir, open_local_path
 
 # --- 日誌路徑與配置 ---
 # 這裡記錄所有：執行錯誤、沒截取成功的記錄、失敗的記錄
-LOG_DIR = os.path.join(os.environ.get('APPDATA', os.getcwd()), "VideoToolkit", "logs")
+LOG_DIR = str(app_data_dir() / "logs")
 try:
     os.makedirs(LOG_DIR, exist_ok=True)
     test_path = os.path.join(LOG_DIR, ".write_test")
@@ -50,7 +51,7 @@ class ProcessThread(QThread):
         self.interval = interval
         self.folder = folder
         self.prefix = prefix
-        self.history_path = os.path.join(os.environ.get('APPDATA', os.getcwd()), "screenshot_history.json")
+        self.history_path = str(app_data_dir() / "screenshot_history.json")
 
     def load_history(self):
         if os.path.exists(self.history_path):
@@ -246,7 +247,7 @@ class VideoTool(QMainWindow):
         # 底部清理
         bot_layout = QHBoxLayout()
         self.btn_open = QPushButton("📂 打開完成文件夾"); self.btn_open.setEnabled(False)
-        self.btn_open.clicked.connect(lambda: os.startfile(self.last_folder))
+        self.btn_open.clicked.connect(lambda: open_local_path(self.last_folder))
         
         btn_clear = QPushButton("🧹 清空歷史查重數據")
         btn_clear.clicked.connect(self.clear_history)
@@ -284,7 +285,7 @@ class VideoTool(QMainWindow):
     def view_log(self):
         """核心功能：打開後台日誌文件"""
         if os.path.exists(LOG_FILE):
-            os.startfile(LOG_FILE)
+            open_local_path(LOG_FILE)
         else:
             QMessageBox.warning(self, "提示", "日誌文件尚未生成。")
 
@@ -320,7 +321,7 @@ class VideoTool(QMainWindow):
         if folder: self.add_local_paths([folder])
 
     def clear_history(self):
-        path = os.path.join(os.environ.get('APPDATA', os.getcwd()), "screenshot_history.json")
+        path = str(app_data_dir() / "screenshot_history.json")
         if os.path.exists(path):
             os.remove(path)
             QMessageBox.information(self, "完成", "歷史記錄已重置。")

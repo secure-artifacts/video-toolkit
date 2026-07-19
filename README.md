@@ -24,7 +24,7 @@
 
 ## 密钥与隐私
 
-密钥仅保存在当前 Windows 用户的 `%APPDATA%\VideoToolkit\config.json`。这是本机明文配置文件，请不要分享。媒体会按所选服务上传到相应 API；Gemini 上传的临时文件会在请求完成后主动删除。
+密钥仅保存在本机配置目录：Windows 为 `%APPDATA%\VideoToolkit\config.json`，macOS 为 `~/Library/Application Support/VideoToolkit/config.json`。这是本机明文配置文件，请不要分享。媒体会按所选服务上传到相应 API；Gemini 上传的临时文件会在请求完成后主动删除。
 
 ## 自动流水线与云端同步
 
@@ -36,6 +36,15 @@
 python -m pip install -r requirements.txt
 python app.py
 ```
+
+## macOS 版本
+
+Release 同时提供以下两个 macOS 压缩包，界面、功能和自动流水线与 Windows 版本一致：
+
+- `macos-arm64`：Apple 芯片（M1/M2/M3/M4 及后续型号）
+- `macos-x64`：Intel 芯片
+
+解压后将“视频工具合集.app”拖入“应用程序”目录。当前公开构建使用临时本地签名，没有 Apple Developer ID 公证；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”，或到“系统设置 → 隐私与安全性”确认打开。
 
 ## 如何发布新版本
 
@@ -55,7 +64,7 @@ git tag -a v1.0.1 -m "Release version 1.0.1"
 git push origin v1.0.1
 ```
 
-GitHub Actions 会自动安装依赖、构建 Windows 便携版、生成 Attestation，并由 `github-actions[bot]` 创建 Release。可在仓库的 Actions 页面查看构建进度，在 Releases 页面下载成品。
+GitHub Actions 会自动安装依赖，同时构建 Windows 便携版、macOS Apple 芯片版和 macOS Intel 版，生成 Attestation，并由 `github-actions[bot]` 创建 Release。可在仓库的 Actions 页面查看构建进度，在 Releases 页面下载成品。
 
 版本号规则：`vX.0.0` 表示重大版本，`vX.Y.0` 表示新增功能，`vX.Y.Z` 表示修复版本。
 

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
 )
 from .path_picker import DropFolderLineEdit, load_subfolders
+from .platform_utils import app_data_dir
 
 
 TITLE_MAX_CHARS = 20
@@ -162,7 +163,7 @@ def unique_destination(path: Path):
 class RenamePage(QWidget):
     def __init__(self):
         super().__init__(); self.tasks = []; self.thread = None; self.worker = None
-        self.preset_path = Path(os.environ.get("APPDATA", Path.home())) / "VideoToolkit" / "rename_presets.json"
+        self.preset_path = app_data_dir() / "rename_presets.json"
         self.presets = self.load_presets(); self.build_ui(); self.refresh_presets()
 
     def build_ui(self):

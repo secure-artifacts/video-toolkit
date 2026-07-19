@@ -46,6 +46,7 @@ from modules.screenshot_page import VideoTool as ScreenshotPage
 from modules.settings_page import SettingsPage, component_bin
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
+from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name
 _startup_trace("tool modules ready")
 
 
@@ -93,10 +94,7 @@ def resource_path(name: str) -> Path:
 
 
 def config_dir() -> Path:
-    base = Path(os.environ.get("APPDATA", Path.home()))
-    path = base / "VideoToolkit"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return app_data_dir()
 
 
 class ConfigStore:
@@ -1244,8 +1242,8 @@ class MainWindow(QMainWindow):
         # 打包版的 FFmpeg / FFprobe 位于 PyInstaller 解包目录；将它与用户组件目录
         # 一并加入 PATH，确保截图、剪辑、水印、字幕和组件检测使用同一套工具。
         media_paths = [str(component_bin())]
-        bundled_media = str(resource_path("ffmpeg.exe").parent)
-        if resource_path("ffmpeg.exe").exists():
+        bundled_media = str(bundled_media_tool("ffmpeg").parent)
+        if bundled_media_tool("ffmpeg").exists():
             media_paths.insert(0, bundled_media)
         current_path = os.environ.get("PATH", "")
         current_parts = current_path.split(os.pathsep)
@@ -2200,14 +2198,15 @@ class MainWindow(QMainWindow):
         return LOCAL_PROVIDER
 
     def _find_ffmpeg(self):
-        candidates = [resource_path("ffmpeg.exe"), app_root() / "ffmpeg.exe", component_bin() / "ffmpeg.exe"]
+        executable = media_tool_name("ffmpeg")
+        candidates = [bundled_media_tool("ffmpeg"), app_root() / executable, component_bin() / executable]
         for path in candidates:
             if path.exists():
                 return str(path)
         found = shutil.which("ffmpeg")
         if found:
             return found
-        raise RuntimeError("未找到 ffmpeg.exe")
+        raise RuntimeError(f"未找到 {executable}")
 
     def _start_transcription(self):
         local_files = [self.file_list.item(i).text() for i in range(self.file_list.count())]
