@@ -1,0 +1,69 @@
+# 视频工具合集
+
+同一个 PySide6 主窗口内整合以下功能：
+
+- 视频批量截图
+- 智能剪辑
+- 视频 / 图片水印添加
+- 视频 / 文件批量重命名
+- 智能提取视频字幕
+
+字幕模块支持无需密钥的本地 Whisper，以及 Groq、Google Gemini、ElevenLabs、Gladia。每个在线服务可以批量添加多枚 API 密钥，软件会轮询使用；遇到无效密钥或额度限制时会自动切换，并支持主动检测。
+
+批量截图支持 YouTube、Facebook、Instagram、TikTok 等 yt-dlp 可解析链接，也支持直接添加本地视频。
+
+批量重命名支持保存多套“前缀＋后缀”方案并快速切换。
+
+## 字幕结果
+
+字幕在当前窗口中以“识别原文 / 简体中文”双栏显示，可以直接复制原文或中外文对照。程序不再自动输出 TXT/JSON 文本文件。
+
+## 设置与组件
+
+顶部“设置与组件”页面会统一检测 Python 依赖、FFmpeg 与 FFprobe；缺少的组件可以一键静默安装。FFmpeg/FFprobe 使用 FFmpeg 官方下载页列出的 gyan.dev Windows Essentials 构建。
+
+## 密钥与隐私
+
+密钥仅保存在当前 Windows 用户的 `%APPDATA%\VideoToolkit\config.json`。这是本机明文配置文件，请不要分享。媒体会按所选服务上传到相应 API；Gemini 上传的临时文件会在请求完成后主动删除。
+
+## 自动流水线与云端同步
+
+自动流水线支持“智能剪辑 → 批量提取字幕 → 引用字幕标题批量重命名”。可选开启 Google Drive/Sheets 同步，仅上传重命名成品。Google 表格 ID、Sheet、列映射、固定字段与每次上传下拉字段均可配置并保存多套方案。
+
+## 本地运行
+
+```powershell
+python -m pip install -r requirements.txt
+python app.py
+```
+
+## 如何发布新版本
+
+本项目使用 GitHub Actions 自动构建和发布。发布前确保所有代码已提交并推送：
+
+```bash
+git status
+git add .
+git commit -m "你的改动说明"
+git push origin main
+```
+
+创建并推送以 `v` 开头的版本 Tag：
+
+```bash
+git tag -a v1.0.1 -m "Release version 1.0.1"
+git push origin v1.0.1
+```
+
+GitHub Actions 会自动安装依赖、构建 Windows 便携版、生成 Attestation，并由 `github-actions[bot]` 创建 Release。可在仓库的 Actions 页面查看构建进度，在 Releases 页面下载成品。
+
+版本号规则：`vX.0.0` 表示重大版本，`vX.Y.0` 表示新增功能，`vX.Y.Z` 表示修复版本。
+
+如果构建失败，请在 Actions 中查看日志并修复，然后删除失败的 Tag 后重新创建：
+
+```bash
+git tag -d v1.0.1
+git push origin :refs/tags/v1.0.1
+git tag -a v1.0.1 -m "Release version 1.0.1"
+git push origin v1.0.1
+```

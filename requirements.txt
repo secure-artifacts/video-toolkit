@@ -1,0 +1,12 @@
+PySide6>=6.8,<7
+requests>=2.31,<3
+Pillow>=10,<13
+opencv-python>=4.10,<5
+yt-dlp>=2025.1
+scenedetect[opencv]>=0.6,<1
+moviepy>=2,<3
+faster-whisper>=1.1,<2
+deep-translator>=1.11,<2
+google-api-python-client>=2,<3
+google-auth>=2,<3
+google-auth-oauthlib>=1,<2
