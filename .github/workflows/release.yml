@@ -49,7 +49,6 @@ jobs:
       - name: Package final artifact
         shell: pwsh
         run: |
-          Rename-Item -LiteralPath 'dist_folder\VideoToolkit\VideoToolkit.exe' -NewName '视频工具合集.exe'
           New-Item -ItemType Directory -Path 'dist_final' -Force | Out-Null
           $archive = "dist_final\video-toolkit-windows-x64-${{ github.ref_name }}.zip"
           Compress-Archive -Path 'dist_folder\VideoToolkit\*' -DestinationPath $archive -CompressionLevel Optimal

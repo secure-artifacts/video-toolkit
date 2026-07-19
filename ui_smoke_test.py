@@ -29,7 +29,10 @@ qt.setStyleSheet(toolkit.STYLE)
 window = toolkit.MainWindow()
 window.resize(1600, 920)
 
-assert window.pages.count() == 9
+assert window.pages.count() == 10
+assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 6
+assert window.nav_buttons[-1].text() == "帮助与说明"
+assert not any(button.text() == "开始智能提取字幕" for button in window.pages.widget(0).findChildren(toolkit.QPushButton))
 assert window.provider_combo.itemText(0) == toolkit.AUTO_PROVIDER
 assert window._resolve_provider() == toolkit.LOCAL_PROVIDER
 assert window.key_table.columnCount() == 7
@@ -185,4 +188,4 @@ window.grab().save("subtitle_layout_preview.png")
 window._show_page(8)
 qt.processEvents()
 window.grab().save("pipeline_layout_preview.png")
-print("OK pages=9 auto=enabled fallback=local key_diagnostics=passed")
+print("OK pages=10 auto=enabled fallback=local key_diagnostics=passed")

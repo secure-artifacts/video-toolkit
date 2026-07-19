@@ -1215,21 +1215,31 @@ class CloudUploadWorker(QObject):
 class ToolCard(QFrame):
     clicked = Signal(str)
 
-    def __init__(self, title, description, accent, path):
+    def __init__(self, icon_text, title, description, accent, path):
         super().__init__()
         self.path = path
         self.setObjectName("toolCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(7)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(6)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        icon = QLabel(icon_text)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setFixedSize(38, 38)
+        icon.setStyleSheet(
+            f"background:{accent}22;border:1px solid {accent}66;border-radius:9px;"
+            f"color:{accent};font-size:20px;font-weight:800;")
         title_label = QLabel(title)
-        title_label.setStyleSheet(f"font-size:20px;font-weight:700;color:{accent};")
+        title_label.setStyleSheet(f"font-size:18px;font-weight:800;color:{accent};")
+        header.addWidget(icon)
+        header.addWidget(title_label, 1)
         desc = QLabel(description)
         desc.setWordWrap(True)
-        desc.setStyleSheet("color:#94a3b8;line-height:1.5;")
+        desc.setStyleSheet("color:#a9b8cb;line-height:1.45;")
         button = QPushButton("进入  →")
         button.clicked.connect(lambda: self.clicked.emit(self.path))
-        layout.addWidget(title_label)
+        layout.addLayout(header)
         layout.addWidget(desc)
         layout.addStretch()
         layout.addWidget(button)
@@ -1287,7 +1297,8 @@ class MainWindow(QMainWindow):
         nav_layout.addSpacing(16)
         self.nav_buttons = []
         nav_items = ("首页", "批量截图", "智能剪辑", "水印添加",
-                     "批量重命名", "字幕提取", "密钥管理", "设置与组件", "自动流水线")
+                     "批量重命名", "字幕提取", "密钥管理", "设置与组件", "自动流水线",
+                     "帮助与说明")
         for i, text in enumerate(nav_items):
             btn = QPushButton(text)
             btn.setCheckable(True)
@@ -1325,6 +1336,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.settings_page)
         self.pages.addWidget(self._pipeline_page())
         _startup_trace("pipeline page ready")
+        self.pages.addWidget(self._help_page())
+        _startup_trace("help page ready")
         outer.addWidget(self.pages, 1)
         self._show_page(0)
 
@@ -1343,24 +1356,80 @@ class MainWindow(QMainWindow):
         return page, layout
 
     def _home_page(self):
-        page, layout = self._page_shell("一站式视频工作台", "保留原工具能力，统一入口，一键启动。")
+        page, layout = self._page_shell("一站式视频工作台", "选择需要的业务功能；文件、文件夹和网络链接均可按模块批量处理。")
         tools = [
-            ("视频批量截图", "批量从网络视频提取画面，保留历史查重与 yt-dlp 支持。", "#38bdf8", "page:1"),
-            ("智能剪辑", "自定义时长序列或智能检测场景并批量切分视频。", "#a78bfa", "page:2"),
-            ("视频 / 图片水印", "批量添加多层文字水印，支持模板、预览和硬件编码。", "#34d399", "page:3"),
-            ("视频 / 文件重命名", "自然排序、编号、标题和日期规则批量重命名。", "#fbbf24", "page:4"),
+            ("▣", "视频批量截图",
+             "• YouTube / FB / IG / TikTok 网络链接取帧\n• 本地视频、文件夹拖拽与父子目录选择\n• 自定义截图间隔、数量、画质和命名\n• 保存任务记录并自动进行历史查重",
+             "#38bdf8", "page:1"),
+            ("✂", "智能剪辑",
+             "• 根据画面变化自动检测视频场景\n• 支持自定义片段时长和批量切分\n• 多视频、文件夹拖拽和任务队列\n• 输出成品并保留视频原有立体声音频",
+             "#a78bfa", "page:2"),
+            ("◉", "视频 / 图片水印",
+             "• 视频与图片统一批量添加文字水印\n• 多层水印、字体、描边和透明度设置\n• 模板保存、位置网格及实时效果预览\n• 支持 CPU 和平台硬件视频编码",
+             "#34d399", "page:3"),
+            ("A↔", "视频 / 文件重命名",
+             "• 文件自然排序及 Windows 安全名称处理\n• 标题、日期、前后缀和连续编号组合\n• 执行前完整预览新旧文件名\n• 多套前缀与后缀方案保存和快速切换",
+             "#fbbf24", "page:4"),
+            ("CC", "智能字幕提取",
+             "• 本地 Whisper 无需密钥即可识别\n• 在线服务支持多密钥检测与轮询\n• 批量处理网络链接、本地视频或音频\n• 中外文对照、全部复制及批量导出字幕",
+             "#fb7185", "page:5"),
+            ("⇢", "自动流水线",
+             "• 智能剪辑 → 字幕提取 → 批量重命名\n• 自动把每段字幕引用为对应视频标题\n• 中间结果与重命名成品分别保留\n• 可选同步 Google Drive 和 Google Sheets",
+             "#22d3ee", "page:8"),
         ]
-        rows = [QHBoxLayout(), QHBoxLayout()]
+        rows = [QHBoxLayout(), QHBoxLayout(), QHBoxLayout()]
         for idx, item in enumerate(tools):
             card = ToolCard(*item)
             card.clicked.connect(self._launch_tool)
             rows[idx // 2].addWidget(card)
         for row in rows:
             layout.addLayout(row, 1)
-        subtitle_btn = QPushButton("开始智能提取字幕")
-        subtitle_btn.setObjectName("primary")
-        subtitle_btn.clicked.connect(lambda: self._show_page(5))
-        layout.addWidget(subtitle_btn)
+        return page
+
+    def _help_page(self):
+        page, layout = self._page_shell("帮助与使用说明", "从添加素材到导出成品的常用操作说明；遇到组件问题也可以在这里快速定位。")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setContentsMargins(2, 2, 8, 8)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        sections = [
+            ("快速开始", "1. 在顶部选择需要的工具。\n2. 拖入视频、音频、文件夹，或点击按钮选择素材。\n3. 检查输出目录和处理参数。\n4. 先预览，再开始批量执行。\n5. 完成后从日志或结果区查看输出位置。"),
+            ("素材添加与拖拽", "需要选择素材的页面均支持拖入文件或文件夹。选择父目录后，可以从子文件夹列表继续添加指定目录。批量截图和字幕提取还支持 YouTube、Facebook、Instagram、TikTok 链接，每行填写一个。"),
+            ("字幕提取", "可以使用“本地 Whisper（无需密钥）”，也可以配置 Groq、Gemini、ElevenLabs、Gladia。批量结果可查看当前项目或全部项目，并支持复制全部原文、复制全部中外文对照及批量导出字幕。"),
+            ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕作为标题 → 批量重命名”执行。处理完成后可选择只上传重命名成品，并按已保存的 Google Drive / Sheets 方案写入表格。"),
+            ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
+            ("组件检查与常见问题", "FFmpeg、FFprobe 或 Python 组件异常时，进入“设置与组件”统一检测并一键恢复。网络链接无法解析时可更新 yt-dlp。macOS 首次打开若被系统拦截，请在 Finder 中右键应用并选择“打开”。"),
+        ]
+        for index, (title, body) in enumerate(sections):
+            group = QGroupBox(title)
+            group_layout = QVBoxLayout(group)
+            group_layout.setContentsMargins(14, 14, 14, 12)
+            text = QLabel(body)
+            text.setWordWrap(True)
+            text.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            text.setStyleSheet("color:#b7c5d8;line-height:1.55;")
+            group_layout.addWidget(text)
+            grid.addWidget(group, index // 2, index % 2)
+        for row in range(3):
+            grid.setRowStretch(row, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        actions = QHBoxLayout()
+        keys = QPushButton("打开密钥管理")
+        keys.clicked.connect(lambda: self._show_page(6))
+        components = QPushButton("检查设置与组件")
+        components.setObjectName("primary")
+        components.clicked.connect(lambda: self._show_page(7))
+        actions.addStretch()
+        actions.addWidget(keys)
+        actions.addWidget(components)
+        layout.addLayout(actions)
         return page
 
     def _subtitle_page(self):
