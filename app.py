@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import asyncio
+import base64
 import mimetypes
 import os
 import re
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -45,7 +47,7 @@ _startup_trace("PySide6 ready")
 
 from modules.rename_page import RenamePage, RenameTask, natural_key as rename_natural_key
 from modules.screenshot_page import VideoTool as ScreenshotPage
-from modules.settings_page import SettingsPage, component_bin
+from modules.settings_page import SettingsPage, component_bin, hidden_kwargs
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
@@ -2004,11 +2006,13 @@ class MainWindow(QMainWindow):
             self._caption_transcribe, self._text_to_speech, self._find_ffmpeg,
             TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER)
         reels_tab_index = self.watermark_tabs.addTab(self.dynamic_caption_page, "动态 Reels 流水线")
-        # Reels 功能代码暂时保留，当前稳定发布版不向用户开放入口。
-        self.watermark_tabs.setTabVisible(reels_tab_index, False)
+        # 开发/预览版默认开放 Reels；稳定发布时仍可设置
+        # VIDEO_TOOLKIT_SHOW_REELS=0 单独隐藏，不影响其他水印功能。
+        show_reels_preview = os.environ.get("VIDEO_TOOLKIT_SHOW_REELS", "1").strip() != "0"
+        self.watermark_tabs.setTabVisible(reels_tab_index, show_reels_preview)
         watermark_tab_index = self.watermark_tabs.addTab(self.watermark_page, "视频 / 图片水印")
         self.watermark_tabs.addTab(MetadataPage(), "素材元数据清理")
-        self.watermark_tabs.setCurrentIndex(watermark_tab_index)
+        self.watermark_tabs.setCurrentIndex(reels_tab_index if show_reels_preview else watermark_tab_index)
         _startup_trace("watermark page ready")
         self.rename_page = RenamePage()
         _startup_trace("rename page ready")
@@ -2099,7 +2103,7 @@ class MainWindow(QMainWindow):
             ("快速开始", "1. 在顶部选择需要的工具。\n2. 拖入视频、音频、文件夹，或点击按钮选择素材。\n3. 检查输出目录和处理参数。\n4. 先预览，再开始批量执行。\n5. 完成后从日志或结果区查看输出位置。"),
             ("素材添加与拖拽", "需要选择素材的页面均支持拖入文件或文件夹。选择父目录后，可以从子文件夹列表继续添加指定目录。批量截图和字幕提取还支持 YouTube、Facebook、Instagram、TikTok 链接，每行填写一个。"),
             ("字幕提取", "可以使用“本地 Whisper（无需密钥）”，也可以配置 Groq、Gemini、ElevenLabs、Gladia。批量结果可查看当前项目或全部项目，并支持复制全部原文、复制全部中外文对照及批量导出字幕。"),
-            ("视频 / 图片水印", "保留原有静态水印功能，可为视频和图片批量添加多层文字或图片水印，并保存、应用水印模板。动态 Reels 功能本版本暂不开放。"),
+            ("视频 / 图片水印", "保留原有静态水印功能，并开放动态 Reels 流水线：视频、音频、独立文案、字幕样式、蒙版和批量导出。"),
             ("素材元数据清理", "可从顶部“清除元数据”直接进入，也可在“视频 / 图片水印”中打开对应子页。程序会显示清理前后的元数据信息；视频和音频使用无损流复制且保留原声道，图片重新保存干净副本以移除 EXIF/XMP，原文件不会修改。"),
             ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕生成标题 → 批量重命名成品 → 批量上传 → 批量填表”执行。只上传重命名成品；支持断点续接、保存同步方案、继续上传和继续填表，并按云端文件链接唯一值跳过已经填写的记录。"),
             ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
@@ -3184,24 +3188,166 @@ class MainWindow(QMainWindow):
                 import edge_tts
             except ImportError as exc:
                 raise RuntimeError("缺少微软语音组件 edge-tts，请到“设置与组件”点击一键安装。") from exc
+            clean_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(text)).strip()
+            if not clean_text:
+                raise RuntimeError("文案为空，无法生成语音。")
+
             selected_voice = voice or "zh-CN-XiaoxiaoNeural"
-            async def generate():
+            locale = selected_voice[:5]
+            voice_fallbacks = {
+                "pt-PT": ["pt-PT-RaquelNeural", "pt-PT-DuarteNeural"],
+                "pt-BR": ["pt-BR-FranciscaNeural", "pt-BR-AntonioNeural"],
+                "zh-CN": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural"],
+                "en-US": ["en-US-JennyNeural", "en-US-GuyNeural"],
+            }
+            voices = list(dict.fromkeys([selected_voice] + voice_fallbacks.get(locale, [])))
+
+            # Edge 的免费接口在长段落或网络短暂波动时偶尔只返回元数据、不返回音频。
+            # 按句拆成适中的请求，并对当前音色及同语种备用音色自动重试。
+            pieces = []
+            pending = ""
+            for sentence in re.split(r"(?<=[。！？.!?；;：:\n])\s*", clean_text):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                if pending and len(pending) + len(sentence) + 1 > 1400:
+                    pieces.append(pending); pending = sentence
+                else:
+                    pending = f"{pending} {sentence}".strip()
+            if pending:
+                pieces.append(pending)
+            if not pieces:
+                pieces = [clean_text]
+
+            async def generate_part(part_text, part_path, part_voice):
                 boundaries = []
-                with target.open("wb") as audio_handle:
-                    async for chunk in edge_tts.Communicate(text, selected_voice).stream():
-                        if chunk.get("type") == "audio":
+                with part_path.open("wb") as audio_handle:
+                    async for chunk in edge_tts.Communicate(part_text, part_voice).stream():
+                        if chunk.get("type") == "audio" and chunk.get("data"):
                             audio_handle.write(chunk["data"])
                         elif chunk.get("type") == "WordBoundary":
                             start = float(chunk.get("offset", 0)) / 10_000_000
                             duration = float(chunk.get("duration", 0)) / 10_000_000
                             boundaries.append({"start": start, "end": start + max(.08, duration),
                                                "text": str(chunk.get("text", "")).strip()})
-                if boundaries:
-                    target.with_suffix(".srt").write_text(segments_to_srt(boundaries), encoding="utf-8-sig")
-            asyncio.run(generate())
-            if not target.exists() or target.stat().st_size == 0:
-                raise RuntimeError("微软文字转语音没有生成有效音频。")
-            return target
+                return boundaries
+
+            last_error = "服务没有返回音频"
+            with tempfile.TemporaryDirectory(prefix="video_toolkit_tts_") as temp_name:
+                temp_dir = Path(temp_name)
+                for selected in voices:
+                    for attempt in range(1, 3):
+                        part_paths = []; all_boundaries = []; time_offset = 0.0
+                        try:
+                            for index, piece in enumerate(pieces):
+                                part_path = temp_dir / f"part_{index:03d}.mp3"
+                                if part_path.exists(): part_path.unlink()
+                                boundaries = asyncio.run(generate_part(piece, part_path, selected))
+                                if not part_path.exists() or part_path.stat().st_size < 256:
+                                    raise RuntimeError(f"第 {index + 1} 段没有收到音频")
+                                part_paths.append(part_path)
+                                for entry in boundaries:
+                                    all_boundaries.append({**entry,
+                                                           "start": entry["start"] + time_offset,
+                                                           "end": entry["end"] + time_offset})
+                                if boundaries:
+                                    time_offset += max(item["end"] for item in boundaries) + .08
+
+                            if target.exists(): target.unlink()
+                            if len(part_paths) == 1:
+                                shutil.copyfile(part_paths[0], target)
+                            else:
+                                concat_file = temp_dir / "concat.txt"
+                                concat_file.write_text("".join(
+                                    f"file '{str(path).replace(chr(39), chr(39) + '\\\'' + chr(39))}'\n"
+                                    for path in part_paths), encoding="utf-8")
+                                result = subprocess.run(
+                                    [self._find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
+                                     "-f", "concat", "-safe", "0", "-i", str(concat_file),
+                                     "-c", "copy", str(target)], stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                    **hidden_kwargs())
+                                if result.returncode:
+                                    raise RuntimeError(result.stderr.strip() or "分段音频合并失败")
+                            if not target.exists() or target.stat().st_size < 256:
+                                raise RuntimeError("合并后音频为空")
+                            if all_boundaries:
+                                target.with_suffix(".srt").write_text(
+                                    segments_to_srt(all_boundaries), encoding="utf-8-sig")
+                            return target
+                        except Exception as exc:
+                            last_error = f"{selected}（第 {attempt} 次）：{exc}"
+                            for part_path in part_paths:
+                                try: part_path.unlink()
+                                except OSError: pass
+            raise RuntimeError(
+                "微软文字转语音连续重试后仍未收到音频。"
+                f"\n最后错误：{last_error}"
+                "\n请检查网络，或切换同语种音色；追求自然度可改用 ElevenLabs。")
+
+        if service == "Gemini 自然语音":
+            candidates = self.store.candidates("Gemini")
+            if not candidates:
+                raise RuntimeError("没有可用的 Gemini 密钥，请先到密钥管理添加并检测。")
+            voice_name = (voice.split("｜", 1)[0].strip() if voice else "Kore") or "Kore"
+            last_error = ""
+            for item in candidates:
+                try:
+                    response = requests.post(
+                        "https://generativelanguage.googleapis.com/v1beta/models/"
+                        "gemini-2.5-flash-preview-tts:generateContent",
+                        params={"key": item["key"]},
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "contents": [{"parts": [{"text": str(text).strip()}]}],
+                            "generationConfig": {
+                                "responseModalities": ["AUDIO"],
+                                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {
+                                    "voiceName": voice_name}}},
+                            },
+                        }, timeout=240)
+                    if response.status_code >= 400:
+                        last_error = response_error(response)
+                        self.store.mark_use("Gemini", item["id"],
+                                            "失效" if response.status_code in (401, 403) else
+                                            "额度受限" if response.status_code == 429 else "异常", last_error)
+                        continue
+                    payload = response.json()
+                    parts = (((payload.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+                    inline = next((part.get("inlineData") or part.get("inline_data")
+                                   for part in parts if part.get("inlineData") or part.get("inline_data")), None)
+                    if not inline or not inline.get("data"):
+                        last_error = "Gemini 没有返回音频数据，请重试或更换音色。"
+                        self.store.mark_use("Gemini", item["id"], "异常", last_error)
+                        continue
+                    audio = base64.b64decode(inline["data"])
+                    mime = str(inline.get("mimeType") or inline.get("mime_type") or "audio/L16;rate=24000").lower()
+                    with tempfile.TemporaryDirectory(prefix="video_toolkit_gemini_tts_") as temp_name:
+                        temp_dir = Path(temp_name)
+                        if "wav" in mime:
+                            source = temp_dir / "voice.wav"; source.write_bytes(audio)
+                        else:
+                            rate_match = re.search(r"rate=(\d+)", mime)
+                            rate = int(rate_match.group(1)) if rate_match else 24000
+                            source = temp_dir / "voice.wav"
+                            with wave.open(str(source), "wb") as wav_file:
+                                wav_file.setnchannels(1); wav_file.setsampwidth(2); wav_file.setframerate(rate)
+                                wav_file.writeframes(audio)
+                        result = subprocess.run(
+                            [self._find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
+                             "-i", str(source), "-c:a", "libmp3lame", "-b:a", "192k", str(target)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace", **hidden_kwargs())
+                        if result.returncode or not target.exists() or target.stat().st_size < 256:
+                            last_error = result.stderr.strip() or "Gemini 音频转换失败"
+                            self.store.mark_use("Gemini", item["id"], "异常", last_error)
+                            continue
+                    self.store.mark_use("Gemini", item["id"], "有效", "")
+                    return target
+                except (requests.RequestException, ValueError, KeyError) as exc:
+                    last_error = f"Gemini 语音请求失败：{exc}"
+                    self.store.mark_use("Gemini", item["id"], "异常", last_error)
+            raise RuntimeError(f"Gemini 可用密钥均生成失败。最后错误：{last_error}")
 
         voice_id = voice.strip()
         if not voice_id or voice_id.endswith("Neural"):
@@ -3223,6 +3369,12 @@ class MainWindow(QMainWindow):
                     self.store.mark_use("ElevenLabs", item["id"],
                                         "失效" if response.status_code in (401, 403) else
                                         "额度受限" if response.status_code == 429 else "异常", last_error)
+                    continue
+                content_type = response.headers.get("Content-Type", "").lower()
+                if len(response.content) < 256 or (content_type and "audio" not in content_type):
+                    last_error = ("接口没有返回有效音频"
+                                  f"（Content-Type: {content_type or '未知'}，{len(response.content)} 字节）")
+                    self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
                     continue
                 target.write_bytes(response.content)
                 self.store.mark_use("ElevenLabs", item["id"], "有效", "")
@@ -3558,8 +3710,18 @@ def main():
     app.setStyleSheet(STYLE)
     icon = resource_path("logo.ico")
     if icon.exists(): app.setWindowIcon(QIcon(str(icon)))
-    window = MainWindow(); window.show()
-    _startup_trace("window shown")
+    window = MainWindow()
+    window.showMaximized()
+    window.raise_()
+    window.activateWindow()
+    _startup_trace(
+        f"window shown platform={app.platformName()} visible={window.isVisible()} "
+        f"winId={int(window.winId())} geometry={window.geometry().getRect()}"
+    )
+    QTimer.singleShot(350, lambda: (window.raise_(), window.activateWindow()))
+    # 打包后自动化启动检查使用；普通用户启动时不会触发。
+    if os.environ.get("VIDEO_TOOLKIT_SMOKE_TEST", "").strip() == "1":
+        QTimer.singleShot(1800, app.quit)
     sys.exit(app.exec())
 
 
