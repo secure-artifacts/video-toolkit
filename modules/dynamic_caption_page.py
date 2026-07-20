@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from .path_picker import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DropListWidget, collect_files, natural_key
 from .settings_page import hidden_kwargs
+from .text_rules import normalize_required_capitalization
 
 
 PRESETS = {
@@ -75,7 +76,7 @@ def parse_srt(srt):
         start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / (10 ** len(raw_values[3]))
         end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / (10 ** len(raw_values[7]))
         # 保留用户手动换行；自由整段字幕需要按输入排版显示全部行。
-        text = "\n".join(lines[timing_index + 1:]).strip()
+        text = normalize_required_capitalization("\n".join(lines[timing_index + 1:]).strip())
         if text: result.append((start, max(start + .1, end), text))
     return result
 
@@ -135,7 +136,7 @@ def media_duration(ffmpeg, path, fallback=8.0):
 
 def free_caption_srt(text, duration, settings):
     """把不需要对口型的自由文案按两行一屏生成时间轴。"""
-    value = str(text or "").strip()
+    value = normalize_required_capitalization(str(text or "").strip())
     if not value:
         return ""
     if "-->" in value:

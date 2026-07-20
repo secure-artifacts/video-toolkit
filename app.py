@@ -51,6 +51,7 @@ from modules.settings_page import SettingsPage, component_bin, hidden_kwargs
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
+from modules.text_rules import normalize_required_capitalization
 from modules.metadata_page import MetadataPage
 from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name
 _startup_trace("tool modules ready")
@@ -356,7 +357,8 @@ def timestamp_srt(seconds: float) -> str:
 def segments_to_srt(segments) -> str:
     blocks = []
     for i, seg in enumerate(segments, 1):
-        text = re.sub(r"\s+", " ", str(seg.get("text", ""))).strip()
+        text = normalize_required_capitalization(
+            re.sub(r"\s+", " ", str(seg.get("text", ""))).strip())
         if not text:
             continue
         start = seg.get("start", 0)
@@ -390,7 +392,7 @@ def words_to_segments(words):
 
 
 def clean_model_srt(text: str) -> str:
-    text = text.strip()
+    text = normalize_required_capitalization(text.strip())
     text = re.sub(r"^```(?:srt)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
     text = text.replace("\r\n", "\n")
@@ -513,9 +515,11 @@ class TranscribeWorker(QObject):
                 source_key = stable_key(source_signature(source))
                 cached = state["results"].get(source_key)
                 if cached:
+                    cached_original = normalize_required_capitalization(cached.get("original", ""))
+                    cached_srt = normalize_required_capitalization(cached.get("srt", ""))
                     self.log.emit(f"断点续接：跳过已完成字幕 {index + 1}/{len(self.files)}：{cached['name']}")
-                    self.result_ready.emit(cached["name"], cached.get("original", ""),
-                                           cached.get("chinese", ""), cached.get("srt", ""))
+                    self.result_ready.emit(cached["name"], cached_original,
+                                           cached.get("chinese", ""), cached_srt)
                     self.progress.emit(round((index + 1) / len(self.files) * 100))
                     continue
                 display = source if is_supported_video_url(source) else Path(source).name
@@ -648,6 +652,8 @@ class TranscribeWorker(QObject):
                 self.log.emit(f"使用 {self.provider} 密钥 {masked_key(item['key'])} …")
             try:
                 srt, plain, raw = self._call_provider(recognition_input, item["key"], temp)
+                srt = normalize_required_capitalization(srt)
+                plain = normalize_required_capitalization(plain)
                 chinese = self._translate_chinese(plain)
                 self.result_ready.emit(result_name, plain, chinese, srt)
                 if self.provider != LOCAL_PROVIDER:
