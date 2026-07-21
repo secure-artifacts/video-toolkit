@@ -8,22 +8,26 @@ from pathlib import Path
 
 import cv2
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QRectF, QSettings, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontDatabase, QFontMetricsF, QImage, QPainter,
     QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
-    QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QTabWidget,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QVBoxLayout, QWidget,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QVBoxLayout, QWidget,
 )
 
-from .path_picker import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DropListWidget, collect_files, natural_key
+from .path_picker import (
+    AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DropFolderLineEdit, DropListWidget, collect_files, natural_key,
+)
+from .group_merge import GroupMergeWorker, discover_groups, split_group_script
 from .settings_page import hidden_kwargs
 from .text_rules import normalize_required_capitalization
+from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder
 
 
 PRESETS = {
@@ -50,6 +54,43 @@ PRESETS = {
     "背景跟读": {"text": "#FFFFFF", "outline": "#111827", "highlight": "#2563EB", "outline_width": 2, "effect": "highlight"},
     "光晕字幕": {"text": "#F5F3FF", "outline": "#7C3AED", "highlight": "#A855F7", "outline_width": 6, "effect": "glow"},
 }
+
+
+class PresetPreviewButton(QPushButton):
+    """Compact preset card that previews the actual caption treatment."""
+
+    def __init__(self, name, preset, parent=None):
+        super().__init__(name,parent); self.name = name; self.preset = preset
+        self.setCheckable(True); self.setMinimumHeight(58); self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"{name}｜文字 {preset['text']}｜强调 {preset['highlight']}")
+
+    def paintEvent(self, _event):
+        painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        background = QColor("#1E293B" if self.underMouse() else "#111827")
+        if self.isChecked(): background = QColor("#172554")
+        painter.setPen(QPen(QColor("#38BDF8" if self.isChecked() else "#334155"), 2 if self.isChecked() else 1))
+        painter.setBrush(background); painter.drawRoundedRect(self.rect().adjusted(1,1,-1,-1),6,6)
+        painter.fillRect(2,7,6,max(10,self.height()-14),QColor(self.preset["highlight"]))
+        name_font = QFont(self.font()); name_font.setPixelSize(11); name_font.setBold(False); painter.setFont(name_font)
+        painter.setPen(QColor("#CBD5E1")); painter.drawText(QRectF(14,4,self.width()-20,18),Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter,self.name)
+        sample = "字幕样式"; font = QFont(self.preset.get("font","Arial")); font.setPixelSize(17); font.setBold(True)
+        painter.setFont(font); metrics=QFontMetricsF(font); width=metrics.horizontalAdvance(sample); x=14; baseline=48
+        effect=self.preset.get("effect","word_color"); text_color=QColor(self.preset["text"]); highlight=QColor(self.preset["highlight"]); outline=QColor(self.preset["outline"])
+        if effect in ("descript","heygen","highlight"):
+            painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(highlight); painter.drawRoundedRect(QRectF(x-3,27,width+8,24),5,5)
+            painter.setPen(text_color); painter.drawText(x,baseline,sample)
+        elif effect == "underline":
+            painter.setPen(text_color); painter.drawText(x,baseline,sample); painter.setPen(QPen(highlight,3)); painter.drawLine(int(x),52,int(x+width),52)
+        elif effect in ("outline","glow"):
+            path=QPainterPath(); path.addText(x,baseline,font,sample)
+            if effect == "glow": painter.setPen(QPen(highlight,7)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawPath(path)
+            painter.setPen(QPen(outline,max(2,int(self.preset.get("outline_width",3))))); painter.setBrush(text_color); painter.drawPath(path)
+        elif effect == "word_color":
+            painter.setPen(text_color); painter.drawText(x,baseline,"字幕"); x2=x+metrics.horizontalAdvance("字幕")
+            painter.setPen(highlight); painter.drawText(x2,baseline,"样式")
+        else:
+            painter.setPen(highlight); painter.drawText(x,baseline,sample)
+        painter.end()
 
 
 def ass_color(hex_color, alpha="00"):
@@ -132,6 +173,56 @@ def media_duration(ffmpeg, path, fallback=8.0):
         return value if value > .05 else fallback
     except Exception:
         return fallback
+
+
+def media_video_size(ffmpeg, path, fallback=(1080,1920)):
+    ffmpeg_path=Path(ffmpeg); ffprobe=ffmpeg_path.with_name("ffprobe"+ffmpeg_path.suffix)
+    try:
+        result=subprocess.run([str(ffprobe),"-v","error","-select_streams","v:0","-show_entries",
+                               "stream=width,height:stream_side_data=rotation","-of","json",str(path)],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding="utf-8",errors="replace",**hidden_kwargs())
+        stream=(json.loads(result.stdout or "{}").get("streams") or [{}])[0]
+        width=int(stream.get("width") or fallback[0]); height=int(stream.get("height") or fallback[1])
+        side_data=stream.get("side_data_list") or []
+        rotation=next((int(item.get("rotation",0)) for item in side_data if "rotation" in item),0)
+        if abs(rotation)%180==90: width,height=height,width
+        return max(2,width),max(2,height)
+    except Exception:
+        return fallback
+
+
+def prepared_fullframe_watermark(ffmpeg, video, watermark, cache_dir, opacity=90):
+    """Pre-scale and apply opacity once so FFmpeg only overlays a static exact-size frame."""
+    source=Path(watermark); width,height=media_video_size(ffmpeg,video)
+    stat=source.stat(); fingerprint=hashlib.sha256(
+        f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{width}x{height}|{opacity}".encode("utf-8")
+    ).hexdigest()[:18]
+    cache=Path(cache_dir)/".watermark_cache"; cache.mkdir(parents=True,exist_ok=True)
+    destination=cache/f"wm_{fingerprint}_{width}x{height}.png"
+    if destination.exists() and destination.stat().st_size>256: return destination
+    image=QImage(str(source))
+    if image.isNull(): raise RuntimeError(f"无法读取公司水印：{source}")
+    scaled=image.scaled(width,height,Qt.AspectRatioMode.IgnoreAspectRatio,Qt.TransformationMode.SmoothTransformation)
+    canvas=QImage(width,height,QImage.Format.Format_ARGB32_Premultiplied); canvas.fill(Qt.GlobalColor.transparent)
+    painter=QPainter(canvas); painter.setOpacity(max(5,min(100,int(opacity)))/100); painter.drawImage(0,0,scaled); painter.end()
+    if not canvas.save(str(destination),"PNG"): raise RuntimeError("无法生成公司水印加速缓存")
+    return destination
+
+
+def short_media_id(path):
+    """Short, stable name for FFmpeg/libass intermediate files on Windows."""
+    return hashlib.sha256(str(Path(path).resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def bounded_output_path(directory, stem, suffix, max_path=230):
+    """Preserve descriptive output names while staying below legacy media-library limits."""
+    directory = Path(directory)
+    candidate = directory / f"{stem}{suffix}"
+    if len(str(candidate.resolve())) <= max_path:
+        return candidate
+    digest = hashlib.sha256(str(stem).encode("utf-8")).hexdigest()[:10]
+    available = max(24, max_path - len(str(directory.resolve())) - len(suffix) - len(digest) - 3)
+    return directory / f"{str(stem)[:available]}_{digest}{suffix}"
 
 
 def free_caption_srt(text, duration, settings):
@@ -236,6 +327,41 @@ def rounded_rect_path(width, height, radius):
             f"l 0 {r} b 0 {r-k} {r-k} 0 {r} 0")
 
 
+def watermark_filter_graph(ass_filter, settings, watermark_input_index):
+    """Build one filter graph so preview and final export use the same watermark geometry."""
+    opacity = max(5, min(100, int(settings.get("watermark_opacity", 90)))) / 100
+    mode = settings.get("watermark_mode", "9:16 全屏覆盖")
+    if mode == "9:16 全屏覆盖" and settings.get("watermark_prepared"):
+        return (f"[0:v]ass='{ass_filter}'[captioned];"
+                f"[{watermark_input_index}:v]format=rgba[wm];"
+                "[captioned][wm]overlay=0:0:eof_action=repeat[outv]")
+    prefix = (
+        f"[0:v]ass='{ass_filter}'[captioned];"
+        f"[{watermark_input_index}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wm_alpha];"
+    )
+    if mode == "9:16 全屏覆盖":
+        return (
+            prefix + "[wm_alpha][captioned]scale2ref=w=main_w:h=main_h[wm][base];"
+            "[base][wm]overlay=0:0:eof_action=repeat[outv]"
+        )
+    width = max(3, min(60, int(settings.get("watermark_width", 18)))) / 100
+    margin = max(0, min(300, int(settings.get("watermark_margin", 28))))
+    position = settings.get("watermark_position", "右上角")
+    positions = {
+        "左上角": (str(margin), str(margin)),
+        "右上角": (f"W-w-{margin}", str(margin)),
+        "左下角": (str(margin), f"H-h-{margin}"),
+        "右下角": (f"W-w-{margin}", f"H-h-{margin}"),
+        "画面中间": ("(W-w)/2", "(H-h)/2"),
+    }
+    x, y = positions.get(position, positions["右上角"])
+    return (
+        prefix +
+        f"[wm_alpha][captioned]scale2ref=w=main_w*{width:.4f}:h=ow/mdar[wm][base];"
+        f"[base][wm]overlay={x}:{y}:eof_action=repeat[outv]"
+    )
+
+
 def write_ass(path, srt, settings, word_srt=""):
     preset = PRESETS[settings["preset"]]
     text_color = ass_color(settings["text_color"])
@@ -266,22 +392,35 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     caption_layer = next((index * 10 for index, layer in enumerate(render_layers)
                           if layer.get("type") == "caption"), 0)
     for index, layer in enumerate(render_layers):
-        if layer.get("type") != "mask" or not layer.get("enabled", True):
+        if not layer.get("enabled", True):
             continue
-        x = 1080 * float(layer.get("x", 10)) / 100
-        y = 1920 * float(layer.get("y", 66)) / 100
-        width = 1080 * float(layer.get("w", 80)) / 100
-        height = 1920 * float(layer.get("h", 15)) / 100
-        opacity = max(0, min(100, int(layer.get("opacity", 55))))
-        alpha = f"{round(255 * (1 - opacity / 100)):02X}"
-        color = ass_color(layer.get("color", "#000000"))
-        radius_percent = max(0, min(100, int(layer.get("radius", 35))))
-        mask_path = rounded_rect_path(width, height, min(width, height) * .5 * radius_percent / 100)
-        mask_override = fr"{{\an7\pos({x:.1f},{y:.1f})\p1\1c{color}\1a&H{alpha}&\bord0\shad0}}"
-        events.append(
-            f"Dialogue: {index * 10},0:00:00.00,9:59:59.00,HighlightBox,,0,0,0,,"
-            f"{mask_override}{mask_path}"
-        )
+        if layer.get("type") == "mask":
+            x = 1080 * float(layer.get("x", 10)) / 100
+            y = 1920 * float(layer.get("y", 66)) / 100
+            width = 1080 * float(layer.get("w", 80)) / 100
+            height = 1920 * float(layer.get("h", 15)) / 100
+            opacity = max(0, min(100, int(layer.get("opacity", 55))))
+            alpha = f"{round(255 * (1 - opacity / 100)):02X}"
+            color = ass_color(layer.get("color", "#000000"))
+            radius_percent = max(0, min(100, int(layer.get("radius", 35))))
+            mask_path = rounded_rect_path(width, height, min(width, height) * .5 * radius_percent / 100)
+            mask_override = fr"{{\an7\pos({x:.1f},{y:.1f})\p1\1c{color}\1a&H{alpha}&\bord0\shad0}}"
+            events.append(
+                f"Dialogue: {index * 10},0:00:00.00,9:59:59.00,HighlightBox,,0,0,0,,"
+                f"{mask_override}{mask_path}"
+            )
+        elif layer.get("type") == "text" and str(layer.get("text", "")).strip():
+            x = 1080 * float(layer.get("x", 50)) / 100; y = 1920 * float(layer.get("y", 18)) / 100
+            opacity = max(0, min(100, int(layer.get("opacity", 100))))
+            alpha = f"{round(255 * (1 - opacity / 100)):02X}"
+            layer_font = str(layer.get("font", font)).replace(",", "")
+            layer_size = max(12, min(220, int(layer.get("size", 58))))
+            color = ass_color(layer.get("color", "#FFFFFF")); outline = ass_color(layer.get("outline", "#111111"))
+            outline_width = max(0, min(12, int(layer.get("outline_width", 2))))
+            safe_text = str(layer.get("text", "")).replace("{", "（").replace("}", "）").replace("\n", r"\N")
+            override = (fr"{{\an5\pos({x:.1f},{y:.1f})\fn{layer_font}\fs{layer_size}"
+                        fr"\1c{color}\3c{outline}\bord{outline_width}\shad0\alpha&H{alpha}&}}")
+            events.append(f"Dialogue: {index * 10},0:00:00.00,9:59:59.00,Base,,0,0,0,,{override}{safe_text}")
     precise_words = parse_srt(word_srt)
     font_size = settings["font_size"]
     metric_font = QFont(font)
@@ -408,6 +547,31 @@ class CaptionWorker(QObject):
 
     def cancel(self): self.cancelled = True
 
+    def _run_render(self, command, duration, index, total):
+        """Run FFmpeg with live time-based progress instead of a frozen percentage."""
+        destination = command[-1]
+        command = command[:-1] + ["-progress", "pipe:1", "-nostats", destination]
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", bufsize=1, **hidden_kwargs(),
+        )
+        tail = []
+        for raw in process.stdout or []:
+            line = raw.strip()
+            if line:
+                tail.append(line)
+                tail = tail[-40:]
+            if line.startswith("out_time_ms="):
+                try:
+                    rendered = int(line.split("=", 1)[1]) / 1_000_000
+                    fraction = min(.98, rendered / max(.1, duration))
+                    self.progress.emit(round((index + fraction) / max(1, total) * 100))
+                except (TypeError, ValueError):
+                    pass
+            if self.cancelled and process.poll() is None:
+                process.terminate()
+        return process.wait(), "\n".join(tail)
+
     @staticmethod
     def _match_stem(path):
         value = Path(path).stem.casefold()
@@ -476,8 +640,12 @@ class CaptionWorker(QObject):
     def run(self):
         try:
             self.output.mkdir(parents=True, exist_ok=True)
+            encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
+            self.log.emit(f"视频编码：{ENCODER_LABELS[encoder]}（自动检测，硬件不可用时使用 CPU）")
             for index, video in enumerate(self.videos):
                 if self.cancelled: raise RuntimeError("任务已停止；已完成的动态文案视频仍保留。")
+                self.progress.emit(round(index / max(1,len(self.videos)) * 100))
+                self.log.emit(f"[{index + 1}/{len(self.videos)}] 开始处理：{video.name}")
                 render_video = self._clean_video(video) if self.settings["clean_metadata"] else video
                 audio, match_reason = self._audio_selection(video, index)
                 self.log.emit(
@@ -519,28 +687,54 @@ class CaptionWorker(QObject):
                             phrase_srt = replace_srt_copy(phrase_srt, override)
                             self.log.emit("已应用人工修订文案，并保留词级时间轴。")
                 self.timeline_ready.emit(source_key, word_srt, phrase_srt)
-                ass = self.output / f".{video.stem}_dynamic.ass"
+                # Keep libass intermediate paths short. Long source titles can exceed
+                # the Windows/libass path limit even when the source video opens fine.
+                ass = self.output / f".caption_{short_media_id(video)}.ass"
                 write_ass(ass, phrase_srt, self.settings, word_srt)
-                destination = self.output / f"{video.stem}_动态文案.mp4"
+                destination = bounded_output_path(self.output, video.stem, "_动态文案.mp4")
+                stages=[]
+                if self.settings.get("watermark_path"): stages.append("公司水印")
+                if any(layer.get("type") in ("mask","text") for layer in self.settings.get("layers",[])): stages.append("图层/蒙版")
+                stage_text="、".join(["字幕",*stages])
+                self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在烧录{stage_text}并编码视频，请等待…")
+                self.progress.emit(round((index + .55) / max(1,len(self.videos)) * 100))
                 ass_filter = str(ass).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
                 command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(render_video)]
                 external = audio.resolve() != video.resolve()
                 if external: command += ["-i", str(audio)]
-                command += ["-vf", f"ass='{ass_filter}'", "-map", "0:v:0"]
+                watermark = Path(str(self.settings.get("watermark_path", "")))
+                watermark_enabled = watermark.is_file()
+                render_settings=self.settings
+                if watermark_enabled and self.settings.get("watermark_mode","9:16 全屏覆盖")=="9:16 全屏覆盖":
+                    watermark=prepared_fullframe_watermark(
+                        self.ffmpeg,render_video,watermark,self.output,self.settings.get("watermark_opacity",90))
+                    render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
+                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 已使用预缩放公司水印缓存，跳过逐帧缩放。")
+                watermark_input = 2 if external else 1
+                if watermark_enabled:
+                    # Decode the static PNG once; overlay=eof_action=repeat keeps that frame
+                    # for the whole video without decoding/scaling the same image every frame.
+                    command += ["-i", str(watermark)]
+                    command += ["-filter_complex", watermark_filter_graph(ass_filter, render_settings, watermark_input),
+                                "-map", "[outv]"]
+                else:
+                    command += ["-vf", f"ass='{ass_filter}'", "-map", "0:v:0"]
                 if external and self.settings["audio_mode"] == "替换为添加的音频":
                     command += ["-map", "1:a:0", "-shortest"]
                 else:
                     command += ["-map", "0:a?"]
                 # 不指定 -ac，保留源音频声道；字幕烧录只重编码画面。
-                command += ["-c:v", "libx264", "-preset", self.settings["encode_preset"], "-crf", "20",
-                            "-c:a", "aac", "-b:a", "192k"]
+                command += encoder_args(encoder, self.settings["encode_preset"])
+                command += ["-c:a", "aac", "-b:a", "192k"]
                 if external and self.settings["audio_mode"] == "替换为添加的音频": command += ["-ac", "2"]
                 command += ["-movflags", "+faststart", str(destination)]
-                process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+                duration = media_duration(self.ffmpeg, render_video)
+                if external and self.settings["audio_mode"] == "替换为添加的音频":
+                    duration = min(duration, media_duration(self.ffmpeg, audio))
+                returncode, render_log = self._run_render(command, duration, index, len(self.videos))
                 try: ass.unlink()
                 except OSError: pass
-                if process.returncode: raise RuntimeError(process.stderr.strip() or "动态文案渲染失败")
+                if returncode: raise RuntimeError(render_log.strip() or "动态文案渲染失败")
                 self.result.emit(str(destination), original)
                 self.progress.emit(round((index + 1) / len(self.videos) * 100))
                 self.log.emit(f"成品：{destination}")
@@ -628,10 +822,23 @@ class PreviewWorker(QObject):
             external = preview_audio.is_file() and preview_audio.resolve() != self.source.resolve()
             if external:
                 command += ["-i", str(preview_audio)]
-            command += ["-t", "8", "-vf", f"ass='{ass_filter}'", "-map", "0:v:0"]
+            watermark = Path(str(self.settings.get("watermark_path", "")))
+            watermark_enabled = watermark.is_file()
+            render_settings=self.settings
+            if watermark_enabled and self.settings.get("watermark_mode","9:16 全屏覆盖")=="9:16 全屏覆盖":
+                watermark=prepared_fullframe_watermark(
+                    self.ffmpeg,self.source,watermark,self.destination.parent,self.settings.get("watermark_opacity",90))
+                render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
+            watermark_input = 2 if external else 1
+            if watermark_enabled:
+                command += ["-i", str(watermark), "-t", "8", "-filter_complex",
+                            watermark_filter_graph(ass_filter, render_settings, watermark_input), "-map", "[outv]"]
+            else:
+                command += ["-t", "8", "-vf", f"ass='{ass_filter}'", "-map", "0:v:0"]
             command += ["-map", "1:a:0"] if external else ["-map", "0:a?"]
-            command += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "25", "-c:a", "aac",
-                        "-b:a", "160k"]
+            encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
+            command += encoder_args(encoder, preview=True)
+            command += ["-c:a", "aac", "-b:a", "160k"]
             if external:
                 command += ["-ac", "2", "-shortest"]
             command += ["-movflags", "+faststart", str(self.destination)]
@@ -684,31 +891,103 @@ class BatchTimelineWorker(QObject):
             self.finished.emit(False, str(exc))
 
 
+class GroupCaptionDialog(QDialog):
+    """Folder-level mapping table: one pasted line maps to one naturally sorted clip."""
+
+    def __init__(self, groups, saved_scripts, parent=None):
+        super().__init__(parent); self.groups=list(groups); self.saved_scripts=dict(saved_scripts)
+        self.setWindowTitle("分组文件与字幕对应表"); self.resize(1120,650)
+        layout=QVBoxLayout(self)
+        tip=QLabel("每行代表一个文件夹组。文案列中每一行对应该文件夹内一个视频；文件按自然顺序 1、2、3…排列。也可复制全部文案后点击“一键按片段数分配”。")
+        tip.setWordWrap(True); tip.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:8px;border-radius:5px;"); layout.addWidget(tip)
+        self.table=QTableWidget(len(self.groups),6)
+        self.table.setHorizontalHeaderLabels(["序号","文件夹","片段数","片段文件（自然排序）","逐段文案（每行一个）","状态"])
+        self.table.verticalHeader().setVisible(False); self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.editors=[]
+        for row,(folder,clips) in enumerate(self.groups):
+            clips=sorted(clips,key=lambda p:natural_key(Path(p).name))
+            values=(f"{row+1:02d}",folder.name,str(len(clips)),"\n".join(f"{i+1:02d}. {Path(p).name}" for i,p in enumerate(clips)))
+            for column,value in enumerate(values):
+                item=QTableWidgetItem(value); item.setToolTip(value); self.table.setItem(row,column,item)
+            editor=QPlainTextEdit(); editor.setPlaceholderText(f"粘贴 {len(clips)} 行文案")
+            existing=str(self.saved_scripts.get(str(folder.resolve()),""))
+            editor.setPlainText("\n".join(split_group_script(existing)))
+            editor.textChanged.connect(lambda r=row:self._update_status(r)); self.table.setCellWidget(row,4,editor); self.editors.append(editor)
+            self.table.setRowHeight(row,122); self._update_status(row)
+        header=self.table.horizontalHeader(); header.setSectionResizeMode(0,QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1,QHeaderView.ResizeMode.ResizeToContents); header.setSectionResizeMode(2,QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3,QHeaderView.ResizeMode.Stretch); header.setSectionResizeMode(4,QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5,QHeaderView.ResizeMode.ResizeToContents); layout.addWidget(self.table,1)
+        actions=QHBoxLayout(); paste_all=QPushButton("从剪贴板一键按片段数分配"); paste_all.clicked.connect(self._paste_all)
+        actions.addWidget(paste_all); actions.addStretch()
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存对应关系")
+        buttons.accepted.connect(self._validate_accept); buttons.rejected.connect(self.reject); actions.addWidget(buttons); layout.addLayout(actions)
+
+    @staticmethod
+    def _lines(editor):
+        return [line.strip() for line in editor.toPlainText().splitlines() if line.strip() and line.strip()!="---"]
+
+    def _update_status(self,row):
+        expected=len(self.groups[row][1]); actual=len(self._lines(self.editors[row])) if row < len(self.editors) else 0
+        text="未填写" if actual==0 else ("✓ 已对应" if actual==expected else f"{actual}/{expected}")
+        item=self.table.item(row,5) or QTableWidgetItem(); item.setText(text)
+        item.setForeground(QColor("#4ade80" if actual==expected else "#facc15")); self.table.setItem(row,5,item)
+
+    def _paste_all(self):
+        lines=[line.strip() for line in QApplication.clipboard().text().splitlines() if line.strip() and line.strip()!="---"]
+        expected=sum(len(clips) for _folder,clips in self.groups)
+        if len(lines)!=expected:
+            QMessageBox.information(self,"数量不一致",f"剪贴板有 {len(lines)} 行有效文案，但全部文件夹共有 {expected} 个视频。\n请保证一行对应一个视频后重试。")
+            return
+        offset=0
+        for editor,(_folder,clips) in zip(self.editors,self.groups):
+            count=len(clips); editor.setPlainText("\n".join(lines[offset:offset+count])); offset+=count
+
+    def _validate_accept(self):
+        errors=[]
+        for editor,(folder,clips) in zip(self.editors,self.groups):
+            count=len(self._lines(editor))
+            if count and count!=len(clips): errors.append(f"{folder.name}：文案 {count} 行，视频 {len(clips)} 个")
+        if errors:
+            QMessageBox.warning(self,"对应数量不一致","请调整以下文件夹：\n"+"\n".join(errors[:10])); return
+        self.accept()
+
+    def scripts(self):
+        return {str(folder.resolve()):"\n\n".join(self._lines(editor)) for editor,(folder,_clips) in zip(self.editors,self.groups)}
+
+
 class DynamicCaptionPage(QWidget):
     def __init__(self, transcribe_callable, tts_callable, find_ffmpeg, providers, default_provider):
         super().__init__(); self.transcribe_callable = transcribe_callable; self.find_ffmpeg = find_ffmpeg
         self.tts_callable = tts_callable; self.providers = providers; self.thread = None; self.worker = None
         self.tts_thread = None; self.tts_worker = None; self.timeline_overrides = {}; self.timeline_words = {}; self._loading_timeline = False
+        self.group_merge_thread = None; self.group_merge_worker = None; self.group_merge_groups = []
+        self.group_scripts = {}; self._loading_group_script = False; self.group_merge_outputs = []
+        self._watermark_image = QImage()
+        self._precise_preview_active = False; self._precise_preview_files = set()
         self.free_texts = {}
         self._active_timeline_source = ""; self._syncing_media_selection = False; self._timeline_pending_source = ""
         # 图层列表按“上层在前”保存；渲染时反向绘制，便于用户理解上移/下移。
         self.layers = [{"type": "caption", "name": "字幕层"}]
         self._mask_counter = 0
+        self._text_counter = 0; self._layer_schemes = {}
         self._build_ui(default_provider)
 
     def _build_ui(self, default_provider):
         root = QVBoxLayout(self); root.setContentsMargins(12, 8, 12, 10); root.setSpacing(6)
-        header = QHBoxLayout(); heading = QLabel("动态 Reels 制作流水线"); heading.setObjectName("heading")
+        header = QHBoxLayout(); heading = QLabel("Reels 视频编辑器"); heading.setObjectName("heading")
         header.addWidget(heading); header.addStretch(); header.addWidget(QLabel("清理素材 → 配音 → 字幕样式 → 视频预览 → 批量输出")); root.addLayout(header)
 
         workspace = QSplitter(Qt.Orientation.Horizontal); workspace.setChildrenCollapsible(False)
 
-        # 左栏：素材、文案与运行输出集中在一个窄操作区。
+        # 左栏内部拆成“内容 + 竖向图标”两列；中间预览和最右设置保持独立。
         left = QWidget(); left_layout = QVBoxLayout(left); left_layout.setContentsMargins(0,0,4,0); left_layout.setSpacing(6)
-        left.setMinimumWidth(340); left.setMaximumWidth(430)
-        source_group = QGroupBox("1. 素材与文案"); source_group_layout = QVBoxLayout(source_group); source_group_layout.setContentsMargins(8,10,8,8)
-        source_group.setMinimumHeight(255); source_group.setMaximumHeight(360)
-        source_tabs = QTabWidget()
+        left.setMinimumWidth(380); left.setMaximumWidth(520)
+        source_group = QGroupBox("素材项目"); source_group_layout = QHBoxLayout(source_group); source_group_layout.setContentsMargins(8,10,8,8)
+        source_group.setMinimumHeight(310); source_group.setMaximumHeight(470)
+        source_stack = QStackedWidget(); self.source_stack = source_stack
 
         video_tab = QWidget(); vg = QVBoxLayout(video_tab); vg.setContentsMargins(4,4,4,4)
         self.videos = DropListWidget(); self.videos.setMinimumHeight(150)
@@ -739,15 +1018,71 @@ class DynamicCaptionPage(QWidget):
         self.tts_generate = QPushButton("批量生成并加入音频队列"); self.tts_generate.clicked.connect(self.generate_tts)
         tts_line1 = QHBoxLayout(); tts_line1.addWidget(self.tts_service); tts_line1.addWidget(self.tts_voice,1)
         text_tab_layout.addLayout(tts_line1); text_tab_layout.addWidget(self.tts_generate)
-        source_tabs.addTab(video_tab,"视频素材"); source_tabs.addTab(audio_tab,"音频素材"); source_tabs.addTab(text_tab,"文案配音")
-        source_tabs.setStyleSheet("QTabBar::tab{background:#17243a;color:#cbd5e1;padding:6px 9px;min-width:72px;border:1px solid #334155;} QTabBar::tab:selected{background:#2563eb;color:white;font-weight:700;} QTabWidget::pane{border:1px solid #334155;}")
+
+        group_tab = QWidget(); group_layout = QVBoxLayout(group_tab); group_layout.setContentsMargins(4,4,4,4); group_layout.setSpacing(4)
+        group_path_row = QHBoxLayout()
+        self.group_parent = DropFolderLineEdit(); self.group_parent.setPlaceholderText("拖入父文件夹：每个直接子文件夹为一组合成任务")
+        self.group_parent.folder_dropped.connect(self._scan_group_parent)
+        choose_group_parent = QPushButton("选择…"); choose_group_parent.clicked.connect(self._choose_group_parent)
+        scan_groups = QPushButton("扫描"); scan_groups.clicked.connect(lambda: self._scan_group_parent(self.group_parent.text()))
+        map_captions = QPushButton("字幕对应表…"); map_captions.clicked.connect(self._open_group_caption_dialog)
+        group_path_row.addWidget(self.group_parent,1); group_path_row.addWidget(choose_group_parent)
+        group_layout.addLayout(group_path_row)
+        group_tools_row=QHBoxLayout(); group_tools_row.addWidget(scan_groups); group_tools_row.addWidget(map_captions,1); group_layout.addLayout(group_tools_row)
+        self.group_table = QTableWidget(0,4); self.group_table.setHorizontalHeaderLabels(["序号","文件夹","片段","文件列表"])
+        self.group_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.group_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.group_table.setMaximumHeight(150); self.group_table.verticalHeader().setVisible(False)
+        self.group_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Fixed)
+        self.group_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch)
+        self.group_table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeMode.Fixed)
+        self.group_table.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeMode.Stretch)
+        self.group_table.setColumnWidth(0,42); self.group_table.setColumnWidth(2,46)
+        self.group_table.currentCellChanged.connect(self._group_selection_changed)
+        group_layout.addWidget(self.group_table)
+        sort_row = QHBoxLayout(); sort_row.addWidget(QLabel("排序"))
+        self.group_sort_mode = QComboBox(); self.group_sort_mode.addItems(["文件名自然排序（推荐）","按分段文案自动匹配"])
+        self.group_sort_mode.currentTextChanged.connect(self._group_sort_mode_changed)
+        self.group_head_padding = QSpinBox(); self.group_head_padding.setRange(0,1000); self.group_head_padding.setValue(80); self.group_head_padding.setSuffix(" ms")
+        self.group_tail_padding = QSpinBox(); self.group_tail_padding.setRange(0,1000); self.group_tail_padding.setValue(120); self.group_tail_padding.setSuffix(" ms")
+        sort_row.addWidget(self.group_sort_mode,1); group_layout.addLayout(sort_row)
+        trim_row=QHBoxLayout(); trim_row.addWidget(QLabel("句首")); trim_row.addWidget(self.group_head_padding,1)
+        trim_row.addWidget(QLabel("句尾")); trim_row.addWidget(self.group_tail_padding,1); group_layout.addLayout(trim_row)
+        # 对应关系改在表格弹窗中集中编辑；保留隐藏编辑器兼容现有断点和选择逻辑。
+        self.group_script = QPlainTextEdit(); self.group_script.hide()
+        self.group_script.textChanged.connect(self._save_current_group_script)
+        group_action_panel=QWidget(); self.group_action_panel=group_action_panel
+        group_action_layout=QVBoxLayout(group_action_panel); group_action_layout.setContentsMargins(2,4,2,2); group_action_layout.setSpacing(5)
+        self.group_resume = QCheckBox("断点续接"); self.group_resume.setChecked(True)
+        self.group_auto_timeline = QCheckBox("合成并转文字"); self.group_auto_timeline.setChecked(True)
+        self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(66,52); self.group_merge_start.clicked.connect(self.start_group_merge)
+        self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(66,52); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
+        group_action_layout.addWidget(self.group_resume); group_action_layout.addWidget(self.group_auto_timeline)
+        group_action_layout.addWidget(self.group_merge_start); group_action_layout.addWidget(self.group_merge_stop); group_action_layout.addStretch()
+        group_action_panel.setFixedWidth(126)
+
+        for page in (group_tab,video_tab,audio_tab,text_tab): source_stack.addWidget(page)
+        source_tools=QVBoxLayout(); source_tools.setContentsMargins(4,0,0,0); source_tools.setSpacing(5)
+        self.source_tool_buttons=[]
+        for index,(icon,label) in enumerate((("▦","分组"),("▶","视频"),("♪","音频"),("文","文案"))):
+            button=QPushButton(f"{icon}\n{label}"); button.setCheckable(True); button.setFixedSize(66,52)
+            button.setToolTip({0:"分组去口气音并合成",1:"视频素材队列",2:"音频素材队列",3:"文案配音"}[index])
+            button.clicked.connect(lambda checked=False,i=index:self._show_source_tool(i))
+            source_tools.addWidget(button); self.source_tool_buttons.append(button)
+        source_tools.addStretch()
+        source_rail=QWidget(); source_rail_layout=QVBoxLayout(source_rail); source_rail_layout.setContentsMargins(0,0,0,0); source_rail_layout.setSpacing(5)
+        source_rail_layout.addLayout(source_tools); source_rail_layout.addWidget(group_action_panel,1)
+        source_rail.setFixedWidth(126)
+        source_group_layout.addWidget(source_rail); source_group_layout.addWidget(source_stack,1)
+        source_group.setStyleSheet("QPushButton:checked{background:#2563eb;color:white;border-color:#60a5fa;font-weight:700;}")
         self.audio_player=QMediaPlayer(self); self.audio_preview_output=QAudioOutput(self); self.audio_preview_output.setVolume(.8); self.audio_player.setAudioOutput(self.audio_preview_output)
         self._preview_external_audio = False
         self.audio_player.positionChanged.connect(self._audio_position_changed); self.audio_player.durationChanged.connect(self._audio_duration_changed)
         audio_controls=QHBoxLayout(); self.audio_play_btn=QPushButton("试听配音"); self.audio_play_btn.clicked.connect(self.toggle_audio_preview)
         self.audio_seek=QSlider(Qt.Orientation.Horizontal); self.audio_seek.setRange(0,0); self.audio_seek.sliderMoved.connect(self.audio_player.setPosition)
         self.audio_time=QLabel("00:00 / 00:00"); audio_controls.addWidget(self.audio_play_btn); audio_controls.addWidget(self.audio_seek,1); audio_controls.addWidget(self.audio_time); audio_tab_layout.addLayout(audio_controls)
-        source_group_layout.addWidget(source_tabs); left_layout.addWidget(source_group,3)
+        self._show_source_tool(0)
+        left_layout.addWidget(source_group,3)
 
         # 右侧工作区中的视频播放器、时间轴和快速效果预览。
         center = QWidget(); center_layout = QVBoxLayout(center); center_layout.setContentsMargins(4,0,4,0); center_layout.setSpacing(6)
@@ -756,7 +1091,7 @@ class DynamicCaptionPage(QWidget):
         # 画面统一交给 OpenCV 解码并显示，QMediaPlayer 只负责音频和播放时钟。
         self.video_widget = QLabel("添加或选择视频后在这里预览")
         self.video_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_widget.setMinimumSize(330,390)
+        self.video_widget.setMinimumSize(300,330)
         self.video_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.video_widget.setStyleSheet("background:#02050b;color:#64748b;border:1px solid #334155;border-radius:7px;")
         self.audio_output = QAudioOutput(self); self.audio_output.setVolume(.65)
@@ -796,19 +1131,20 @@ class DynamicCaptionPage(QWidget):
         preview_layout.addLayout(live_row)
         self.render_preview_btn = QPushButton("渲染 8 秒精确预览"); self.render_preview_btn.setObjectName("primary"); self.render_preview_btn.clicked.connect(self.render_effect_preview)
         self.render_preview_btn.setMaximumWidth(230)
-        render_row=QHBoxLayout(); render_row.addStretch(); render_row.addWidget(self.render_preview_btn)
+        self.clear_preview_btn=QPushButton("清除精确预览"); self.clear_preview_btn.clicked.connect(self._clear_precise_preview)
+        render_row=QHBoxLayout(); render_row.addStretch(); render_row.addWidget(self.clear_preview_btn); render_row.addWidget(self.render_preview_btn)
         preview_layout.addLayout(render_row); center_layout.addWidget(preview_group,1)
         self.style_preview = QLabel(); self.style_preview.setAlignment(Qt.AlignmentFlag.AlignCenter); self.style_preview.setMinimumHeight(76)
         self.style_preview.setVisible(False)
 
         # 右栏：设置独立滚动，任何窗口高度都不会把控件压扁。
-        settings_scroll = QScrollArea(); settings_scroll.setWidgetResizable(True); settings_scroll.setMinimumWidth(430)
-        settings_body = QWidget(); settings_layout = QVBoxLayout(settings_body); settings_layout.setContentsMargins(4,0,8,4); settings_layout.setSpacing(7)
-        preset_group = QGroupBox("3. 字幕样式与动画"); pg = QVBoxLayout(preset_group); pg.setContentsMargins(10,12,10,10); pg.setSpacing(8)
-        preset_grid = QGridLayout(); preset_grid.setSpacing(6); self.preset_buttons=[]
-        for index,name in enumerate(PRESETS):
-            button=QPushButton(name); button.setCheckable(True); button.setMinimumHeight(32); button.clicked.connect(lambda checked=False,n=name:self.apply_preset(n)); preset_grid.addWidget(button,index//3,index%3); self.preset_buttons.append(button)
-        pg.addLayout(preset_grid)
+        settings_scroll = QScrollArea(); settings_scroll.setWidgetResizable(True); settings_scroll.setMinimumWidth(500)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings_body = QWidget(); settings_body.setMinimumWidth(0); settings_body.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        settings_layout = QVBoxLayout(settings_body); settings_layout.setContentsMargins(4,0,8,4); settings_layout.setSpacing(7)
+        preset_group = QGroupBox("4. 字幕样式与动画"); preset_group.setMinimumWidth(0); preset_group.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        pg = QHBoxLayout(preset_group); pg.setContentsMargins(10,12,10,10); pg.setSpacing(10)
+        self.preset_buttons=[]
         form = QFormLayout(); form.setVerticalSpacing(9); form.setHorizontalSpacing(8)
         self.provider=QComboBox(); self.provider.addItems(self.providers); self.provider.setCurrentText(default_provider)
         self.caption_mode=QComboBox(); self.caption_mode.addItems(["语音同步字幕", "自由文案动画（不对口型）"])
@@ -845,7 +1181,12 @@ class DynamicCaptionPage(QWidget):
         self.audio_match_mode.currentTextChanged.connect(self._rematch_current_video)
         self.audio_match_mode.currentTextChanged.connect(self._refresh_task_queue)
         self.clean_metadata=QCheckBox("输出前无损清除视频素材元数据"); self.clean_metadata.setChecked(True)
+        self.encoder_backend=QComboBox(); self.encoder_backend.addItems(list(ENCODER_LABELS.values()))
+        self.encoder_backend.setToolTip("自动模式会实际测试显卡编码器；不可用时自动使用 CPU。")
         self.encode_preset=QComboBox(); self.encode_preset.addItems(["veryfast","faster","fast","medium"])
+        for combo in (self.caption_mode,self.free_animation,self.font,self.position,self.audio_match_mode,self.audio_mode,self.encoder_backend,self.encode_preset):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8); combo.setMinimumWidth(0)
         phrase_line=QHBoxLayout(); phrase_line.addWidget(QLabel("每句词数")); phrase_line.addWidget(self.max_words); phrase_line.addWidget(QLabel("每行字符")); phrase_line.addWidget(self.line_length)
         width_line=QHBoxLayout(); width_line.addWidget(QLabel("字幕行宽")); width_line.addWidget(self.line_width)
         spacing_line=QHBoxLayout(); spacing_line.addWidget(QLabel("字间距")); spacing_line.addWidget(self.letter_spacing); spacing_line.addWidget(QLabel("行距")); spacing_line.addWidget(self.line_spacing)
@@ -853,28 +1194,45 @@ class DynamicCaptionPage(QWidget):
         form.addRow("字幕模式",self.caption_mode); form.addRow("自由动画",free_line)
         form.addRow("字体",font_line); form.addRow("自然分句",phrase_line); form.addRow("排版宽度",width_line); form.addRow("字幕间距",spacing_line)
         form.addRow("跟读效果",effect_line)
-        form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width); form.addRow("音频匹配",self.audio_match_mode); form.addRow("音频处理",self.audio_mode); form.addRow("渲染质量",self.encode_preset); form.addRow("素材清理",self.clean_metadata)
-        pg.addLayout(form)
+        form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width); form.addRow("音频匹配",self.audio_match_mode); form.addRow("音频处理",self.audio_mode); form.addRow("编码加速",self.encoder_backend); form.addRow("CPU 质量",self.encode_preset); form.addRow("素材清理",self.clean_metadata)
         batch_style_hint=QLabel("✓ 每个视频、匹配音频和文案组成独立任务；这里只批量套用字幕样式、蒙版和动画，最后统一批量导出。")
         batch_style_hint.setWordWrap(True); batch_style_hint.setStyleSheet("color:#67e8f9;background:#0b1830;padding:6px;border-radius:5px;")
-        pg.addWidget(batch_style_hint)
         colors=QGridLayout(); self.text_color=QPushButton("文字 #FFFFFF"); self.outline_color=QPushButton("描边 #111827"); self.highlight_color=QPushButton("跟读背景 #8B5CF6")
         for index,button in enumerate((self.text_color,self.outline_color,self.highlight_color)):
             button.setMinimumHeight(32); button.clicked.connect(lambda checked=False,b=button:self.pick_color(b)); colors.addWidget(button,index//2,index%2)
-        pg.addLayout(colors); settings_layout.addWidget(preset_group)
+        style_controls=QWidget(); style_controls.setMinimumWidth(0); style_controls.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        style_controls_layout=QVBoxLayout(style_controls); style_controls_layout.setContentsMargins(0,0,0,0); style_controls_layout.setSpacing(7)
+        style_controls_layout.addLayout(form); style_controls_layout.addWidget(batch_style_hint); style_controls_layout.addLayout(colors); style_controls_layout.addStretch()
+        preset_panel=QWidget(); preset_panel.setMinimumWidth(145); preset_panel.setMaximumWidth(160)
+        preset_list=QVBoxLayout(preset_panel); preset_list.setContentsMargins(0,0,0,0); preset_list.setSpacing(5)
+        preset_title=QLabel("动画与配色预设"); preset_title.setAlignment(Qt.AlignmentFlag.AlignCenter); preset_title.setStyleSheet("color:#7dd3fc;font-weight:700;")
+        preset_list.addWidget(preset_title)
+        for name,preset in PRESETS.items():
+            button=PresetPreviewButton(name,preset)
+            button.clicked.connect(lambda checked=False,n=name:self.apply_preset(n)); preset_list.addWidget(button); self.preset_buttons.append(button)
+        preset_list.addStretch(); pg.addWidget(style_controls,1); pg.addWidget(preset_panel)
+        settings_layout.addWidget(preset_group)
 
-        layer_group = QGroupBox("4. 蒙版与图层顺序")
+        layer_group = QGroupBox("5. 蒙版、公司水印与图层顺序")
         layer_layout = QVBoxLayout(layer_group); layer_layout.setContentsMargins(9,11,9,8); layer_layout.setSpacing(6)
-        layer_tip = QLabel("列表上方会覆盖下方；字幕层和蒙版可直接上移或下移。")
+        layer_tip = QLabel("列表上方会覆盖下方；字幕、文字和蒙版都可调整层级，并保存为常用方案。")
         layer_tip.setStyleSheet("color:#7dd3fc;"); layer_tip.setWordWrap(True); layer_layout.addWidget(layer_tip)
+        scheme_row=QHBoxLayout(); self.layer_scheme_combo=QComboBox(); self.layer_scheme_combo.setEditable(True); self.layer_scheme_combo.setPlaceholderText("输入或选择图层方案")
+        apply_scheme=QPushButton("应用"); apply_scheme.clicked.connect(self._apply_layer_scheme)
+        save_scheme=QPushButton("保存方案"); save_scheme.clicked.connect(self._save_layer_scheme)
+        delete_scheme=QPushButton("删除"); delete_scheme.clicked.connect(self._delete_layer_scheme)
+        scheme_row.addWidget(QLabel("图层方案")); scheme_row.addWidget(self.layer_scheme_combo,1)
+        for button in (apply_scheme,save_scheme,delete_scheme): scheme_row.addWidget(button)
+        layer_layout.addLayout(scheme_row)
         self.layer_list = QListWidget(); self.layer_list.setMinimumHeight(92); self.layer_list.setMaximumHeight(130)
         self.layer_list.currentRowChanged.connect(self._layer_selected); layer_layout.addWidget(self.layer_list)
         layer_actions = QHBoxLayout()
         add_mask = QPushButton("＋ 添加蒙版"); add_mask.clicked.connect(self._add_mask_layer)
+        add_text = QPushButton("＋ 添加文字"); add_text.clicked.connect(self._add_text_layer)
         delete_layer = QPushButton("删除"); delete_layer.clicked.connect(self._delete_layer)
         move_up = QPushButton("上移"); move_up.clicked.connect(lambda:self._move_layer(-1))
         move_down = QPushButton("下移"); move_down.clicked.connect(lambda:self._move_layer(1))
-        for button in (add_mask, delete_layer, move_up, move_down): layer_actions.addWidget(button)
+        for button in (add_mask, add_text, delete_layer, move_up, move_down): layer_actions.addWidget(button)
         layer_layout.addLayout(layer_actions)
         mask_form = QGridLayout(); mask_form.setHorizontalSpacing(6); mask_form.setVerticalSpacing(5)
         self.mask_color = QPushButton("蒙版颜色 #000000"); self.mask_color.clicked.connect(self._pick_mask_color)
@@ -894,14 +1252,54 @@ class DynamicCaptionPage(QWidget):
         quick_positions=QHBoxLayout(); quick_positions.addWidget(QLabel("快速定位")); self.mask_quick_buttons=[]
         for label,mode in (("上下居中","vertical"),("左右居中","horizontal"),("顶部居中","top"),("底部居中","bottom")):
             button=QPushButton(label); button.setMinimumHeight(26); button.clicked.connect(lambda checked=False,m=mode:self._quick_mask_position(m)); quick_positions.addWidget(button); self.mask_quick_buttons.append(button)
-        layer_layout.addLayout(quick_positions); settings_layout.addWidget(layer_group)
-        revise_group=QGroupBox("5. 字幕时间轴与文字调整"); revise_layout=QVBoxLayout(revise_group); revise_layout.setContentsMargins(9,11,9,8)
+        layer_layout.addLayout(quick_positions)
+        text_form=QGridLayout(); text_form.setHorizontalSpacing(6); text_form.setVerticalSpacing(5)
+        self.layer_text=QLineEdit(); self.layer_text.setPlaceholderText("选中文字层后输入内容")
+        self.layer_text_font=QComboBox(); self.layer_text_font.addItems(QFontDatabase.families()); self.layer_text_font.setCurrentText("Microsoft YaHei")
+        self.layer_text_size=QSpinBox(); self.layer_text_size.setRange(12,220); self.layer_text_size.setValue(58)
+        self.layer_text_color=QPushButton("文字颜色 #FFFFFF"); self.layer_text_color.clicked.connect(self._pick_layer_text_color)
+        self.layer_text_outline=QSpinBox(); self.layer_text_outline.setRange(0,12); self.layer_text_outline.setValue(2)
+        self.layer_text_opacity=QSpinBox(); self.layer_text_opacity.setRange(5,100); self.layer_text_opacity.setValue(100); self.layer_text_opacity.setSuffix(" %")
+        self.layer_text_x=QSpinBox(); self.layer_text_y=QSpinBox()
+        for control in (self.layer_text_x,self.layer_text_y): control.setRange(0,100); control.setSuffix(" %")
+        text_form.addWidget(QLabel("文字层"),0,0); text_form.addWidget(self.layer_text,0,1,1,5)
+        text_form.addWidget(QLabel("字体"),1,0); text_form.addWidget(self.layer_text_font,1,1,1,2); text_form.addWidget(QLabel("字号"),1,3); text_form.addWidget(self.layer_text_size,1,4)
+        text_form.addWidget(self.layer_text_color,2,0,1,2); text_form.addWidget(QLabel("描边"),2,2); text_form.addWidget(self.layer_text_outline,2,3); text_form.addWidget(QLabel("透明度"),2,4); text_form.addWidget(self.layer_text_opacity,2,5)
+        text_form.addWidget(QLabel("横向位置"),3,0); text_form.addWidget(self.layer_text_x,3,1); text_form.addWidget(QLabel("纵向位置"),3,2); text_form.addWidget(self.layer_text_y,3,3)
+        text_quick=QHBoxLayout(); text_quick.addWidget(QLabel("文字快速定位")); self.text_quick_buttons=[]
+        for label,mode in (("顶部居中","top"),("画面中心","center"),("底部居中","bottom")):
+            button=QPushButton(label); button.clicked.connect(lambda checked=False,m=mode:self._quick_text_position(m)); text_quick.addWidget(button); self.text_quick_buttons.append(button)
+        layer_layout.addLayout(text_form); layer_layout.addLayout(text_quick)
+        self.layer_text.textChanged.connect(self._text_layer_changed); self.layer_text_font.currentTextChanged.connect(self._text_layer_changed)
+        for control in (self.layer_text_size,self.layer_text_outline,self.layer_text_opacity,self.layer_text_x,self.layer_text_y): control.valueChanged.connect(self._text_layer_changed)
+
+        watermark_title=QLabel("公司水印烧录（实时预览，并应用到全部批量成品）")
+        watermark_title.setStyleSheet("color:#7dd3fc;font-weight:700;"); layer_layout.addWidget(watermark_title)
+        watermark_path_row=QHBoxLayout(); self.company_watermark=QLineEdit(); self.company_watermark.setReadOnly(True); self.company_watermark.setPlaceholderText("支持透明 PNG、WebP、JPG")
+        choose_watermark=QPushButton("选择图片…"); choose_watermark.clicked.connect(self._choose_company_watermark)
+        clear_watermark=QPushButton("清除"); clear_watermark.clicked.connect(self._clear_company_watermark)
+        watermark_path_row.addWidget(self.company_watermark,1); watermark_path_row.addWidget(choose_watermark); watermark_path_row.addWidget(clear_watermark); layer_layout.addLayout(watermark_path_row)
+        watermark_mode_row=QHBoxLayout(); self.watermark_mode=QComboBox(); self.watermark_mode.addItems(["9:16 全屏覆盖","小 Logo 自定义位置"])
+        watermark_mode_row.addWidget(QLabel("覆盖方式")); watermark_mode_row.addWidget(self.watermark_mode,1); layer_layout.addLayout(watermark_mode_row)
+        watermark_controls=QHBoxLayout(); self.watermark_position=QComboBox(); self.watermark_position.addItems(["右上角","左上角","右下角","左下角","画面中间"])
+        self.watermark_width=QSpinBox(); self.watermark_width.setRange(3,60); self.watermark_width.setValue(18); self.watermark_width.setSuffix(" %")
+        self.watermark_opacity=QSpinBox(); self.watermark_opacity.setRange(5,100); self.watermark_opacity.setValue(90); self.watermark_opacity.setSuffix(" %")
+        self.watermark_margin=QSpinBox(); self.watermark_margin.setRange(0,300); self.watermark_margin.setValue(28); self.watermark_margin.setSuffix(" px")
+        watermark_controls.addWidget(QLabel("位置")); watermark_controls.addWidget(self.watermark_position,1)
+        watermark_controls.addWidget(QLabel("宽度")); watermark_controls.addWidget(self.watermark_width)
+        watermark_controls.addWidget(QLabel("透明度")); watermark_controls.addWidget(self.watermark_opacity)
+        watermark_controls.addWidget(QLabel("边距")); watermark_controls.addWidget(self.watermark_margin); layer_layout.addLayout(watermark_controls)
+        self.watermark_mode.currentTextChanged.connect(self._watermark_mode_changed)
+        self.watermark_position.currentTextChanged.connect(self._refresh_live_preview)
+        for control in (self.watermark_width,self.watermark_opacity,self.watermark_margin): control.valueChanged.connect(self._refresh_live_preview)
+        settings_layout.addWidget(layer_group)
+        revise_group=QGroupBox("3. 字幕提取与文字编辑"); revise_layout=QVBoxLayout(revise_group); revise_layout.setContentsMargins(9,11,9,8)
         provider_row=QHBoxLayout(); provider_row.addWidget(QLabel("字幕识别服务")); provider_row.addWidget(self.provider,1); revise_layout.addLayout(provider_row)
         self.combination_label=QLabel("当前任务组合：尚未选择视频")
         self.combination_label.setWordWrap(True); self.combination_label.setStyleSheet("color:#67e8f9;background:#0b1830;padding:5px 7px;border-radius:4px;")
         revise_layout.addWidget(self.combination_label)
         queue_title=QLabel("批处理对应队列（序号相同即为同一组任务）")
-        queue_title.setStyleSheet("color:#cbd5e1;"); revise_layout.addWidget(queue_title)
+        queue_title.setStyleSheet("color:#cbd5e1;")
         self.task_queue=QTableWidget(0,4)
         self.task_queue.setHorizontalHeaderLabels(["序号","视频","匹配音频","文案"])
         self.task_queue.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -913,7 +1311,6 @@ class DynamicCaptionPage(QWidget):
         self.task_queue.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeMode.Stretch)
         self.task_queue.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeMode.ResizeToContents)
         self.task_queue.cellClicked.connect(lambda row,_column:self.videos.setCurrentRow(row))
-        revise_layout.addWidget(self.task_queue)
         self.timeline_source_label=QLabel("当前字幕：尚未选择视频")
         self.timeline_source_label.setStyleSheet("color:#facc15;background:#111827;padding:5px 7px;border-radius:4px;")
         self.timeline_source_label.setWordWrap(True); revise_layout.addWidget(self.timeline_source_label)
@@ -926,17 +1323,22 @@ class DynamicCaptionPage(QWidget):
         self.override_text=QPlainTextEdit(); self.override_text.setMinimumHeight(190); self.override_text.setPlaceholderText("1\n00:00:00,250 --> 00:00:00,780\nPrimeira\n\n2\n00:00:00,790 --> 00:00:01,240\npalavra")
         self.override_text.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;")
         self.override_text.textChanged.connect(self._timeline_text_changed)
-        revise_layout.addWidget(self.override_text); settings_layout.addWidget(revise_group); settings_layout.addStretch(); settings_scroll.setWidget(settings_body)
+        revise_layout.addWidget(self.override_text)
+        revise_layout.addWidget(queue_title); revise_layout.addWidget(self.task_queue)
+        settings_layout.insertWidget(0,revise_group); settings_layout.addStretch(); settings_scroll.setWidget(settings_body)
 
         # 左下角的输出与日志保持窄而完整，不再横跨整个窗口挤压预览。
         output_group=QGroupBox("2. 输出与运行"); og=QVBoxLayout(output_group); og.setContentsMargins(8,10,8,8); og.setSpacing(6)
         outrow=QHBoxLayout(); self.output=QLineEdit(str(Path.cwd()/"dynamic_caption_outputs")); self.output.setToolTip(self.output.text()); outrow.addWidget(QLabel("输出")); outrow.addWidget(self.output,1)
         choose=QPushButton("选择…"); choose.clicked.connect(self.choose_output); outrow.addWidget(choose); og.addLayout(outrow)
+        self.run_status=QLabel("当前状态：等待任务")
+        self.run_status.setWordWrap(True); self.run_status.setStyleSheet("color:#67e8f9;background:#0b1830;padding:5px 8px;border-radius:5px;font-weight:700;")
+        og.addWidget(self.run_status)
         self.progress=QProgressBar(); self.progress.setMinimumHeight(20); og.addWidget(self.progress)
         status_row=QHBoxLayout()
         self.stop=QPushButton("停止"); self.stop.setEnabled(False); self.stop.clicked.connect(self.cancel)
         self.start=QPushButton("开始批量生成 Reels"); self.start.setObjectName("primary"); self.start.clicked.connect(self.run); status_row.addWidget(self.stop); status_row.addWidget(self.start,1); og.addLayout(status_row)
-        self.log=QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMinimumHeight(115); self.log.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;line-height:1.35;")
+        self.log=QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMinimumHeight(72); self.log.setMaximumHeight(115); self.log.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;line-height:1.35;")
         og.addWidget(self.log,1); left_layout.addWidget(output_group,2)
 
         # 右侧工作设置区：预览与全部设置等高延伸到底部。
@@ -946,14 +1348,206 @@ class DynamicCaptionPage(QWidget):
         center.setMinimumWidth(500); settings_scroll.setMinimumWidth(430)
         work_splitter.addWidget(center); work_splitter.addWidget(settings_scroll); work_splitter.setSizes([650,500])
         work_group_layout.addWidget(work_splitter)
-        workspace.addWidget(left); workspace.addWidget(work_group); workspace.setSizes([380,1080]); root.addWidget(workspace,1)
+        workspace.addWidget(left); workspace.addWidget(work_group); workspace.setSizes([430,1080]); root.addWidget(workspace,1)
 
         self.preview_thread=None; self.preview_worker=None; self.timeline_thread=None; self.timeline_worker=None
         self._refresh_layer_list(0)
+        self._load_layer_schemes(); self._watermark_mode_changed(self.watermark_mode.currentText())
         self._refresh_task_queue()
         self._connect_live_preview_signals()
         self._caption_mode_changed(self.caption_mode.currentText())
+        self._group_sort_mode_changed(self.group_sort_mode.currentText())
         self.apply_preset("Descript 经典黄")
+
+    def _show_source_tool(self, index):
+        if hasattr(self,"source_stack"):
+            self.source_stack.setCurrentIndex(index)
+        if hasattr(self,"group_action_panel"):
+            self.group_action_panel.setVisible(index == 0)
+        for button_index,button in enumerate(getattr(self,"source_tool_buttons",[])):
+            button.setChecked(button_index == index)
+
+    def _append_run_log(self,message):
+        text=str(message or "").strip()
+        if not text: return
+        self.log.appendPlainText(text)
+        if hasattr(self,"run_status"):
+            current=text.splitlines()[0]
+            self.run_status.setText(f"当前状态：{current}")
+
+    def _choose_group_parent(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择分组合成父文件夹", self.group_parent.text())
+        if folder:
+            self.group_parent.setText(folder)
+            self._scan_group_parent(folder)
+            if self.group_merge_groups: self._open_group_caption_dialog()
+
+    def _open_group_caption_dialog(self):
+        self._save_current_group_script()
+        if not self.group_merge_groups:
+            self._scan_group_parent(self.group_parent.text())
+        if not self.group_merge_groups:
+            QMessageBox.information(self,"没有视频组","请先选择或拖入父文件夹。")
+            return
+        dialog=GroupCaptionDialog(self.group_merge_groups,self.group_scripts,self)
+        if dialog.exec()==QDialog.DialogCode.Accepted:
+            self.group_scripts.update(dialog.scripts())
+            current=self.group_table.currentRow()
+            if 0<=current<len(self.group_merge_groups):
+                folder=self.group_merge_groups[current][0]
+                self._loading_group_script=True
+                try: self.group_script.setPlainText(self.group_scripts.get(str(folder.resolve()),""))
+                finally: self._loading_group_script=False
+            self.group_sort_mode.setCurrentText("按分段文案自动匹配")
+            self._append_run_log("已保存分组字幕对应表；每行文案将按文件自然顺序对应一个视频片段。")
+
+    def _scan_group_parent(self, folder):
+        folder = str(folder or "").strip()
+        self._save_current_group_script()
+        self.group_merge_groups = discover_groups(folder)
+        self.group_table.setRowCount(len(self.group_merge_groups))
+        for row, (group_folder, clips) in enumerate(self.group_merge_groups):
+            file_names="；".join(Path(clip).name for clip in sorted(clips,key=lambda p:natural_key(Path(p).name)))
+            for column, value in enumerate((f"{row + 1:02d}", group_folder.name, str(len(clips)),file_names)):
+                item = QTableWidgetItem(value); item.setToolTip(str(group_folder)); self.group_table.setItem(row, column, item)
+        if self.group_merge_groups:
+            self.group_table.selectRow(0); self.group_table.setCurrentCell(0, 0)
+            self.log.appendPlainText(
+                f"已扫描 {len(self.group_merge_groups)} 组文件夹，共 {sum(len(clips) for _folder, clips in self.group_merge_groups)} 个视频片段。"
+            )
+        else:
+            self._loading_group_script = True
+            try: self.group_script.clear()
+            finally: self._loading_group_script = False
+            if folder: self.log.appendPlainText("所选目录中没有找到可处理的视频组。")
+
+    def _group_selection_changed(self, current_row, _current_column, previous_row, _previous_column):
+        if 0 <= previous_row < len(self.group_merge_groups):
+            folder = self.group_merge_groups[previous_row][0]
+            self.group_scripts[str(folder.resolve())] = self.group_script.toPlainText()
+        self._loading_group_script = True
+        try:
+            if 0 <= current_row < len(self.group_merge_groups):
+                folder = self.group_merge_groups[current_row][0]
+                self.group_script.setPlainText(self.group_scripts.get(str(folder.resolve()), ""))
+            else:
+                self.group_script.clear()
+        finally:
+            self._loading_group_script = False
+
+    def _save_current_group_script(self):
+        if self._loading_group_script or not hasattr(self, "group_table"):
+            return
+        row = self.group_table.currentRow()
+        if 0 <= row < len(self.group_merge_groups):
+            folder = self.group_merge_groups[row][0]
+            self.group_scripts[str(folder.resolve())] = self.group_script.toPlainText()
+
+    def _group_sort_mode_changed(self, text):
+        script_mode = "文案" in str(text)
+        self.group_script.setEnabled(script_mode)
+        self.group_script.setToolTip(
+            "选择一个组后粘贴它的分段文案；段数必须与视频数一致。" if script_mode
+            else "文件名自然排序会正确处理 1、2、3…10；如需按内容排序，请切换为按分段文案自动匹配。"
+        )
+
+    def start_group_merge(self):
+        if self.group_merge_thread and self.group_merge_thread.isRunning():
+            return
+        self._save_current_group_script()
+        if not self.group_merge_groups:
+            self._scan_group_parent(self.group_parent.text())
+        if not self.group_merge_groups:
+            QMessageBox.information(self, "没有视频组", "请选择父文件夹。每个直接子文件夹会作为一组合成任务。")
+            return
+        if "文案" in self.group_sort_mode.currentText():
+            missing = [folder.name for folder, _clips in self.group_merge_groups
+                       if not self.group_scripts.get(str(folder.resolve()), "").strip()]
+            if missing:
+                QMessageBox.information(
+                    self, "缺少分段文案", "以下组尚未填写分段文案：\n" + "、".join(missing[:8]) +
+                    "\n\n可以补充文案，或切换为“文件名自然排序”。",
+                )
+                return
+        try:
+            ffmpeg = self.find_ffmpeg()
+        except Exception as exc:
+            QMessageBox.critical(self, "缺少组件", str(exc)); return
+        output = Path(self.output.text()) / "00_分组合成"
+        provider = self.provider.currentText()
+        callback = lambda path: self.transcribe_callable(path, provider)
+        settings = {
+            "sort_mode": "script" if "文案" in self.group_sort_mode.currentText() else "natural",
+            "scripts": dict(self.group_scripts),
+            "head_padding_ms": self.group_head_padding.value(),
+            "tail_padding_ms": self.group_tail_padding.value(),
+            "resume": self.group_resume.isChecked(),
+            "encoder_backend": self.encoder_backend.currentText(),
+            "encode_preset": self.encode_preset.currentText(),
+        }
+        self.group_merge_outputs = []
+        self.group_merge_thread = QThread(self)
+        self.group_merge_worker = GroupMergeWorker(self.group_merge_groups, output, ffmpeg, callback, settings)
+        self.group_merge_worker.moveToThread(self.group_merge_thread)
+        self.group_merge_thread.started.connect(self.group_merge_worker.run)
+        self.group_merge_worker.log.connect(self._append_run_log)
+        self.group_merge_worker.progress.connect(self.progress.setValue)
+        self.group_merge_worker.item_done.connect(self._group_merge_item_done)
+        self.group_merge_worker.finished.connect(self._group_merge_finished)
+        self.group_merge_worker.finished.connect(self.group_merge_thread.quit)
+        self.group_merge_thread.finished.connect(self._group_merge_ended)
+        self.group_merge_thread.finished.connect(self.group_merge_thread.deleteLater)
+        self.group_merge_start.setEnabled(False); self.group_merge_stop.setEnabled(True); self.progress.setValue(0)
+        self._append_run_log("开始分组批处理：识别首尾说话边界 → 去口气音 → 统一音视频参数 → 按组无缝合成。")
+        self.group_merge_thread.start()
+
+    def stop_group_merge(self):
+        if self.group_merge_worker:
+            self.group_merge_worker.cancel()
+            self.group_merge_stop.setEnabled(False)
+            self.log.appendPlainText("正在完成当前片段后停止；已完成内容可供下次断点续接。")
+
+    def _group_merge_item_done(self, output, group_name, index, total):
+        if output not in self.group_merge_outputs:
+            self.group_merge_outputs.append(output)
+        self.log.appendPlainText(f"[{index}/{total}] {group_name} 已加入合成结果队列。")
+
+    def _load_group_merge_outputs(self):
+        outputs = [path for path in self.group_merge_outputs if Path(path).is_file()]
+        if not outputs:
+            return
+        self.videos.clear()
+        self._add(self.videos, outputs, VIDEO_EXTENSIONS)
+        self.audio_match_mode.setCurrentText("每个视频使用自身音频")
+        self.audio_mode.setCurrentText("保留视频原音")
+        self.caption_mode.setCurrentText("语音同步字幕")
+        self._refresh_task_queue()
+        if self.group_auto_timeline.isChecked():
+            QTimer.singleShot(300, self.extract_all_timelines)
+
+    def _group_merge_finished(self, ok, message):
+        if ok:
+            try:
+                for path in json.loads(message).get("outputs", []):
+                    if path not in self.group_merge_outputs: self.group_merge_outputs.append(path)
+            except Exception:
+                pass
+            self.progress.setValue(100); self._load_group_merge_outputs()
+            self.log.appendPlainText(
+                f"分组合成完成：共 {len(self.group_merge_outputs)} 个完整视频。已进入视频队列，"
+                + ("正在继续批量提取字幕。" if self.group_auto_timeline.isChecked() else "可手动提取字幕并批量输出。")
+            )
+            self.run_status.setText("当前状态：分组合成完成" + ("，正在提取字幕" if self.group_auto_timeline.isChecked() else ""))
+        else:
+            if self.group_merge_outputs:
+                self._load_group_merge_outputs()
+                message += f"\n\n已完成的 {len(self.group_merge_outputs)} 组仍已加入视频队列，可修复后断点续接。"
+            QMessageBox.critical(self, "分组合成失败", message)
+            self.run_status.setText("当前状态：分组合成失败，请查看日志")
+
+    def _group_merge_ended(self):
+        self.group_merge_start.setEnabled(True); self.group_merge_stop.setEnabled(False)
+        self.group_merge_worker = None; self.group_merge_thread = None
 
     def _add(self, widget, paths, extensions):
         existing = {widget.item(i).text() for i in range(widget.count())}
@@ -1006,8 +1600,9 @@ class DynamicCaptionPage(QWidget):
         ])
         self.tts_voice.setToolTip("Gemini 官方预置音色；可使用现有 Gemini 密钥轮询生成。")
 
-    def load_video_preview(self, path, external_audio=""):
+    def load_video_preview(self, path, external_audio="", precise=False):
         if not path or not Path(path).is_file(): return
+        self._precise_preview_active = bool(precise)
         if self.preview_capture is not None:
             self.preview_capture.release()
         self.preview_capture = None
@@ -1051,7 +1646,7 @@ class DynamicCaptionPage(QWidget):
         image = self.preview_base_image.scaled(
             self.video_widget.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation)
-        if getattr(self, "live_preview", None) and self.live_preview.isChecked():
+        if getattr(self, "live_preview", None) and self.live_preview.isChecked() and not self._precise_preview_active:
             self._paint_live_layers(image, self.player.position() / 1000)
         self.video_widget.setPixmap(QPixmap.fromImage(image))
 
@@ -1068,7 +1663,7 @@ class DynamicCaptionPage(QWidget):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb.shape
         image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
-        if getattr(self, "live_preview", None) and self.live_preview.isChecked():
+        if getattr(self, "live_preview", None) and self.live_preview.isChecked() and not self._precise_preview_active:
             self._paint_live_layers(image, target / 1000)
         pixmap = QPixmap.fromImage(image).scaled(
             self.video_widget.size(), Qt.AspectRatioMode.KeepAspectRatio,
@@ -1131,10 +1726,46 @@ class DynamicCaptionPage(QWidget):
                     radius_percent=max(0,min(100,int(layer.get("radius",35))))
                     radius=min(width,height)*.5*radius_percent/100
                     painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QBrush(color)); painter.drawRoundedRect(int(x),int(y),int(width),int(height),radius,radius)
+                elif layer.get("type") == "text":
+                    self._paint_live_text_layer(painter,layer)
                 elif layer.get("type") == "caption":
                     self._paint_live_caption(painter,image,seconds)
+            self._paint_live_watermark(painter)
         finally:
             painter.end()
+
+    def _paint_live_watermark(self, painter):
+        if self._watermark_image.isNull() or not hasattr(self,"watermark_width"):
+            return
+        if self.watermark_mode.currentText()=="9:16 全屏覆盖":
+            image=self._watermark_image.scaled(1080,1920,Qt.AspectRatioMode.IgnoreAspectRatio,Qt.TransformationMode.SmoothTransformation)
+            x=y=0
+            painter.save(); painter.setOpacity(self.watermark_opacity.value()/100); painter.drawImage(x,y,image); painter.restore(); return
+        width=max(1,round(1080*self.watermark_width.value()/100)); image=self._watermark_image.scaledToWidth(width,Qt.TransformationMode.SmoothTransformation)
+        margin=self.watermark_margin.value(); position=self.watermark_position.currentText(); height=image.height()
+        positions={
+            "左上角":(margin,margin), "右上角":(1080-width-margin,margin),
+            "左下角":(margin,1920-height-margin), "右下角":(1080-width-margin,1920-height-margin),
+            "画面中间":((1080-width)//2,(1920-height)//2),
+        }
+        x,y=positions.get(position,positions["右上角"]); painter.save(); painter.setOpacity(self.watermark_opacity.value()/100)
+        painter.drawImage(int(x),int(y),image); painter.restore()
+
+    def _paint_live_text_layer(self,painter,layer):
+        text=str(layer.get("text","")).strip()
+        if not text: return
+        font=QFont(str(layer.get("font","Microsoft YaHei"))); font.setPixelSize(max(12,int(layer.get("size",58)))); font.setBold(True)
+        metrics=QFontMetricsF(font); lines=text.splitlines() or [text]; line_height=metrics.height()*1.1
+        center_x=1080*float(layer.get("x",50))/100; center_y=1920*float(layer.get("y",18))/100
+        painter.save(); painter.setOpacity(max(0,min(100,int(layer.get("opacity",100))))/100)
+        for index,line in enumerate(lines):
+            width=metrics.horizontalAdvance(line); baseline=center_y+(index-(len(lines)-1)/2)*line_height+metrics.ascent()/2-metrics.descent()/2
+            path=QPainterPath(); path.addText(center_x-width/2,baseline,font,line)
+            outline=max(0,int(layer.get("outline_width",2)))
+            if outline:
+                painter.setPen(QPen(QColor(layer.get("outline","#111111")),outline*2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap,Qt.PenJoinStyle.RoundJoin)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawPath(path)
+            painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(layer.get("color","#FFFFFF"))); painter.drawPath(path)
+        painter.restore()
 
     def _paint_live_caption(self, painter, image, seconds):
         settings = self._current_settings(); preset = PRESETS[settings["preset"]]
@@ -1195,7 +1826,7 @@ class DynamicCaptionPage(QWidget):
         if not hasattr(self,"layer_list"): return
         self.layer_list.blockSignals(True); self.layer_list.clear()
         for index,layer in enumerate(self.layers):
-            prefix="字幕" if layer.get("type")=="caption" else "蒙版"
+            prefix={"caption":"字幕","mask":"蒙版","text":"文字"}.get(layer.get("type"),"图层")
             self.layer_list.addItem(f"{index+1}. {prefix} · {layer.get('name',prefix)}")
         self.layer_list.setCurrentRow(max(0,min(selected,len(self.layers)-1)))
         self.layer_list.blockSignals(False); self._layer_selected(self.layer_list.currentRow())
@@ -1204,6 +1835,13 @@ class DynamicCaptionPage(QWidget):
         self._mask_counter+=1; caption_index=next((i for i,l in enumerate(self.layers) if l.get("type")=="caption"),0)
         layer={"type":"mask","name":f"蒙版 {self._mask_counter}","enabled":True,"x":10,"y":66,"w":80,"h":15,"color":"#000000","opacity":55,"radius":35}
         self.layers.insert(caption_index+1,layer); self._refresh_layer_list(caption_index+1); self._refresh_live_preview()
+
+    def _add_text_layer(self):
+        self._text_counter+=1; caption_index=next((i for i,l in enumerate(self.layers) if l.get("type")=="caption"),0)
+        layer={"type":"text","name":f"文字 {self._text_counter}","enabled":True,"text":"公司名称或提示文字",
+               "font":"Microsoft YaHei","size":58,"color":"#FFFFFF","outline":"#111111","outline_width":2,
+               "opacity":100,"x":50,"y":18}
+        self.layers.insert(caption_index,layer); self._refresh_layer_list(caption_index); self._refresh_live_preview()
 
     def _delete_layer(self):
         row=self.layer_list.currentRow()
@@ -1217,12 +1855,24 @@ class DynamicCaptionPage(QWidget):
         self._refresh_layer_list(target); self._refresh_live_preview()
 
     def _layer_selected(self, row):
-        layer=self.layers[row] if 0<=row<len(self.layers) else None; enabled=bool(layer and layer.get("type")=="mask")
-        for control in (self.mask_color,self.mask_opacity,self.mask_x,self.mask_y,self.mask_w,self.mask_h,self.mask_radius,*self.mask_quick_buttons): control.setEnabled(enabled)
-        if not enabled: return
-        controls=((self.mask_x,"x"),(self.mask_y,"y"),(self.mask_w,"w"),(self.mask_h,"h"),(self.mask_opacity,"opacity"),(self.mask_radius,"radius"))
-        for control,key in controls: control.blockSignals(True); control.setValue(int(layer.get(key,0))); control.blockSignals(False)
-        self.mask_color.setText(f"蒙版颜色 {layer.get('color','#000000')}"); self.mask_opacity_value.setText(f"{layer.get('opacity',55)}%")
+        layer=self.layers[row] if 0<=row<len(self.layers) else None; mask_enabled=bool(layer and layer.get("type")=="mask"); text_enabled=bool(layer and layer.get("type")=="text")
+        for control in (self.mask_color,self.mask_opacity,self.mask_x,self.mask_y,self.mask_w,self.mask_h,self.mask_radius,*self.mask_quick_buttons): control.setEnabled(mask_enabled)
+        text_controls=(self.layer_text,self.layer_text_font,self.layer_text_size,self.layer_text_color,self.layer_text_outline,
+                       self.layer_text_opacity,self.layer_text_x,self.layer_text_y,*self.text_quick_buttons)
+        for control in text_controls: control.setEnabled(text_enabled)
+        if mask_enabled:
+            controls=((self.mask_x,"x"),(self.mask_y,"y"),(self.mask_w,"w"),(self.mask_h,"h"),(self.mask_opacity,"opacity"),(self.mask_radius,"radius"))
+            for control,key in controls: control.blockSignals(True); control.setValue(int(layer.get(key,0))); control.blockSignals(False)
+            self.mask_color.setText(f"蒙版颜色 {layer.get('color','#000000')}"); self.mask_opacity_value.setText(f"{layer.get('opacity',55)}%")
+        if text_enabled:
+            controls=((self.layer_text,"text"),(self.layer_text_font,"font"),(self.layer_text_size,"size"),(self.layer_text_outline,"outline_width"),
+                      (self.layer_text_opacity,"opacity"),(self.layer_text_x,"x"),(self.layer_text_y,"y"))
+            for control,key in controls:
+                control.blockSignals(True)
+                if isinstance(control,(QLineEdit,QComboBox)): control.setText(str(layer.get(key,""))) if isinstance(control,QLineEdit) else control.setCurrentText(str(layer.get(key,"")))
+                else: control.setValue(int(layer.get(key,0)))
+                control.blockSignals(False)
+            self.layer_text_color.setText(f"文字颜色 {layer.get('color','#FFFFFF')}")
 
     def _mask_control_changed(self, *_args):
         row=self.layer_list.currentRow()
@@ -1241,12 +1891,80 @@ class DynamicCaptionPage(QWidget):
         elif mode=="bottom": self.mask_y.setValue(max(0,95-height))
         self._mask_control_changed()
 
+    def _text_layer_changed(self,*_args):
+        row=self.layer_list.currentRow()
+        if row<0 or self.layers[row].get("type")!="text": return
+        self.layers[row].update({"text":self.layer_text.text(),"font":self.layer_text_font.currentText(),"size":self.layer_text_size.value(),
+                                 "outline_width":self.layer_text_outline.value(),"opacity":self.layer_text_opacity.value(),
+                                 "x":self.layer_text_x.value(),"y":self.layer_text_y.value()})
+        self._refresh_live_preview()
+
+    def _quick_text_position(self,mode):
+        self.layer_text_x.setValue(50)
+        self.layer_text_y.setValue({"top":12,"center":50,"bottom":88}.get(mode,18)); self._text_layer_changed()
+
+    def _pick_layer_text_color(self):
+        row=self.layer_list.currentRow()
+        if row<0 or self.layers[row].get("type")!="text": return
+        color=QColorDialog.getColor(QColor(self.layers[row].get("color","#FFFFFF")),self)
+        if color.isValid():
+            self.layers[row]["color"]=color.name().upper(); self.layer_text_color.setText(f"文字颜色 {color.name().upper()}"); self._refresh_live_preview()
+
+    def _layer_settings_store(self):
+        return QSettings("VideoToolkit","DynamicReels")
+
+    def _load_layer_schemes(self):
+        try: self._layer_schemes=json.loads(self._layer_settings_store().value("layer_schemes","{}"))
+        except Exception: self._layer_schemes={}
+        self.layer_scheme_combo.clear(); self.layer_scheme_combo.addItems(sorted(self._layer_schemes))
+
+    def _save_layer_scheme(self):
+        name=self.layer_scheme_combo.currentText().strip()
+        if not name:
+            name=f"方案 {len(self._layer_schemes)+1}"
+        self._layer_schemes[name]=json.loads(json.dumps(self.layers,ensure_ascii=False))
+        self._layer_settings_store().setValue("layer_schemes",json.dumps(self._layer_schemes,ensure_ascii=False))
+        self._load_layer_schemes(); self.layer_scheme_combo.setCurrentText(name); self.log.appendPlainText(f"已保存图层方案：{name}")
+
+    def _apply_layer_scheme(self):
+        name=self.layer_scheme_combo.currentText().strip(); saved=self._layer_schemes.get(name)
+        if not saved:
+            QMessageBox.information(self,"没有方案","请选择已保存的图层方案，或输入名称后点击“保存方案”。"); return
+        self.layers=json.loads(json.dumps(saved,ensure_ascii=False))
+        if not any(layer.get("type")=="caption" for layer in self.layers): self.layers.append({"type":"caption","name":"字幕层"})
+        self._mask_counter=sum(1 for layer in self.layers if layer.get("type")=="mask")
+        self._text_counter=sum(1 for layer in self.layers if layer.get("type")=="text")
+        self._refresh_layer_list(0); self._refresh_live_preview(); self.log.appendPlainText(f"已应用图层方案：{name}")
+
+    def _delete_layer_scheme(self):
+        name=self.layer_scheme_combo.currentText().strip()
+        if name in self._layer_schemes:
+            self._layer_schemes.pop(name); self._layer_settings_store().setValue("layer_schemes",json.dumps(self._layer_schemes,ensure_ascii=False)); self._load_layer_schemes()
+
+    def _watermark_mode_changed(self,*_args):
+        custom=self.watermark_mode.currentText()=="小 Logo 自定义位置"
+        for control in (self.watermark_position,self.watermark_width,self.watermark_margin): control.setEnabled(custom)
+        self._refresh_live_preview()
+
     def _pick_mask_color(self):
         row=self.layer_list.currentRow()
         if row<0 or self.layers[row].get("type")!="mask": return
         color=QColorDialog.getColor(QColor(self.layers[row].get("color","#000000")),self)
         if color.isValid():
             self.layers[row]["color"]=color.name().upper(); self.mask_color.setText(f"蒙版颜色 {color.name().upper()}"); self._refresh_live_preview()
+
+    def _choose_company_watermark(self):
+        path,_=QFileDialog.getOpenFileName(self,"选择公司水印图片","","图片 (*.png *.webp *.jpg *.jpeg *.bmp)")
+        if not path: return
+        image=QImage(path)
+        if image.isNull():
+            QMessageBox.critical(self,"水印图片无效","无法读取这张图片，请改用 PNG、WebP 或 JPG。")
+            return
+        self.company_watermark.setText(path); self.company_watermark.setToolTip(path); self._watermark_image=image
+        self._refresh_live_preview(); self.log.appendPlainText(f"已加载公司水印：{path}")
+
+    def _clear_company_watermark(self):
+        self.company_watermark.clear(); self.company_watermark.setToolTip(""); self._watermark_image=QImage(); self._refresh_live_preview()
 
     def _preview_margin_changed(self, value):
         if hasattr(self, "margin_v"):
@@ -1303,12 +2021,19 @@ class DynamicCaptionPage(QWidget):
                 "audio_mode":self.audio_mode.currentText(),"audio_match_mode":self.audio_match_mode.currentText(),
                 "clean_metadata":self.clean_metadata.isChecked(),
                 "override_text":self.override_text.toPlainText().strip(),"encode_preset":self.encode_preset.currentText(),
+                "encoder_backend":self.encoder_backend.currentText(),
                 "timeline_overrides":dict(self.timeline_overrides),
                 "word_timelines":dict(self.timeline_words),
                 "free_texts":dict(self.free_texts),
                 "free_default_text":self.override_text.toPlainText().strip(),
                 "preview_word_srt":self.timeline_words.get(self._timeline_key(self._timeline_source()),""),
                 "layers":[dict(layer) for layer in self.layers],
+                "watermark_path":self.company_watermark.text().strip(),
+                "watermark_mode":self.watermark_mode.currentText(),
+                "watermark_position":self.watermark_position.currentText(),
+                "watermark_width":self.watermark_width.value(),
+                "watermark_opacity":self.watermark_opacity.value(),
+                "watermark_margin":self.watermark_margin.value(),
                 "text_color":self._hex(self.text_color),"outline_color":self._hex(self.outline_color),
                 "highlight_color":self._hex(self.highlight_color),"provider":self.provider.currentText()}
 
@@ -1322,7 +2047,8 @@ class DynamicCaptionPage(QWidget):
         if "-->" not in text and self.caption_mode.currentText() != "自由文案动画（不对口型）":
             text=re.sub(r"\s+"," ",text)[:100]
         preview_dir=Path(self.output.text())/".preview"; preview_dir.mkdir(parents=True,exist_ok=True)
-        destination=preview_dir/f"effect_{Path(item.text()).stem}_{len(list(preview_dir.glob('effect_*.mp4'))) + 1}.mp4"
+        preview_index=len(list(preview_dir.glob('effect_*.mp4'))) + 1
+        destination=preview_dir/f"effect_{short_media_id(item.text())}_{preview_index}.mp4"
         self.render_preview_btn.setEnabled(False); self.render_preview_btn.setText("正在生成 8 秒预览…")
         settings=self._current_settings(); matched=self._matched_source_for_video(item.text())
         if (matched and Path(matched).is_file() and Path(matched).resolve()!=Path(item.text()).resolve()
@@ -1336,11 +2062,29 @@ class DynamicCaptionPage(QWidget):
     def _effect_preview_done(self, ok, result):
         self.render_preview_btn.setEnabled(True); self.render_preview_btn.setText("渲染 8 秒精确预览")
         if ok:
-            self.load_video_preview(result)
+            self._precise_preview_files.add(str(result))
+            self.load_video_preview(result, precise=True)
             # 预览生成后停在有字幕的画面，避免自动播放到第 8 秒后看起来像“没有效果”。
             QTimer.singleShot(220, lambda: self._pause_effect_preview_at(900))
             self.log.appendPlainText(f"效果预览已生成并载入播放器：{result}")
         else: QMessageBox.critical(self,"预览生成失败",result)
+
+    def _clear_precise_preview(self):
+        """Return to source/live preview and remove generated preview clips."""
+        item=self.videos.currentItem()
+        if item:
+            source=self._matched_source_for_video(item.text())
+            external=(source if source and Path(source).is_file() and Path(source).resolve()!=Path(item.text()).resolve()
+                      and self.audio_mode.currentText()=="替换为添加的音频" else "")
+            self.load_video_preview(item.text(),external,precise=False)
+        pending=list(self._precise_preview_files); self._precise_preview_files.clear()
+        def remove_files():
+            removed=0
+            for path in pending:
+                try: Path(path).unlink(missing_ok=True); removed+=1
+                except OSError: pass
+            self._append_run_log(f"已清除精确预览，恢复实时预览。移除 {removed} 个临时预览文件。")
+        QTimer.singleShot(700,remove_files)
 
     def _preview_thread_ended(self): self.preview_worker=None; self.preview_thread=None
 
@@ -1710,7 +2454,7 @@ class DynamicCaptionPage(QWidget):
         callback = lambda path: self.transcribe_callable(path, settings["provider"])
         self.worker = CaptionWorker(videos, audios, self.output.text(), ffmpeg, callback, settings)
         self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run)
-        self.worker.log.connect(self.log.appendPlainText); self.worker.progress.connect(self.progress.setValue)
+        self.worker.log.connect(self._append_run_log); self.worker.progress.connect(self.progress.setValue)
         self.worker.timeline_ready.connect(self._worker_timeline_ready)
         self.worker.finished.connect(self.done); self.worker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self.ended); self.thread.finished.connect(self.thread.deleteLater)
@@ -1720,7 +2464,8 @@ class DynamicCaptionPage(QWidget):
         if self.worker: self.worker.cancel()
 
     def done(self, ok, message):
-        self.start.setEnabled(True); self.stop.setEnabled(False); self.log.appendPlainText(message)
+        self.start.setEnabled(True); self.stop.setEnabled(False); self._append_run_log(message)
+        self.run_status.setText("当前状态：已完成" if ok else "当前状态：执行失败，请查看日志")
         (QMessageBox.information if ok else QMessageBox.critical)(self, "动态文案" if ok else "生成失败", message)
 
     def ended(self): self.worker = None; self.thread = None

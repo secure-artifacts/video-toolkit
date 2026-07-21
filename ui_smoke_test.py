@@ -32,9 +32,9 @@ window.resize(1600, 920)
 assert window.pages.count() == 11
 assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 7
 assert window.nav_buttons[-1].text() == "帮助"
-reels_index = window.watermark_tabs.indexOf(window.dynamic_caption_page)
-assert reels_index >= 0 and window.watermark_tabs.isTabVisible(reels_index)
-assert window.watermark_tabs.tabText(window.watermark_tabs.currentIndex()) == "动态 Reels 流水线"
+assert window.pages.widget(3) is window.dynamic_caption_page
+assert not hasattr(window, "watermark_tabs")
+assert window.dynamic_caption_page.source_stack.count() == 4
 pipeline_step_labels = [label.text() for label in window.pages.widget(8).findChildren(toolkit.QLabel)]
 assert any("⑤ 批量上传" in text and "⑥ 批量填表" in text for text in pipeline_step_labels)
 assert not any(button.text() == "开始智能提取字幕" for button in window.pages.widget(0).findChildren(toolkit.QPushButton))
@@ -64,8 +64,6 @@ assert window.smartcut_page.files.count() == 1
 window.screenshot_page.add_local_paths([str(media_root.parent)])
 assert "2.mp4" in window.screenshot_page.url_input.toPlainText()
 assert "10.mp3" not in window.screenshot_page.url_input.toPlainText()
-window.watermark_page.add_dropped_paths([str(media_root.parent)])
-assert len(window.watermark_page.files) == 1
 window.rename_page.set_input_folder(str(media_root))
 assert window.rename_page.input.text() == str(media_root)
 

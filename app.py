@@ -2006,25 +2006,15 @@ class MainWindow(QMainWindow):
         _startup_trace("screenshot page ready")
         self.smartcut_page = SmartCutPage()
         _startup_trace("smartcut page ready")
-        self.watermark_tabs = QTabWidget()
-        self.watermark_page = WatermarkPage()
         self.dynamic_caption_page = DynamicCaptionPage(
             self._caption_transcribe, self._text_to_speech, self._find_ffmpeg,
             TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER)
-        reels_tab_index = self.watermark_tabs.addTab(self.dynamic_caption_page, "动态 Reels 流水线")
-        # 开发/预览版默认开放 Reels；稳定发布时仍可设置
-        # VIDEO_TOOLKIT_SHOW_REELS=0 单独隐藏，不影响其他水印功能。
-        show_reels_preview = os.environ.get("VIDEO_TOOLKIT_SHOW_REELS", "1").strip() != "0"
-        self.watermark_tabs.setTabVisible(reels_tab_index, show_reels_preview)
-        watermark_tab_index = self.watermark_tabs.addTab(self.watermark_page, "视频 / 图片水印")
-        self.watermark_tabs.addTab(MetadataPage(), "素材元数据清理")
-        self.watermark_tabs.setCurrentIndex(reels_tab_index if show_reels_preview else watermark_tab_index)
         _startup_trace("watermark page ready")
         self.rename_page = RenamePage()
         _startup_trace("rename page ready")
         self.pages.addWidget(self.screenshot_page)
         self.pages.addWidget(self.smartcut_page)
-        self.pages.addWidget(self.watermark_tabs)
+        self.pages.addWidget(self.dynamic_caption_page)
         self.pages.addWidget(self.rename_page)
         self.pages.addWidget(self._subtitle_page())
         _startup_trace("subtitle page ready")
