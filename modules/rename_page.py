@@ -27,6 +27,7 @@ WINDOWS_RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 
 def clean_filename_part(value, fallback="未命名", max_chars=None):
@@ -140,6 +141,41 @@ class RenameWorker(QObject):
             self.finished.emit(False, str(exc))
 
 
+class SmartTitleWorker(QObject):
+    log = Signal(str); progress = Signal(int); finished = Signal(bool, str, list)
+
+    def __init__(self, files, transcribe_callable):
+        super().__init__(); self.files = list(files); self.transcribe_callable = transcribe_callable
+
+    def run(self):
+        titles = []; errors = []
+        try:
+            for index, source in enumerate(self.files):
+                self.log.emit(f"[{index + 1}/{len(self.files)}] 正在识别视频内容：{source.name}")
+                try:
+                    original, chinese, _srt = self.transcribe_callable(str(source))
+                    chinese = re.sub(r"\s+", " ", str(chinese or "")).strip()
+                    chinese_chars=sum("\u4e00"<=char<="\u9fff" for char in chinese)
+                    title = chinese if chinese_chars and not chinese.startswith("【自动翻译失败") else ""
+                    if not title:
+                        errors.append(f"{source.name}: 未生成有效中文字幕")
+                        self.log.emit(f"当前视频只识别到外文，未把外文写入标题；暂用原文件名：{source.name}")
+                except Exception as exc:
+                    title = ""; errors.append(f"{source.name}: {exc}")
+                    self.log.emit(f"识别失败，暂用原文件名，可稍后重试或手动修改：{source.name}（{exc}）")
+                if not title:
+                    title = source.stem
+                    self.log.emit(f"未识别到有效文案，保留原文件名：{source.name}")
+                titles.append(title)
+                self.progress.emit(round((index + 1) / max(1, len(self.files)) * 100))
+            if errors:
+                self.finished.emit(False, f"已生成 {len(titles)} 行标题，其中 {len(errors)} 个视频识别失败并暂用原文件名。", titles)
+            else:
+                self.finished.emit(True, f"已读取 {len(titles)} 个视频内容并写入标题列表。", titles)
+        except Exception as exc:
+            self.finished.emit(False, str(exc), titles)
+
+
 def natural_key(text):
     return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", text)]
 
@@ -161,8 +197,9 @@ def unique_destination(path: Path):
 
 
 class RenamePage(QWidget):
-    def __init__(self):
+    def __init__(self, transcribe_callable=None):
         super().__init__(); self.tasks = []; self.thread = None; self.worker = None
+        self.transcribe_callable = transcribe_callable; self.title_thread = None; self.title_worker = None
         self.preset_path = app_data_dir() / "rename_presets.json"
         self.presets = self.load_presets(); self.build_ui(); self.refresh_presets()
 
@@ -220,8 +257,13 @@ class RenamePage(QWidget):
         buttons = QHBoxLayout()
         preview = QPushButton("刷新预览"); preview.clicked.connect(self.update_preview)
         load = QPushButton("读取文件名为标题"); load.clicked.connect(self.load_titles)
+        self.smart_titles_btn = QPushButton("智能读取视频内容为标题")
+        self.smart_titles_btn.setObjectName("primary")
+        self.smart_titles_btn.setToolTip("按自然排序批量识别视频内容，每个视频生成一行标题；识别后仍可手动修改")
+        self.smart_titles_btn.clicked.connect(self.load_smart_titles)
+        self.smart_titles_btn.setEnabled(callable(self.transcribe_callable))
         add = QPushButton("添加到队列"); add.clicked.connect(self.add_task)
-        buttons.addWidget(load); buttons.addWidget(preview); buttons.addWidget(add); buttons.addStretch()
+        buttons.addWidget(load); buttons.addWidget(self.smart_titles_btn); buttons.addWidget(preview); buttons.addWidget(add); buttons.addStretch()
         title_layout.addLayout(buttons); left_layout.addWidget(title_group, 1)
         left_scroll.setWidget(left); content.addWidget(left_scroll)
 
@@ -347,6 +389,52 @@ class RenamePage(QWidget):
         if folder.is_dir():
             self.titles.setPlainText("\n".join(x.stem for x in sorted(folder.iterdir(), key=lambda x: natural_key(x.name)) if x.is_file()))
             self.update_preview()
+
+    def load_smart_titles(self):
+        folder = Path(self.input.text())
+        if not folder.is_dir():
+            QMessageBox.information(self, "没有源文件夹", "请先选择包含视频的源文件夹。")
+            return
+        files = sorted(
+            (item for item in folder.iterdir() if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS),
+            key=lambda item: natural_key(item.name),
+        )
+        if not files:
+            QMessageBox.information(self, "没有视频", "当前文件夹没有可识别的视频文件。")
+            return
+        if self.title_thread and self.title_thread.isRunning():
+            QMessageBox.information(self, "正在识别", "请等待当前标题识别任务完成。")
+            return
+        self.smart_titles_btn.setEnabled(False); self.smart_titles_btn.setText(f"正在识别 0/{len(files)}")
+        self.progress.setValue(0); self.log.appendPlainText(f"开始按自然排序读取 {len(files)} 个视频内容……")
+        self.title_thread = QThread(self); self.title_worker = SmartTitleWorker(files, self.transcribe_callable)
+        self.title_worker.moveToThread(self.title_thread); self.title_thread.started.connect(self.title_worker.run)
+        self.title_worker.log.connect(self.log.appendPlainText)
+        self.title_worker.progress.connect(self._smart_title_progress)
+        self.title_worker.finished.connect(self._smart_titles_done)
+        self.title_worker.finished.connect(self.title_thread.quit)
+        self.title_thread.finished.connect(self._smart_title_ended)
+        self.title_thread.finished.connect(self.title_thread.deleteLater)
+        self.title_thread.start()
+
+    def _smart_title_progress(self, value):
+        self.progress.setValue(value)
+        folder = Path(self.input.text())
+        count = len([item for item in folder.iterdir() if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS]) if folder.is_dir() else 0
+        current = min(count, max(0, round(value * count / 100)))
+        self.smart_titles_btn.setText(f"正在识别 {current}/{count}")
+
+    def _smart_titles_done(self, ok, message, titles):
+        if titles:
+            self.titles.setPlainText("\n".join(titles)); self.update_preview()
+        self.log.appendPlainText(message)
+        if not ok:
+            self.log.appendPlainText("失败项未写入外文标题，已安全回退为原文件名；可补充 Gemini 密钥后重试。")
+
+    def _smart_title_ended(self):
+        self.smart_titles_btn.setEnabled(callable(self.transcribe_callable))
+        self.smart_titles_btn.setText("智能读取视频内容为标题")
+        self.title_worker = None; self.title_thread = None
 
     def add_task(self):
         try:

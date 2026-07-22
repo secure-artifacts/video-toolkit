@@ -16,6 +16,8 @@ test_media/
 test_cuts/
 test_shots/
 watermark_outputs/
+dynamic_caption_outputs/
+metadata_clean_outputs/
 流水线输出/
 rename_regression_*/
 .rename_mac_compat_test/
@@ -26,6 +28,8 @@ execution_detailed.log
 tools/ffmpeg/
 *.zip
 *.exe
+.test_*.mp4
+.test_*.wav
 *.app/
 *.icns
 *.iconset/

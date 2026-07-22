@@ -14,7 +14,7 @@ import requests
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QProgressBar,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from .platform_utils import app_data_dir, bundled_media_tool, media_tool_name
@@ -178,7 +178,8 @@ class SettingsPage(QWidget):
         self.refresh()
 
     def build_ui(self):
-        layout = QVBoxLayout(self); layout.setContentsMargins(24, 16, 24, 16); layout.setSpacing(8)
+        layout = QVBoxLayout(self); self.main_layout = layout
+        layout.setContentsMargins(24, 16, 24, 16); layout.setSpacing(8)
         title = QLabel("设置与组件管理"); title.setObjectName("heading")
         layout.addWidget(title)
         layout.addWidget(QLabel("集中检查整个软件需要的组件；安装过程静默执行，不弹出命令窗口。"))
@@ -198,6 +199,23 @@ class SettingsPage(QWidget):
         self.progress = QProgressBar(); layout.addWidget(self.progress)
         self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(170)
         layout.addWidget(self.log)
+
+    def add_font_management(self, import_callback, library_callback, font_folder):
+        """Install one-time font management beside other reusable components."""
+        if hasattr(self, "font_management_group"):
+            return
+        group = QGroupBox("字幕字体管理")
+        self.font_management_group = group
+        row = QHBoxLayout(group)
+        row.addWidget(QLabel(f"字体目录：{font_folder}"), 1)
+        import_button = QPushButton("导入本地字体…")
+        import_button.setToolTip("导入 TTF、OTF 或 TTC，之后可在 Reels 字幕样式中直接选择")
+        import_button.clicked.connect(import_callback)
+        library_button = QPushButton("开源字体库…")
+        library_button.setToolTip("从 Google Fonts 官方仓库安装开源字体，下载一次后离线使用")
+        library_button.clicked.connect(library_callback)
+        row.addWidget(import_button); row.addWidget(library_button)
+        self.main_layout.insertWidget(3, group)
 
     def refresh(self):
         self.rows = component_rows(); self.table.setRowCount(0)

@@ -1,6 +1,20 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root 'dist_folder'
+$version = $env:VIDEO_TOOLKIT_VERSION
+if ([string]::IsNullOrWhiteSpace($version)) { $version = $env:GITHUB_REF_NAME }
+if ([string]::IsNullOrWhiteSpace($version)) {
+  try { $version = (& git -C $root describe --tags --abbrev=0 2>$null).Trim() } catch { $version = '' }
+}
+if ([string]::IsNullOrWhiteSpace($version)) { $version = '1.6.1' }
+$version = $version.Trim().TrimStart('v')
+if ($version -notmatch '^[0-9A-Za-z._-]+$') { throw "Invalid application version: $version" }
+$versionHook = Join-Path $env:TEMP ("video_toolkit_version_" + [guid]::NewGuid().ToString('N') + '.py')
+Set-Content -LiteralPath $versionHook -Encoding UTF8 -Value @(
+  'import os',
+  "os.environ['VIDEO_TOOLKIT_VERSION'] = '$version'"
+)
+Write-Host "Embedding application version: $version"
 $mediaBin = if ($env:VIDEO_TOOLKIT_MEDIA_BIN) {
   $env:VIDEO_TOOLKIT_MEDIA_BIN
 } else {
@@ -21,6 +35,7 @@ python -m PyInstaller --noconfirm --windowed --onedir --contents-directory 'inte
   --collect-binaries 'onnxruntime' `
   --hidden-import 'faster_whisper' `
   --hidden-import 'onnxruntime' `
+  --runtime-hook $versionHook `
   --exclude-module 'torch' `
   --exclude-module 'torchvision' `
   --exclude-module 'torchaudio' `

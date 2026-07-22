@@ -34,13 +34,13 @@ def _startup_trace(message):
 _startup_trace("standard imports ready")
 import requests
 _startup_trace("requests ready")
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QInputDialog,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QToolTip,
     QScrollArea, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 _startup_trace("PySide6 ready")
@@ -54,10 +54,13 @@ from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, wri
 from modules.text_rules import normalize_required_capitalization
 from modules.metadata_page import MetadataPage
 from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name
+from modules.app_logging import app_log_path, read_app_log, write_app_log
 _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.6.1").strip().lstrip("v") or "1.6.1"
+APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
 LOCAL_PROVIDER = "本地 Whisper（无需密钥）"
@@ -471,7 +474,7 @@ class TranscribeWorker(QObject):
 
     def __init__(self, store: ConfigStore, provider: str, model: str, files: list[str],
                  output_dir: str, language: str, diarize: bool, ffmpeg_path: str,
-                 resume_existing: bool = True):
+                 resume_existing: bool = True, allow_provider_fallback: bool = True):
         super().__init__()
         self.store = store
         self.provider = provider
@@ -484,6 +487,7 @@ class TranscribeWorker(QObject):
         self._local_model = None
         self._local_device = None
         self.resume_existing = resume_existing
+        self.allow_provider_fallback = allow_provider_fallback
         task_payload = {
             "version": 2, "provider": provider, "model": model,
             "language": self.language, "diarize": bool(diarize),
@@ -509,6 +513,7 @@ class TranscribeWorker(QObject):
             state.setdefault("results", {})
             state["status"] = "running"
             atomic_write_json(self.checkpoint_path, state)
+            failures = []
             for index, source in enumerate(self.files):
                 if self.cancelled:
                     raise RuntimeError("任务已取消")
@@ -524,18 +529,26 @@ class TranscribeWorker(QObject):
                     continue
                 display = source if is_supported_video_url(source) else Path(source).name
                 self.log.emit(f"正在处理 {index + 1}/{len(self.files)}：{display}")
-                result = self._process_one(source)
-                state["results"][source_key] = {
-                    "source": source, "name": result["name"], "original": result["original"],
-                    "chinese": result["chinese"], "srt": result["srt"],
-                    "completed_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                atomic_write_json(self.checkpoint_path, state)
-                self._cleanup_source_work(source)
+                try:
+                    result = self._process_one(source)
+                    state["results"][source_key] = {
+                        "source": source, "name": result["name"], "original": result["original"],
+                        "chinese": result["chinese"], "srt": result["srt"],
+                        "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    atomic_write_json(self.checkpoint_path, state)
+                    self._cleanup_source_work(source)
+                except Exception as exc:
+                    message=f"{display}：{exc}"
+                    failures.append(message); self.log.emit(f"当前素材失败，已记录并继续下一项：{message}")
+                    write_app_log(message,"ERROR","字幕批处理")
                 self.progress.emit(round((index + 1) / len(self.files) * 100))
-            state["status"] = "completed"
+            state["status"] = "completed_with_errors" if failures else "completed"
             atomic_write_json(self.checkpoint_path, state)
-            self.finished.emit(True, "完成，字幕与中文对照已显示在当前窗口")
+            succeeded=len(self.files)-len(failures)
+            self.finished.emit(bool(succeeded),
+                               f"批量字幕完成：成功 {succeeded} 个，失败 {len(failures)} 个；失败项已写入软件日志。"
+                               if failures else "完成，字幕与中文对照已显示在当前窗口")
         except Exception as exc:
             try:
                 state["status"] = "failed"
@@ -676,7 +689,23 @@ class TranscribeWorker(QObject):
                 if self.provider != LOCAL_PROVIDER:
                     self.store.mark_use(self.provider, item["id"], "异常", last_error)
                     self.log.emit(f"密钥 {masked_key(item['key'])} 网络失败，保留分段进度并轮换下一枚。")
-        raise RuntimeError(f"{self.provider} 的可用密钥均调用失败。最后错误：{last_error}")
+        primary_error=f"{self.provider} 的可用密钥均调用失败。最后错误：{last_error}"
+        if self.allow_provider_fallback:
+            fallbacks=list(self.store.data.get("provider_priority") or [])+[LOCAL_PROVIDER]
+            for provider in fallbacks:
+                if provider==self.provider: continue
+                if provider!=LOCAL_PROVIDER and not self.store.has_candidates(provider): continue
+                self.log.emit(f"{primary_error}；自动切换到 {provider} 继续识别。")
+                write_app_log(f"{primary_error}；切换到 {provider}","WARNING","字幕识别")
+                child=TranscribeWorker(self.store,provider,self.store.data["models"].get(provider,DEFAULT_MODELS[provider]),[],
+                                       str(self.output_dir),self.language,self.diarize,self.ffmpeg_path,
+                                       self.resume_existing,False)
+                child.log.connect(self.log.emit); child.result_ready.connect(self.result_ready.emit)
+                try: return child._process_one(source_value)
+                except Exception as exc:
+                    self.log.emit(f"备用识别服务 {provider} 失败，继续切换：{exc}")
+                    write_app_log(f"{provider} 备用识别失败：{exc}","WARNING","字幕识别")
+        raise RuntimeError(primary_error)
 
     def _translate_chinese(self, text: str) -> str:
         text = text.strip()
@@ -1123,11 +1152,12 @@ class GoogleCloudSync:
         found = drive.files().list(q=query, spaces="drive", fields="files(id,name,webViewLink)", pageSize=10,
                                    supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
         if found:
-            request = drive.files().update(fileId=found[0]["id"], media_body=media,
-                                           fields="id,name,webViewLink", supportsAllDrives=True)
-        else:
-            request = drive.files().create(body={"name": path.name, "parents": [parent_id]}, media_body=media,
-                                           fields="id,name,webViewLink", supportsAllDrives=True)
+            # 断点续传：同一个任务文件夹中已经存在该成品时直接复用云端文件，
+            # 不重新传输，也不会生成重名副本。表格仍使用真实 Drive 链接去重。
+            existing = dict(found[0]); existing["_reused"] = True
+            return existing
+        request = drive.files().create(body={"name": path.name, "parents": [parent_id]}, media_body=media,
+                                       fields="id,name,webViewLink", supportsAllDrives=True)
         response = None
         while response is None:
             if self.cancelled(): raise RuntimeError("云端上传已停止；已上传的文件会保留，可稍后继续上传。")
@@ -1172,6 +1202,36 @@ class GoogleCloudSync:
             match = re.search(r'HYPERLINK\(\s*"([^"]+)"\s*[,;]\s*"[^"]*"', value, re.I)
             link = match.group(1) if match else (value if value.lower().startswith(("http://","https://")) else "")
             if link: existing[link.strip().casefold()] = insert_row + offset
+
+        # Google Sheets 的 B 列（或用户配置的文件链接列）也可能是富文本超链接，
+        # Values API 只返回显示文字。额外读取 CellData，提取 hyperlink / textFormatRuns
+        # 中的真实 Drive URL，确保不会因为同名文件或显示文字而误判。
+        try:
+            rich_response = sheets.spreadsheets().get(
+                spreadsheetId=spreadsheet_id,
+                ranges=[f"{quoted_sheet}!{file_col}{insert_row}:{file_col}"],
+                includeGridData=True,
+                fields="sheets(data(rowData(values)))",
+            ).execute()
+            for sheet in rich_response.get("sheets", []):
+                for data in sheet.get("data", []):
+                    for row in data.get("rowData", []):
+                        for cell in row.get("values", []):
+                            candidates = [str(cell.get("hyperlink", ""))]
+                            effective = cell.get("effectiveValue", {})
+                            candidates.append(str(effective.get("formulaValue", "")))
+                            candidates.append(str(cell.get("formattedValue", "")))
+                            candidates.extend(
+                                str(run.get("format", {}).get("link", {}).get("uri", ""))
+                                for run in cell.get("textFormatRuns", [])
+                            )
+                            for value in candidates:
+                                match = re.search(r'HYPERLINK\(\s*"([^"]+)"', value, re.I)
+                                link = match.group(1) if match else value.strip()
+                                if link.lower().startswith(("http://", "https://")):
+                                    existing[link.casefold()] = True
+        except Exception as exc:
+            self.log(f"读取 {file_col} 列富文本链接失败，已继续使用公式链接检查：{exc}")
 
         new_rows, update_data = [], []
         for item in uploaded:
@@ -1236,19 +1296,25 @@ class GoogleCloudSync:
                                        supportsAllDrives=True).execute()
         folder_url = f"https://drive.google.com/drive/folders/{task_folder}"
         record_map = {Path(item["path"]).name: item for item in records}
-        uploaded = []
+        uploaded = []; reused_count = 0; uploaded_count = 0
         final_files = sorted((Path(path) for path in selected_files), key=lambda path: rename_natural_key(path.name)) if selected_files else sorted((path for path in final_dir.iterdir() if path.is_file()),
                              key=lambda path: rename_natural_key(path.name))
         self.log(f"只上传重命名成品：共 {len(final_files)} 个文件")
         for number, path in enumerate(final_files, 1):
             if self.cancelled(): raise RuntimeError("云端上传已停止；可以稍后点击继续上传。")
             response = self._upload_file(drive, path, task_folder)
+            if response.get("_reused"):
+                reused_count += 1
+                self.log(f"云端已存在，断点跳过上传 {number}/{len(final_files)}：{path.name}")
+            else:
+                uploaded_count += 1
             source_record = record_map.get(path.name, {})
             uploaded.append({"path": path, "url": response.get("webViewLink") or
                              f"https://drive.google.com/file/d/{response['id']}/view",
                              "chinese": source_record.get("chinese", ""),
                              "original": source_record.get("original", "")})
-            self.log(f"云端上传完成 {number}/{len(final_files)}：{path.name}")
+            if not response.get("_reused"):
+                self.log(f"云端上传完成 {number}/{len(final_files)}：{path.name}")
         sheet_note = "未开启表格写入"
         if self.config.get("write_sheet"):
             try:
@@ -1256,7 +1322,7 @@ class GoogleCloudSync:
                 sheet_note = f"表格新增 {added} 行，跳过已存在链接 {updated} 行"
             except Exception as exc:
                 raise SheetWritePendingError(folder_url, uploaded, exc) from exc
-        return folder_url, f"上传 {len(uploaded)} 个重命名成品；{sheet_note}"
+        return folder_url, f"新上传 {uploaded_count} 个，复用云端已有 {reused_count} 个；{sheet_note}"
 
     def write_sheet_only(self, uploaded, folder_url):
         _drive, sheets, email = self._services()
@@ -1930,6 +1996,32 @@ class GoogleSettingsPanel(QWidget):
     def auth_ended(self): self.auth_worker=None; self.auth_thread=None
 
 
+class FullTextToolTipFilter(QObject):
+    """Show unabridged text for compact combo boxes and item views across the app."""
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.ToolTip:
+            if isinstance(watched, QComboBox):
+                text = watched.currentText().strip()
+                if text:
+                    QToolTip.showText(event.globalPos(), text, watched)
+                    return True
+            view = watched if isinstance(watched, QAbstractItemView) else None
+            parent = watched.parentWidget() if hasattr(watched, "parentWidget") else None
+            while view is None and parent is not None:
+                if isinstance(parent, QAbstractItemView): view = parent; break
+                parent = parent.parentWidget()
+            if view is not None:
+                point = view.viewport().mapFromGlobal(event.globalPos())
+                index = view.indexAt(point)
+                if index.isValid():
+                    text = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+                    if text:
+                        QToolTip.showText(event.globalPos(), text, view)
+                        return True
+        return super().eventFilter(watched, event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1951,8 +2043,9 @@ class MainWindow(QMainWindow):
         self.cloud_thread = None
         self.cloud_worker = None
         self.pending_upload_files = []
+        self.pending_upload_records = []
         self.pending_sheet_uploads = []; self.pending_sheet_folder_url = ""
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1380, 820)
         self.setMinimumSize(1080, 680)
         icon = resource_path("logo.ico")
@@ -1960,6 +2053,8 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon)))
         _startup_trace("building UI")
         self._build_ui()
+        self.full_text_tooltips = FullTextToolTipFilter(self)
+        QApplication.instance().installEventFilter(self.full_text_tooltips)
         _startup_trace("UI built")
         self._refresh_keys()
         _startup_trace("keys refreshed")
@@ -1977,14 +2072,14 @@ class MainWindow(QMainWindow):
         nav_layout = QHBoxLayout(nav)
         nav_layout.setContentsMargins(18, 10, 18, 10)
         nav_layout.setSpacing(5)
-        brand = QLabel("▶  视频工具合集")
+        brand = QLabel(f"▶  {APP_DISPLAY_NAME}")
         brand.setObjectName("brand")
         nav_layout.addWidget(brand)
         nav_layout.addSpacing(16)
         self.nav_buttons = []
-        nav_items = (("首页", 0), ("批量截图", 1), ("智能剪辑", 2), ("动态文案/水印", 3),
+        nav_items = (("首页", 0), ("批量截图", 1), ("智能剪辑", 2), ("Reels 编辑器", 3),
                      ("批量重命名", 4), ("清除元数据", 10), ("字幕提取", 5), ("自动流水线", 8),
-                     ("密钥管理", 6), ("设置与组件", 7), ("帮助", 9))
+                     ("设置与组件", 7), ("帮助", 9))
         for text, page_index in nav_items:
             btn = QPushButton(text)
             btn.setCheckable(True)
@@ -2008,9 +2103,10 @@ class MainWindow(QMainWindow):
         _startup_trace("smartcut page ready")
         self.dynamic_caption_page = DynamicCaptionPage(
             self._caption_transcribe, self._text_to_speech, self._find_ffmpeg,
-            TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER)
+            TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER,
+            self._reels_sync_profiles, self._start_reels_cloud_sync, self._open_google_settings)
         _startup_trace("watermark page ready")
-        self.rename_page = RenamePage()
+        self.rename_page = RenamePage(self._rename_title_transcribe)
         _startup_trace("rename page ready")
         self.pages.addWidget(self.screenshot_page)
         self.pages.addWidget(self.smartcut_page)
@@ -2018,17 +2114,23 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.rename_page)
         self.pages.addWidget(self._subtitle_page())
         _startup_trace("subtitle page ready")
-        self.pages.addWidget(self._keys_page())
+        # 保留原页面索引 6 作为兼容入口；_show_page(6) 会转到设置中的“API 密钥管理”标签。
+        self.pages.addWidget(QWidget())
         _startup_trace("keys page ready")
         self.settings_page = QTabWidget()
+        self.key_settings_page = self._keys_page()
         self.component_settings_page = SettingsPage()
+        self.font_settings_page = self._font_settings_page()
         self.google_settings_page = GoogleSettingsPanel(self.store)
         self.settings_page.addTab(self.component_settings_page, "组件检测与安装")
+        self.settings_page.addTab(self.font_settings_page, "字体管理")
         self.settings_page.addTab(self.google_settings_page, "Google 授权与同步方案")
+        self.settings_page.addTab(self.key_settings_page, "API 密钥管理")
         _startup_trace("settings page ready")
         self.pages.addWidget(self.settings_page)
         self.pages.addWidget(self._pipeline_page())
         self.google_settings_page.profiles_changed.connect(self._refresh_pipeline_profiles)
+        self.google_settings_page.profiles_changed.connect(self.dynamic_caption_page.refresh_sync_profiles)
         _startup_trace("pipeline page ready")
         self.pages.addWidget(self._help_page())
         _startup_trace("help page ready")
@@ -2037,6 +2139,31 @@ class MainWindow(QMainWindow):
         _startup_trace("metadata page ready")
         outer.addWidget(self.pages, 1)
         self._show_page(0)
+
+    def _font_settings_page(self):
+        page, layout = self._page_shell(
+            "字幕字体管理",
+            "字体只需安装一次；安装后会自动出现在 Reels 编辑器的字体下拉框中，并用于预览和最终烧录。",
+        )
+        group=QGroupBox("本地与开源字体")
+        group_layout=QVBoxLayout(group); group_layout.setContentsMargins(14,14,14,14); group_layout.setSpacing(10)
+        folder=QLineEdit(str(app_data_dir()/"fonts")); folder.setReadOnly(True)
+        folder_row=QHBoxLayout(); folder_row.addWidget(QLabel("字体保存目录")); folder_row.addWidget(folder,1)
+        group_layout.addLayout(folder_row)
+        buttons=QHBoxLayout()
+        import_button=QPushButton("导入本地字体…"); import_button.setObjectName("primary")
+        import_button.setToolTip("支持 TTF、OTF、TTC；复制到软件字体目录并长期记忆")
+        import_button.clicked.connect(self.dynamic_caption_page._import_local_fonts)
+        open_button=QPushButton("下载开源字体…")
+        open_button.setToolTip("从 Google Fonts 官方仓库下载，安装一次后可离线使用")
+        open_button.clicked.connect(self.dynamic_caption_page._open_source_font_library)
+        buttons.addWidget(import_button); buttons.addWidget(open_button); buttons.addStretch()
+        group_layout.addLayout(buttons)
+        note=QLabel("导入或下载完成后，无需重启软件；回到 Reels 编辑器即可在“字体”下拉框中选择。")
+        note.setWordWrap(True); note.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:8px;border-radius:5px;")
+        group_layout.addWidget(note)
+        layout.addWidget(group); layout.addStretch()
+        return page
 
     def _page_shell(self, title, subtitle):
         page = QWidget()
@@ -2061,8 +2188,8 @@ class MainWindow(QMainWindow):
             ("✂", "智能剪辑",
              "• 根据画面变化自动检测视频场景\n• 支持自定义片段时长和批量切分\n• 多视频、文件夹拖拽和任务队列\n• 输出成品并保留视频原有立体声音频",
              "#a78bfa", "page:2"),
-            ("◉", "视频 / 图片水印",
-             "• 批量添加文字水印与图片水印\n• 支持多层水印、模板保存和快速复用\n• 可调整位置、透明度、边距与预览比例\n• 视频和图片素材均可批量处理",
+            ("▶", "Reels 编辑器",
+             "• 分组合成、批量配音与字幕智能识别\n• 字幕样式、字幕校对、视频预览和公司水印\n• 每个视频对应自己的音频与文案并批量生成\n• 可选生成后上传云端并按方案填写 Google Sheets",
              "#34d399", "page:3"),
             ("A↔", "视频 / 文件重命名",
              "• 文件自然排序及 Windows 安全名称处理\n• 标题、日期、前后缀和连续编号组合\n• 执行前完整预览新旧文件名\n• 多套前缀与后缀方案保存和快速切换",
@@ -2088,6 +2215,19 @@ class MainWindow(QMainWindow):
 
     def _help_page(self):
         page, layout = self._page_shell("帮助与使用说明", "从添加素材到导出成品的常用操作说明；遇到组件问题也可以在这里快速定位。")
+        actions = QHBoxLayout()
+        logs = QPushButton("查看软件日志")
+        logs.clicked.connect(self._show_app_log)
+        keys = QPushButton("打开密钥管理")
+        keys.clicked.connect(lambda: self._show_page(6))
+        components = QPushButton("检查设置与组件")
+        components.setObjectName("primary")
+        components.clicked.connect(lambda: self._show_page(7))
+        actions.addWidget(logs)
+        actions.addWidget(keys)
+        actions.addWidget(components)
+        actions.addStretch()
+        layout.addLayout(actions)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
@@ -2099,7 +2239,7 @@ class MainWindow(QMainWindow):
             ("快速开始", "1. 在顶部选择需要的工具。\n2. 拖入视频、音频、文件夹，或点击按钮选择素材。\n3. 检查输出目录和处理参数。\n4. 先预览，再开始批量执行。\n5. 完成后从日志或结果区查看输出位置。"),
             ("素材添加与拖拽", "需要选择素材的页面均支持拖入文件或文件夹。选择父目录后，可以从子文件夹列表继续添加指定目录。批量截图和字幕提取还支持 YouTube、Facebook、Instagram、TikTok 链接，每行填写一个。"),
             ("字幕提取", "可以使用“本地 Whisper（无需密钥）”，也可以配置 Groq、Gemini、ElevenLabs、Gladia。批量结果可查看当前项目或全部项目，并支持复制全部原文、复制全部中外文对照及批量导出字幕。"),
-            ("视频 / 图片水印", "保留原有静态水印功能，并开放动态 Reels 流水线：视频、音频、独立文案、字幕样式、蒙版和批量导出。"),
+            ("Reels 编辑器", "合成、配音、字幕样式/字幕校对、视频预览、公司水印和批量生成集中在同一页面；可选择复用自动流水线的 Google 上传与填表方案。"),
             ("素材元数据清理", "可从顶部“清除元数据”直接进入，也可在“视频 / 图片水印”中打开对应子页。程序会显示清理前后的元数据信息；视频和音频使用无损流复制且保留原声道，图片重新保存干净副本以移除 EXIF/XMP，原文件不会修改。"),
             ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕生成标题 → 批量重命名成品 → 批量上传 → 批量填表”执行。只上传重命名成品；支持断点续接、保存同步方案、继续上传和继续填表，并按云端文件链接唯一值跳过已经填写的记录。"),
             ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
@@ -2124,17 +2264,25 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(1, 1)
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
-        actions = QHBoxLayout()
-        keys = QPushButton("打开密钥管理")
-        keys.clicked.connect(lambda: self._show_page(6))
-        components = QPushButton("检查设置与组件")
-        components.setObjectName("primary")
-        components.clicked.connect(lambda: self._show_page(7))
-        actions.addStretch()
-        actions.addWidget(keys)
-        actions.addWidget(components)
-        layout.addLayout(actions)
         return page
+
+    def _show_app_log(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("视频工具合集 · 软件运行日志")
+        dialog.resize(920, 600)
+        box = QVBoxLayout(dialog)
+        hint = QLabel("记录批处理进度、API 配额/密钥异常、自动切换和无法继续的错误，方便后续排查。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;")
+        box.addWidget(hint)
+        viewer = QPlainTextEdit(); viewer.setReadOnly(True); viewer.setPlainText(read_app_log())
+        viewer.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;")
+        box.addWidget(viewer, 1)
+        path = QLabel(f"日志位置：{app_log_path()}")
+        path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        path.setStyleSheet("color:#94a3b8;"); box.addWidget(path)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject); box.addWidget(buttons)
+        dialog.exec()
 
     def _subtitle_page(self):
         page, layout = self._page_shell("智能提取视频字幕", "结果直接显示在当前窗口；支持原文与简体中文对照、一键复制。")
@@ -2374,6 +2522,19 @@ class MainWindow(QMainWindow):
 
     def _restore_pending_sheet_checkpoint(self):
         try:
+            resume=dict(self.store.data.get("cloud_resume",{}))
+            if resume.get("status")=="sheet_pending" and resume.get("uploads") and resume.get("folder_url"):
+                self.pending_sheet_uploads=list(resume["uploads"]); self.pending_sheet_folder_url=resume["folder_url"]
+                self.pipeline_continue_sheet.setEnabled(True)
+                self.pipeline_cloud_result.setStyleSheet("color:#fbbf24;padding:4px;")
+                self.pipeline_cloud_result.setText("检测到上次视频已上传但表格未完成，可直接点击“继续填表”。")
+                return
+            if resume.get("status")=="upload_pending" and resume.get("files"):
+                self.pending_upload_files=list(resume["files"]); self.pending_upload_records=list(resume.get("records",[]))
+                self.pipeline_retry_upload.setEnabled(True)
+                self.pipeline_cloud_result.setStyleSheet("color:#fbbf24;padding:4px;")
+                self.pipeline_cloud_result.setText("检测到上次上传未完成；点击“继续上传”将匹配云端已有文件并从缺少项继续。")
+                return
             root=Path(self.pipeline_output.text())
             checkpoints=sorted(root.rglob("pipeline_checkpoint.json"),key=lambda path:path.stat().st_mtime,reverse=True) if root.is_dir() else []
             for checkpoint in checkpoints:
@@ -2438,9 +2599,19 @@ class MainWindow(QMainWindow):
         return page
 
     def _show_page(self, index):
+        requested_index = index
+        nav_index = index
+        if index == 6 and hasattr(self, "settings_page"):
+            # 旧的“密钥管理”入口统一落到设置页中的独立标签，避免重复顶栏入口。
+            index = 7
+            nav_index = 7
+            self.settings_page.setCurrentWidget(self.key_settings_page)
         self.pages.setCurrentIndex(index)
+        page_names={0:"首页",1:"批量截图",2:"智能剪辑",3:"Reels 编辑器",4:"批量重命名",5:"字幕提取",
+                    6:"密钥管理",7:"设置与组件",8:"自动流水线",9:"帮助",10:"清除元数据"}
+        write_app_log(f"切换页面：{page_names.get(requested_index,requested_index)}","INFO","界面")
         for btn in self.nav_buttons:
-            btn.setChecked(int(btn.property("pageIndex")) == index)
+            btn.setChecked(int(btn.property("pageIndex")) == nav_index)
 
     def _launch_tool(self, relative):
         if relative.startswith("page:"):
@@ -2614,6 +2785,16 @@ class MainWindow(QMainWindow):
                 updated=dict(item); updated["selected"]=self.pipeline_runtime_values.get(item.get("field",""),item.get("selected","")); fields.append(updated)
             base["variable_fields"]=fields
         return base
+
+    def _reels_sync_profiles(self):
+        config = self.store.data.get("google_sync", {})
+        return list(config.get("sync_profiles", {}).keys()), config.get("active_sync_profile", "")
+
+    def _start_reels_cloud_sync(self, files, records, profile_name=""):
+        if profile_name and hasattr(self, "pipeline_sync_profile"):
+            index = self.pipeline_sync_profile.findData(profile_name)
+            if index >= 0: self.pipeline_sync_profile.setCurrentIndex(index)
+        self._start_cloud_upload(files, records=records)
 
     def _pipeline_profile_changed(self, _text):
         if not hasattr(self, "pipeline_profile_hint"): return
@@ -2963,13 +3144,18 @@ class MainWindow(QMainWindow):
 
     def _pipeline_cloud_ready(self, folder_url, summary):
         self.pending_upload_files = []; self.pipeline_retry_upload.setEnabled(False)
+        self.pending_upload_records=[]
         self.pending_sheet_uploads=[]; self.pending_sheet_folder_url=""; self.pipeline_continue_sheet.setEnabled(False)
+        self.store.data.pop("cloud_resume",None); self.store.save()
         self.pipeline_cloud_result.setText(
             f'云端同步完成：{summary}<br><a href="{folder_url}">打开 Google Drive 文件夹</a>')
 
     def _pipeline_sheet_pending(self, folder_url, uploaded, error):
         self.pending_upload_files=[]; self.pipeline_retry_upload.setEnabled(False)
+        self.pending_upload_records=[]
         self.pending_sheet_uploads=list(uploaded); self.pending_sheet_folder_url=folder_url
+        self.store.data["cloud_resume"]={"status":"sheet_pending","folder_url":folder_url,"uploads":list(uploaded)}
+        self.store.save()
         self.pipeline_continue_sheet.setEnabled(bool(self.pending_sheet_uploads))
         self.pipeline_cloud_result.setStyleSheet("color:#fbbf24;padding:4px;")
         self.pipeline_cloud_result.setText(
@@ -2982,6 +3168,9 @@ class MainWindow(QMainWindow):
                                       key=lambda path: natural_path_key(path.name))
                                      if path.is_file() and path.suffix.lower() in video_extensions]
         self.pipeline_retry_upload.setEnabled(bool(self.pending_upload_files))
+        self.store.data["cloud_resume"]={"status":"upload_pending","files":list(self.pending_upload_files),
+                                         "records":list(self.pending_upload_records)}
+        self.store.save()
         self.pipeline_cloud_result.setText(f"云端同步失败，但本地视频已处理完成：{error}<br>可点击“继续上传”。")
         self.pipeline_cloud_result.setStyleSheet("color:#fca5a5;padding:4px;")
 
@@ -3007,7 +3196,7 @@ class MainWindow(QMainWindow):
         else: self._start_cloud_upload(files)
 
     def _retry_cloud_upload(self):
-        if self.pending_upload_files: self._start_cloud_upload(self.pending_upload_files)
+        if self.pending_upload_files: self._start_cloud_upload(self.pending_upload_files,self.pending_upload_records or None)
 
     def _continue_sheet_write(self):
         if not self.pending_sheet_uploads or not self.pending_sheet_folder_url: return
@@ -3033,6 +3222,7 @@ class MainWindow(QMainWindow):
         if ok:
             self._mark_pending_sheet_complete(folder_url)
             self.pending_sheet_uploads=[]; self.pending_sheet_folder_url=""; self.pipeline_continue_sheet.setEnabled(False)
+            self.store.data.pop("cloud_resume",None); self.store.save()
             self.pipeline_cloud_result.setStyleSheet("color:#86efac;padding:4px;")
             self.pipeline_cloud_result.setText(f'{message}<br><a href="{folder_url}">打开 Google Drive 文件夹</a>')
         else:
@@ -3050,7 +3240,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _start_cloud_upload(self, files):
+    def _start_cloud_upload(self, files, records=None):
         if self.cloud_thread:
             try:
                 if self.cloud_thread.isRunning():
@@ -3061,13 +3251,24 @@ class MainWindow(QMainWindow):
         if not Path(config.get("json_path", "")).is_file() or not extract_google_id(config.get("parent_folder", "")):
             QMessageBox.warning(self, "Google 配置不完整", "请先配置授权 JSON 和 Drive 父文件夹。")
             self._open_google_settings(); return
-        results = list(self.subtitle_results.values())
-        records = []
-        for index, path in enumerate(files):
-            result = results[index] if index < len(results) else {}
-            records.append({"path": path, "original": result.get("original", ""),
-                            "chinese": result.get("chinese", "")})
+        if records is None:
+            results = list(self.subtitle_results.values())
+            records = []
+            for index, path in enumerate(files):
+                result = results[index] if index < len(results) else {}
+                records.append({"path": path, "original": result.get("original", ""),
+                                "chinese": result.get("chinese", "")})
+        else:
+            by_path = {str(item.get("path", "")): item for item in records}
+            records = [{"path": path,
+                        "original": by_path.get(str(path), {}).get("original", ""),
+                        "chinese": by_path.get(str(path), {}).get("chinese", "")}
+                       for path in files]
         self.pending_upload_files = list(files)
+        self.pending_upload_records = list(records)
+        self.store.data["cloud_resume"]={"status":"upload_pending","files":[str(path) for path in files],
+                                         "records":[{**dict(item),"path":str(item.get("path",""))} for item in records]}
+        self.store.save()
         self.cloud_thread = QThread(self); self.cloud_worker = CloudUploadWorker(config, files, records, files)
         self.cloud_worker.moveToThread(self.cloud_thread); self.cloud_thread.started.connect(self.cloud_worker.run)
         self.cloud_worker.log.connect(self.pipeline_log.appendPlainText)
@@ -3159,22 +3360,49 @@ class MainWindow(QMainWindow):
 
     def _caption_transcribe(self, media_path, selected_provider):
         """在动态文案工作线程中复用同一套识别、翻译和密钥轮询逻辑。"""
-        provider = self._resolve_provider() if selected_provider == AUTO_PROVIDER else selected_provider
-        if provider != LOCAL_PROVIDER and not self.store.has_candidates(provider):
-            raise RuntimeError(f"{provider} 没有可用密钥，请先到“密钥管理”添加并检测。")
-        model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
-        worker = TranscribeWorker(self.store, provider, model, [media_path], "", "auto", False,
-                                  self._find_ffmpeg(), True)
-        result = worker._process_one(media_path)
-        raw = result.get("raw") or {}; words = raw.get("words") or (raw.get("response") or {}).get("words") or []
-        timed_words = []
-        for word in words:
-            text = str(word.get("text") or word.get("word") or "").strip()
-            if text and word.get("start") is not None:
-                timed_words.append({"start": float(word.get("start", 0)),
-                                    "end": float(word.get("end", word.get("start", 0) + .25)), "text": text})
-        precise_srt = segments_to_srt(timed_words) if timed_words else result["srt"]
-        return result["original"], result["chinese"], precise_srt
+        priority = list(self.store.data.get("provider_priority") or PROVIDERS + [LOCAL_PROVIDER])
+        candidates = ([selected_provider] if selected_provider != AUTO_PROVIDER else []) + priority + [LOCAL_PROVIDER]
+        ordered = []
+        for provider in candidates:
+            if provider in TRANSCRIPTION_PROVIDERS and provider != AUTO_PROVIDER and provider not in ordered:
+                ordered.append(provider)
+        errors = []
+        for provider in ordered:
+            if provider != LOCAL_PROVIDER and not self.store.has_candidates(provider):
+                message = f"{provider} 没有可用密钥，自动尝试下一种识别服务"
+                errors.append(message); write_app_log(message, "WARNING", "字幕识别")
+                continue
+            model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
+            try:
+                worker = TranscribeWorker(self.store, provider, model, [media_path], "", "auto", False,
+                                          self._find_ffmpeg(), True)
+                result = worker._process_one(media_path)
+                raw = result.get("raw") or {}
+                words = raw.get("words") or (raw.get("response") or {}).get("words") or []
+                timed_words = []
+                for word in words:
+                    text = str(word.get("text") or word.get("word") or "").strip()
+                    if text and word.get("start") is not None:
+                        timed_words.append({"start": float(word.get("start", 0)),
+                                            "end": float(word.get("end", word.get("start", 0) + .25)), "text": text})
+                precise_srt = segments_to_srt(timed_words) if timed_words else result["srt"]
+                if errors:
+                    write_app_log(f"已自动切换到 {provider} 并继续：{Path(media_path).name}", "INFO", "字幕识别")
+                return result["original"], result["chinese"], precise_srt
+            except Exception as exc:
+                message = f"{provider} 调用失败（可能是配额、密钥或网络问题）：{exc}；自动切换下一方案"
+                errors.append(message); write_app_log(message, "WARNING", "字幕识别")
+        final = "所有字幕识别方案均不可用：" + "｜".join(errors[-5:])
+        write_app_log(final, "ERROR", "字幕识别")
+        raise RuntimeError(final)
+
+    def _rename_title_transcribe(self, media_path):
+        """Reuse subtitle-page results first; transcribe only videos that have no cached content."""
+        path = Path(media_path)
+        cached = self.subtitle_results.get(path.name) or self.subtitle_results.get(path.stem)
+        if cached and (cached.get("chinese") or cached.get("original")):
+            return cached.get("original", ""), cached.get("chinese", ""), cached.get("srt", "")
+        return self._caption_transcribe(str(path), AUTO_PROVIDER)
 
     def _text_to_speech(self, text, service, voice, destination):
         """生成配音；ElevenLabs 失败时自动轮换下一枚可用密钥。"""
@@ -3694,6 +3922,12 @@ QSplitter::handle:hover { background:#3b82f6; }
 
 def main():
     _startup_trace("main entered")
+    write_app_log(f"启动 {APP_DISPLAY_NAME}","INFO","应用")
+    original_hook=sys.excepthook
+    def log_unhandled(exc_type,exc_value,exc_traceback):
+        write_app_log(f"未处理异常：{exc_type.__name__}: {exc_value}","ERROR","应用")
+        original_hook(exc_type,exc_value,exc_traceback)
+    sys.excepthook=log_unhandled
     if os.name == "nt":
         try:
             import ctypes
@@ -3703,6 +3937,7 @@ def main():
     app = QApplication(sys.argv)
     _startup_trace("QApplication ready")
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setStyleSheet(STYLE)
     icon = resource_path("logo.ico")
     if icon.exists(): app.setWindowIcon(QIcon(str(icon)))

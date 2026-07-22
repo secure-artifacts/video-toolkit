@@ -15,7 +15,7 @@ from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder
 
 
 def discover_groups(parent):
-    """Return one video group per direct child folder, in natural-name order."""
+    """Discover groups by child folder, or by a shared filename prefix plus numeric suffix."""
     root = Path(parent)
     if not root.is_dir():
         return []
@@ -24,10 +24,21 @@ def discover_groups(parent):
         clips = collect_files([str(folder)], VIDEO_EXTENSIONS)
         if clips:
             groups.append((folder, [Path(p) for p in clips]))
-    if not groups:
-        clips = collect_files([str(root)], VIDEO_EXTENSIONS)
-        if clips:
-            groups.append((root, [Path(p) for p in clips]))
+    direct_clips=sorted(
+        (path for path in root.iterdir() if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS),
+        key=lambda path:natural_key(path.name),
+    )
+    if direct_clips:
+        buckets={}
+        for clip in direct_clips:
+            key=re.sub(r"(?:[\s_.-]*(?:part|segment|clip|片段)?[\s_.-]*\d+|[\s_.-]*\(\d+\))$","",clip.stem,flags=re.I).strip(" ._-")
+            buckets.setdefault(key or clip.stem,[]).append(clip)
+        useful=[(name,clips) for name,clips in buckets.items() if clips]
+        if len(useful)>1 and any(len(clips)>1 for _name,clips in useful):
+            for name,clips in sorted(useful,key=lambda item:natural_key(item[0])):
+                groups.append((root/name,sorted(clips,key=lambda path:natural_key(path.name))))
+        else:
+            groups.append((root,direct_clips))
     return groups
 
 

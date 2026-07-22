@@ -6,9 +6,15 @@ root = tempfile.mkdtemp(prefix="video_toolkit_test_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["APPDATA"] = root
 os.environ["LOCALAPPDATA"] = root
+os.environ["VIDEO_TOOLKIT_DISABLE_STYLE_MEMORY"] = "1"
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 import app as toolkit
+from modules.rename_page import SmartTitleWorker
+
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, root)
 
 class FakeResponse:
     status_code = 200
@@ -32,9 +38,38 @@ window.resize(1600, 920)
 assert window.pages.count() == 11
 assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 7
 assert window.nav_buttons[-1].text() == "帮助"
+assert not any(button.text() == "密钥管理" for button in window.nav_buttons)
 assert window.pages.widget(3) is window.dynamic_caption_page
+assert any(button.text() == "Reels 编辑器" for button in window.nav_buttons)
 assert not hasattr(window, "watermark_tabs")
 assert window.dynamic_caption_page.source_stack.count() == 4
+assert window.dynamic_caption_page.font.currentText() == "Arial"
+assert window.dynamic_caption_page.font_size.value() == 90
+assert window.dynamic_caption_page.letter_spacing.value() == -4
+assert window.dynamic_caption_page.line_spacing.value() == 100
+assert window.dynamic_caption_page.margin_v.value() == 500
+assert window.dynamic_caption_page.cloud_sync_check.isChecked() is False
+assert not window.dynamic_caption_page.log.isHidden()
+assert not hasattr(window.dynamic_caption_page, "view_log_btn")
+assert any(button.text() == "查看软件日志" for button in window.pages.widget(9).findChildren(toolkit.QPushButton))
+assert window.settings_page.count() == 4
+assert window.settings_page.tabText(1) == "字体管理"
+assert window.settings_page.tabText(3) == "API 密钥管理"
+window._show_page(6)
+assert window.pages.currentIndex() == 7
+assert window.settings_page.currentWidget() is window.key_settings_page
+assert window.dynamic_caption_page.videos.isHidden()
+assert window.dynamic_caption_page.task_queue.parent() is not None
+assert window.dynamic_caption_page.watermark_opacity.value() == 100
+assert window.dynamic_caption_page.watermark_table.columnCount() == 4
+reels_buttons=[button.text() for button in window.dynamic_caption_page.findChildren(toolkit.QPushButton)]
+assert "本地字体…" not in reels_buttons and "开源字体…" not in reels_buttons
+settings_buttons=[button.text() for button in window.font_settings_page.findChildren(toolkit.QPushButton)]
+assert "导入本地字体…" in settings_buttons and "下载开源字体…" in settings_buttons
+assert window.dynamic_caption_page.tts_text.columnCount() == 2
+assert window.dynamic_caption_page.tts_text.editTriggers() == toolkit.QAbstractItemView.EditTrigger.NoEditTriggers
+assert hasattr(window.dynamic_caption_page, "source_proofread")
+assert window.dynamic_caption_page.findChild(toolkit.QFrame, "reelsRunPanel") is not None
 pipeline_step_labels = [label.text() for label in window.pages.widget(8).findChildren(toolkit.QLabel)]
 assert any("⑤ 批量上传" in text and "⑥ 批量填表" in text for text in pipeline_step_labels)
 assert not any(button.text() == "开始智能提取字幕" for button in window.pages.widget(0).findChildren(toolkit.QPushButton))
@@ -66,6 +101,22 @@ assert "2.mp4" in window.screenshot_page.url_input.toPlainText()
 assert "10.mp3" not in window.screenshot_page.url_input.toPlainText()
 window.rename_page.set_input_folder(str(media_root))
 assert window.rename_page.input.text() == str(media_root)
+assert window.rename_page.smart_titles_btn.isEnabled()
+window.subtitle_results["2.mp4"] = {"original":"cached original", "chinese":"缓存标题", "srt":"cached srt"}
+assert window._rename_title_transcribe(str(media_root / "2.mp4"))[1] == "缓存标题"
+foreign_only=[]
+worker=SmartTitleWorker([media_root/"2.mp4"],lambda _path:("foreign title","", "srt"))
+worker.finished.connect(lambda ok,message,titles:foreign_only.extend(titles)); worker.run()
+assert foreign_only == ["2"]
+chinese_only=[]
+worker=SmartTitleWorker([media_root/"2.mp4"],lambda _path:("foreign title","中文标题", "srt"))
+worker.finished.connect(lambda ok,message,titles:chinese_only.extend(titles)); worker.run()
+assert chinese_only == ["中文标题"]
+original_caption_transcribe = window._caption_transcribe
+window._caption_transcribe = lambda path, provider: ("fresh original", "新识别标题", "fresh srt")
+assert window._rename_title_transcribe(str(media_root / "missing.mp4"))[1] == "新识别标题"
+window._caption_transcribe = original_caption_transcribe
+window.subtitle_results.pop("2.mp4", None)
 
 pipeline_output = Path(root) / "pipeline_test"
 pipeline = toolkit.PipelineWorker(
@@ -146,7 +197,7 @@ cloud._upload_file = lambda drive, path, parent: uploaded_names.append(path.name
 folder_url, cloud_summary = cloud.run(cloud_final, [], [str(media_root / "2.mp4")])
 assert uploaded_names == ["001-final.mp4", "002-final.mp4"]
 assert folder_calls[0][0].count("-") == 2 and folder_calls[1][0] == "2"
-assert "上传 2 个重命名成品" in cloud_summary and "/folders/" in folder_url
+assert "新上传 2 个" in cloud_summary and "复用云端已有 0 个" in cloud_summary and "/folders/" in folder_url
 
 class FakeCall:
     def __init__(self, payload=None): self.payload = payload or {}
