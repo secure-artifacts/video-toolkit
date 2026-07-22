@@ -62,6 +62,44 @@ assert window.dynamic_caption_page.videos.isHidden()
 assert window.dynamic_caption_page.task_queue.parent() is not None
 assert window.dynamic_caption_page.watermark_opacity.value() == 100
 assert window.dynamic_caption_page.watermark_table.columnCount() == 4
+assert window.dynamic_caption_page.group_burn_watermark.isChecked() is False
+assert Path(window.dynamic_caption_page.output.text()).is_absolute()
+assert Path(window.dynamic_caption_page.output.text()).parent != Path(Path(window.dynamic_caption_page.output.text()).anchor)
+assert any(button.text() == "清空" for button in window.dynamic_caption_page.source_stack.widget(0).findChildren(toolkit.QPushButton))
+assert hasattr(window.dynamic_caption_page,"style_template_combo")
+style_page=window.dynamic_caption_page
+style_page.font_size.setValue(73); style_page.letter_spacing.setValue(6)
+style_page.layers=[{"type":"caption","name":"字幕层"},{"type":"mask","name":"测试蒙版","x":2,"y":3,"w":90,"h":20,"opacity":50,"radius":10,"color":"#000000"}]
+snapshot=style_page._style_template_snapshot()
+style_page.font_size.setValue(42); style_page.letter_spacing.setValue(-2); style_page.layers=[{"type":"caption","name":"字幕层"}]
+style_page._apply_style_template_data(snapshot)
+assert style_page.font_size.value()==73 and style_page.letter_spacing.value()==6
+assert any(layer.get("name")=="测试蒙版" for layer in style_page.layers)
+style_page.style_template_combo.setCurrentText("测试样式")
+style_page._save_style_template()
+assert "测试样式" in style_page._style_templates
+style_export=Path(root)/"subtitle-style.json"
+original_save_file=toolkit.QFileDialog.getSaveFileName
+original_open_file=toolkit.QFileDialog.getOpenFileName
+toolkit.QFileDialog.getSaveFileName=lambda *args,**kwargs:(str(style_export),"字幕样式模板 (*.json)")
+style_page._export_style_template()
+assert style_export.is_file() and "VideoToolkitSubtitleStyle" in style_export.read_text(encoding="utf-8")
+style_page._style_templates={}; style_page._load_style_templates()
+toolkit.QFileDialog.getOpenFileName=lambda *args,**kwargs:(str(style_export),"字幕样式模板 (*.json)")
+style_page._import_style_template()
+toolkit.QFileDialog.getSaveFileName=original_save_file
+toolkit.QFileDialog.getOpenFileName=original_open_file
+assert "测试样式" in style_page._style_templates and style_page.font_size.value()==73
+extract_calls=[]
+style_page.extract_all_timelines=lambda:extract_calls.append("all")
+style_page._load_group_merge_outputs(auto_extract=True)
+qt.processEvents(); assert not extract_calls
+style_page._group_auto_extract_pending=True
+style_page._group_merge_ended(); qt.processEvents()
+assert extract_calls==["all"]
+assert window.rename_page.date_enabled.isChecked() and window.rename_page.suffix_enabled.isChecked()
+assert not window.rename_page.direct_replace.isChecked()
+assert not hasattr(window.rename_page,"subfolders") and not hasattr(window.rename_page,"output") and not hasattr(window.rename_page,"task_name")
 reels_buttons=[button.text() for button in window.dynamic_caption_page.findChildren(toolkit.QPushButton)]
 assert "本地字体…" not in reels_buttons and "开源字体…" not in reels_buttons
 settings_buttons=[button.text() for button in window.font_settings_page.findChildren(toolkit.QPushButton)]
@@ -250,6 +288,16 @@ assert "连接超时" in window.key_table.item(0, 5).text()
 window._key_check_result("Groq", key_id, False, "HTTP 401：Unauthorized")
 assert window.store.data["providers"]["Groq"][0]["status"] == "失效"
 
+rename_intake = Path(root) / "reels_rename_intake"
+rename_intake.mkdir()
+(rename_intake / "001.mp4").write_bytes(b"video")
+window._open_folder_in_batch_rename(str(rename_intake))
+assert window.pages.currentWidget() is window.rename_page
+assert Path(window.rename_page.input.text()).resolve() == rename_intake.resolve()
+assert "001.mp4" in window.rename_page.preview.toPlainText()
+assert hasattr(window.dynamic_caption_page, "group_to_rename")
+assert hasattr(window.dynamic_caption_page, "output_to_rename")
+
 window._show_page(5)
 window.show()
 qt.processEvents()
@@ -260,4 +308,7 @@ window.grab().save("pipeline_layout_preview.png")
 window._show_page(3)
 qt.processEvents()
 window.grab().save("reels_layout_preview.png")
+window.pages.setCurrentWidget(window.rename_page)
+qt.processEvents()
+window.grab().save("rename_layout_preview.png")
 print("OK pages=11 auto=enabled fallback=local key_diagnostics=passed")

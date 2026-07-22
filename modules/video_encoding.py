@@ -31,7 +31,7 @@ def encoder_available(ffmpeg, key):
         return key == "cpu"
     command = [
         str(ffmpeg), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-        "color=black:s=320x240:d=0.12", "-c:v", codec, "-frames:v", "1", "-f", "null", "NUL",
+        "color=black:s=320x240:d=0.12", "-c:v", codec, "-frames:v", "1", "-f", "null", "-",
     ]
     try:
         result = subprocess.run(

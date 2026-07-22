@@ -53,13 +53,14 @@ from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
 from modules.text_rules import normalize_required_capitalization
 from modules.metadata_page import MetadataPage
-from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name
+from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name, validate_media_tool
+from modules.path_picker import default_output_path
 from modules.app_logging import app_log_path, read_app_log, write_app_log
 _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.6.1").strip().lstrip("v") or "1.6.1"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.6.3").strip().lstrip("v") or "1.6.3"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -2105,6 +2106,7 @@ class MainWindow(QMainWindow):
             self._caption_transcribe, self._text_to_speech, self._find_ffmpeg,
             TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER,
             self._reels_sync_profiles, self._start_reels_cloud_sync, self._open_google_settings)
+        self.dynamic_caption_page.rename_folder_requested.connect(self._open_folder_in_batch_rename)
         _startup_trace("watermark page ready")
         self.rename_page = RenamePage(self._rename_title_transcribe)
         _startup_trace("rename page ready")
@@ -2428,7 +2430,7 @@ class MainWindow(QMainWindow):
         child_row.addWidget(self.pipeline_subfolders, 1); child_row.addWidget(add_child); left_layout.addLayout(child_row)
 
         settings = QGroupBox("2. 流程设置"); form = QFormLayout(settings)
-        output_row = QHBoxLayout(); self.pipeline_output = QLineEdit(str(Path.cwd() / "流水线输出"))
+        output_row = QHBoxLayout(); self.pipeline_output = QLineEdit(str(default_output_path("流水线输出")))
         choose_output = QPushButton("选择…"); choose_output.clicked.connect(self._pipeline_choose_output)
         output_row.addWidget(self.pipeline_output); output_row.addWidget(choose_output)
         output_widget = QWidget(); output_widget.setLayout(output_row); form.addRow("输出目录", output_widget)
@@ -2612,6 +2614,17 @@ class MainWindow(QMainWindow):
         write_app_log(f"切换页面：{page_names.get(requested_index,requested_index)}","INFO","界面")
         for btn in self.nav_buttons:
             btn.setChecked(int(btn.property("pageIndex")) == nav_index)
+
+    def _open_folder_in_batch_rename(self, folder):
+        path=Path(str(folder)).expanduser()
+        if not path.is_dir():
+            QMessageBox.information(self,"文件夹不存在",f"无法加入批量重命名：\n{path}")
+            return
+        self.rename_page.titles.clear()
+        self.rename_page.set_input_folder(str(path.resolve()))
+        self._show_page(4)
+        self.rename_page.input.setFocus()
+        write_app_log(f"Reels 成品已加入批量重命名：{path.resolve()}","INFO","批量重命名")
 
     def _launch_tool(self, relative):
         if relative.startswith("page:"):
@@ -3612,10 +3625,10 @@ class MainWindow(QMainWindow):
         executable = media_tool_name("ffmpeg")
         candidates = [bundled_media_tool("ffmpeg"), app_root() / executable, component_bin() / executable]
         for path in candidates:
-            if path.exists():
+            if validate_media_tool(path,"ffmpeg"):
                 return str(path)
         found = shutil.which("ffmpeg")
-        if found:
+        if found and validate_media_tool(found,"ffmpeg"):
             return found
         raise RuntimeError(f"未找到 {executable}")
 
@@ -3921,6 +3934,10 @@ QSplitter::handle:hover { background:#3b82f6; }
 
 
 def main():
+    # A damaged macOS bundle once resolved "ffmpeg" to the app bootloader.
+    # Media probes must never construct a second application window.
+    if os.environ.get("VIDEO_TOOLKIT_MEDIA_PROBE") == "1":
+        return
     _startup_trace("main entered")
     write_app_log(f"启动 {APP_DISPLAY_NAME}","INFO","应用")
     original_hook=sys.excepthook
@@ -3957,4 +3974,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

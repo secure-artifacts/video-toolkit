@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
 )
-from .path_picker import DropFolderLineEdit, load_subfolders
+from .path_picker import DropFolderLineEdit
 from .platform_utils import app_data_dir
 
 
@@ -67,7 +67,7 @@ def safe_filename(filename, parent: Path):
 
 class RenameTask:
     def __init__(self, input_dir, output_parent, task_name, prefix, titles, date_str,
-                 suffix, start_index, padding, copy_files):
+                 suffix, start_index, padding, copy_files, direct_replace=False):
         self.input_dir = Path(input_dir)
         self.output_parent = Path(output_parent)
         raw_task_name = task_name.strip() or self.input_dir.name
@@ -75,9 +75,11 @@ class RenameTask:
         self.task_name_changed = filename_part_changed(raw_task_name, 80)
         self.prefix = clean_filename_part(prefix.strip(), fallback="", max_chars=60) if prefix.strip() else ""
         self.prefix_changed = filename_part_changed(prefix, 60) if prefix.strip() else False
+        self.direct_replace = bool(direct_replace)
         raw_titles = [x.strip() for x in titles.splitlines() if x.strip()]
-        self.titles = [clean_filename_part(x, fallback="", max_chars=TITLE_MAX_CHARS) for x in raw_titles]
-        self.title_changed = [filename_part_changed(x, TITLE_MAX_CHARS) for x in raw_titles]
+        title_limit = None if self.direct_replace else TITLE_MAX_CHARS
+        self.titles = [clean_filename_part(x, fallback="", max_chars=title_limit) for x in raw_titles]
+        self.title_changed = [filename_part_changed(x, title_limit) for x in raw_titles]
         self.date_str = clean_filename_part(date_str.strip(), fallback="", max_chars=30) if date_str.strip() else ""
         self.date_changed = filename_part_changed(date_str, 30) if date_str.strip() else False
         self.suffix = clean_filename_part(suffix.strip(), fallback="", max_chars=60) if suffix.strip() else ""
@@ -96,6 +98,13 @@ class RenameTask:
         source = Path(original)
         title_index = index - self.start_index
         changed = self.task_name_changed or self.prefix_changed or self.date_changed or self.suffix_changed
+        if self.direct_replace:
+            raw_title = self.titles[title_index] if 0 <= title_index < len(self.titles) else source.stem
+            # 标题列表约定为“不含扩展名的文件名”；若用户恰好粘贴了相同扩展名，避免重复追加。
+            base = raw_title[:-len(source.suffix)] if source.suffix and raw_title.casefold().endswith(source.suffix.casefold()) else raw_title
+            result, truncated = safe_filename(base + source.suffix, self.output_folder())
+            title_changed = self.title_changed[title_index] if 0 <= title_index < len(self.title_changed) else False
+            return result, title_changed or truncated
         if self.titles:
             title = self.titles[title_index] if 0 <= title_index < len(self.titles) else ""
             if 0 <= title_index < len(self.title_changed):
@@ -224,15 +233,6 @@ class RenamePage(QWidget):
         self.input = DropFolderLineEdit(); self.input.setPlaceholderText("可把文件夹拖到这里")
         self.input.folder_dropped.connect(self.set_input_folder)
         form.addRow("源文件夹", self.path_row(self.input, self.choose_input))
-        parent_row = QHBoxLayout()
-        self.subfolders = QComboBox(); self.subfolders.setEnabled(False)
-        choose_parent = QPushButton("选择父目录"); choose_parent.clicked.connect(self.choose_parent_folder)
-        use_subfolder = QPushButton("使用所选目录"); use_subfolder.clicked.connect(self.use_selected_folder)
-        parent_row.addWidget(self.subfolders, 1); parent_row.addWidget(choose_parent); parent_row.addWidget(use_subfolder)
-        parent_widget = QWidget(); parent_widget.setLayout(parent_row); form.addRow("子文件夹", parent_widget)
-        self.output = DropFolderLineEdit(); self.output.setPlaceholderText("可把输出文件夹拖到这里")
-        form.addRow("输出父目录", self.path_row(self.output, self.choose_output))
-        self.task_name = QLineEdit(); form.addRow("任务名称", self.task_name)
         preset_row = QHBoxLayout()
         self.preset_combo = QComboBox(); self.preset_combo.currentTextChanged.connect(self.apply_preset)
         save_preset = QPushButton("保存当前方案"); save_preset.clicked.connect(self.save_preset)
@@ -241,12 +241,20 @@ class RenamePage(QWidget):
         preset_widget = QWidget(); preset_widget.setLayout(preset_row); form.addRow("前后缀方案", preset_widget)
         self.prefix = QLineEdit(); form.addRow("前缀", self.prefix)
         line = QHBoxLayout()
+        self.date_enabled = QCheckBox("日期"); self.date_enabled.setChecked(True)
         self.date = QLineEdit(datetime.date.today().strftime("%Y%m%d")); self.suffix = QLineEdit("FF-PT")
+        self.suffix_enabled = QCheckBox("后缀"); self.suffix_enabled.setChecked(True)
         self.start_index = QSpinBox(); self.start_index.setRange(0, 999999); self.start_index.setValue(1)
         self.padding = QSpinBox(); self.padding.setRange(1, 12); self.padding.setValue(3)
-        line.addWidget(QLabel("日期")); line.addWidget(self.date); line.addWidget(QLabel("后缀")); line.addWidget(self.suffix)
+        line.addWidget(self.date_enabled); line.addWidget(self.date); line.addWidget(self.suffix_enabled); line.addWidget(self.suffix)
         line.addWidget(QLabel("起始编号")); line.addWidget(self.start_index); line.addWidget(QLabel("位数")); line.addWidget(self.padding)
         line_widget = QWidget(); line_widget.setLayout(line); form.addRow("命名规则", line_widget)
+        self.direct_replace = QCheckBox("标题原样替换文件名（不添加编号、前缀、日期和后缀）")
+        self.direct_replace.setToolTip("标题列表每一行直接作为对应文件名；只保留原文件扩展名。Windows 不允许的字符仍会自动清理。")
+        form.addRow("替换方式", self.direct_replace)
+        self.date_enabled.toggled.connect(self.date.setEnabled)
+        self.suffix_enabled.toggled.connect(self.suffix.setEnabled)
+        self.direct_replace.toggled.connect(self._direct_replace_changed)
         self.copy = QCheckBox("复制到输出目录，保留原文件"); self.copy.setChecked(True); form.addRow("处理方式", self.copy)
         left_layout.addWidget(form_group)
 
@@ -317,7 +325,8 @@ class RenamePage(QWidget):
             QMessageBox.information(self, "无法保存", "请输入方案名称。")
             return
         try:
-            self.presets[name] = {"prefix": self.prefix.text(), "suffix": self.suffix.text()}
+            self.presets[name] = {"prefix": self.prefix.text(), "suffix": self.suffix.text(),
+                                  "suffix_enabled": self.suffix_enabled.isChecked()}
             self.persist_presets(); self.refresh_presets(name)
             QMessageBox.information(self, "保存成功", f"前后缀方案“{name}”已保存。")
         except Exception as exc:
@@ -326,7 +335,8 @@ class RenamePage(QWidget):
     def apply_preset(self, name):
         data = self.presets.get(name)
         if data:
-            self.prefix.setText(data.get("prefix", "")); self.suffix.setText(data.get("suffix", "")); self.update_preview()
+            self.prefix.setText(data.get("prefix", "")); self.suffix.setText(data.get("suffix", ""))
+            self.suffix_enabled.setChecked(bool(data.get("suffix_enabled", True))); self.update_preview()
 
     def delete_preset(self):
         name = self.preset_combo.currentText()
@@ -347,30 +357,24 @@ class RenamePage(QWidget):
 
     def set_input_folder(self, path):
         self.input.setText(path)
-        if not self.output.text(): self.output.setText(str(Path(path).parent))
-        if not self.task_name.text(): self.task_name.setText(Path(path).name)
         self.update_preview()
 
-    def choose_parent_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "选择父目录")
-        if path:
-            try: load_subfolders(self.subfolders, path)
-            except OSError as exc: QMessageBox.warning(self, "无法读取目录", str(exc))
-
-    def use_selected_folder(self):
-        path = self.subfolders.currentData()
-        if path: self.set_input_folder(path)
-
-    def choose_output(self):
-        path = QFileDialog.getExistingDirectory(self, "选择输出父目录")
-        if path: self.output.setText(path)
+    def _direct_replace_changed(self, enabled):
+        for control in (self.prefix, self.date_enabled, self.suffix_enabled, self.start_index, self.padding):
+            control.setEnabled(not enabled)
+        self.date.setEnabled(not enabled and self.date_enabled.isChecked())
+        self.suffix.setEnabled(not enabled and self.suffix_enabled.isChecked())
+        self.update_preview()
 
     def task_from_form(self):
-        if not Path(self.input.text()).is_dir() or not Path(self.output.text()).is_dir():
-            raise ValueError("请选择有效的源文件夹和输出父目录")
-        return RenameTask(self.input.text(), self.output.text(), self.task_name.text(), self.prefix.text(),
-                          self.titles.toPlainText(), self.date.text(), self.suffix.text(),
-                          self.start_index.value(), self.padding.value(), self.copy.isChecked())
+        input_dir = Path(self.input.text())
+        if not input_dir.is_dir():
+            raise ValueError("请选择有效的源文件夹")
+        return RenameTask(str(input_dir), str(input_dir.parent), input_dir.name, self.prefix.text(),
+                          self.titles.toPlainText(), self.date.text() if self.date_enabled.isChecked() else "",
+                          self.suffix.text() if self.suffix_enabled.isChecked() else "",
+                          self.start_index.value(), self.padding.value(), self.copy.isChecked(),
+                          direct_replace=self.direct_replace.isChecked())
 
     def update_preview(self):
         try:

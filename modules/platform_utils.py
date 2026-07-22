@@ -33,6 +33,27 @@ def bundled_media_tool(name: str) -> Path:
     return bundled_root() / media_tool_name(name)
 
 
+def validate_media_tool(path: str | os.PathLike[str], name: str) -> bool:
+    """Reject a missing/corrupt tool or a frozen app executable copied as FFmpeg."""
+    candidate=Path(path)
+    if not candidate.is_file():
+        return False
+    try:
+        if Path(sys.executable).is_file() and candidate.samefile(sys.executable):
+            return False
+    except OSError:
+        pass
+    environment=os.environ.copy()
+    environment["VIDEO_TOOLKIT_MEDIA_PROBE"]="1"
+    try:
+        result=subprocess.run([str(candidate),"-version"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                              text=True,encoding="utf-8",errors="replace",timeout=5,env=environment)
+    except Exception:
+        return False
+    output=(result.stdout or "").casefold()
+    return result.returncode == 0 and f"{name.casefold()} version" in output
+
+
 def open_local_path(path: str | os.PathLike[str]) -> None:
     """Open a file or directory with the platform's default application."""
     target = str(Path(path).expanduser().resolve())

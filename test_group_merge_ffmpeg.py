@@ -1,8 +1,13 @@
 import json
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from PIL import Image
 
 from modules.group_merge import GroupMergeWorker, discover_groups
 
@@ -24,6 +29,7 @@ def main():
     with TemporaryDirectory() as temp:
         root = Path(temp); parent = root / "批次"; group = parent / "01组"; output = root / "输出"
         group.mkdir(parents=True)
+        watermark=root/"watermark.png"; Image.new("RGBA",(270,480),(255,0,0,48)).save(watermark)
         for index, color in ((1, "red"), (2, "blue")):
             subprocess.run([
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -34,8 +40,9 @@ def main():
             ], check=True)
         worker = GroupMergeWorker(
             discover_groups(parent), output, ffmpeg,
-            lambda _path: ("Teste de voz", "", SRT),
-            {"sort_mode": "natural", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True},
+            lambda _path: (_ for _ in ()).throw(AssertionError("natural mode must not transcribe")),
+            {"sort_mode": "natural", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True,
+             "burn_watermark":True,"watermark_prepare":lambda _video,_cache:str(watermark)},
         )
         results = []
         worker.item_done.connect(lambda path, *_args: results.append(path))
@@ -53,12 +60,36 @@ def main():
         second = []
         worker = GroupMergeWorker(
             discover_groups(parent), output, ffmpeg,
-            lambda _path: (_ for _ in ()).throw(AssertionError("resume should reuse transcript")),
-            {"sort_mode": "natural", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True},
+            lambda _path: (_ for _ in ()).throw(AssertionError("natural mode must not transcribe")),
+            {"sort_mode": "natural", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True,
+             "burn_watermark":True,"watermark_prepare":lambda _video,_cache:str(watermark)},
         )
         worker.item_done.connect(lambda path, *_args: second.append(path)); worker.run()
         assert second == results
+
+        # 停止必须能立即中断当前子进程；界面随后会创建新 worker 继续运行。
+        stopper = GroupMergeWorker(
+            discover_groups(parent), output, ffmpeg,
+            lambda _path: (_ for _ in ()).throw(AssertionError("natural mode must not transcribe")),
+            {"sort_mode": "natural", "resume": True},
+        )
+        stopped = []
+        thread = threading.Thread(
+            target=lambda: stopped.append(_run_until_stopped(stopper, [
+                sys.executable, "-c", "import time; time.sleep(10)",
+            ])), daemon=True,
+        )
+        thread.start(); time.sleep(0.25); stopper.cancel(); thread.join(3)
+        assert not thread.is_alive() and stopped == [True]
     print("group merge ffmpeg + stereo + resume: OK")
+
+
+def _run_until_stopped(worker, command):
+    try:
+        worker._run(command)
+    except RuntimeError as exc:
+        return "已停止" in str(exc)
+    return False
 
 
 if __name__ == "__main__":

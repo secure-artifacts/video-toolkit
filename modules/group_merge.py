@@ -31,7 +31,14 @@ def discover_groups(parent):
     if direct_clips:
         buckets={}
         for clip in direct_clips:
-            key=re.sub(r"(?:[\s_.-]*(?:part|segment|clip|片段)?[\s_.-]*\d+|[\s_.-]*\(\d+\))$","",clip.stem,flags=re.I).strip(" ._-")
+            # Flow 等工具常见命名：11-1.mp4、11-2.mp4，或
+            # 2-1_202607211405.mp4、2-2_202607211405.mp4。前一段是组号，
+            # 后一段是片段号；其后的时间戳/描述不参与分组。
+            numbered = re.match(r"^(?P<group>\d+)[-_](?P<part>\d+)(?:[_\s-].*)?$", clip.stem)
+            if numbered:
+                key = numbered.group("group")
+            else:
+                key=re.sub(r"(?:[\s_.-]*(?:part|segment|clip|片段)?[\s_.-]*\d+|[\s_.-]*\(\d+\))$","",clip.stem,flags=re.I).strip(" ._-")
             buckets.setdefault(key or clip.stem,[]).append(clip)
         useful=[(name,clips) for name,clips in buckets.items() if clips]
         if len(useful)>1 and any(len(clips)>1 for _name,clips in useful):
@@ -115,10 +122,17 @@ class GroupMergeWorker(QObject):
         self.transcribe = transcribe
         self.settings = dict(settings)
         self.cancelled = False
+        self._current_process = None
         self.encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
 
     def cancel(self):
         self.cancelled = True
+        process = self._current_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
 
     @property
     def ffprobe(self):
@@ -126,13 +140,36 @@ class GroupMergeWorker(QObject):
         return str(candidate if candidate.exists() else "ffprobe")
 
     def _run(self, command):
-        result = subprocess.run(
+        if self.cancelled:
+            raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+        process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace", **hidden_kwargs(),
         )
-        if result.returncode:
-            raise RuntimeError(result.stderr[-1200:].strip() or "FFmpeg 处理失败")
-        return result
+        self._current_process = process
+        try:
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=0.15)
+                    break
+                except subprocess.TimeoutExpired:
+                    if not self.cancelled:
+                        continue
+                    try:
+                        process.terminate()
+                        stdout, stderr = process.communicate(timeout=1.5)
+                    except Exception:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+        finally:
+            if self._current_process is process:
+                self._current_process = None
+        if self.cancelled:
+            raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+        if process.returncode:
+            raise RuntimeError(stderr[-1200:].strip() or "FFmpeg 处理失败")
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     def _probe(self, path):
         result = self._run([
@@ -167,20 +204,75 @@ class GroupMergeWorker(QObject):
         self.log.emit(f"说话边界识别完成：{clip.name}")
         return info
 
-    def _normalize(self, clip, index, cache_dir, analysis, target_w, target_h):
+    def _fast_analysis(self, clip, cache):
+        """Find leading/trailing quiet sections locally, without ASR or subtitle matching."""
+        signature = self._signature(clip)
+        key = str(Path(clip).resolve())
+        saved = cache.get(key, {})
+        if (self.settings.get("resume", True) and saved.get("signature") == signature
+                and saved.get("fast_bounds_version") == 1 and saved.get("bounds")):
+            self.log.emit(f"续接：复用本地声音边界 {clip.name}")
+            return saved
         probe = self._probe(clip)
-        start, end, detected = speech_trim_bounds(
-            analysis.get("srt", ""), probe["duration"],
-            self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
-        )
+        duration = max(0.05, probe["duration"])
+        if not probe["audio"]:
+            info = {"signature": signature, "fast_bounds_version": 1,
+                    "bounds": [0.0, duration, False], "original": "", "srt": ""}
+            cache[key] = info
+            return info
+        self.log.emit(f"快速检测首尾声音：{clip.name}（本地处理，不识别字幕）")
+        result = self._run([
+            self.ffmpeg, "-hide_banner", "-nostats", "-i", str(clip),
+            "-map", "0:a:0", "-af", "silencedetect=noise=-38dB:d=0.10", "-f", "null", "-",
+        ])
+        events = []
+        for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", result.stderr or ""):
+            events.append((kind, float(value)))
+        start = 0.0
+        end = duration
+        detected = False
+        if events and events[0][0] == "start" and events[0][1] <= 0.08:
+            first_end = next((value for kind, value in events if kind == "end"), None)
+            if first_end is not None:
+                start = min(duration, first_end)
+                detected = True
+        trailing_start = None
+        for index, (kind, value) in enumerate(events):
+            if kind == "start" and not any(next_kind == "end" for next_kind, _ in events[index + 1:]):
+                trailing_start = value
+        if trailing_start is not None and trailing_start < duration:
+            end = trailing_start
+            detected = True
+        if detected:
+            start = max(0.0, start - max(0, self.settings.get("head_padding_ms", 80)) / 1000.0)
+            end = min(duration, end + max(0, self.settings.get("tail_padding_ms", 120)) / 1000.0)
+        if end <= start + 0.05:
+            start, end, detected = 0.0, duration, False
+        info = {"signature": signature, "fast_bounds_version": 1,
+                "bounds": [start, end, detected], "original": "", "srt": ""}
+        cache[key] = info
+        return info
+
+    def _normalize(self, clip, index, cache_dir, analysis, target_w, target_h, watermark=None):
+        probe = self._probe(clip)
+        if analysis.get("bounds"):
+            start, end, detected = analysis["bounds"]
+        else:
+            start, end, detected = speech_trim_bounds(
+                analysis.get("srt", ""), probe["duration"],
+                self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
+            )
         if not detected:
             self.log.emit(f"提醒：{clip.name} 未识别到说话时间，保留完整片段。")
         else:
             self.log.emit(f"去口气音：{clip.name} 保留 {start:.2f}s - {end:.2f}s")
         duration = max(0.05, end - start)
+        watermark = Path(watermark) if watermark and Path(watermark).is_file() else None
         fingerprint = hashlib.sha256(json.dumps({
             "source": self._signature(clip), "start": round(start, 3), "end": round(end, 3),
-            "width": target_w, "height": target_h, "version": 1,
+            "width": target_w, "height": target_h,
+            "watermark": self._signature(watermark) if watermark else None,
+            "clean_metadata": bool(self.settings.get("clean_metadata", True)), "version": 4,
         }, sort_keys=True).encode("utf-8")).hexdigest()[:14]
         destination = cache_dir / f"segment_{index + 1:03d}_{fingerprint}.mp4"
         if self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024:
@@ -194,16 +286,30 @@ class GroupMergeWorker(QObject):
         )
         command = [
             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}",
-            "-i", str(clip), "-t", f"{duration:.3f}", "-map", "0:v:0",
+            "-i", str(clip),
         ]
+        if watermark:
+            command += ["-loop", "1", "-i", str(watermark)]
+        command += ["-t", f"{duration:.3f}"]
+        if watermark:
+            command += [
+                "-filter_complex",
+                f"[0:v]{video_filter}[base];[1:v]scale={target_w}:{target_h},format=rgba[wm];"
+                "[base][wm]overlay=0:0:eof_action=repeat,format=yuv420p[outv]",
+                "-map", "[outv]",
+            ]
+        else:
+            command += ["-map", "0:v:0", "-vf", video_filter]
         if probe["audio"]:
             command += [
                 "-map", "0:a:0", "-af",
                 f"aresample=48000,aformat=channel_layouts=stereo,afade=t=in:st=0:d=0.018,afade=t=out:st={fade_out:.3f}:d=0.018",
             ]
-        command += [
-            "-vf", video_filter, "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
-        ]
+        if self.settings.get("clean_metadata", True):
+            command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                        "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                        "-map_chapters", "-1"]
+        command += ["-sn", "-dn"]
         command += encoder_args(self.encoder, self.settings.get("encode_preset", "veryfast"))
         if probe["audio"]:
             command += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
@@ -237,10 +343,14 @@ class GroupMergeWorker(QObject):
                     analysis_cache = {}
                 analyses = {}
                 self.log.emit(f"[{group_index}/{len(self.groups)}] 开始处理文件夹：{folder.name}（{len(clips)} 段）")
+                script_mode = self.settings.get("sort_mode") == "script"
                 for clip in clips:
                     if self.cancelled:
                         raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
-                    analyses[str(clip.resolve())] = self._analysis(clip, analysis_cache)
+                    analyses[str(clip.resolve())] = (
+                        self._analysis(clip, analysis_cache) if script_mode
+                        else self._fast_analysis(clip, analysis_cache)
+                    )
                     cache_file.write_text(json.dumps(analysis_cache, ensure_ascii=False, indent=2), encoding="utf-8")
                     completed_steps += 1
                     self.progress.emit(round(completed_steps / total_steps * 100))
@@ -257,10 +367,18 @@ class GroupMergeWorker(QObject):
                         self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
                 first_probe = self._probe(clips[0])
                 target_w, target_h = ((1920, 1080) if first_probe["width"] > first_probe["height"] else (1080, 1920))
+                watermark = None
+                prepare_watermark = self.settings.get("watermark_prepare")
+                if self.settings.get("burn_watermark") and callable(prepare_watermark):
+                    watermark = Path(prepare_watermark(str(clips[0]), str(cache_dir)))
+                    if watermark.is_file():
+                        self.log.emit("已启用合成时烧录水印：水印将在片段统一编码时一次完成，后续导出不重复烧录。")
+                    else:
+                        watermark = None
                 normalized = []
                 for clip_index, clip in enumerate(clips):
                     normalized.append(self._normalize(
-                        clip, clip_index, cache_dir, analyses[str(clip.resolve())], target_w, target_h,
+                        clip, clip_index, cache_dir, analyses[str(clip.resolve())], target_w, target_h, watermark,
                     ))
                     completed_steps += 1
                     self.progress.emit(round(completed_steps / total_steps * 100))
@@ -272,7 +390,8 @@ class GroupMergeWorker(QObject):
                 ), encoding="utf-8")
                 destination = self.output / f"{_safe_name(folder.name)}_去口气音合成.mp4"
                 final_fingerprint = hashlib.sha256(json.dumps({
-                    "files": [self._signature(path) for path in normalized], "version": 1,
+                    "files": [self._signature(path) for path in normalized],
+                    "clean_metadata": bool(self.settings.get("clean_metadata", True)), "version": 2,
                 }, sort_keys=True).encode("utf-8")).hexdigest()
                 state_file = cache_dir / "final.json"
                 try:
@@ -282,11 +401,16 @@ class GroupMergeWorker(QObject):
                 if not (self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024
                         and state.get("fingerprint") == final_fingerprint):
                     self.log.emit(f"正在合并文件夹“{folder.name}”的 {len(normalized)} 个片段，请等待…")
-                    self._run([
+                    concat_command = [
                         self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
                         "-i", str(concat_file), "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
-                        "-map_metadata", "-1", "-map_chapters", "-1", "-movflags", "+faststart", str(destination),
-                    ])
+                    ]
+                    if self.settings.get("clean_metadata", True):
+                        concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                                           "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                                           "-map_chapters", "-1"]
+                    concat_command += ["-movflags", "+faststart", str(destination)]
+                    self._run(concat_command)
                     state_file.write_text(json.dumps({"fingerprint": final_fingerprint}, indent=2), encoding="utf-8")
                 else:
                     self.log.emit(f"续接：复用已完成合成视频 {destination.name}")

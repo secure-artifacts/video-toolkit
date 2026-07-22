@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
-from .platform_utils import app_data_dir, bundled_media_tool, media_tool_name
+from .platform_utils import app_data_dir, bundled_media_tool, media_tool_name, validate_media_tool
 
 
 PYTHON_COMPONENTS = [
@@ -56,9 +56,10 @@ def hidden_kwargs():
 def find_media_tool(name: str):
     local = component_bin() / media_tool_name(name)
     bundled = bundled_media_tool(name)
-    if local.exists(): return str(local)
-    if bundled.exists(): return str(bundled)
-    return shutil.which(name)
+    if validate_media_tool(local,name): return str(local)
+    if validate_media_tool(bundled,name): return str(bundled)
+    found=shutil.which(name)
+    return found if found and validate_media_tool(found,name) else None
 
 
 def component_rows():

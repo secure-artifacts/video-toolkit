@@ -28,6 +28,17 @@ def main():
             ["祷告A_1.mp4", "祷告A_2.mp4"],
         ]
 
+        timestamped = root / "带时间戳"; timestamped.mkdir()
+        for name in ("2-3_202607211405.mp4", "2-1_202607211405.mp4", "2-2_202607211405.mp4",
+                     "11-2.mp4", "11-1.mp4"):
+            (timestamped / name).touch()
+        timestamped_groups = discover_groups(timestamped)
+        assert [folder.name for folder, _clips in timestamped_groups] == ["2", "11"]
+        assert [[clip.name for clip in clips] for _folder, clips in timestamped_groups] == [
+            ["2-1_202607211405.mp4", "2-2_202607211405.mp4", "2-3_202607211405.mp4"],
+            ["11-1.mp4", "11-2.mp4"],
+        ]
+
         clips = [group_2 / "a.mp4", group_2 / "b.mp4"]
         transcripts = {
             str(clips[0].resolve()): "Jesus está contigo",

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QVBoxLayout, QWidget,
 )
-from .path_picker import DropListWidget, VIDEO_EXTENSIONS, collect_files, load_subfolders
+from .path_picker import DropListWidget, VIDEO_EXTENSIONS, collect_files, default_output_path, load_subfolders
 
 
 def hidden_kwargs():
@@ -150,7 +150,7 @@ class SmartCutPage(QWidget):
         folder_row.addWidget(self.subfolders, 1); folder_row.addWidget(add_selected); layout.addLayout(folder_row)
         form = QFormLayout()
         out_row = QHBoxLayout()
-        self.output = QLineEdit(str(Path.cwd() / "智能剪辑输出"))
+        self.output = QLineEdit(str(default_output_path("智能剪辑输出")))
         choose = QPushButton("选择…"); choose.clicked.connect(self.choose_output)
         out_row.addWidget(self.output); out_row.addWidget(choose)
         out_widget = QWidget(); out_widget.setLayout(out_row); form.addRow("输出目录", out_widget)

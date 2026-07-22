@@ -8,7 +8,7 @@ if [[ -z "$APP_VERSION" ]]; then
   APP_VERSION="$(git -C "$ROOT_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
 fi
 APP_VERSION="${APP_VERSION#v}"
-APP_VERSION="${APP_VERSION:-1.6.1}"
+APP_VERSION="${APP_VERSION:-1.6.3}"
 if [[ ! "$APP_VERSION" =~ ^[0-9A-Za-z._-]+$ ]]; then
   echo "Invalid application version: $APP_VERSION" >&2
   exit 1
@@ -32,6 +32,7 @@ python -m PyInstaller \
   --osx-bundle-identifier com.secureartifacts.videotoolkit \
   --icon "$ROOT_DIR/logo.icns" \
   --add-data "$ROOT_DIR/logo.ico:." \
+  --add-data "$ROOT_DIR/resources/fonts:resources/fonts" \
   --add-binary "$MEDIA_BIN/ffmpeg:." \
   --add-binary "$MEDIA_BIN/ffprobe:." \
   --collect-data faster_whisper \

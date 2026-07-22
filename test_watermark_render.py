@@ -57,6 +57,11 @@ def main():
         settings["preview_audio"]=str(external); second=root/"preview_external.mp4"; results.clear()
         worker=PreviewWorker(ffmpeg,source,second,"字幕效果",settings); worker.finished.connect(lambda ok,message:results.append((ok,message))); worker.run()
         assert results and results[0][0],results
+        # 分组合成阶段已烧录相同水印时，后续精确预览/导出必须跳过重复叠加。
+        settings["watermark_baked_videos"]=[str(source.resolve())]
+        third=root/"preview_baked.mp4"; results.clear()
+        worker=PreviewWorker(ffmpeg,source,third,"字幕效果",settings); worker.finished.connect(lambda ok,message:results.append((ok,message))); worker.run()
+        assert results and results[0][0] and third.stat().st_size>1024,results
     print("watermark preview + stereo render: OK")
 
 

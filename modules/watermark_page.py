@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QWidget,
 )
+from .path_picker import default_output_path
 from .path_picker import DropTableWidget, collect_files, load_subfolders
 from .platform_utils import app_data_dir, media_tool_name
 
@@ -573,7 +574,7 @@ class MainWindow(QMainWindow):
         output_layout.setContentsMargins(12, 12, 12, 12)
         out_row = QHBoxLayout()
         out_row.setSpacing(4)
-        self.output_edit = QLineEdit(str(Path.cwd() / "watermark_outputs"))
+        self.output_edit = QLineEdit(str(default_output_path("watermark_outputs")))
         out_btn = QPushButton("选择")
         out_btn.clicked.connect(self.choose_output)
         out_row.addWidget(self.output_edit)

@@ -4,13 +4,20 @@ import os
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QStandardPaths, Signal
 from PySide6.QtWidgets import QAbstractItemView, QLineEdit, QListWidget, QTableWidget, QTextEdit
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v", ".flv", ".ts"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus", ".wma"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def default_output_path(folder_name):
+    """Return a user-writable output folder, including for a macOS .app bundle."""
+    movies=QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
+    base=Path(movies) if movies else (Path.home()/("Movies" if os.name!="nt" else "Videos"))
+    return base/"VideoToolkit"/str(folder_name)
 
 
 def natural_key(value):

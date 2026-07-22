@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from .path_picker import (AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS,
-                          DropListWidget, collect_files, load_subfolders, natural_key)
+                          DropListWidget, collect_files, default_output_path, load_subfolders, natural_key)
 from .settings_page import find_media_tool, hidden_kwargs
 
 
@@ -162,7 +162,7 @@ class MetadataPage(QWidget):
 
         options = QGroupBox("输出与执行"); options_layout = QVBoxLayout(options)
         form = QFormLayout()
-        self.output = QLineEdit(str(Path.cwd() / "metadata_clean_outputs"))
+        self.output = QLineEdit(str(default_output_path("metadata_clean_outputs")))
         out_row = QHBoxLayout(); out_row.addWidget(self.output); choose = QPushButton("选择…"); choose.clicked.connect(self.choose_output); out_row.addWidget(choose)
         form.addRow("输出目录", out_row)
         self.keep_structure = QCheckBox("保留输入文件夹层级"); self.keep_structure.setChecked(True)
