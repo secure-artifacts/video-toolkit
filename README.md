@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.6.4**
+当前版本：**v1.6.6**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,11 +10,22 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.4.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.4/video-toolkit-windows-x64-v1.6.4.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.4.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.4/video-toolkit-macos-arm64-v1.6.4.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.6.4.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.4/video-toolkit-macos-x64-v1.6.4.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.6.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.6/video-toolkit-windows-x64-v1.6.6.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.6.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.6/video-toolkit-macos-arm64-v1.6.6.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.6.6.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.6/video-toolkit-macos-x64-v1.6.6.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### 最新更新 (v1.6.6)
+* **Reels 视频编辑器界面与空间优化**：
+  * 主运行按钮与上传配置迁移至窗口右上角，流程步骤以小字灰蓝字体置于左上角，使整个界面更紧凑。
+  * 移除左下角冗余按钮，释放大面积垂直空间给素材项目列表，展示范围更宽广。
+  * 可折叠设置面板标题引入了专属 Emoji 标签，折叠与展开状态样式采用动态边框和色彩高亮，区分更明显，视觉更舒适。
+* **中文重命名机制增强**：
+  * 文件命名逻辑首选 ASR 的中文译文；在无 Gemini 密钥或云端翻译暂不可用时，自动启动本地备用谷歌翻译，100% 避免外语视频标题直接输出。
+  * 新增「前缀预设方案」下拉管理板块，可快捷保存和删除常用重命名方案。
+* **路径记忆**：支持自动保存与重载「输出目录」路径，避免每次打开重置。
+* **进程占用与清理修复**：在批量合成启动时强制切断预览播放器并释放 OpenCV 句柄；在最终成品导出完成后，执行深度垃圾回收并配合延迟删除重试，彻底解决 Windows 环境下的 `WinError 32` 临时文件占用问题。
 
 ## 主要功能
 
@@ -141,7 +152,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.6.4"
+$env:VIDEO_TOOLKIT_VERSION = "1.6.6"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -156,6 +167,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release 并上传三个 ZIP。
 
 ```bash
-git tag -a v1.6.4 -m "Release version 1.6.4"
-git push origin v1.6.4
+git tag -a v1.6.6 -m "Release version 1.6.6"
+git push origin v1.6.6
 ```
