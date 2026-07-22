@@ -45,9 +45,11 @@ def validate_media_tool(path: str | os.PathLike[str], name: str) -> bool:
         pass
     environment=os.environ.copy()
     environment["VIDEO_TOOLKIT_MEDIA_PROBE"]="1"
+    creation=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
         result=subprocess.run([str(candidate),"-version"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                              text=True,encoding="utf-8",errors="replace",timeout=5,env=environment)
+                              text=True,encoding="utf-8",errors="replace",timeout=5,env=environment,
+                              creationflags=creation)
     except Exception:
         return False
     output=(result.stdout or "").casefold()

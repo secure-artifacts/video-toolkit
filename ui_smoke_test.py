@@ -107,7 +107,7 @@ assert "导入本地字体…" in settings_buttons and "下载开源字体…" i
 assert window.dynamic_caption_page.tts_text.columnCount() == 2
 assert window.dynamic_caption_page.tts_text.editTriggers() == toolkit.QAbstractItemView.EditTrigger.NoEditTriggers
 assert hasattr(window.dynamic_caption_page, "source_proofread")
-assert window.dynamic_caption_page.findChild(toolkit.QFrame, "reelsRunPanel") is not None
+assert window.dynamic_caption_page.findChild(toolkit.QFrame, "reelsRunPanel") is None
 pipeline_step_labels = [label.text() for label in window.pages.widget(8).findChildren(toolkit.QLabel)]
 assert any("⑤ 批量上传" in text and "⑥ 批量填表" in text for text in pipeline_step_labels)
 assert not any(button.text() == "开始智能提取字幕" for button in window.pages.widget(0).findChildren(toolkit.QPushButton))
