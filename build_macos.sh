@@ -3,6 +3,20 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEDIA_BIN="${VIDEO_TOOLKIT_MEDIA_BIN:-}"
+APP_VERSION="${VIDEO_TOOLKIT_VERSION:-${GITHUB_REF_NAME:-}}"
+if [[ -z "$APP_VERSION" ]]; then
+  APP_VERSION="$(git -C "$ROOT_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
+fi
+APP_VERSION="${APP_VERSION#v}"
+APP_VERSION="${APP_VERSION:-1.6.1}"
+if [[ ! "$APP_VERSION" =~ ^[0-9A-Za-z._-]+$ ]]; then
+  echo "Invalid application version: $APP_VERSION" >&2
+  exit 1
+fi
+VERSION_HOOK="$(mktemp "${TMPDIR:-/tmp}/video_toolkit_version.XXXXXX.py")"
+trap 'rm -f "$VERSION_HOOK"' EXIT
+printf "import os\nos.environ['VIDEO_TOOLKIT_VERSION'] = '%s'\n" "$APP_VERSION" > "$VERSION_HOOK"
+echo "Embedding application version: $APP_VERSION"
 
 if [[ -z "$MEDIA_BIN" || ! -x "$MEDIA_BIN/ffmpeg" || ! -x "$MEDIA_BIN/ffprobe" ]]; then
   echo "VIDEO_TOOLKIT_MEDIA_BIN must contain executable ffmpeg and ffprobe files." >&2
@@ -28,6 +42,7 @@ python -m PyInstaller \
   --hidden-import onnxruntime \
   --hidden-import google_auth_oauthlib \
   --hidden-import googleapiclient.discovery \
+  --runtime-hook "$VERSION_HOOK" \
   --exclude-module torch \
   --exclude-module tensorflow \
   --exclude-module matplotlib \

@@ -49,7 +49,8 @@ first._process_one = first_process
 first_status = {}
 first.finished.connect(lambda ok, message: first_status.update(ok=ok, message=message))
 first.run()
-assert first_status["ok"] is False
+# 部分失败不能终止整批：已有成功项应视为可续接的部分完成。
+assert first_status["ok"] is True
 assert first_calls == ["1.mp4", "2.mp4", "3.mp4"]
 
 second = toolkit.TranscribeWorker(DummyStore(), toolkit.LOCAL_PROVIDER, "small", files,

@@ -18,6 +18,16 @@ def main():
         assert [folder.name for folder, _clips in groups] == ["2组", "10组"]
         assert [path.name for path in groups[0][1]] == ["1.mp4", "2.mp4", "10.mp4"]
 
+        flat = root / "同目录分组"; flat.mkdir()
+        for name in ("祷告A_1.mp4", "祷告A_2.mp4", "祝福B-1.mp4", "祝福B-2.mp4", "祝福B-3.mp4"):
+            (flat / name).touch()
+        flat_groups = discover_groups(flat)
+        assert [folder.name for folder, _clips in flat_groups] == ["祝福B", "祷告A"]
+        assert [[clip.name for clip in clips] for _folder, clips in flat_groups] == [
+            ["祝福B-1.mp4", "祝福B-2.mp4", "祝福B-3.mp4"],
+            ["祷告A_1.mp4", "祷告A_2.mp4"],
+        ]
+
         clips = [group_2 / "a.mp4", group_2 / "b.mp4"]
         transcripts = {
             str(clips[0].resolve()): "Jesus está contigo",
