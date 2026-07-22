@@ -17,9 +17,7 @@ from .path_picker import DropFolderLineEdit
 from .platform_utils import app_data_dir
 
 
-TITLE_MAX_CHARS = 20
 MAX_FILENAME_CHARS = 230
-MAX_SAFE_PATH_CHARS = 245
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 INVALID_FILENAME_TRANS = str.maketrans("", "", INVALID_FILENAME_CHARS)
 WINDOWS_RESERVED_NAMES = {
@@ -53,9 +51,11 @@ def safe_filename(filename, parent: Path):
     source = Path(filename)
     extension = source.suffix
     stem = clean_filename_part(source.stem)
-    parent_text = str(parent.resolve())
-    available = MAX_SAFE_PATH_CHARS - len(parent_text) - 1 - len(extension)
-    maximum = min(MAX_FILENAME_CHARS - len(extension), available)
+    # Modern Python/Qt use Unicode long-path capable file APIs.  Limiting the
+    # title again by the full parent path made perfectly valid titles become
+    # much shorter merely because the selected output folder was deeply nested.
+    # Keep only the per-file safety limit here.
+    maximum = MAX_FILENAME_CHARS - len(extension)
     if maximum < 12:
         raise ValueError(f"输出路径过长，请选择更短的输出目录：{parent}")
     truncated = len(stem) > maximum
@@ -77,7 +77,7 @@ class RenameTask:
         self.prefix_changed = filename_part_changed(prefix, 60) if prefix.strip() else False
         self.direct_replace = bool(direct_replace)
         raw_titles = [x.strip() for x in titles.splitlines() if x.strip()]
-        title_limit = None if self.direct_replace else TITLE_MAX_CHARS
+        title_limit = None
         self.titles = [clean_filename_part(x, fallback="", max_chars=title_limit) for x in raw_titles]
         self.title_changed = [filename_part_changed(x, title_limit) for x in raw_titles]
         self.date_str = clean_filename_part(date_str.strip(), fallback="", max_chars=30) if date_str.strip() else ""
@@ -110,8 +110,8 @@ class RenameTask:
             if 0 <= title_index < len(self.title_changed):
                 changed = changed or self.title_changed[title_index]
         else:
-            title = clean_filename_part(source.stem, fallback="", max_chars=TITLE_MAX_CHARS)
-            changed = changed or filename_part_changed(source.stem, TITLE_MAX_CHARS)
+            title = clean_filename_part(source.stem, fallback="")
+            changed = changed or filename_part_changed(source.stem)
         parts = [str(index).zfill(self.padding)]
         for part in (self.prefix, title, self.date_str):
             if part: parts.append(part)
@@ -194,10 +194,7 @@ def unique_destination(path: Path):
     number = 1
     while True:
         tail = f"_{number}"
-        available = min(
-            MAX_FILENAME_CHARS - len(path.suffix) - len(tail),
-            MAX_SAFE_PATH_CHARS - len(str(path.parent.resolve())) - 1 - len(path.suffix) - len(tail),
-        )
+        available = MAX_FILENAME_CHARS - len(path.suffix) - len(tail)
         if available < 8:
             raise ValueError(f"输出路径过长，请选择更短的输出目录：{path.parent}")
         candidate = path.with_name(f"{path.stem[:available].rstrip(' .')}{tail}{path.suffix}")

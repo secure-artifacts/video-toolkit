@@ -295,8 +295,28 @@ window._open_folder_in_batch_rename(str(rename_intake))
 assert window.pages.currentWidget() is window.rename_page
 assert Path(window.rename_page.input.text()).resolve() == rename_intake.resolve()
 assert "001.mp4" in window.rename_page.preview.toPlainText()
-assert hasattr(window.dynamic_caption_page, "group_to_rename")
 assert hasattr(window.dynamic_caption_page, "output_to_rename")
+assert not hasattr(window.dynamic_caption_page, "group_resume")
+assert window.dynamic_caption_page.group_trim_mode.currentText() == "智能混合边界（推荐）"
+assert window.dynamic_caption_page.group_head_padding.value() == 80
+assert window.dynamic_caption_page.group_tail_padding.value() == 120
+assert window.dynamic_caption_page.group_silence_threshold.value() == -35
+assert window.dynamic_caption_page.group_silence_min.value() == 180
+assert window.dynamic_caption_page.fix_overlap_btn.text() == "修正重叠"
+assert window.dynamic_caption_page.audio_fade_mode.currentText() == "直接加入（无淡入淡出）"
+
+# 全部最终成品成功后删除分组合成中间目录；失败时必须保留供断点续接。
+group_intermediate=Path(root)/"00_分组合成"
+(group_intermediate/".group_merge_cache").mkdir(parents=True)
+(group_intermediate/"01_去口气音合成.mp4").write_bytes(b"source"*400)
+final_product=Path(root)/"01_动态文案.mp4"; final_product.write_bytes(b"final"*500)
+page=window.dynamic_caption_page
+page._pending_group_cleanup_dir=group_intermediate
+page._batch_expected_count=1
+page.group_merge_outputs=[str(group_intermediate/"01_去口气音合成.mp4")]
+page.generated_records=[{"path":str(final_product),"original":"","chinese":""}]
+assert page._cleanup_completed_group_intermediates(True) is True
+assert not group_intermediate.exists() and final_product.is_file()
 
 window._show_page(5)
 window.show()

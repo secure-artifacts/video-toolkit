@@ -85,7 +85,7 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.22):
     return [mapping[index][0] for index in range(len(segments))], "已按分段文案自动匹配排序"
 
 
-def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=120):
+def _speech_spans(srt):
     timing = re.compile(
         r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)"
     )
@@ -95,12 +95,47 @@ def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=120):
         start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / (10 ** len(match.group(4)))
         end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / (10 ** len(match.group(8)))
         spans.append((start, end))
+    return spans
+
+
+def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=120):
+    spans = _speech_spans(srt)
     duration = max(0.05, float(duration or 0.05))
     if not spans:
         return 0.0, duration, False
     start = max(0.0, spans[0][0] - max(0, head_padding_ms) / 1000.0)
     end = min(duration, spans[-1][1] + max(0, tail_padding_ms) / 1000.0)
     return start, max(start + 0.05, end), True
+
+
+def hybrid_trim_bounds(srt, duration, audio_bounds, head_padding_ms=80, tail_padding_ms=120,
+                       word_guard_ms=40):
+    """Combine transcript and audio boundaries without ever cutting into a timed word.
+
+    Audio detection is only allowed to refine the leading/trailing edge.  Internal
+    pauses remain untouched, which avoids the unnatural jump cuts produced by a
+    global silence remover.
+    """
+    duration = max(0.05, float(duration or 0.05))
+    spans = _speech_spans(srt)
+    text_start, text_end, text_detected = speech_trim_bounds(
+        srt, duration, head_padding_ms, tail_padding_ms,
+    )
+    if not text_detected:
+        return tuple(audio_bounds) if audio_bounds else (0.0, duration, False)
+    if not audio_bounds or not bool(audio_bounds[2]):
+        return text_start, text_end, True
+    audio_start, audio_end, _detected = audio_bounds
+    guard = max(0, int(word_guard_ms)) / 1000.0
+    # Never move the start past the first timed word (minus a small consonant guard),
+    # nor the end before the last timed word (plus the same guard).
+    latest_safe_start = max(0.0, spans[0][0] - guard)
+    earliest_safe_end = min(duration, spans[-1][1] + guard)
+    start = min(latest_safe_start, max(text_start, float(audio_start)))
+    end = max(earliest_safe_end, min(text_end, float(audio_end)))
+    if end <= start + 0.05:
+        return text_start, text_end, True
+    return max(0.0, start), min(duration, end), True
 
 
 def _safe_name(value):
@@ -194,12 +229,15 @@ class GroupMergeWorker(QObject):
         signature = self._signature(clip)
         key = str(Path(clip).resolve())
         saved = cache.get(key, {})
-        if self.settings.get("resume", True) and saved.get("signature") == signature and saved.get("srt") is not None:
+        if (self.settings.get("resume", True) and saved.get("signature") == signature
+                and str(saved.get("srt") or "").strip()):
             self.log.emit(f"续接：复用语音边界 {clip.name}")
             return saved
         self.log.emit(f"正在识别说话边界：{clip.name}（此阶段可能需要一些时间）")
         original, _translated, srt = self.transcribe(str(clip))
-        info = {"signature": signature, "original": str(original or ""), "srt": str(srt or "")}
+        if not str(srt or "").strip():
+            raise RuntimeError("没有识别到带时间轴的有效文案")
+        info = {**saved, "signature": signature, "original": str(original or ""), "srt": str(srt or "")}
         cache[key] = info
         self.log.emit(f"说话边界识别完成：{clip.name}")
         return info
@@ -209,21 +247,28 @@ class GroupMergeWorker(QObject):
         signature = self._signature(clip)
         key = str(Path(clip).resolve())
         saved = cache.get(key, {})
+        threshold = int(self.settings.get("silence_threshold_db", -35))
+        minimum = max(0.06, float(self.settings.get("silence_min_ms", 180)) / 1000.0)
+        params = {"threshold": threshold, "minimum": round(minimum, 3),
+                  "head": int(self.settings.get("head_padding_ms", 80)),
+                  "tail": int(self.settings.get("tail_padding_ms", 120))}
         if (self.settings.get("resume", True) and saved.get("signature") == signature
-                and saved.get("fast_bounds_version") == 1 and saved.get("bounds")):
+                and saved.get("fast_bounds_version") == 2 and saved.get("fast_params") == params
+                and saved.get("bounds")):
             self.log.emit(f"续接：复用本地声音边界 {clip.name}")
             return saved
         probe = self._probe(clip)
         duration = max(0.05, probe["duration"])
         if not probe["audio"]:
-            info = {"signature": signature, "fast_bounds_version": 1,
-                    "bounds": [0.0, duration, False], "original": "", "srt": ""}
+            info = {**saved, "signature": signature, "fast_bounds_version": 2,
+                    "fast_params": params, "duration": duration, "bounds": [0.0, duration, False]}
             cache[key] = info
             return info
         self.log.emit(f"快速检测首尾声音：{clip.name}（本地处理，不识别字幕）")
         result = self._run([
             self.ffmpeg, "-hide_banner", "-nostats", "-i", str(clip),
-            "-map", "0:a:0", "-af", "silencedetect=noise=-38dB:d=0.10", "-f", "null", "-",
+            "-map", "0:a:0", "-af",
+            f"silencedetect=noise={threshold}dB:d={minimum:.3f}", "-f", "null", "-",
         ])
         events = []
         for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", result.stderr or ""):
@@ -248,14 +293,16 @@ class GroupMergeWorker(QObject):
             end = min(duration, end + max(0, self.settings.get("tail_padding_ms", 120)) / 1000.0)
         if end <= start + 0.05:
             start, end, detected = 0.0, duration, False
-        info = {"signature": signature, "fast_bounds_version": 1,
-                "bounds": [start, end, detected], "original": "", "srt": ""}
+        info = {**saved, "signature": signature, "fast_bounds_version": 2,
+                "fast_params": params, "duration": duration, "bounds": [start, end, detected]}
         cache[key] = info
         return info
 
     def _normalize(self, clip, index, cache_dir, analysis, target_w, target_h, watermark=None):
         probe = self._probe(clip)
-        if analysis.get("bounds"):
+        if analysis.get("hybrid_bounds"):
+            start, end, detected = analysis["hybrid_bounds"]
+        elif analysis.get("bounds"):
             start, end, detected = analysis["bounds"]
         else:
             start, end, detected = speech_trim_bounds(
@@ -267,12 +314,19 @@ class GroupMergeWorker(QObject):
         else:
             self.log.emit(f"去口气音：{clip.name} 保留 {start:.2f}s - {end:.2f}s")
         duration = max(0.05, end - start)
+        removed = max(0.0, probe["duration"] - duration)
+        ratio = (removed / probe["duration"] * 100.0) if probe["duration"] > 0 else 0.0
+        self.log.emit(
+            f"时长：{clip.name} 原始 {probe['duration']:.2f}s → 保留 {duration:.2f}s，删减 {removed:.2f}s（{ratio:.1f}%）"
+        )
+        if ratio > 40:
+            self.log.emit(f"提醒：{clip.name} 删减超过 40%，请检查文案时间轴或适当调低静音阈值。")
         watermark = Path(watermark) if watermark and Path(watermark).is_file() else None
         fingerprint = hashlib.sha256(json.dumps({
             "source": self._signature(clip), "start": round(start, 3), "end": round(end, 3),
             "width": target_w, "height": target_h,
             "watermark": self._signature(watermark) if watermark else None,
-            "clean_metadata": bool(self.settings.get("clean_metadata", True)), "version": 4,
+            "clean_metadata": bool(self.settings.get("clean_metadata", True)), "version": 5,
         }, sort_keys=True).encode("utf-8")).hexdigest()[:14]
         destination = cache_dir / f"segment_{index + 1:03d}_{fingerprint}.mp4"
         if self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024:
@@ -280,9 +334,11 @@ class GroupMergeWorker(QObject):
             return destination
         self.log.emit(f"正在裁剪口气音并统一音视频参数：{clip.name}")
         fade_out = max(0.0, duration - 0.018)
+        # Flow 等服务输出的竖屏素材宽高比常有少量偏差。缩小后 pad 会在
+        # 成品周围留下黑边；改为等比放大铺满并居中裁剪，不拉伸画面。
         video_filter = (
-            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p"
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+            f"crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1,fps=30,format=yuv420p"
         )
         command = [
             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}",
@@ -344,13 +400,35 @@ class GroupMergeWorker(QObject):
                 analyses = {}
                 self.log.emit(f"[{group_index}/{len(self.groups)}] 开始处理文件夹：{folder.name}（{len(clips)} 段）")
                 script_mode = self.settings.get("sort_mode") == "script"
+                trim_mode = self.settings.get("trim_mode", "hybrid")
                 for clip in clips:
                     if self.cancelled:
                         raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
-                    analyses[str(clip.resolve())] = (
-                        self._analysis(clip, analysis_cache) if script_mode
-                        else self._fast_analysis(clip, analysis_cache)
-                    )
+                    if script_mode or trim_mode in ("hybrid", "text"):
+                        try:
+                            analysis = self._analysis(clip, analysis_cache)
+                            if trim_mode == "hybrid":
+                                analysis = self._fast_analysis(clip, analysis_cache)
+                                media_duration = float(analysis.get("duration") or self._probe(clip)["duration"])
+                                analysis["hybrid_bounds"] = list(hybrid_trim_bounds(
+                                    analysis.get("srt", ""), media_duration, analysis.get("bounds"),
+                                    self.settings.get("head_padding_ms", 80),
+                                    self.settings.get("tail_padding_ms", 120),
+                                ))
+                                analysis_cache[str(clip.resolve())] = analysis
+                                self.log.emit(f"智能混合边界：文案时间轴 + 首尾声音检测已完成 {clip.name}")
+                            elif not script_mode:
+                                self.log.emit(f"智能文案边界：已按首词/末词时间定位 {clip.name}")
+                            analyses[str(clip.resolve())] = analysis
+                        except Exception as exc:
+                            if script_mode:
+                                raise
+                            self.log.emit(
+                                f"智能文案边界识别失败，自动改用本地声音边界继续处理：{clip.name}（{exc}）"
+                            )
+                            analyses[str(clip.resolve())] = self._fast_analysis(clip, analysis_cache)
+                    else:
+                        analyses[str(clip.resolve())] = self._fast_analysis(clip, analysis_cache)
                     cache_file.write_text(json.dumps(analysis_cache, ensure_ascii=False, indent=2), encoding="utf-8")
                     completed_steps += 1
                     self.progress.emit(round(completed_steps / total_steps * 100))

@@ -6,6 +6,7 @@ __pycache__/
 .watermark_studio/
 .pytest_cache/
 build/
+.build_media/
 build_macos/
 dist/
 dist_macos/
@@ -24,6 +25,8 @@ rename_regression_*/
 .rename_resume_regression/
 VideoToolkit.spec
 *_preview.png
+fontcheck*.png
+font_test.png
 execution_detailed.log
 tools/ffmpeg/
 *.zip

@@ -31,9 +31,10 @@ def main():
         group.mkdir(parents=True)
         watermark=root/"watermark.png"; Image.new("RGBA",(270,480),(255,0,0,48)).save(watermark)
         for index, color in ((1, "red"), (2, "blue")):
+            size = "270x480" if index == 1 else "280x480"
             subprocess.run([
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "lavfi", "-i", f"color={color}:s=270x480:r=30:d=0.8",
+                "-f", "lavfi", "-i", f"color={color}:s={size}:r=30:d=0.8",
                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.8",
                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-ac", "2", str(group / f"{index}.mp4"),
@@ -41,7 +42,7 @@ def main():
         worker = GroupMergeWorker(
             discover_groups(parent), output, ffmpeg,
             lambda _path: (_ for _ in ()).throw(AssertionError("natural mode must not transcribe")),
-            {"sort_mode": "natural", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True,
+            {"sort_mode": "natural", "trim_mode": "fast", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True,
              "burn_watermark":True,"watermark_prepare":lambda _video,_cache:str(watermark)},
         )
         results = []
@@ -56,12 +57,19 @@ def main():
         audio = next(stream for stream in data["streams"] if stream["codec_type"] == "audio")
         assert audio["channels"] == 2
         assert 1.0 < float(data["format"]["duration"]) < 1.7
+        # 第二段故意使用非 9:16 比例。成品应居中裁剪铺满，不应用黑色 pad 补边。
+        corner = subprocess.run([
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", "1.1", "-i", results[0],
+            "-vf", "crop=24:24:0:0,scale=1:1", "-frames:v", "1", "-f", "rawvideo",
+            "-pix_fmt", "rgb24", "pipe:1",
+        ], check=True, capture_output=True).stdout
+        assert len(corner) == 3 and max(corner) > 100, f"unexpected black padded corner: {list(corner)}"
         # 第二次运行必须复用缓存，且输出仍只有一个成品。
         second = []
         worker = GroupMergeWorker(
             discover_groups(parent), output, ffmpeg,
             lambda _path: (_ for _ in ()).throw(AssertionError("natural mode must not transcribe")),
-            {"sort_mode": "natural", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True,
+            {"sort_mode": "natural", "trim_mode": "fast", "head_padding_ms": 40, "tail_padding_ms": 40, "resume": True,
              "burn_watermark":True,"watermark_prepare":lambda _video,_cache:str(watermark)},
         )
         worker.item_done.connect(lambda path, *_args: second.append(path)); worker.run()
@@ -71,7 +79,7 @@ def main():
         stopper = GroupMergeWorker(
             discover_groups(parent), output, ffmpeg,
             lambda _path: (_ for _ in ()).throw(AssertionError("natural mode must not transcribe")),
-            {"sort_mode": "natural", "resume": True},
+            {"sort_mode": "natural", "trim_mode": "fast", "resume": True},
         )
         stopped = []
         thread = threading.Thread(

@@ -2,7 +2,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from modules.group_merge import (
-    discover_groups, match_clips_to_script, speech_trim_bounds, split_group_script,
+    GroupMergeWorker, discover_groups, hybrid_trim_bounds, match_clips_to_script,
+    speech_trim_bounds, split_group_script,
 )
 
 
@@ -54,6 +55,29 @@ def main():
         start, end, detected = speech_trim_bounds(srt, 3.0, 80, 120)
         assert detected and abs(start - 0.22) < 0.001 and abs(end - 2.52) < 0.001
         assert speech_trim_bounds("", 3.0) == (0.0, 3.0, False)
+
+        # Smart natural-order trimming must use the transcript timeline instead
+        # of reusing an older fast-silence cache entry with an empty SRT.
+        smart_clip = root / "smart.mp4"; smart_clip.touch()
+        calls = []
+        smart_srt = "1\n00:00:01,500 --> 00:00:04,200\nTexto real"
+        worker = GroupMergeWorker([], root / "out", "ffmpeg",
+                                  lambda path: (calls.append(path) or ("Texto real", "", smart_srt)),
+                                  {"trim_mode": "smart", "resume": True})
+        stale = {str(smart_clip.resolve()): {
+            "signature": worker._signature(smart_clip), "srt": "", "bounds": [0.0, 5.0, False],
+        }}
+        analysis = worker._analysis(smart_clip, stale)
+        assert calls == [str(smart_clip)] and analysis["srt"] == smart_srt
+        start, end, detected = speech_trim_bounds(analysis["srt"], 6.0, 80, 120)
+        assert detected and abs(start - 1.42) < .001 and abs(end - 4.32) < .001
+        # Audio may tighten padding, but must never cross into the first/last word.
+        start, end, detected = hybrid_trim_bounds(
+            analysis["srt"], 6.0, (1.47, 4.23, True), 80, 120, 40,
+        )
+        assert detected and abs(start - 1.46) < .001 and abs(end - 4.24) < .001
+        # Internal silence is intentionally irrelevant: only the outer bounds are combined.
+        assert hybrid_trim_bounds(analysis["srt"], 6.0, (0.0, 6.0, False), 80, 120)[:2] == (1.42, 4.32)
     print("group merge helpers: OK")
 
 

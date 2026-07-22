@@ -86,7 +86,7 @@ STATIC_BOLD_FONT_FILES = {
     "Libre Baskerville": "LibreBaskerville-Bold.ttf",
 }
 
-CAPTION_RENDERER_VERSION = 8
+CAPTION_RENDERER_VERSION = 9
 
 
 def custom_font_dir():
@@ -335,13 +335,47 @@ def parse_srt(srt):
     return result
 
 
-def group_word_srt(srt, max_chars=36, max_duration=4.6, max_words=8):
+def fix_srt_overlaps(srt, gap_ms=20, min_duration_ms=80):
+    """Fix adjacent SRT overlaps without touching caption text or word timing caches."""
+    entries=parse_srt(srt)
+    if len(entries) < 2: return srt,0
+    entries=[list(item) for item in sorted(entries,key=lambda item:(item[0],item[1]))]
+    gap=max(0,int(gap_ms))/1000; minimum=max(20,int(min_duration_ms))/1000
+    fixed=0
+    for index in range(1,len(entries)):
+        previous=entries[index-1]; current=entries[index]
+        if current[0] >= previous[1]: continue
+        # Subtitle Edit style: normally shorten the previous cue to just before
+        # the next cue.  Only move the next start when the previous cue would
+        # otherwise become too short to display.
+        candidate=current[0]-gap
+        if candidate >= previous[0]+minimum:
+            previous[1]=candidate
+        else:
+            previous[1]=previous[0]+minimum
+            current[0]=previous[1]+gap
+            current[1]=max(current[1],current[0]+minimum)
+        fixed+=1
+    if not fixed: return srt,0
+
+    def stamp(value):
+        milliseconds=max(0,round(float(value)*1000)); hours,remainder=divmod(milliseconds,3600000)
+        minutes,remainder=divmod(remainder,60000); seconds,millis=divmod(remainder,1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    blocks=[f"{index}\n{stamp(start)} --> {stamp(end)}\n{text}"
+            for index,(start,end,text) in enumerate(entries,1)]
+    return "\n\n".join(blocks)+"\n",fixed
+
+
+def group_word_srt(srt, max_chars=36, max_duration=4.6, max_words=8, return_fix_count=False):
     """把词级时间轴合并成便于阅读/编辑的逐句 SRT，保留首尾真实时间。"""
     words = parse_srt(srt)
-    if not words: return srt
+    if not words: return (srt,0) if return_fix_count else srt
     # 已经是正常句级字幕时不重复合并。
     if len(words) <= 2 or sum(len(tokens_for(text)) for _,_,text in words) > len(words) * 2:
-        return srt
+        fixed,count=fix_srt_overlaps(srt)
+        return (fixed,count) if return_fix_count else fixed
     phrases=[]; current=[]; start=None; end=None
 
     def flush():
@@ -369,7 +403,8 @@ def group_word_srt(srt, max_chars=36, max_duration=4.6, max_words=8):
             ms=max(0,round(value*1000)); h,rem=divmod(ms,3600000); m,rem=divmod(rem,60000); sec,milli=divmod(rem,1000)
             return f"{h:02d}:{m:02d}:{sec:02d},{milli:03d}"
         blocks.append(f"{index}\n{stamp(start)} --> {stamp(end)}\n{text}")
-    return "\n\n".join(blocks)+"\n"
+    fixed,count=fix_srt_overlaps("\n\n".join(blocks)+"\n")
+    return (fixed,count) if return_fix_count else fixed
 
 
 def media_duration(ffmpeg, path, fallback=8.0):
@@ -403,22 +438,44 @@ def media_has_audio(ffmpeg, path):
         return False
 
 
-def mixed_audio_filter(original_volume=100, background_volume=25):
+def added_audio_fade_filters(mode="直接加入（无淡入淡出）", fade_in_ms=500,
+                             fade_out_ms=500, duration=0):
+    """Return FFmpeg filters for the matched external track only."""
+    filters=[]; duration=max(0.0,float(duration or 0))
+    fade_in=max(0.0,int(fade_in_ms or 0)/1000)
+    fade_out=max(0.0,int(fade_out_ms or 0)/1000)
+    if mode in ("仅淡入","淡入＋淡出") and fade_in > 0:
+        filters.append(f"afade=t=in:st=0:d={min(fade_in,duration or fade_in):.3f}")
+    if mode in ("仅淡出","淡入＋淡出") and fade_out > 0 and duration > 0:
+        actual=min(fade_out,duration)
+        filters.append(f"afade=t=out:st={max(0.0,duration-actual):.3f}:d={actual:.3f}")
+    return filters
+
+
+def mixed_audio_filter(original_volume=100, background_volume=25,
+                       fade_mode="直接加入（无淡入淡出）", fade_in_ms=500,
+                       fade_out_ms=500, duration=0):
     """Shared FFmpeg graph used by exact preview and final export."""
     original = max(0, min(200, int(original_volume))) / 100
     background = max(0, min(200, int(background_volume))) / 100
+    background_filters=["aresample=48000","aformat=channel_layouts=stereo",f"volume={background:.3f}"]
+    background_filters.extend(added_audio_fade_filters(
+        fade_mode,fade_in_ms,fade_out_ms,duration))
     return (
         f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={original:.3f}[original_audio];"
-        f"[1:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={background:.3f}[background_audio];"
+        f"[1:a:0]{','.join(background_filters)}[background_audio];"
         "[original_audio][background_audio]amix=inputs=2:duration=longest:"
         "dropout_transition=2:normalize=0[aout]"
     )
 
 
-def replacement_audio_filter():
+def replacement_audio_filter(fade_mode="直接加入（无淡入淡出）", fade_in_ms=500,
+                             fade_out_ms=500, duration=0):
     """Pad a replacement track with silence; -shortest then keeps video length."""
-    return ("[1:a:0]aresample=48000,aformat=channel_layouts=stereo,"
-            "apad=pad_dur=86400[aout]")
+    filters=["aresample=48000","aformat=channel_layouts=stereo"]
+    filters.extend(added_audio_fade_filters(fade_mode,fade_in_ms,fade_out_ms,duration))
+    filters.append("apad=pad_dur=86400")
+    return f"[1:a:0]{','.join(filters)}[aout]"
 
 
 def media_video_size(ffmpeg, path, fallback=(1080,1920)):
@@ -1054,47 +1111,6 @@ class CaptionWorker(QObject):
     def _audio_for(self, video, index):
         return self._audio_selection(video, index)[0]
 
-    def _clean_video(self, video):
-        clean_dir = self.output / "00_无元数据素材"; clean_dir.mkdir(parents=True, exist_ok=True)
-        destination = clean_dir / video.name
-        if destination.exists() and destination.stat().st_size > 0:
-            ffmpeg_path = Path(self.ffmpeg)
-            ffprobe = ffmpeg_path.with_name("ffprobe" + ffmpeg_path.suffix)
-            probe = subprocess.run(
-                [str(ffprobe), "-v", "error", "-select_streams", "V:0",
-                 "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", str(destination)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                encoding="utf-8", errors="replace", **hidden_kwargs(),
-            ) if ffprobe.exists() else None
-            if probe is None or (probe.returncode == 0 and "video" in probe.stdout):
-                self.log.emit(f"续接：复用已清理素材 {destination.name}"); return destination
-            self.log.emit(f"检测到上次遗留的无效文件，自动重新清理：{destination.name}")
-            try:
-                destination.unlink()
-            except OSError as exc:
-                raise RuntimeError(f"无法覆盖上次失败留下的文件：{destination}\n{exc}") from exc
-        # Reels 输入只需要主画面和音轨。部分手机、剪辑软件或下载器会在 MP4
-        # 中附带 timed metadata / data / attachment 流；使用 `-map 0` 会把这些
-        # codec=none 的辅助流也复制进新 MP4，导致 muxer 无法写入文件头。
-        # 大写 V 排除 attached_pic，全部音轨仍按码流原样复制，不改变声道数、
-        # 采样率或音频编码。
-        command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
-                   "-map", "0:V:0", "-map", "0:a?",
-                   "-map_metadata", "-1", "-map_metadata:s", "-1",
-                   "-map_metadata:p", "-1", "-map_metadata:c", "-1",
-                   "-map_chapters", "-1", "-sn", "-dn", "-c:v", "copy", "-c:a", "copy",
-                   str(destination)]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
-        if result.returncode:
-            # FFmpeg 可能已留下一个不完整文件；删除它，避免断点续接误判为成功。
-            try:
-                destination.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise RuntimeError(f"Reels 素材元数据清理失败：{video.name}\n{result.stderr[-500:]}")
-        self.log.emit(f"已清理素材元数据：{destination.name}"); return destination
-
     def run(self):
         """Keep a batch alive when one media item fails; only stop on explicit cancellation."""
         failures=[]; completed=0; total=len(self.videos)
@@ -1157,7 +1173,9 @@ class CaptionWorker(QObject):
                     self.progress.emit(round((index+1)/len(self.videos)*100))
                     self.log.emit(f"续接：素材和样式未变化，复用已完成成品 {destination.name}")
                     continue
-                render_video = self._clean_video(video) if self.settings["clean_metadata"] else video
+                # 元数据在最终成品的同一条 FFmpeg 命令中清除。不再先生成
+                # `00_无元数据素材` 副本，避免额外占用空间和一次完整读写。
+                render_video = video
                 source_key = str(caption_audio.resolve())
                 if self.settings.get("caption_mode") == "自由文案动画（不对口型）":
                     video_key = str(video.resolve())
@@ -1198,6 +1216,9 @@ class CaptionWorker(QObject):
                         else:
                             phrase_srt = replace_srt_copy(phrase_srt, override)
                             self.log.emit("已应用人工修订文案，并保留词级时间轴。")
+                phrase_srt,overlap_fixes=fix_srt_overlaps(phrase_srt)
+                if overlap_fixes:
+                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 渲染前自动修正 {overlap_fixes} 处逐句字幕时间重叠。")
                 self.timeline_ready.emit(source_key, word_srt, phrase_srt)
                 # Keep libass intermediate paths short. Long source titles can exceed
                 # the Windows/libass path limit even when the source video opens fine.
@@ -1243,10 +1264,17 @@ class CaptionWorker(QObject):
                     render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 已使用预缩放公司水印缓存，跳过逐帧缩放。")
                 watermark_input = 2 if external else 1
+                video_duration = media_duration(self.ffmpeg, render_video)
                 audio_graph = (mixed_audio_filter(self.settings.get("original_volume", 100),
-                                                  self.settings.get("background_volume", 25))
+                                                  self.settings.get("background_volume", 25),
+                                                  self.settings.get("audio_fade_mode"),
+                                                  self.settings.get("audio_fade_in_ms",500),
+                                                  self.settings.get("audio_fade_out_ms",500),video_duration)
                                if mix_audio and source_has_audio else
-                               (replacement_audio_filter() if replace_audio else ""))
+                               (replacement_audio_filter(self.settings.get("audio_fade_mode"),
+                                                        self.settings.get("audio_fade_in_ms",500),
+                                                        self.settings.get("audio_fade_out_ms",500),video_duration)
+                                if replace_audio else ""))
                 if watermark_enabled:
                     # Decode the static PNG once; overlay=eof_action=repeat keeps that frame
                     # for the whole video without decoding/scaling the same image every frame.
@@ -1278,9 +1306,13 @@ class CaptionWorker(QObject):
                 command += ["-c:a", "aac", "-b:a", "192k"]
                 if external and audio_mode in ("替换为添加的音频", "原声＋背景音混合"):
                     command += ["-ac", "2"]
+                if self.settings.get("clean_metadata", True):
+                    command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                                "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                                "-map_chapters", "-1"]
+                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 将在成品输出时直接清除元数据（不生成副本）。")
                 command += ["-movflags", "+faststart", str(destination)]
-                duration = media_duration(self.ffmpeg, render_video)
-                returncode, render_log = self._run_render(command, duration, index, len(self.videos))
+                returncode, render_log = self._run_render(command, video_duration, index, len(self.videos))
                 try: ass.unlink()
                 except OSError: pass
                 if returncode: raise RuntimeError(render_log.strip() or "动态文案渲染失败")
@@ -1397,10 +1429,17 @@ class PreviewWorker(QObject):
                     self.ffmpeg,self.source,watermark,self.destination.parent,self.settings.get("watermark_opacity",90))
                 render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
             watermark_input = 2 if external else 1
+            preview_duration=min(8.0,media_duration(self.ffmpeg,self.source))
             audio_graph = (mixed_audio_filter(self.settings.get("original_volume", 100),
-                                              self.settings.get("background_volume", 25))
+                                              self.settings.get("background_volume", 25),
+                                              self.settings.get("audio_fade_mode"),
+                                              self.settings.get("audio_fade_in_ms",500),
+                                              self.settings.get("audio_fade_out_ms",500),preview_duration)
                            if mix_audio and source_has_audio else
-                           (replacement_audio_filter() if replace_audio else ""))
+                           (replacement_audio_filter(self.settings.get("audio_fade_mode"),
+                                                    self.settings.get("audio_fade_in_ms",500),
+                                                    self.settings.get("audio_fade_out_ms",500),preview_duration)
+                            if replace_audio else ""))
             if watermark_enabled:
                 graph = watermark_filter_graph(ass_filter, render_settings, watermark_input)
                 if audio_graph: graph += ";" + audio_graph
@@ -1576,6 +1615,7 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_thread = None; self.group_merge_worker = None; self.group_merge_groups = []
         self._group_auto_extract_requested = False; self._group_auto_extract_pending = False
         self.group_scripts = {}; self._loading_group_script = False; self.group_merge_outputs = []
+        self._pending_group_cleanup_dir=None; self._batch_expected_count=0
         self._watermark_image = QImage(); self._watermark_images=[]; self._watermark_paths=[]; self._watermark_entries=[]
         self._active_group_watermark_fingerprint=""
         try: self._baked_watermarks=json.loads(QSettings("VideoToolkit","DynamicReels").value("baked_watermarks","{}"))
@@ -1664,7 +1704,11 @@ class DynamicCaptionPage(QWidget):
         tts_line1 = QHBoxLayout(); tts_line1.addWidget(self.tts_service); tts_line1.addWidget(self.tts_voice,1)
         text_tab_layout.addLayout(tts_line1); text_tab_layout.addWidget(self.tts_generate)
 
-        group_tab = QWidget(); group_layout = QVBoxLayout(group_tab); group_layout.setContentsMargins(4,4,4,4); group_layout.setSpacing(4)
+        group_tab = QScrollArea(); group_tab.setWidgetResizable(True)
+        group_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        group_tab.setFrameShape(QFrame.Shape.NoFrame)
+        group_body = QWidget(); group_layout = QVBoxLayout(group_body); group_layout.setContentsMargins(4,4,4,4); group_layout.setSpacing(4)
+        group_tab.setWidget(group_body)
         group_path_row = QHBoxLayout()
         self.group_parent = DropFolderLineEdit(); self.group_parent.setPlaceholderText("拖入父文件夹：每个直接子文件夹为一组合成任务")
         self.group_parent.folder_dropped.connect(self._scan_group_parent)
@@ -1689,40 +1733,59 @@ class DynamicCaptionPage(QWidget):
         sort_row = QHBoxLayout(); sort_row.addWidget(QLabel("排序"))
         self.group_sort_mode = QComboBox(); self.group_sort_mode.addItems(["文件名自然排序（推荐）","按分段文案自动匹配"])
         self.group_sort_mode.currentTextChanged.connect(self._group_sort_mode_changed)
+        self.group_trim_mode = QComboBox(); self.group_trim_mode.addItems([
+            "智能混合边界（推荐）", "仅按文案边界", "快速声音边界",
+        ])
+        self.group_trim_mode.setToolTip(
+            "智能混合模式会用文案首词/末词时间定位正文，再用声音检测修正首尾；"
+            "识别失败会自动退回本地声音检测，不会中断整批任务。"
+        )
         self.group_head_padding = QSpinBox(); self.group_head_padding.setRange(0,1000); self.group_head_padding.setValue(80); self.group_head_padding.setSuffix(" ms")
         self.group_tail_padding = QSpinBox(); self.group_tail_padding.setRange(0,1000); self.group_tail_padding.setValue(120); self.group_tail_padding.setSuffix(" ms")
         sort_row.addWidget(self.group_sort_mode,1); group_layout.addLayout(sort_row)
-        trim_row=QHBoxLayout(); trim_row.addWidget(QLabel("句首")); trim_row.addWidget(self.group_head_padding,1)
-        trim_row.addWidget(QLabel("句尾")); trim_row.addWidget(self.group_tail_padding,1); group_layout.addLayout(trim_row)
-        self.group_burn_watermark=QCheckBox("合成时烧录当前水印（后续导出自动跳过重复水印）")
+        trim_mode_row=QHBoxLayout(); trim_mode_row.addWidget(QLabel("裁剪")); trim_mode_row.addWidget(self.group_trim_mode,1)
+        group_layout.addLayout(trim_mode_row)
+        self.group_head_padding.setMinimumWidth(78); self.group_tail_padding.setMinimumWidth(78)
+        self.group_head_padding.setToolTip("第一词前最多保留的保护时间，防止吞掉词首发音")
+        self.group_tail_padding.setToolTip("最后一词后最多保留的保护时间，防止吞掉词尾发音")
+        trim_row=QHBoxLayout(); trim_row.addWidget(QLabel("首保护")); trim_row.addWidget(self.group_head_padding,1)
+        trim_row.addWidget(QLabel("尾保护")); trim_row.addWidget(self.group_tail_padding,1); group_layout.addLayout(trim_row)
+        self.group_silence_threshold = QSpinBox(); self.group_silence_threshold.setRange(-60,-20)
+        self.group_silence_threshold.setValue(-35); self.group_silence_threshold.setSuffix(" dB")
+        self.group_silence_min = QSpinBox(); self.group_silence_min.setRange(60,1000)
+        self.group_silence_min.setValue(180); self.group_silence_min.setSuffix(" ms")
+        self.group_silence_threshold.setMinimumWidth(78); self.group_silence_min.setMinimumWidth(78)
+        self.group_silence_threshold.setToolTip("低于该音量时视为静音；数值越大，裁剪越积极")
+        self.group_silence_min.setToolTip("持续达到该时长才视为有效静音，避免误切很短的停顿")
+        silence_row=QHBoxLayout(); silence_row.addWidget(QLabel("静音阈值")); silence_row.addWidget(self.group_silence_threshold,1)
+        silence_row.addWidget(QLabel("最短静音")); silence_row.addWidget(self.group_silence_min,1); group_layout.addLayout(silence_row)
+        self.group_burn_watermark=QCheckBox("水印")
         self.group_burn_watermark.setChecked(False)
-        group_layout.addWidget(self.group_burn_watermark)
-        self.group_clean_metadata=QCheckBox("合成时清除素材元数据")
+        self.group_burn_watermark.setToolTip("合成时烧录当前公司水印；后续导出会自动跳过重复烧录")
+        self.group_clean_metadata=QCheckBox("清除元数据")
         self.group_clean_metadata.setChecked(True)
-        self.group_clean_metadata.setToolTip("在片段统一编码和最终合并时移除位置、时间、设备、作者、版权及容器元数据。")
-        group_layout.addWidget(self.group_clean_metadata)
+        self.group_clean_metadata.setToolTip("勾选后在合成成品的同一条 FFmpeg 命令中清除元数据，不生成额外副本。")
         # 对应关系改在表格弹窗中集中编辑；保留隐藏编辑器兼容现有断点和选择逻辑。
         self.group_script = QPlainTextEdit(); self.group_script.hide()
         self.group_script.textChanged.connect(self._save_current_group_script)
         group_action_panel=QWidget(); self.group_action_panel=group_action_panel
         group_action_layout=QVBoxLayout(group_action_panel); group_action_layout.setContentsMargins(2,4,2,2); group_action_layout.setSpacing(5)
-        self.group_resume = QCheckBox("断点续接"); self.group_resume.setChecked(True)
         self.group_auto_timeline = QCheckBox("合成并转文字"); self.group_auto_timeline.setChecked(True)
-        self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(66,52); self.group_merge_start.clicked.connect(self.start_group_merge)
-        self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(66,52); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
-        self.group_to_rename = QPushButton("加入批量\n重命名"); self.group_to_rename.setFixedSize(66,52)
-        self.group_to_rename.setToolTip("把分组合成成品文件夹直接加入批量重命名")
-        self.group_to_rename.clicked.connect(self._send_group_output_to_rename)
-        group_action_layout.addWidget(self.group_resume); group_action_layout.addWidget(self.group_auto_timeline)
+        self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(66,42); self.group_merge_start.clicked.connect(self.start_group_merge)
+        self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(66,42); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
+        group_action_layout.addWidget(self.group_auto_timeline)
+        compact_options=QHBoxLayout(); compact_options.setSpacing(3)
+        compact_options.addWidget(self.group_burn_watermark); compact_options.addWidget(self.group_clean_metadata)
+        group_action_layout.addLayout(compact_options)
         group_action_layout.addWidget(self.group_merge_start); group_action_layout.addWidget(self.group_merge_stop)
-        group_action_layout.addWidget(self.group_to_rename); group_action_layout.addStretch()
+        group_action_layout.addStretch()
         group_action_panel.setFixedWidth(126)
 
         for page in (group_tab,video_tab,audio_tab,text_tab): source_stack.addWidget(page)
         source_tools=QVBoxLayout(); source_tools.setContentsMargins(4,0,0,0); source_tools.setSpacing(5)
         self.source_tool_buttons=[]
         for index,label in enumerate(("合成","视频","音频","文转音")):
-            button=QPushButton(label); button.setCheckable(True); button.setFixedSize(66,52)
+            button=QPushButton(label); button.setCheckable(True); button.setFixedSize(66,42)
             button.setToolTip({0:"分组去口气音并合成",1:"视频素材队列",2:"音频素材队列",3:"文案配音"}[index])
             button.clicked.connect(lambda checked=False,i=index:self._show_source_tool(i))
             source_tools.addWidget(button); self.source_tool_buttons.append(button)
@@ -1873,6 +1936,18 @@ class DynamicCaptionPage(QWidget):
         self.background_volume.valueChanged.connect(self._update_preview_audio_levels)
         audio_volume_line=QHBoxLayout(); audio_volume_line.addWidget(QLabel("原声")); audio_volume_line.addWidget(self.original_volume)
         audio_volume_line.addWidget(QLabel("背景音")); audio_volume_line.addWidget(self.background_volume)
+        self.audio_fade_mode=QComboBox(); self.audio_fade_mode.addItems([
+            "直接加入（无淡入淡出）","仅淡入","仅淡出","淡入＋淡出",
+        ])
+        self.audio_fade_in=QSpinBox(); self.audio_fade_in.setRange(0,10000); self.audio_fade_in.setValue(500); self.audio_fade_in.setSuffix(" ms")
+        self.audio_fade_out=QSpinBox(); self.audio_fade_out.setRange(0,10000); self.audio_fade_out.setValue(500); self.audio_fade_out.setSuffix(" ms")
+        self.audio_fade_mode.setToolTip("只处理当前视频匹配的外部音频；直接加入不改变音量曲线。")
+        self.audio_fade_in.setToolTip("外部音频从静音到设定音量的时间")
+        self.audio_fade_out.setToolTip("外部音频在视频结尾逐渐变为静音的时间")
+        self.audio_fade_mode.setEnabled(False); self.audio_fade_in.setEnabled(False); self.audio_fade_out.setEnabled(False)
+        self.audio_fade_mode.currentTextChanged.connect(self._audio_fade_mode_changed)
+        fade_time_line=QHBoxLayout(); fade_time_line.addWidget(QLabel("淡入")); fade_time_line.addWidget(self.audio_fade_in)
+        fade_time_line.addWidget(QLabel("淡出")); fade_time_line.addWidget(self.audio_fade_out)
         self.audio_match_mode=QComboBox(); self.audio_match_mode.addItems([
             "自动匹配（同名优先，其次按队列）", "严格按队列一一对应", "每个视频使用自身音频",
         ])
@@ -1880,11 +1955,13 @@ class DynamicCaptionPage(QWidget):
             "添加的音频按同名或队列序号与视频一一对应；一条音频不会重复套用到其他视频")
         self.audio_match_mode.currentTextChanged.connect(self._rematch_current_video)
         self.audio_match_mode.currentTextChanged.connect(self._refresh_task_queue)
-        self.clean_metadata=QCheckBox("输出前无损清除视频素材元数据"); self.clean_metadata.setChecked(True)
+        self.clean_metadata=QCheckBox("成品直接清除元数据"); self.clean_metadata.setChecked(True)
+        self.clean_metadata.setToolTip("与字幕、水印和音轨一起在最终输出命令中处理，不会另外生成无元数据副本。")
         self.encoder_backend=QComboBox(); self.encoder_backend.addItems(list(ENCODER_LABELS.values()))
         self.encoder_backend.setToolTip("自动模式会实际测试显卡编码器；不可用时自动使用 CPU。")
         self.encode_preset=QComboBox(); self.encode_preset.addItems(["veryfast","faster","fast","medium"])
-        for combo in (self.caption_mode,self.free_animation,self.font,self.position,self.audio_match_mode,self.audio_mode,self.encoder_backend,self.encode_preset):
+        for combo in (self.caption_mode,self.free_animation,self.font,self.position,self.audio_match_mode,self.audio_mode,
+                      self.audio_fade_mode,self.encoder_backend,self.encode_preset):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(8); combo.setMinimumWidth(0)
         phrase_line=QHBoxLayout(); phrase_line.addWidget(QLabel("每句词数")); phrase_line.addWidget(self.max_words); phrase_line.addWidget(QLabel("每行字符")); phrase_line.addWidget(self.line_length)
@@ -1895,7 +1972,9 @@ class DynamicCaptionPage(QWidget):
         form.addRow("字幕模式",self.caption_mode); form.addRow("自由动画",free_line)
         form.addRow("字体",font_line); form.addRow("自然分句",phrase_line); form.addRow("排版宽度",width_line); form.addRow("字幕间距",spacing_line)
         form.addRow("行间距",line_spacing_line); form.addRow("色块留白",effect_line); form.addRow("跟读动画",self.animation_speed)
-        form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width); form.addRow("音频匹配",self.audio_match_mode); form.addRow("音频处理",self.audio_mode); form.addRow("音轨音量",audio_volume_line); form.addRow("编码加速",self.encoder_backend); form.addRow("CPU 质量",self.encode_preset); form.addRow("素材清理",self.clean_metadata)
+        form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width); form.addRow("音频匹配",self.audio_match_mode); form.addRow("音频处理",self.audio_mode); form.addRow("音轨音量",audio_volume_line)
+        form.addRow("音频淡化",self.audio_fade_mode); form.addRow("淡化时长",fade_time_line)
+        form.addRow("编码加速",self.encoder_backend); form.addRow("CPU 质量",self.encode_preset); form.addRow("素材清理",self.clean_metadata)
         batch_style_hint=QLabel("✓ 每个视频、匹配音频和文案组成独立任务；这里只批量套用字幕样式、蒙版和动画，最后统一批量导出。")
         batch_style_hint.setWordWrap(True); batch_style_hint.setStyleSheet("color:#67e8f9;background:#0b1830;padding:6px;border-radius:5px;")
         colors=QGridLayout(); self.text_color=QPushButton("文字 #FFFFFF"); self.outline_color=QPushButton("描边 #111827"); self.highlight_color=QPushButton("跟读背景 #8B5CF6")
@@ -2024,7 +2103,9 @@ class DynamicCaptionPage(QWidget):
         self.timeline_source_label.setWordWrap(True); revise_layout.addWidget(self.timeline_source_label)
         timeline_actions=QHBoxLayout(); self.extract_timeline_btn=QPushButton("重新提取选中素材"); self.extract_timeline_btn.clicked.connect(self.extract_timeline)
         self.extract_all_btn=QPushButton("批量提取全部"); self.extract_all_btn.clicked.connect(self.extract_all_timelines)
-        load_sidecar=QPushButton("载入 SRT…"); load_sidecar.clicked.connect(self.load_srt_file); timeline_actions.addWidget(self.extract_timeline_btn); timeline_actions.addWidget(self.extract_all_btn); timeline_actions.addWidget(load_sidecar)
+        self.fix_overlap_btn=QPushButton("修正重叠"); self.fix_overlap_btn.setToolTip("批量修正当前 SRT 中后一句提前开始造成的时间重叠")
+        self.fix_overlap_btn.clicked.connect(self._fix_current_overlaps)
+        load_sidecar=QPushButton("载入 SRT…"); load_sidecar.clicked.connect(self.load_srt_file); timeline_actions.addWidget(self.extract_timeline_btn); timeline_actions.addWidget(self.extract_all_btn); timeline_actions.addWidget(self.fix_overlap_btn); timeline_actions.addWidget(load_sidecar)
         revise_layout.addLayout(timeline_actions)
         timeline_hint=QLabel("语音同步：按时间轴对齐朗读。自由动画：每个视频保存自己的文案；整段固定保留全部手动换行，不限制行数和每屏秒数。")
         timeline_hint.setWordWrap(True); timeline_hint.setStyleSheet("color:#7dd3fc;"); revise_layout.addWidget(timeline_hint)
@@ -2085,7 +2166,7 @@ class DynamicCaptionPage(QWidget):
         status_row=QHBoxLayout(); status_row.setSpacing(6)
         self.stop=QPushButton("停止"); self.stop.setEnabled(False); self.stop.clicked.connect(self.cancel)
         self.output_to_rename=QPushButton("加入批量重命名")
-        self.output_to_rename.setToolTip("把当前批量导出的 Reels 成品文件夹直接加入批量重命名")
+        self.output_to_rename.setToolTip("自动选择最近完成的分组合成或批量输出文件夹，并进入批量重命名")
         self.output_to_rename.clicked.connect(self._send_export_output_to_rename)
         self.start=QPushButton("开始批量生成 Reels"); self.start.setObjectName("primary"); self.start.clicked.connect(self.run)
         status_row.addWidget(self.stop); status_row.addWidget(self.output_to_rename); status_row.addWidget(self.start,1); run_layout.addLayout(status_row); og.addWidget(run_panel)
@@ -2292,7 +2373,7 @@ class DynamicCaptionPage(QWidget):
         self.group_script.setEnabled(script_mode)
         self.group_script.setToolTip(
             "选择一个组后粘贴它的分段文案；段数必须与视频数一致。" if script_mode
-            else "文件名自然排序会正确处理 1、2、3…10，并用本地声音边界快速去口气音；不会识别或核对字幕。"
+            else "文件名自然排序会正确处理 1、2、3…10；裁剪方式可选择智能混合、仅文案或快速声音边界。"
         )
 
     def start_group_merge(self):
@@ -2322,10 +2403,14 @@ class DynamicCaptionPage(QWidget):
         callback = lambda path: self.transcribe_callable(path, provider)
         settings = {
             "sort_mode": "script" if "文案" in self.group_sort_mode.currentText() else "natural",
+            "trim_mode": ("hybrid" if "混合" in self.group_trim_mode.currentText()
+                          else "text" if "文案" in self.group_trim_mode.currentText() else "fast"),
             "scripts": dict(self.group_scripts),
             "head_padding_ms": self.group_head_padding.value(),
             "tail_padding_ms": self.group_tail_padding.value(),
-            "resume": self.group_resume.isChecked(),
+            "silence_threshold_db": self.group_silence_threshold.value(),
+            "silence_min_ms": self.group_silence_min.value(),
+            "resume": True,
             "encoder_backend": self.encoder_backend.currentText(),
             "encode_preset": self.encode_preset.currentText(),
             "clean_metadata": self.group_clean_metadata.isChecked(),
@@ -2360,7 +2445,12 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_thread.finished.connect(self.group_merge_thread.deleteLater)
         self.group_merge_start.setEnabled(False); self.group_merge_stop.setEnabled(True); self.progress.setValue(0)
         if settings["sort_mode"] == "natural":
-            self._append_run_log("开始快速分组合成：文件名自然排序 → 本地检测首尾声音 → 去口气音 → 无缝合成；不识别、不核对字幕。")
+            if settings["trim_mode"] == "hybrid":
+                self._append_run_log("开始智能混合分组合成：文件名自然排序 → 文案首尾定位 → 声音边界修正 → 自动去口气音 → 无缝合成；不核对字幕内容。")
+            elif settings["trim_mode"] == "text":
+                self._append_run_log("开始文案边界分组合成：文件名自然排序 → 识别每段首词/末词时间 → 自动去口气音 → 无缝合成。")
+            else:
+                self._append_run_log("开始快速分组合成：文件名自然排序 → 本地检测首尾声音 → 去口气音 → 无缝合成。")
         else:
             self._append_run_log("开始文案匹配合成：识别片段文字 → 按文案排序 → 去口气音 → 无缝合成。")
         self.group_merge_thread.start()
@@ -2371,9 +2461,6 @@ class DynamicCaptionPage(QWidget):
             self.group_merge_stop.setEnabled(False)
             self.run_status.setText("当前状态：正在停止分组合成…")
             self.log.appendPlainText("正在停止当前处理；已完成内容会保留，下次可直接断点续接。")
-
-    def _send_group_output_to_rename(self):
-        self._request_rename_folder(Path(self.output.text()) / "00_分组合成", "分组合成")
 
     def _group_merge_item_done(self, output, group_name, index, total):
         if output not in self.group_merge_outputs:
@@ -2575,14 +2662,15 @@ class DynamicCaptionPage(QWidget):
 
     def _connect_live_preview_signals(self):
         for control in (self.font, self.position, self.free_animation, self.caption_mode,
-                        self.audio_match_mode, self.audio_mode, self.encoder_backend, self.encode_preset,
+                        self.audio_match_mode, self.audio_mode, self.audio_fade_mode,
+                        self.encoder_backend, self.encode_preset,
                         self.watermark_mode, self.watermark_position):
             control.currentTextChanged.connect(self._refresh_live_preview)
             control.currentTextChanged.connect(self._save_style_preferences)
         for control in (self.font_size, self.line_length, self.line_width, self.letter_spacing, self.word_spacing,
                         self.line_spacing, self.max_words, self.highlight_padding, self.highlight_padding_y,
                         self.animation_speed, self.outline_width, self.margin_v, self.free_page_seconds,
-                        self.original_volume, self.background_volume,
+                        self.original_volume, self.background_volume,self.audio_fade_in,self.audio_fade_out,
                         self.watermark_width, self.watermark_opacity, self.watermark_margin):
             control.valueChanged.connect(self._refresh_live_preview)
             control.valueChanged.connect(self._save_style_preferences)
@@ -2807,6 +2895,8 @@ class DynamicCaptionPage(QWidget):
             "margin_v":self.margin_v.value(),"audio_match_mode":self.audio_match_mode.currentText(),
             "audio_mode":self.audio_mode.currentText(),"encoder_backend":self.encoder_backend.currentText(),
             "original_volume":self.original_volume.value(),"background_volume":self.background_volume.value(),
+            "audio_fade_mode":self.audio_fade_mode.currentText(),
+            "audio_fade_in_ms":self.audio_fade_in.value(),"audio_fade_out_ms":self.audio_fade_out.value(),
             "encode_preset":self.encode_preset.currentText(),"clean_metadata":self.clean_metadata.isChecked(),
             "watermark_mode":self.watermark_mode.currentText(),"watermark_position":self.watermark_position.currentText(),
             "watermark_width":self.watermark_width.value(),"watermark_opacity":self.watermark_opacity.value(),
@@ -2834,6 +2924,7 @@ class DynamicCaptionPage(QWidget):
         if preset in PRESETS: self.apply_preset(preset)
         combos={"font":self.font,"caption_mode":self.caption_mode,"free_animation":self.free_animation,
                 "position":self.position,"audio_match_mode":self.audio_match_mode,"audio_mode":self.audio_mode,
+                "audio_fade_mode":self.audio_fade_mode,
                 "encoder_backend":self.encoder_backend,"encode_preset":self.encode_preset,
                 "watermark_mode":self.watermark_mode,"watermark_position":self.watermark_position}
         spins={"font_size":self.font_size,"free_page_seconds":self.free_page_seconds,"line_length":self.line_length,
@@ -2842,6 +2933,7 @@ class DynamicCaptionPage(QWidget):
                "highlight_padding_y":self.highlight_padding_y,"animation_speed":self.animation_speed,
                "outline_width":self.outline_width,"margin_v":self.margin_v,"watermark_width":self.watermark_width,
                "original_volume":self.original_volume,"background_volume":self.background_volume,
+               "audio_fade_in_ms":self.audio_fade_in,"audio_fade_out_ms":self.audio_fade_out,
                "watermark_opacity":self.watermark_opacity,"watermark_margin":self.watermark_margin}
         for key,control in combos.items():
             if key in saved: control.setCurrentText(str(saved[key]))
@@ -3313,6 +3405,8 @@ class DynamicCaptionPage(QWidget):
                 "position":self.position.currentText(),"margin_v":self.margin_v.value(),
                 "audio_mode":self.audio_mode.currentText(),"audio_match_mode":self.audio_match_mode.currentText(),
                 "original_volume":self.original_volume.value(),"background_volume":self.background_volume.value(),
+                "audio_fade_mode":self.audio_fade_mode.currentText(),
+                "audio_fade_in_ms":self.audio_fade_in.value(),"audio_fade_out_ms":self.audio_fade_out.value(),
                 "audio_offsets":dict(self.audio_offsets),
                 "clean_metadata":self.clean_metadata.isChecked(),
                 "override_text":self.override_text.toPlainText().strip(),"encode_preset":self.encode_preset.currentText(),
@@ -3479,6 +3573,14 @@ class DynamicCaptionPage(QWidget):
                 and self.audios.count()):
             self.audio_match_mode.setCurrentText("严格按队列一一对应")
         self._update_preview_audio_levels()
+        self._audio_fade_mode_changed(self.audio_fade_mode.currentText())
+        self._refresh_live_preview()
+
+    def _audio_fade_mode_changed(self, mode):
+        external_mode=self.audio_mode.currentText() in ("替换为添加的音频","原声＋背景音混合")
+        self.audio_fade_mode.setEnabled(external_mode)
+        self.audio_fade_in.setEnabled(external_mode and mode in ("仅淡入","淡入＋淡出"))
+        self.audio_fade_out.setEnabled(external_mode and mode in ("仅淡出","淡入＋淡出"))
         self._refresh_live_preview()
 
     def _update_preview_audio_levels(self, *_args):
@@ -3532,11 +3634,29 @@ class DynamicCaptionPage(QWidget):
                 "自由文案分页动画中，每一屏字幕持续显示的时间。")
         self._refresh_live_preview()
 
-    def _group_words_for_current_layout(self, word_srt):
+    def _group_words_for_current_layout(self, word_srt, return_fix_count=False):
         return group_word_srt(
             word_srt, max_chars=max(18,self.line_length.value()*2),
             max_words=self.max_words.value(),
+            return_fix_count=return_fix_count,
         )
+
+    def _fix_current_overlaps(self):
+        text=self.override_text.toPlainText().strip()
+        if "-->" not in text:
+            QMessageBox.information(self,"没有时间轴","请先提取字幕或载入 SRT。")
+            return
+        fixed,count=fix_srt_overlaps(text)
+        if not count:
+            self._append_run_log("当前字幕时间轴没有检测到重叠。")
+            return
+        self._loading_timeline=True
+        try: self.override_text.setPlainText(fixed)
+        finally: self._loading_timeline=False
+        source=self._timeline_source()
+        if source: self.timeline_overrides[self._timeline_key(source)]=fixed
+        self._refresh_task_queue(); self._refresh_live_preview()
+        self._append_run_log(f"已自动修正 {count} 处字幕时间重叠，文字内容和词级时间轴保持不变。")
 
     def _timeline_selection_changed(self, source):
         self._active_timeline_source=source or ""
@@ -3640,10 +3760,11 @@ class DynamicCaptionPage(QWidget):
 
     def _batch_timeline_item_done(self,source,srt,index,total):
         self._stop_timeline_activity(round(index/max(1,total)*100))
-        key=self._timeline_key(source); phrase_srt=self._group_words_for_current_layout(srt)
+        key=self._timeline_key(source); phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
         self.timeline_words[key]=srt; self.timeline_overrides[key]=phrase_srt
         self.extract_all_btn.setText(f"排队提取 {index}/{total}")
         self.log.appendPlainText(f"[{index}/{total}] 时间轴已归档到：{Path(source).name}")
+        if fixes: self._append_run_log(f"[{index}/{total}] 已自动修正 {fixes} 处逐句字幕时间重叠。")
         if self._timeline_key(self._timeline_source())==key:
             self._loading_timeline=True
             try: self.override_text.setPlainText(phrase_srt)
@@ -3658,7 +3779,9 @@ class DynamicCaptionPage(QWidget):
 
     def _worker_timeline_ready(self,source,word_srt,phrase_srt):
         key=self._timeline_key(source)
+        phrase_srt,fixes=fix_srt_overlaps(phrase_srt)
         self.timeline_words[key]=word_srt; self.timeline_overrides[key]=phrase_srt
+        if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠：{Path(source).name}")
         if self._timeline_key(self._timeline_source())==key:
             self._loading_timeline=True
             try: self.override_text.setPlainText(phrase_srt)
@@ -3677,7 +3800,7 @@ class DynamicCaptionPage(QWidget):
         self._stop_timeline_activity(100 if ok else self.progress.value())
         self.extract_timeline_btn.setEnabled(True); self.extract_timeline_btn.setText("重新提取选中素材")
         if ok:
-            source=self._timeline_pending_source or self._timeline_source(); phrase_srt=self._group_words_for_current_layout(result)
+            source=self._timeline_pending_source or self._timeline_source(); phrase_srt,fixes=self._group_words_for_current_layout(result,True)
             if source:
                 key=self._timeline_key(source); self.timeline_words[key]=result; self.timeline_overrides[key]=phrase_srt
                 if self._timeline_key(self._timeline_source())==key:
@@ -3685,6 +3808,7 @@ class DynamicCaptionPage(QWidget):
                     try: self.override_text.setPlainText(phrase_srt)
                     finally: self._loading_timeline=False
             self.log.appendPlainText("已重新识别并覆盖旧时间轴；词级时间轴已保留，编辑器已合并为逐句字幕。")
+            if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠。")
             self._refresh_task_queue()
         else:
             self._append_run_log(f"选中素材字幕识别失败：{result}")
@@ -3700,8 +3824,10 @@ class DynamicCaptionPage(QWidget):
         path,_=QFileDialog.getOpenFileName(self,"载入字幕时间轴","","SRT 字幕 (*.srt);;文本 (*.txt)")
         if not path: return
         try:
-            text=Path(path).read_text(encoding="utf-8-sig"); self.override_text.setPlainText(text); source=self._timeline_source()
+            text=Path(path).read_text(encoding="utf-8-sig"); text,fixes=fix_srt_overlaps(text); self.override_text.setPlainText(text); source=self._timeline_source()
             if source: self.timeline_overrides[self._timeline_key(source)]=text
+            self._append_run_log(f"已载入 SRT：{Path(path).name}"
+                                 +(f"，并自动修正 {fixes} 处时间重叠。" if fixes else "，未检测到时间重叠。"))
         except Exception as exc: QMessageBox.critical(self,"无法读取字幕",str(exc))
 
     def _choose_videos(self):
@@ -3828,7 +3954,21 @@ class DynamicCaptionPage(QWidget):
         if folder: self.output.setText(folder)
 
     def _send_export_output_to_rename(self):
-        self._request_rename_folder(Path(self.output.text()), "批量导出")
+        root = Path(self.output.text()).expanduser()
+        candidates = [(root, "批量输出"), (root / "00_分组合成", "分组合成")]
+        available = []
+        for folder, label in candidates:
+            if not folder.is_dir():
+                continue
+            videos = [item for item in folder.iterdir()
+                      if item.is_file() and item.suffix.casefold() in VIDEO_EXTENSIONS]
+            if videos:
+                available.append((max(item.stat().st_mtime_ns for item in videos), folder, label))
+        if not available:
+            self._request_rename_folder(root, "合成/批量输出")
+            return
+        _mtime, folder, label = max(available, key=lambda item: item[0])
+        self._request_rename_folder(folder, label)
 
     def _request_rename_folder(self, folder, source_label):
         folder=Path(folder).expanduser()
@@ -3879,7 +4019,15 @@ class DynamicCaptionPage(QWidget):
         if not videos: QMessageBox.information(self, "没有视频", "请先添加视频素材。"); return
         try: ffmpeg = self.find_ffmpeg()
         except Exception as exc: QMessageBox.critical(self, "缺少组件", str(exc)); return
-        settings = self._current_settings(); self.generated_records = []
+        settings = self._current_settings(); self.generated_records = []; self._batch_expected_count=len(videos)
+        # 只有 00_分组合成 中的全部中间视频都进入本次渲染队列，
+        # 才在全部最终成品成功后删除目录，避免误删未处理的组。
+        group_dir=(Path(self.output.text()).expanduser()/"00_分组合成").resolve()
+        queued_group={str(Path(path).resolve()) for path in videos if Path(path).resolve().parent==group_dir}
+        existing_group=({str(path.resolve()) for path in group_dir.iterdir()
+                         if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS}
+                        if group_dir.is_dir() else set())
+        self._pending_group_cleanup_dir=(group_dir if existing_group and existing_group.issubset(queued_group) else None)
         self.log.clear(); self.progress.setValue(0)
         self.log_status.setText("任务已开始；详细记录写入“帮助 → 软件日志”")
         self.log_status.setStyleSheet("color:#7dd3fc;font-size:11px;")
@@ -3903,6 +4051,7 @@ class DynamicCaptionPage(QWidget):
     def done(self, ok, message):
         self.start.setEnabled(True); self.stop.setEnabled(False); self._append_run_log(message)
         self.run_status.setText("当前状态：已完成" if ok else "当前状态：执行失败，请到“帮助 → 软件日志”查看")
+        self._cleanup_completed_group_intermediates(ok)
         if ok and self.cloud_sync_check.isChecked():
             files=[item["path"] for item in self.generated_records if Path(item.get("path","")).is_file()]
             if files and callable(self.cloud_sync_callable):
@@ -3916,5 +4065,31 @@ class DynamicCaptionPage(QWidget):
             elif not files:
                 self._append_run_log("未找到本次生成的成品，已跳过自动上传。")
         (QMessageBox.information if ok else QMessageBox.critical)(self, "动态文案" if ok else "生成失败", message)
+
+    def _cleanup_completed_group_intermediates(self, ok):
+        folder=self._pending_group_cleanup_dir
+        self._pending_group_cleanup_dir=None
+        completed=[Path(item.get("path","")) for item in self.generated_records]
+        all_completed=(ok and self._batch_expected_count > 0 and
+                       len(completed)==self._batch_expected_count and
+                       all(path.is_file() and path.stat().st_size>1024 for path in completed))
+        if not folder: return False
+        if not all_completed:
+            self._append_run_log("本次未全部渲染成功，已保留分组合成中间文件供断点续接。")
+            return False
+        try:
+            shutil.rmtree(folder)
+            removed={str(Path(path).resolve()) for path in self.group_merge_outputs}
+            self.group_merge_outputs=[]
+            for key in list(self._baked_watermarks):
+                if key in removed: self._baked_watermarks.pop(key,None)
+            QSettings("VideoToolkit","DynamicReels").setValue(
+                "baked_watermarks",json.dumps(self._baked_watermarks,ensure_ascii=False))
+            self._append_run_log("最终成品已全部生成；已自动清理 00_分组合成 中间视频与断点缓存，输出目录只保留最终成品。")
+            return True
+        except OSError as exc:
+            self._append_run_log(f"最终成品已生成，但中间目录自动清理失败：{exc}")
+            write_app_log(f"清理分组合成中间目录失败：{folder}｜{exc}","ERROR","Reels")
+            return False
 
     def ended(self): self.worker = None; self.thread = None
