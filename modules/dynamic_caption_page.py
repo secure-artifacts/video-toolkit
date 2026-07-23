@@ -292,6 +292,72 @@ class ProgressSlider(QSlider):
         )
 
 
+class DragHandleWidget(QWidget):
+    def __init__(self, list_widget, parent=None):
+        super().__init__(parent)
+        self.list_widget = list_widget
+        self.setFixedWidth(16)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip("用鼠标拖拽此处可上下调整顺序")
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QPen, QColor
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor("#4b5563"), 2))
+        x = self.width() // 2
+        for y in (16, 22, 28, 34, 40):
+            painter.drawPoint(x - 2, y)
+            painter.drawPoint(x + 2, y)
+
+    def mousePressEvent(self, event):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtGui import QMouseEvent
+        viewport = self.list_widget.viewport()
+        pos_in_viewport = viewport.mapFromGlobal(event.globalPosition().toPoint())
+        fake_event = QMouseEvent(
+            event.type(),
+            pos_in_viewport,
+            event.globalPosition().toPoint(),
+            event.button(),
+            event.buttons(),
+            event.modifiers()
+        )
+        QCoreApplication.sendEvent(viewport, fake_event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtGui import QMouseEvent
+        viewport = self.list_widget.viewport()
+        pos_in_viewport = viewport.mapFromGlobal(event.globalPosition().toPoint())
+        fake_event = QMouseEvent(
+            event.type(),
+            pos_in_viewport,
+            event.globalPosition().toPoint(),
+            event.button(),
+            event.buttons(),
+            event.modifiers()
+        )
+        QCoreApplication.sendEvent(viewport, fake_event)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtGui import QMouseEvent
+        viewport = self.list_widget.viewport()
+        pos_in_viewport = viewport.mapFromGlobal(event.globalPosition().toPoint())
+        fake_event = QMouseEvent(
+            event.type(),
+            pos_in_viewport,
+            event.globalPosition().toPoint(),
+            event.button(),
+            event.buttons(),
+            event.modifiers()
+        )
+        QCoreApplication.sendEvent(viewport, fake_event)
+        super().mouseReleaseEvent(event)
+
+
 class PresetPreviewButton(QPushButton):
     """Compact preset card that previews the actual caption treatment."""
 
@@ -1836,7 +1902,7 @@ class DynamicCaptionPage(QWidget):
             ["Gemini 自然语音", "ElevenLabs API", "微软文字转语音"])
         self.tts_voice = QComboBox(); self.tts_voice.setEditable(True); self._load_gemini_voices()
         self.tts_service.currentTextChanged.connect(self.tts_service_changed)
-        self.tts_generate = QPushButton("批量生成并加入音频队列"); self.tts_generate.clicked.connect(self.generate_tts)
+        self.tts_generate = QPushButton("批量生成并加入音频队列"); self.tts_generate.setObjectName("primary"); self.tts_generate.clicked.connect(self.generate_tts)
         tts_line1 = QHBoxLayout(); tts_line1.addWidget(self.tts_service); tts_line1.addWidget(self.tts_voice,1)
         text_tab_layout.addLayout(tts_line1); text_tab_layout.addWidget(self.tts_generate)
 
@@ -2007,7 +2073,7 @@ class DynamicCaptionPage(QWidget):
         settings_layout = QVBoxLayout(settings_body); settings_layout.setContentsMargins(4,0,8,4); settings_layout.setSpacing(7)
 
 
-        preset_group = QGroupBox("✨ 4. 字幕样式与动画"); preset_group.setMinimumWidth(0); preset_group.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        preset_group = QGroupBox("🎨 4. 字幕样式与动画"); preset_group.setMinimumWidth(0); preset_group.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         pg = QHBoxLayout(preset_group); pg.setContentsMargins(10,12,10,10); pg.setSpacing(10)
         self.preset_buttons=[]
         form = QFormLayout(); form.setVerticalSpacing(9); form.setHorizontalSpacing(8)
@@ -2128,6 +2194,8 @@ class DynamicCaptionPage(QWidget):
         self.preset_list_widget = QListWidget()
         self.preset_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.preset_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.preset_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.preset_list_widget.customContextMenuRequested.connect(self._show_preset_context_menu)
         self.preset_list_widget.setStyleSheet("QListWidget { background: transparent; border: none; } QListWidget::item { background: transparent; padding: 0px; border: none; }")
         self.preset_list_widget.model().rowsMoved.connect(
             lambda parent, start, end, dest, row: QTimer.singleShot(50, self._preset_order_changed)
@@ -2222,7 +2290,7 @@ class DynamicCaptionPage(QWidget):
         watermark_title=QLabel("公司水印烧录（实时预览，并应用到全部批量成品）")
         watermark_title.setStyleSheet("color:#7dd3fc;font-weight:700;"); layer_layout.addWidget(watermark_title)
         watermark_path_row=QHBoxLayout(); self.company_watermark=QLineEdit(); self.company_watermark.setReadOnly(True); self.company_watermark.setPlaceholderText("支持添加多张透明 PNG、WebP、JPG")
-        choose_watermark=QPushButton("添加图片…"); choose_watermark.clicked.connect(self._choose_company_watermark)
+        choose_watermark=QPushButton("添加图片…"); choose_watermark.setObjectName("primary"); choose_watermark.clicked.connect(self._choose_company_watermark)
         clear_watermark=QPushButton("删除选中"); clear_watermark.clicked.connect(self._remove_selected_watermarks)
         clear_all_watermarks=QPushButton("清空"); clear_all_watermarks.clicked.connect(self._clear_company_watermark)
         watermark_path_row.addWidget(self.company_watermark,1); watermark_path_row.addWidget(choose_watermark); watermark_path_row.addWidget(clear_watermark); watermark_path_row.addWidget(clear_all_watermarks); layer_layout.addLayout(watermark_path_row)
@@ -2267,8 +2335,8 @@ class DynamicCaptionPage(QWidget):
         self.timeline_source_label=QLabel("当前字幕：尚未选择视频")
         self.timeline_source_label.setStyleSheet("color:#facc15;background:#111827;padding:5px 7px;border-radius:4px;")
         self.timeline_source_label.setWordWrap(True); revise_layout.addWidget(self.timeline_source_label)
-        timeline_actions=QHBoxLayout(); self.extract_timeline_btn=QPushButton("重新提取选中素材"); self.extract_timeline_btn.clicked.connect(self.extract_timeline)
-        self.extract_all_btn=QPushButton("批量提取全部"); self.extract_all_btn.clicked.connect(self.extract_all_timelines)
+        timeline_actions=QHBoxLayout(); self.extract_timeline_btn=QPushButton("重新提取选中素材"); self.extract_timeline_btn.setObjectName("primary"); self.extract_timeline_btn.clicked.connect(self.extract_timeline)
+        self.extract_all_btn=QPushButton("批量提取全部"); self.extract_all_btn.setStyleSheet("QPushButton { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10b981, stop:1 #059669); border-color: #34d399; color: white; font-weight: 700; } QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #34d399, stop:1 #10b981); }"); self.extract_all_btn.clicked.connect(self.extract_all_timelines)
         self.fix_overlap_btn=QPushButton("修正重叠"); self.fix_overlap_btn.setToolTip("批量修正当前 SRT 中后一句提前开始造成的时间重叠")
         self.fix_overlap_btn.clicked.connect(self._fix_current_overlaps)
         load_sidecar=QPushButton("载入 SRT…"); load_sidecar.clicked.connect(self.load_srt_file); timeline_actions.addWidget(self.extract_timeline_btn); timeline_actions.addWidget(self.extract_all_btn); timeline_actions.addWidget(self.fix_overlap_btn); timeline_actions.addWidget(load_sidecar)
@@ -2968,36 +3036,20 @@ class DynamicCaptionPage(QWidget):
                 repr_preset = data
                 
             button = PresetPreviewButton(name, repr_preset)
-            button.setFixedWidth(135)
             button.clicked.connect(lambda checked=False, idx=index: self._apply_preset_by_index(idx))
             self.preset_buttons.append(button)
             
             item_widget = QWidget()
             item_layout = QHBoxLayout(item_widget)
             item_layout.setContentsMargins(1, 1, 1, 1)
-            item_layout.setSpacing(2)
-            item_layout.addWidget(button, 1)
+            item_layout.setSpacing(4)
             
-            del_btn = QPushButton("×")
-            del_btn.setFixedSize(20, 58)
-            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            del_btn.setStyleSheet("""
-                QPushButton {
-                    background: #111827;
-                    border: 1px solid #334155;
-                    border-radius: 4px;
-                    color: #94a3b8;
-                    font-size: 14px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background: #991b1b;
-                    border-color: #f87171;
-                    color: white;
-                }
-            """)
-            del_btn.clicked.connect(lambda checked=False, idx=index: self._delete_preset_by_index(idx))
-            item_layout.addWidget(del_btn)
+            # Drag handle on the left
+            handle = DragHandleWidget(self.preset_list_widget)
+            item_layout.addWidget(handle)
+            
+            # Preview button fills the rest
+            item_layout.addWidget(button, 1)
             
             list_item = QListWidgetItem(self.preset_list_widget)
             list_item.setSizeHint(item_widget.sizeHint())
@@ -3021,6 +3073,43 @@ class DynamicCaptionPage(QWidget):
         store = QSettings("VideoToolkit", "DynamicReels")
         store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
         self._load_all_presets()
+
+    def _show_preset_context_menu(self, pos):
+        item = self.preset_list_widget.itemAt(pos)
+        if not item:
+            return
+        item_widget = self.preset_list_widget.itemWidget(item)
+        if not item_widget:
+            return
+        button = item_widget.findChild(PresetPreviewButton)
+        if not button:
+            return
+        name = button.name
+        
+        preset_item = next((x for x in self.all_presets if x["name"] == name), None)
+        if not preset_item:
+            return
+            
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        
+        apply_action = menu.addAction("应用该预设")
+        export_action = menu.addAction("导出为 JSON 文件")
+        delete_action = menu.addAction("删除预设")
+            
+        action = menu.exec(self.preset_list_widget.mapToGlobal(pos))
+        if action == apply_action:
+            idx = next((i for i, x in enumerate(self.all_presets) if x["name"] == name), -1)
+            if idx != -1:
+                self._apply_preset_by_index(idx)
+        elif action == export_action:
+            for btn in self.preset_buttons:
+                btn.setChecked(btn.name == name)
+            self._export_selected_preset()
+        elif action == delete_action:
+            idx = next((i for i, x in enumerate(self.all_presets) if x["name"] == name), -1)
+            if idx != -1:
+                self._delete_preset_by_index(idx)
 
     def _apply_preset_by_index(self, idx):
         if idx < 0 or idx >= len(self.all_presets):

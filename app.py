@@ -2277,6 +2277,8 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;")
         box.addWidget(hint)
         viewer = QPlainTextEdit(); viewer.setReadOnly(True); viewer.setPlainText(read_app_log())
+        from PySide6.QtGui import QTextCursor
+        viewer.moveCursor(QTextCursor.MoveOperation.End)
         viewer.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;")
         box.addWidget(viewer, 1)
         path = QLabel(f"日志位置：{app_log_path()}")

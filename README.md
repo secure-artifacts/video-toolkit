@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.6.7**
+当前版本：**v1.6.8**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,22 +10,24 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.7.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.7/video-toolkit-windows-x64-v1.6.7.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.7.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.7/video-toolkit-macos-arm64-v1.6.7.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.6.7.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.7/video-toolkit-macos-x64-v1.6.7.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.8.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.8/video-toolkit-windows-x64-v1.6.8.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.8.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.8/video-toolkit-macos-arm64-v1.6.8.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.6.8.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.8/video-toolkit-macos-x64-v1.6.8.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
 
-### 最新更新 (v1.6.7)
-* **Reels 视频编辑器界面与空间优化**：
-  * 主运行按钮与上传配置迁移至窗口右上角，流程步骤以小字灰蓝字体置于左上角，使整个界面更紧凑。
-  * 移除左下角冗余按钮，释放大面积垂直空间给素材项目列表，展示范围更宽广。
-  * 可折叠设置面板标题引入了专属 Emoji 标签，折叠与展开状态样式采用动态边框和色彩高亮，区分更明显，视觉更舒适。
-* **中文重命名机制增强**：
-  * 文件命名逻辑首选 ASR 的中文译文；在无 Gemini 密钥或云端翻译暂不可用时，自动启动本地备用谷歌翻译，100% 避免外语视频标题直接输出。
-  * 新增「前缀预设方案」下拉管理板块，可快捷保存和删除常用重命名方案。
-* **路径记忆**：支持自动保存与重载「输出目录」路径，避免每次打开重置。
-* **进程占用与清理修复**：在批量合成启动时强制切断预览播放器并释放 OpenCV 句柄；在最终成品导出完成后，执行深度垃圾回收并配合延迟删除重试，彻底解决 Windows 环境下的 `WinError 32` 临时文件占用问题。
+### 最新更新 (v1.6.8)
+* **Reels 预设与模板合并及交互重构**：
+  * 彻底合并字幕样式模板与样式预设。移除多余的模板板块，在右侧内置统一的预设列表管理。
+  * 预设保存与导入将以高优先级自动置顶，并支持**用鼠标手柄拖动卡片上下调整预设的先后顺序**（自动保存）。
+  * 移除预设卡片原有的删除按钮，改用更加清爽的**右键菜单（应用、导出、删除）**来进行选项操作，有效规避误删和排版杂乱。
+* **全局“选择父目录”及“子文件夹”移除**：
+  * 全局剥离“选择父目录”和“子文件夹”行。现在，所有的队列版块均使用纯粹的“添加视频/音频/文件夹”拖入或选择，大幅精简操作链路。
+* **运行日志查看优化**：
+  * 点击帮助页面中的“查看软件日志”时，日志视图默认**自动滚动显示最新的一页内容**，极大节省排查时间。
+* **色彩提示与图标更新**：
+  * “字幕样式与动画”面板的图标替换为更加符合性质的 `🎨` 调色板图标。
+  * 将执行类按钮（如 `批量提取全部`、`重新提取选中素材`、`添加图片…`、`批量生成并加入音频队列`）采用独特的绿、蓝渐变高亮颜色加以区分，直观标识需要执行的重要操作。
 
 ## 主要功能
 
@@ -152,7 +154,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.6.7"
+$env:VIDEO_TOOLKIT_VERSION = "1.6.8"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -167,6 +169,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release 并上传三个 ZIP。
 
 ```bash
-git tag -a v1.6.7 -m "Release version 1.6.7"
-git push origin v1.6.7
+git tag -a v1.6.8 -m "Release version 1.6.8"
+git push origin v1.6.8
 ```
