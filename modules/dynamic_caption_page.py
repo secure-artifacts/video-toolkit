@@ -67,10 +67,18 @@ PRESETS = {
                          "effect": "word_color", "font": "Arial", "font_size": 90, "line_length": 26,
                          "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
                          "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
-    "网红大红黄": {"text": "#FF0000", "outline": "#FFFF00", "highlight": "#FFFFFF", "outline_width": 6,
-                     "effect": "word_color", "font": "Arial", "font_size": 90, "line_length": 26,
-                     "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
-                     "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
+    "双眼皮 经典红黄黑": {"text": "#FF0000", "outline": "#FFFF00", "highlight": "#111111", "outline_width": 3,
+                           "effect": "double_outline", "font": "Arial", "font_size": 90, "line_length": 26,
+                           "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
+                           "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
+    "双眼皮 极光绿白黑": {"text": "#FFFFFF", "outline": "#A3E635", "highlight": "#111111", "outline_width": 3,
+                           "effect": "double_outline", "font": "Arial", "font_size": 90, "line_length": 26,
+                           "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
+                           "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
+    "双眼皮 炫彩黄蓝黑": {"text": "#FACC15", "outline": "#2563EB", "highlight": "#111111", "outline_width": 3,
+                           "effect": "double_outline", "font": "Arial", "font_size": 90, "line_length": 26,
+                           "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
+                           "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
     "Descript 暖橙": {"text": "#FFFFFF", "outline": "#171717", "highlight": "#FB923C", "outline_width": 5,
                        "effect": "word_color", "font": "Arial", "font_size": 76, "line_length": 26,
                        "margin_v": 315, "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
@@ -391,6 +399,16 @@ class PresetPreviewButton(QPushButton):
             path=QPainterPath(); path.addText(x,baseline,font,sample)
             if effect == "glow": painter.setPen(QPen(highlight,7)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawPath(path)
             painter.setPen(QPen(outline,max(2,int(self.preset.get("outline_width",3))))); painter.setBrush(text_color); painter.drawPath(path)
+        elif effect == "double_outline":
+            path=QPainterPath(); path.addText(x,baseline,font,sample)
+            painter.setPen(QPen(highlight,max(2,int(self.preset.get("outline_width",3)))+4,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap,Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+            painter.setPen(QPen(outline,max(2,int(self.preset.get("outline_width",3))),Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap,Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(path)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(text_color)
+            painter.drawPath(path)
         elif effect == "word_color":
             painter.setPen(text_color); painter.drawText(x,baseline,"字幕"); x2=x+metrics.horizontalAdvance("字幕")
             painter.setPen(highlight); painter.drawText(x2,baseline,"样式")
@@ -1005,6 +1023,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Base,{font},{settings['font_size']},{text_color},{text_color},{outline_color},&H90000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,{settings['outline_width']},2,{alignment},40,40,{settings['margin_v']},1
+Style: DoubleOuter,{font},{settings['font_size']},{highlight},{highlight},{highlight},&H90000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,{settings['outline_width'] + 3},2,{alignment},40,40,{settings['margin_v']},1
 Style: Active,{font},{settings['font_size']},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,0,0,{alignment},40,40,{settings['margin_v']},1
 Style: ActiveColor,{font},{settings['font_size']},{highlight},{highlight},{outline_color},&H90000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,{settings['outline_width']},2,{alignment},40,40,{settings['margin_v']},1
 Style: HighlightBox,{font},{settings['font_size']},{highlight},{highlight},{highlight},{highlight},{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,0,0,7,0,0,0,1
@@ -1106,14 +1125,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             override = fr"{{\an5\move({x:.1f},{y+70:.1f},{x:.1f},{y:.1f},0,{max(220,animation_ms*2)})\fad(160,120)}}"
                         elif free_animation == "淡入淡出":
                             override = fr"{{\an5\pos({x:.1f},{y:.1f})\fad(320,320)}}"
-                        events.append(
-                            f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
-                            f"Base,,0,0,0,,{override}{token}")
+                        if effect == "double_outline":
+                            events.append(
+                                f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
+                                f"DoubleOuter,,0,0,0,,{override}{token}")
+                            events.append(
+                                f"Dialogue: {caption_layer + 1},{ass_time(visible_start)},{ass_time(page_end)},"
+                                f"Base,,0,0,0,,{override}{token}")
+                        else:
+                            events.append(
+                                f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
+                                f"Base,,0,0,0,,{override}{token}")
                         continue
                     intro=fr"{{\an5\pos({x:.1f},{y:.1f})\fad(70,70)}}"
                     if effect == "glow": intro=fr"{{\an5\pos({x:.1f},{y:.1f})\blur3\fad(70,70)}}"
+                    if effect == "double_outline":
+                        events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},DoubleOuter,,0,0,0,,{intro}{token}")
+                        events.append(f"Dialogue: {caption_layer + 1},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{token}")
+                        continue
                     events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{token}")
-                    if effect in ("outline","glow"): continue
+                    if effect in ("outline","glow","double_outline"): continue
 
                     active_style="Active"
                     if effect == "word_color":
@@ -3010,9 +3041,13 @@ class DynamicCaptionPage(QWidget):
                 })
             store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
         else:
+            # First, clean the temporary "网红大红黄" preset if it exists in the saved presets
+            original_len = len(self.all_presets)
+            self.all_presets = [x for x in self.all_presets if x["name"] != "网红大红黄"]
+            modified = len(self.all_presets) != original_len
+            
             # Auto-merge any new default system presets that are not in the user's config
             existing_names = {x["name"] for x in self.all_presets}
-            modified = False
             for name, preset_dict in PRESETS.items():
                 if name not in existing_names:
                     # Insert before the first custom preset, or at the end
@@ -3706,9 +3741,20 @@ class DynamicCaptionPage(QWidget):
                     path=QPainterPath(); path.addText(0,0,font,token); path_cache[token]=path
                 painter.save(); painter.translate(cursor,baseline)
                 pen_width=max(1.0,settings["outline_width"])
-                painter.setPen(QPen(outline,pen_width*2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap,Qt.PenJoinStyle.RoundJoin)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawPath(path)
-                fill=highlight if is_active and effect in ("word_color","pop","underline") else base_color
-                painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(fill); painter.drawPath(path)
+                if effect == "double_outline":
+                    outer_pen_width = (pen_width + 3) * 2
+                    painter.setPen(QPen(highlight, outer_pen_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawPath(path)
+                    painter.setPen(QPen(outline, pen_width * 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    painter.drawPath(path)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(base_color)
+                    painter.drawPath(path)
+                else:
+                    painter.setPen(QPen(outline,pen_width*2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap,Qt.PenJoinStyle.RoundJoin)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawPath(path)
+                    fill=highlight if is_active and effect in ("word_color","pop","underline") else base_color
+                    painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(fill); painter.drawPath(path)
                 painter.restore()
                 if is_active and effect=="underline":
                     painter.setPen(QPen(highlight,max(2,pen_width))); painter.drawLine(int(cursor),int(baseline+metrics.descent()+3),int(cursor+width),int(baseline+metrics.descent()+3))
