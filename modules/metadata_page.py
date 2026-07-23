@@ -67,8 +67,7 @@ class MetadataWorker(QObject):
         ffmpeg = find_media_tool("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("未找到 FFmpeg，请先到“设置与组件”一键安装。")
-        # 只保留正常画面、音频和字幕。大写 V 会排除 attached_pic（音频封面图）；
-        # 附件、数据轨、章节、全局/轨道/节目元数据全部不复制。
+        # 1. 尝试保留画面、音频和字幕（最完整流拷贝）
         command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
                    "-map", "0:V?", "-map", "0:a?", "-map", "0:s?",
                    "-map_metadata", "-1", "-map_metadata:s", "-1", "-map_metadata:p", "-1",
@@ -79,15 +78,30 @@ class MetadataWorker(QObject):
                    "-metadata", "encoder=", "-c", "copy", str(destination)]
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+        
+        # 2. 如果失败，尝试不映射字幕轨（极多 MP4 视频带有不兼容字幕格式如 PGS/mov_text 导致流复制失败）
         if result.returncode:
-            # 个别容器不接受部分高级映射参数时仍只保留标准音视频/字幕流。
             command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                       "-map", "0:V?", "-map", "0:a?", "-map", "0:s?", "-map_metadata", "-1",
+                       "-map", "0:V?", "-map", "0:a?",
+                       "-map_metadata", "-1", "-map_metadata:s", "-1", "-map_metadata:p", "-1",
+                       "-map_metadata:c", "-1", "-map_chapters", "-1", "-fflags", "+bitexact",
+                       "-metadata", "creation_time=", "-metadata", "date=", "-metadata", "location=",
+                       "-metadata", "title=", "-metadata", "artist=", "-metadata", "author=",
+                       "-metadata", "copyright=", "-metadata", "comment=", "-metadata", "description=",
+                       "-metadata", "encoder=", "-c", "copy", str(destination)]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+            
+        # 3. 仍失败，则回退到基本映射方式（不带高级 bitexact/metadata 设置）
+        if result.returncode:
+            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+                       "-map", "0:V?", "-map", "0:a?", "-map_metadata", "-1",
                        "-map_metadata:s", "-1", "-map_chapters", "-1", "-metadata", "creation_time=",
                        "-metadata", "location=", "-metadata", "title=", "-metadata", "artist=",
                        "-metadata", "copyright=", "-metadata", "comment=", "-c", "copy", str(destination)]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+                                    
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "FFmpeg 清除元数据失败")
 
