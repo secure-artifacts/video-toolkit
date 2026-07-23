@@ -67,6 +67,10 @@ PRESETS = {
                          "effect": "word_color", "font": "Arial", "font_size": 90, "line_length": 26,
                          "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
                          "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
+    "网红大红黄": {"text": "#FF0000", "outline": "#FFFF00", "highlight": "#FFFFFF", "outline_width": 6,
+                     "effect": "word_color", "font": "Arial", "font_size": 90, "line_length": 26,
+                     "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
+                     "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
     "Descript 暖橙": {"text": "#FFFFFF", "outline": "#171717", "highlight": "#FB923C", "outline_width": 5,
                        "effect": "word_color", "font": "Arial", "font_size": 76, "line_length": 26,
                        "margin_v": 315, "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
@@ -3005,6 +3009,26 @@ class DynamicCaptionPage(QWidget):
                     "data": preset_dict
                 })
             store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
+        else:
+            # Auto-merge any new default system presets that are not in the user's config
+            existing_names = {x["name"] for x in self.all_presets}
+            modified = False
+            for name, preset_dict in PRESETS.items():
+                if name not in existing_names:
+                    # Insert before the first custom preset, or at the end
+                    insert_idx = len(self.all_presets)
+                    for i, x in enumerate(self.all_presets):
+                        if x.get("is_custom", False):
+                            insert_idx = i
+                            break
+                    self.all_presets.insert(insert_idx, {
+                        "name": name,
+                        "is_custom": False,
+                        "data": preset_dict
+                    })
+                    modified = True
+            if modified:
+                store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
             
         for index, item in enumerate(self.all_presets):
             name = item["name"]
