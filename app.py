@@ -2072,23 +2072,27 @@ class UpdateCheckWorker(QObject):
         except Exception as e:
             self.finished.emit(False, "", "", str(e))
 
+
 class CollapsibleSection(QWidget):
-    def __init__(self, title, body, parent=None):
+    def __init__(self, icon, title, body, parent=None):
         super().__init__(parent)
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
         
-        self.btn = QPushButton(f"▶  {title}")
+        self.icon = icon
+        self.title = title
+        
+        self.btn = QPushButton(f"▶  {self.icon}  {self.title}")
         self.btn.setStyleSheet("""
             QPushButton {
                 background: #17243a;
                 border: 1px solid #30445f;
                 border-radius: 6px;
-                padding: 10px 15px;
+                padding: 12px 18px;
                 text-align: left;
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 14px;
                 color: #e5edf9;
             }
             QPushButton:hover {
@@ -2099,11 +2103,11 @@ class CollapsibleSection(QWidget):
         
         self.body_widget = QWidget()
         self.body_layout = QVBoxLayout(self.body_widget)
-        self.body_layout.setContentsMargins(15, 10, 15, 10)
+        self.body_layout.setContentsMargins(20, 12, 20, 15)
         self.body_text = QLabel(body)
         self.body_text.setWordWrap(True)
         self.body_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body_text.setStyleSheet("color:#cbd5e1; font-size:12px; line-height:1.6;")
+        self.body_text.setStyleSheet("color:#cbd5e1; font-size:13px; line-height:1.65;")
         self.body_layout.addWidget(self.body_text)
         
         self.body_widget.setStyleSheet("""
@@ -2122,13 +2126,12 @@ class CollapsibleSection(QWidget):
         
         self.body_widget.setVisible(False)
         self.btn.clicked.connect(self.toggle)
-        self.title = title
         
     def toggle(self):
         visible = not self.body_widget.isVisible()
         self.body_widget.setVisible(visible)
         if visible:
-            self.btn.setText(f"▼  {self.title}")
+            self.btn.setText(f"▼  {self.icon}  {self.title}")
             self.btn.setStyleSheet("""
                 QPushButton {
                     background: #1e293b;
@@ -2140,10 +2143,10 @@ class CollapsibleSection(QWidget):
                     border-top-right-radius: 6px;
                     border-bottom-left-radius: 0px;
                     border-bottom-right-radius: 0px;
-                    padding: 10px 15px;
+                    padding: 12px 18px;
                     text-align: left;
                     font-weight: bold;
-                    font-size: 13px;
+                    font-size: 14px;
                     color: #f8fafc;
                 }
                 QPushButton:hover {
@@ -2151,16 +2154,16 @@ class CollapsibleSection(QWidget):
                 }
             """)
         else:
-            self.btn.setText(f"▶  {self.title}")
+            self.btn.setText(f"▶  {self.icon}  {self.title}")
             self.btn.setStyleSheet("""
                 QPushButton {
                     background: #17243a;
                     border: 1px solid #30445f;
                     border-radius: 6px;
-                    padding: 10px 15px;
+                    padding: 12px 18px;
                     text-align: left;
                     font-weight: bold;
-                    font-size: 13px;
+                    font-size: 14px;
                     color: #e5edf9;
                 }
                 QPushButton:hover {
@@ -2168,7 +2171,6 @@ class CollapsibleSection(QWidget):
                     border-color: #3b82f6;
                 }
             """)
-
 
 
 class MainWindow(QMainWindow):
@@ -2390,35 +2392,70 @@ class MainWindow(QMainWindow):
         
         content_widget = QWidget()
         content_widget.setStyleSheet("background: transparent;")
-        main_lay = QHBoxLayout(content_widget)
-        main_lay.setContentsMargins(0, 10, 0, 20)
-        
-        center_widget = QWidget()
-        center_widget.setMaximumWidth(850)
-        center_layout = QVBoxLayout(center_widget)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(12)
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 10, 0, 20)
+        content_layout.setSpacing(12)
         
         sections = [
-            ("快速开始", "1. 在顶部选择需要的工具。\n2. 拖入视频、音频、文件夹，或点击按钮选择素材。\n3. 检查输出目录和处理参数。\n4. 先预览，再开始批量执行。\n5. 完成后从日志或结果区查看输出位置。"),
-            ("素材添加与拖拽", "需要选择素材的页面均支持拖入文件或文件夹。选择父目录后，可以从子文件夹列表继续添加指定目录。批量截图和字幕提取还支持 YouTube、Facebook、Instagram、TikTok 链接，每行填写一个。"),
-            ("字幕提取", "可以使用“本地 Whisper（无需密钥）”，也可以配置 Groq、Gemini、ElevenLabs、Gladia。批量结果可查看当前项目或全部项目，并支持复制全部原文、复制全部中外文对照及批量导出字幕。"),
-            ("Reels 编辑器", "合成、配音、字幕样式/字幕校对、视频预览、公司水印和批量生成集中在同一页面；可选择复用自动流水线的 Google 上传与填表方案。"),
-            ("素材元数据清理", "可从顶部“清除元数据”直接进入，也可在“视频 / 图片水印”中打开对应子页。程序会显示清理前后的元数据信息；视频和音频使用无损流复制且保留原声道，图片重新保存干净副本以移除 EXIF/XMP，原文件不会修改。"),
-            ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕生成标题 → 批量重命名成品 → 批量上传 → 批量填表”执行。只上传重命名成品；支持断点续接、保存同步方案、继续上传 and 继续填表，并按云端文件链接唯一值跳过已经填写的记录。"),
-            ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
-            ("组件检查与常见问题", "FFmpeg、FFprobe 或 Python 组件异常时，进入“设置与组件”统一检测并一键恢复。网络链接无法解析时可更新 yt-dlp。macOS 首次打开若被系统拦截，请在 Finder 中右键应用并选择“打开”。"),
-            ("长视频与断点续接", "字幕提取和自动流水线默认开启“自动续接”。同一批素材再次执行时，程序会跳过已成功的视频；流水线还会跳过已经完成的剪辑和重命名。请保留流水线输出目录及其中的 pipeline_checkpoint.json。需要全部重做时，取消勾选自动续接。"),
-            ("提高本地识别效率", "本地 Whisper 会直接流式读取媒体，避免先生成整段超大 WAV。建议普通电脑使用 small 模型；GPU 不适合 FP16 时会自动选择可用计算模式或回退 CPU INT8。ONNX Runtime 用于 VAD 静音过滤，缺失时程序会自动关闭 VAD 继续运行。Groq 长视频会自动拆成 90 秒分段并逐段保存进度。"),
+            ("⚡", "快速开始", 
+             "① **选择业务功能**：在顶部导航栏选择您需要的工具页面（如 Reels 编辑器、智能剪辑、批量里命名等）。\n"
+             "② **导入素材文件**：直接拖入或点击按钮导入您的视频、音频、图片或整个素材文件夹。\n"
+             "③ **配置处理参数**：根据页面提示设置所需的输出规格，并在输出目录框检查/选择成品的存放位置。\n"
+             "④ **执行与查看**：强烈建议先点击 [预览] 检查效果，确定无误后点击 [开始批量执行]，等待进度条走满即可在成品目录查看结果。"),
+             
+            ("📁", "素材添加与拖拽", 
+             "① **拖拽与选择导入**：所有支持素材输入的页面均可直接拖拽文件或整个文件夹入内，或点击框旁按钮导入。\n"
+             "② **子目录筛选机制**：拖入一个父文件夹后，软件会在下方列表显示所有包含的子文件夹，您可以双击或勾选来指派具体要处理的子目录。\n"
+             "③ **网络链接批量抓取**：批量截图和字幕提取页面支持批量抓取网络视频，每行填写一个视频链接（支持 YouTube、TikTok、Instagram、Facebook 等）即可自动下载并开始处理。"),
+             
+            ("📝", "智能字幕提取", 
+             "① **导入待处理媒体**：在字幕提取页拖入需要提取字幕的视频、音频或整个素材文件夹，或者填入网页视频链接。\n"
+             "② **选择语音识别服务**：推荐选用「本地 Whisper（免费、无需密钥）」，配置较低建议选择 medium 模型并开启 VAD 静音加速；若有海外密钥，可使用 Groq, Gemini, ElevenLabs 等，支持轮询负载均衡。\n"
+             "③ **执行提取与精修**：点击 [开始提取]，识别出的双语字幕会排列在下方，您可以双击任意一行直接编辑、修正错别字。\n"
+             "④ **导出复制**：点击下方按钮一键复制全部原文、全部中英对照，或打包导出为标准的 `.srt` 视频字幕或 `.txt` 文本文件。"),
+             
+            ("🎬", "Reels 编辑器", 
+             "① **第一步：文案与视频一一配对**：在左侧导入文案文件夹（每行一个句子，对应每个视频）和视频文件夹。软件默认按顺序一一配对合成。\n"
+             "② **第二步：配音与背景音乐混合**：开启语音合成（选择您的 TTS 服务商和配音音色）。如果想加入背景音乐，可在音频设置中指定 BGM 文件夹，并选择“替换为添加的音频”来静音原视频噪音，实现 TTS 配音 + BGM 背景音乐的完美双路混音！\n"
+             "③ **第三步：字幕设计与定位**：选择您喜欢的字体、字号（字号范围已放开到 10 - 600）、文字颜色、描边粗细和字幕放置位置（顶部/中间/底部）。\n"
+             "④ **第四步：打包批量生成**：点击右侧的 [开始批量执行] 进行 FFmpeg 合成，第一个视频对应第一条配音与第一行字幕，以此类推，完成无缝合成输出。"),
+             
+            ("🧹", "素材元数据清理", 
+             "① **进入清理页面**：从顶部点击“清除元数据”进入该功能，也可在“视频/图片水印”页面下方打开对应子页。\n"
+             "② **拖入原始素材**：将需要清理的视频、音频或图片文件/整个文件夹拖入界面，程序会扫描并加载信息。\n"
+             "③ **一键无损清理**：点击 [开始清理元数据]，软件会采用无损流复制方式清除视频与音频的设备、定位、作者、章节等隐私元数据，并为图片重新生成纯净副本，彻底移除 EXIF 拍摄信息，原文件内容不会损坏。"),
+             
+            ("⚙️", "自动流水线", 
+             "① **定制您的流水线步骤**：在自动流水线页面，自由勾选您需要合并串联执行的步骤（如：智能场景剪辑 → 字幕提取 → AI 标题生成 → 批量重命名 → 一键上传云端 → 自动填写 Google 表格）。\n"
+             "② **设置全局配置**：导入原始长视频或素材文件夹，设置各项参数，保存同步方案以便下次直接复用。\n"
+             "③ **断点续接机制**：点击 [开始流水线] 执行，程序会自动按步骤顺序全自动批量产出并上传，遇到网络波动失败时，支持在页面上点击 [继续上传/继续填表] 进行断点续接。"),
+             
+            ("🔑", "密钥与云端授权", 
+             "① **管理接口密钥**：点击顶部导航的“设置与组件”进入设置，或在帮助页点击“打开密钥管理”按钮。\n"
+             "② **密钥粘贴与诊断**：支持一次性粘贴多枚密钥（每行一个），点击诊断系统会自动排查网络连接、失效状态，并开启轮询以避免 API 超限。\n"
+             "③ **Google 账户授权**：若需授权 Google Drive / Sheets 自动同步，导入您的 client_secrets.json 授权文件，软件会自动拉起浏览器让您点击授权，安全且防丢。"),
+             
+            ("🛡️", "组件检查与故障恢复", 
+             "① **组件异常排查**：运行过程中若提示 FFmpeg / FFprobe 或 Python 依赖组件异常，直接进入“设置与组件”页面。\n"
+             "② **一键环境恢复**：点击 [一键检测并修复] 或 [重试配置]，系统会自动从打包好的临时或预设路径一键恢复损坏的组件运行环境，免去手动配置环境变量的烦恼。\n"
+             "③ **解析引擎更新**：遇到网络链接无法解析下载视频，可在此一键点击“更新 yt-dlp”获取最新解析引擎。"),
+             
+            ("🔄", "长视频与断点续接", 
+             "① **防重复处理缓存**：字幕提取和自动流水线默认开启“自动续接”。\n"
+             "② **按进度断点续做**：重复导入同一批视频时，软件会自动读取本地 pipeline_checkpoint.json 缓存，自动跳过已经成功剪辑、重命名或上传成功的视频，只对失败或新增的媒体进行处理。\n"
+             "③ **重做全部流程**：如果您想要全部重新处理，只需在页面参数中取消勾选“自动续接”即可。"),
+             
+            ("🚀", "提高本地识别效率", 
+             "① **GPU 显卡硬件加速**：使用本地 Whisper 时，如果您的电脑配有英伟达（NVIDIA）显卡，会自动启用 CUDA GPU 加速；若提示显卡暂不支持 FP16，程序会自动降级切换为 CPU INT8 运行，确保正常完成。\n"
+             "② **静音过滤（VAD）加速**：尽量开启 VAD（静音过滤），它会智能过滤掉说话间隔的空白区，直接跳过无声片段，使识别速度提升一倍以上。\n"
+             "③ **分段并发处理**：长视频提取时，Groq 在线接口会自动分段 90 秒进行并发请求并保存阶段进度，防止单次请求超时出错。"),
         ]
         
-        for title, body in sections:
-            sect = CollapsibleSection(title, body)
-            center_layout.addWidget(sect)
+        for icon, title, body in sections:
+            sect = CollapsibleSection(icon, title, body)
+            content_layout.addWidget(sect)
             
-        center_layout.addStretch()
-        main_lay.addWidget(center_widget, 0, Qt.AlignmentFlag.AlignCenter)
-        
+        content_layout.addStretch()
         scroll.setWidget(content_widget)
         layout.addWidget(scroll, 1)
         return page
