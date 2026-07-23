@@ -2072,6 +2072,104 @@ class UpdateCheckWorker(QObject):
         except Exception as e:
             self.finished.emit(False, "", "", str(e))
 
+class CollapsibleSection(QWidget):
+    def __init__(self, title, body, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+        
+        self.btn = QPushButton(f"▶  {title}")
+        self.btn.setStyleSheet("""
+            QPushButton {
+                background: #17243a;
+                border: 1px solid #30445f;
+                border-radius: 6px;
+                padding: 10px 15px;
+                text-align: left;
+                font-weight: bold;
+                font-size: 13px;
+                color: #e5edf9;
+            }
+            QPushButton:hover {
+                background: #223654;
+                border-color: #3b82f6;
+            }
+        """)
+        
+        self.body_widget = QWidget()
+        self.body_layout = QVBoxLayout(self.body_widget)
+        self.body_layout.setContentsMargins(15, 10, 15, 10)
+        self.body_text = QLabel(body)
+        self.body_text.setWordWrap(True)
+        self.body_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body_text.setStyleSheet("color:#cbd5e1; font-size:12px; line-height:1.6;")
+        self.body_layout.addWidget(self.body_text)
+        
+        self.body_widget.setStyleSheet("""
+            QWidget {
+                background: #0c1424;
+                border-left: 1px solid #30445f;
+                border-right: 1px solid #30445f;
+                border-bottom: 1px solid #30445f;
+                border-bottom-left-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+        """)
+        
+        self.layout.addWidget(self.btn)
+        self.layout.addWidget(self.body_widget)
+        
+        self.body_widget.setVisible(False)
+        self.btn.clicked.connect(self.toggle)
+        self.title = title
+        
+    def toggle(self):
+        visible = not self.body_widget.isVisible()
+        self.body_widget.setVisible(visible)
+        if visible:
+            self.btn.setText(f"▼  {self.title}")
+            self.btn.setStyleSheet("""
+                QPushButton {
+                    background: #1e293b;
+                    border-top: 1px solid #3b82f6;
+                    border-left: 1px solid #3b82f6;
+                    border-right: 1px solid #3b82f6;
+                    border-bottom: none;
+                    border-top-left-radius: 6px;
+                    border-top-right-radius: 6px;
+                    border-bottom-left-radius: 0px;
+                    border-bottom-right-radius: 0px;
+                    padding: 10px 15px;
+                    text-align: left;
+                    font-weight: bold;
+                    font-size: 13px;
+                    color: #f8fafc;
+                }
+                QPushButton:hover {
+                    background: #334155;
+                }
+            """)
+        else:
+            self.btn.setText(f"▶  {self.title}")
+            self.btn.setStyleSheet("""
+                QPushButton {
+                    background: #17243a;
+                    border: 1px solid #30445f;
+                    border-radius: 6px;
+                    padding: 10px 15px;
+                    text-align: left;
+                    font-weight: bold;
+                    font-size: 13px;
+                    color: #e5edf9;
+                }
+                QPushButton:hover {
+                    background: #223654;
+                    border-color: #3b82f6;
+                }
+            """)
+
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -2285,41 +2383,43 @@ class MainWindow(QMainWindow):
         actions.addWidget(update_btn)
         actions.addStretch()
         layout.addLayout(actions)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        content = QWidget()
-        grid = QGridLayout(content)
-        grid.setContentsMargins(2, 2, 8, 8)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(10)
+        scroll.setStyleSheet("background: transparent;")
+        
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background: transparent;")
+        main_lay = QHBoxLayout(content_widget)
+        main_lay.setContentsMargins(0, 10, 0, 20)
+        
+        center_widget = QWidget()
+        center_widget.setMaximumWidth(850)
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(12)
+        
         sections = [
             ("快速开始", "1. 在顶部选择需要的工具。\n2. 拖入视频、音频、文件夹，或点击按钮选择素材。\n3. 检查输出目录和处理参数。\n4. 先预览，再开始批量执行。\n5. 完成后从日志或结果区查看输出位置。"),
             ("素材添加与拖拽", "需要选择素材的页面均支持拖入文件或文件夹。选择父目录后，可以从子文件夹列表继续添加指定目录。批量截图和字幕提取还支持 YouTube、Facebook、Instagram、TikTok 链接，每行填写一个。"),
             ("字幕提取", "可以使用“本地 Whisper（无需密钥）”，也可以配置 Groq、Gemini、ElevenLabs、Gladia。批量结果可查看当前项目或全部项目，并支持复制全部原文、复制全部中外文对照及批量导出字幕。"),
             ("Reels 编辑器", "合成、配音、字幕样式/字幕校对、视频预览、公司水印和批量生成集中在同一页面；可选择复用自动流水线的 Google 上传与填表方案。"),
             ("素材元数据清理", "可从顶部“清除元数据”直接进入，也可在“视频 / 图片水印”中打开对应子页。程序会显示清理前后的元数据信息；视频和音频使用无损流复制且保留原声道，图片重新保存干净副本以移除 EXIF/XMP，原文件不会修改。"),
-            ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕生成标题 → 批量重命名成品 → 批量上传 → 批量填表”执行。只上传重命名成品；支持断点续接、保存同步方案、继续上传和继续填表，并按云端文件链接唯一值跳过已经填写的记录。"),
+            ("自动流水线", "流水线按“智能剪辑 → 提取字幕 → 字幕生成标题 → 批量重命名成品 → 批量上传 → 批量填表”执行。只上传重命名成品；支持断点续接、保存同步方案、继续上传 and 继续填表，并按云端文件链接唯一值跳过已经填写的记录。"),
             ("密钥与云端授权", "密钥管理支持一次粘贴多枚密钥、自动检测、状态诊断及轮询调用。Google 云端同步需要在流水线配置中选择正确的授权 JSON；授权或上传失败不会删除已经处理好的本地成品，可稍后继续上传。"),
             ("组件检查与常见问题", "FFmpeg、FFprobe 或 Python 组件异常时，进入“设置与组件”统一检测并一键恢复。网络链接无法解析时可更新 yt-dlp。macOS 首次打开若被系统拦截，请在 Finder 中右键应用并选择“打开”。"),
             ("长视频与断点续接", "字幕提取和自动流水线默认开启“自动续接”。同一批素材再次执行时，程序会跳过已成功的视频；流水线还会跳过已经完成的剪辑和重命名。请保留流水线输出目录及其中的 pipeline_checkpoint.json。需要全部重做时，取消勾选自动续接。"),
             ("提高本地识别效率", "本地 Whisper 会直接流式读取媒体，避免先生成整段超大 WAV。建议普通电脑使用 small 模型；GPU 不适合 FP16 时会自动选择可用计算模式或回退 CPU INT8。ONNX Runtime 用于 VAD 静音过滤，缺失时程序会自动关闭 VAD 继续运行。Groq 长视频会自动拆成 90 秒分段并逐段保存进度。"),
         ]
-        for index, (title, body) in enumerate(sections):
-            group = QGroupBox(title)
-            group_layout = QVBoxLayout(group)
-            group_layout.setContentsMargins(14, 14, 14, 12)
-            text = QLabel(body)
-            text.setWordWrap(True)
-            text.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            text.setStyleSheet("color:#b7c5d8;line-height:1.55;")
-            group_layout.addWidget(text)
-            grid.addWidget(group, index // 2, index % 2)
-        for row in range(5):
-            grid.setRowStretch(row, 1)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        scroll.setWidget(content)
+        
+        for title, body in sections:
+            sect = CollapsibleSection(title, body)
+            center_layout.addWidget(sect)
+            
+        center_layout.addStretch()
+        main_lay.addWidget(center_widget, 0, Qt.AlignmentFlag.AlignCenter)
+        
+        scroll.setWidget(content_widget)
         layout.addWidget(scroll, 1)
         return page
 
@@ -3893,6 +3993,122 @@ class MainWindow(QMainWindow):
         for provider, item in jobs:
             self.store.remove_key(provider, item["id"])
         self._refresh_keys()
+
+
+
+    def _check_update(self, manual=False):
+        if hasattr(self, "_update_thread") and self._update_thread.isRunning():
+            if manual:
+                QMessageBox.information(self, "检查更新", "正在检查中，请稍候...")
+            return
+        
+        self._update_thread = QThread(self)
+        self._update_worker = UpdateCheckWorker(APP_VERSION)
+        self._update_worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(self._update_worker.run)
+        
+        def on_finished(has_new, latest_version, download_url, error):
+            self._update_thread.quit()
+            self._update_thread.wait()
+            if error:
+                if manual:
+                    QMessageBox.warning(self, "检查更新失败", f"检测失败，错误原因：\n{error}")
+                return
+            
+            if has_new:
+                reply = QMessageBox.question(
+                    self, "检测到新版本",
+                    f"发现新版本 v{latest_version}（当前版本 v{APP_VERSION}）。\n"
+                    f"是否立即下载并运行升级安装程序？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._start_update_download(latest_version, download_url)
+            else:
+                if manual:
+                    QMessageBox.information(self, "已经是最新版本", f"当前版本 v{APP_VERSION} 已经是最新版本！")
+                    
+        self._update_worker.finished.connect(on_finished)
+        self._update_thread.start()
+
+    def _start_update_download(self, version, url):
+        from PySide6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("正在下载升级安装包，请稍候...", "取消", 0, 100, self)
+        progress.setWindowTitle("下载更新")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        
+        class DownloadWorker(QObject):
+            progress = Signal(int)
+            finished = Signal(bool, str, str) # success, file_path, error
+            
+            def __init__(self, url, version):
+                super().__init__()
+                self.url = url
+                self.version = version
+                self.cancelled = False
+                
+            def run(self):
+                try:
+                    import requests
+                    import tempfile
+                    response = requests.get(self.url, stream=True, timeout=60)
+                    response.raise_for_status()
+                    total = int(response.headers.get('content-length', 0))
+                    
+                    dest = Path(tempfile.gettempdir()) / f"VideoToolkit_Setup_v{self.version}.exe"
+                    downloaded = 0
+                    with open(dest, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=128 * 1024):
+                            if self.cancelled:
+                                return
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total > 0:
+                                    self.progress.emit(int(downloaded / total * 100))
+                                    
+                    self.finished.emit(True, str(dest), "")
+                except Exception as e:
+                    self.finished.emit(False, "", str(e))
+                    
+        thread = QThread(self)
+        worker = DownloadWorker(url, version)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        
+        def on_prog(val):
+            progress.setValue(val)
+            
+        def on_cancelled():
+            worker.cancelled = True
+            thread.quit()
+            thread.wait()
+            
+        progress.canceled.connect(on_cancelled)
+        
+        def on_finished(success, file_path, error):
+            progress.close()
+            thread.quit()
+            thread.wait()
+            if success:
+                try:
+                    import subprocess
+                    subprocess.Popen([file_path], shell=True)
+                    self.close()
+                except Exception as e:
+                    QMessageBox.warning(self, "运行安装包失败", f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
+            else:
+                if not worker.cancelled:
+                    QMessageBox.warning(self, "下载失败", f"下载升级安装包失败：\n{error}")
+                    
+        worker.progress.connect(on_prog)
+        worker.finished.connect(on_finished)
+        thread.start()
+        self._download_thread = thread
+        self._download_worker = worker
 
 
 STYLE = """

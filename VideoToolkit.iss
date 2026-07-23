@@ -17,7 +17,7 @@ Source: "dist_folder\VideoToolkit\*"; DestDir: "{app}"; Flags: recursesubdirs cr
 
 [Icons]
 Name: "{group}\VideoToolkit"; Filename: "{app}\VideoToolkit.exe"
-Name: "{commondesktop}\VideoToolkit"; Filename: "{app}\VideoToolkit.exe"
+Name: "{userdesktop}\VideoToolkit"; Filename: "{app}\VideoToolkit.exe"
 
 [Run]
 Filename: "{app}\VideoToolkit.exe"; Description: "运行 VideoToolkit"; Flags: postinstall nowait
