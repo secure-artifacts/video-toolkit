@@ -2073,6 +2073,91 @@ class UpdateCheckWorker(QObject):
             self.finished.emit(False, "", "", str(e))
 
 
+
+class UpdateCheckWorker(QObject):
+    finished = Signal(bool, str, str, str) # has_new_version, latest_version, download_url, error_message
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version.strip().lstrip("v")
+
+    def run(self):
+        try:
+            import requests
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            response = requests.get(
+                "https://api.github.com/repos/secure-artifacts/video-toolkit/releases/latest",
+                headers=headers,
+                timeout=10
+            )
+            if response.status_code != 200:
+                self.finished.emit(False, "", "", f"HTTP {response.status_code}")
+                return
+            data = response.json()
+            tag_name = data.get("tag_name", "").strip()
+            latest_version = tag_name.lstrip("v")
+            if not latest_version:
+                self.finished.emit(False, "", "", "无法获取最新版本号")
+                return
+            
+            def parse_ver(v):
+                try: return [int(x) for x in v.split(".")]
+                except Exception: return [0, 0, 0]
+            
+            current_parts = parse_ver(self.current_version)
+            latest_parts = parse_ver(latest_version)
+            has_new = latest_parts > current_parts
+            
+            download_url = ""
+            assets = data.get("assets", [])
+            for asset in assets:
+                name = asset.get("name", "")
+                if name.endswith(".exe") and "Setup" in name:
+                    download_url = asset.get("browser_download_url", "")
+                    break
+            if not download_url and assets:
+                download_url = assets[0].get("browser_download_url", "")
+                
+            self.finished.emit(has_new, latest_version, download_url, "")
+        except Exception as e:
+            self.finished.emit(False, "", "", str(e))
+
+
+class DownloadWorker(QObject):
+    progress = Signal(int)
+    finished = Signal(bool, str, str) # success, file_path, error
+    
+    def __init__(self, url, version):
+        super().__init__()
+        self.url = url
+        self.version = version
+        self.cancelled = False
+        
+    def run(self):
+        try:
+            import requests
+            import tempfile
+            response = requests.get(self.url, stream=True, timeout=60)
+            response.raise_for_status()
+            total = int(response.headers.get('content-length', 0))
+            
+            dest = Path(tempfile.gettempdir()) / f"VideoToolkit_Setup_v{self.version}.exe"
+            downloaded = 0
+            with open(dest, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=128 * 1024):
+                    if self.cancelled:
+                        return
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            self.progress.emit(int(downloaded / total * 100))
+                            
+            self.finished.emit(True, str(dest), "")
+        except Exception as e:
+            self.finished.emit(False, "", str(e))
+
+
 class CollapsibleSection(QWidget):
     def __init__(self, icon, title, body, parent=None):
         super().__init__(parent)
@@ -4039,113 +4124,88 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "检查更新", "正在检查中，请稍候...")
             return
         
+        self._update_manual_check = manual
         self._update_thread = QThread(self)
         self._update_worker = UpdateCheckWorker(APP_VERSION)
         self._update_worker.moveToThread(self._update_thread)
         self._update_thread.started.connect(self._update_worker.run)
-        
-        def on_finished(has_new, latest_version, download_url, error):
-            self._update_thread.quit()
-            self._update_thread.wait()
-            if error:
-                if manual:
-                    QMessageBox.warning(self, "检查更新失败", f"检测失败，错误原因：\n{error}")
-                return
-            
-            if has_new:
-                reply = QMessageBox.question(
-                    self, "检测到新版本",
-                    f"发现新版本 v{latest_version}（当前版本 v{APP_VERSION}）。\n"
-                    f"是否立即下载并运行升级安装程序？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self._start_update_download(latest_version, download_url)
-            else:
-                if manual:
-                    QMessageBox.information(self, "已经是最新版本", f"当前版本 v{APP_VERSION} 已经是最新版本！")
-                    
-        self._update_worker.finished.connect(on_finished)
+        self._update_worker.finished.connect(self._on_update_finished)
         self._update_thread.start()
+
+    def _on_update_finished(self, has_new, latest_version, download_url, error):
+        self._update_thread.quit()
+        self._update_thread.wait()
+        
+        manual = getattr(self, "_update_manual_check", False)
+        if error:
+            if manual:
+                QMessageBox.warning(self, "检查更新失败", f"检测失败，错误原因：\n{error}")
+            return
+        
+        if has_new:
+            reply = QMessageBox.question(
+                self, "检测到新版本",
+                f"发现新版本 v{latest_version}（当前版本 v{APP_VERSION}）。\n"
+                f"是否立即下载并运行升级安装程序？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._start_update_download(latest_version, download_url)
+        else:
+            if manual:
+                QMessageBox.information(self, "已经是最新版本", f"当前版本 v{APP_VERSION} 已经是最新版本！")
 
     def _start_update_download(self, version, url):
         from PySide6.QtWidgets import QProgressDialog
-        progress = QProgressDialog("正在下载升级安装包，请稍候...", "取消", 0, 100, self)
-        progress.setWindowTitle("下载更新")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
+        self._update_progress_dialog = QProgressDialog("正在下载升级安装包，请稍候...", "取消", 0, 100, self)
+        self._update_progress_dialog.setWindowTitle("下载更新")
+        self._update_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._update_progress_dialog.setMinimumDuration(0)
+        self._update_progress_dialog.canceled.connect(self._on_download_cancelled)
+        self._update_progress_dialog.show()
         
-        class DownloadWorker(QObject):
-            progress = Signal(int)
-            finished = Signal(bool, str, str) # success, file_path, error
-            
-            def __init__(self, url, version):
-                super().__init__()
-                self.url = url
-                self.version = version
-                self.cancelled = False
-                
-            def run(self):
-                try:
-                    import requests
-                    import tempfile
-                    response = requests.get(self.url, stream=True, timeout=60)
-                    response.raise_for_status()
-                    total = int(response.headers.get('content-length', 0))
-                    
-                    dest = Path(tempfile.gettempdir()) / f"VideoToolkit_Setup_v{self.version}.exe"
-                    downloaded = 0
-                    with open(dest, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=128 * 1024):
-                            if self.cancelled:
-                                return
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                if total > 0:
-                                    self.progress.emit(int(downloaded / total * 100))
-                                    
-                    self.finished.emit(True, str(dest), "")
-                except Exception as e:
-                    self.finished.emit(False, "", str(e))
-                    
-        thread = QThread(self)
-        worker = DownloadWorker(url, version)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
+        self._download_thread = QThread(self)
+        self._download_worker = DownloadWorker(url, version)
+        self._download_worker.moveToThread(self._download_thread)
+        self._download_thread.started.connect(self._download_worker.run)
         
-        def on_prog(val):
-            progress.setValue(val)
-            
-        def on_cancelled():
-            worker.cancelled = True
-            thread.quit()
-            thread.wait()
-            
-        progress.canceled.connect(on_cancelled)
+        self._download_worker.progress.connect(self._on_download_progress)
+        self._download_worker.finished.connect(self._on_download_finished)
+        self._download_thread.start()
+
+    def _on_download_progress(self, val):
+        if hasattr(self, "_update_progress_dialog") and self._update_progress_dialog:
+            self._update_progress_dialog.setValue(val)
+
+    def _on_download_cancelled(self):
+        if hasattr(self, "_download_worker") and self._download_worker:
+            self._download_worker.cancelled = True
+        if hasattr(self, "_download_thread") and self._download_thread:
+            self._download_thread.quit()
+            self._download_thread.wait()
+
+    def _on_download_finished(self, success, file_path, error):
+        if hasattr(self, "_update_progress_dialog") and self._update_progress_dialog:
+            self._update_progress_dialog.close()
         
-        def on_finished(success, file_path, error):
-            progress.close()
-            thread.quit()
-            thread.wait()
-            if success:
-                try:
-                    import subprocess
-                    subprocess.Popen([file_path], shell=True)
-                    self.close()
-                except Exception as e:
-                    QMessageBox.warning(self, "运行安装包失败", f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
-            else:
-                if not worker.cancelled:
-                    QMessageBox.warning(self, "下载失败", f"下载升级安装包失败：\n{error}")
-                    
-        worker.progress.connect(on_prog)
-        worker.finished.connect(on_finished)
-        thread.start()
-        self._download_thread = thread
-        self._download_worker = worker
+        if hasattr(self, "_download_thread") and self._download_thread:
+            self._download_thread.quit()
+            self._download_thread.wait()
+            
+        if success:
+            try:
+                import subprocess
+                subprocess.Popen([file_path], shell=True)
+                self.close()
+            except Exception as e:
+                QMessageBox.warning(self, "运行安装包失败", f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
+        else:
+            is_cancelled = False
+            if hasattr(self, "_download_worker") and self._download_worker:
+                is_cancelled = self._download_worker.cancelled
+            if not is_cancelled:
+                QMessageBox.warning(self, "下载失败", f"下载升级安装包失败：\n{error}")
 
 
 STYLE = """
