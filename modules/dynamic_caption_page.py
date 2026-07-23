@@ -1892,6 +1892,7 @@ class DynamicCaptionPage(QWidget):
         self.group_silence_min.setToolTip("持续达到该时长才视为有效静音，避免误切很短的停顿")
         silence_row=QHBoxLayout(); silence_row.addWidget(QLabel("静音阈值")); silence_row.addWidget(self.group_silence_threshold,1)
         silence_row.addWidget(QLabel("最短静音")); silence_row.addWidget(self.group_silence_min,1); group_layout.addLayout(silence_row)
+        group_layout.addStretch(1)
         self.group_burn_watermark=QCheckBox("水印")
         self.group_burn_watermark.setChecked(False)
         self.group_burn_watermark.setToolTip("合成时烧录当前公司水印；后续导出会自动跳过重复烧录")
