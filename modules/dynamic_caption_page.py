@@ -1796,7 +1796,7 @@ class DynamicCaptionPage(QWidget):
 
         # 左栏内部拆成“内容 + 竖向图标”两列；中间预览和最右设置保持独立。
         left = QWidget(); left_layout = QVBoxLayout(left); left_layout.setContentsMargins(0,0,4,0); left_layout.setSpacing(6)
-        left.setMinimumWidth(380); left.setMaximumWidth(520)
+        left.setMinimumWidth(360)
         source_group = QGroupBox("素材项目"); source_group_layout = QHBoxLayout(source_group); source_group_layout.setContentsMargins(8,10,8,8)
         source_group.setMinimumHeight(350)
         source_stack = QStackedWidget(); self.source_stack = source_stack
@@ -2350,14 +2350,26 @@ class DynamicCaptionPage(QWidget):
         og.addWidget(self.log,1)
         left_layout.addWidget(output_group,0)
 
+        # Proportional sizes based on screen resolution
+        screen = QApplication.primaryScreen()
+        screen_width = screen.geometry().width() if screen else 1920
+        left_w = int(screen_width * 0.23)
+        right_w = screen_width - left_w
+        preview_w = int(right_w * 0.55)
+        settings_w = right_w - preview_w
+
         # 右侧工作设置区：预览与全部设置等高延伸到底部。
         work_group=QGroupBox("工作设置区 · 实时预览与字幕设计")
         work_group_layout=QVBoxLayout(work_group); work_group_layout.setContentsMargins(7,10,7,7)
         work_splitter=QSplitter(Qt.Orientation.Horizontal); work_splitter.setChildrenCollapsible(False)
-        center.setMinimumWidth(500); settings_scroll.setMinimumWidth(430)
-        work_splitter.addWidget(center); work_splitter.addWidget(settings_scroll); work_splitter.setSizes([650,500])
+        center.setMinimumWidth(380); settings_scroll.setMinimumWidth(400)
+        work_splitter.addWidget(center); work_splitter.addWidget(settings_scroll); work_splitter.setSizes([preview_w,settings_w])
+        work_splitter.setStretchFactor(0, 3)
+        work_splitter.setStretchFactor(1, 2)
         work_group_layout.addWidget(work_splitter)
-        workspace.addWidget(left); workspace.addWidget(work_group); workspace.setSizes([430,1080]); root.addWidget(workspace,1)
+        workspace.addWidget(left); workspace.addWidget(work_group); workspace.setSizes([left_w,right_w])
+        workspace.setStretchFactor(0, 1)
+        workspace.setStretchFactor(1, 3); root.addWidget(workspace,1)
 
         self.preview_thread=None; self.preview_worker=None; self.timeline_thread=None; self.timeline_worker=None
         self._refresh_layer_list(0)
