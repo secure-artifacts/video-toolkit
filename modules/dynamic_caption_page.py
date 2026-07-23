@@ -1899,9 +1899,7 @@ class DynamicCaptionPage(QWidget):
         self.group_burn_watermark=QCheckBox("水印")
         self.group_burn_watermark.setChecked(False)
         self.group_burn_watermark.setToolTip("合成时烧录当前公司水印；后续导出会自动跳过重复烧录")
-        self.group_clean_metadata=QCheckBox("清除元数据")
-        self.group_clean_metadata.setChecked(True)
-        self.group_clean_metadata.setToolTip("勾选后在合成成品的同一条 FFmpeg 命令中清除元数据，不生成额外副本。")
+
         # 对应关系改在表格弹窗中集中编辑；保留隐藏编辑器兼容现有断点和选择逻辑。
         self.group_script = QPlainTextEdit(); self.group_script.hide()
         self.group_script.textChanged.connect(self._save_current_group_script)
@@ -1912,7 +1910,7 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(66,42); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
         group_action_layout.addWidget(self.group_auto_timeline)
         compact_options=QHBoxLayout(); compact_options.setSpacing(3)
-        compact_options.addWidget(self.group_burn_watermark); compact_options.addWidget(self.group_clean_metadata)
+        compact_options.addWidget(self.group_burn_watermark)
         group_action_layout.addLayout(compact_options)
         group_action_layout.addWidget(self.group_merge_start); group_action_layout.addWidget(self.group_merge_stop)
         group_action_layout.addStretch()
@@ -2007,22 +2005,7 @@ class DynamicCaptionPage(QWidget):
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         settings_body = QWidget(); settings_body.setMinimumWidth(0); settings_body.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         settings_layout = QVBoxLayout(settings_body); settings_layout.setContentsMargins(4,0,8,4); settings_layout.setSpacing(7)
-        template_group=QGroupBox("🎨 字幕样式模板")
-        template_layout=QVBoxLayout(template_group); template_layout.setContentsMargins(9,8,9,8); template_layout.setSpacing(5)
-        self.style_template_combo=QComboBox(); self.style_template_combo.setEditable(True)
-        self.style_template_combo.setPlaceholderText("输入模板名称，或选择已保存模板")
-        self.style_template_combo.setToolTip("保存当前字幕字体、排版、动画、颜色、位置、图层与水印设置。不会保存视频、音频或字幕时间轴。")
-        self.style_template_apply=QPushButton("应用"); self.style_template_apply.clicked.connect(self._apply_style_template)
-        self.style_template_save=QPushButton("保存模板"); self.style_template_save.clicked.connect(self._save_style_template)
-        self.style_template_delete=QPushButton("删除"); self.style_template_delete.clicked.connect(self._delete_style_template)
-        self.style_template_export=QPushButton("导出…"); self.style_template_export.clicked.connect(self._export_style_template)
-        self.style_template_import=QPushButton("导入…"); self.style_template_import.clicked.connect(self._import_style_template)
-        template_name_row=QHBoxLayout(); template_name_row.addWidget(QLabel("模板")); template_name_row.addWidget(self.style_template_combo,1)
-        template_action_row=QHBoxLayout()
-        for button in (self.style_template_apply,self.style_template_save,self.style_template_delete,
-                       self.style_template_export,self.style_template_import): template_action_row.addWidget(button)
-        template_layout.addLayout(template_name_row); template_layout.addLayout(template_action_row)
-        settings_layout.addWidget(template_group)
+
 
         preset_group = QGroupBox("✨ 4. 字幕样式与动画"); preset_group.setMinimumWidth(0); preset_group.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         pg = QHBoxLayout(preset_group); pg.setContentsMargins(10,12,10,10); pg.setSpacing(10)
@@ -2118,14 +2101,39 @@ class DynamicCaptionPage(QWidget):
         style_controls=QWidget(); style_controls.setMinimumWidth(0); style_controls.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         style_controls_layout=QVBoxLayout(style_controls); style_controls_layout.setContentsMargins(0,0,0,0); style_controls_layout.setSpacing(7)
         style_controls_layout.addLayout(form); style_controls_layout.addWidget(batch_style_hint); style_controls_layout.addLayout(colors); style_controls_layout.addStretch()
-        preset_panel=QWidget(); preset_panel.setMinimumWidth(145); preset_panel.setMaximumWidth(160)
+        preset_panel=QWidget(); preset_panel.setMinimumWidth(170); preset_panel.setMaximumWidth(195)
         preset_list=QVBoxLayout(preset_panel); preset_list.setContentsMargins(0,0,0,0); preset_list.setSpacing(5)
         preset_title=QLabel("动画与配色预设"); preset_title.setAlignment(Qt.AlignmentFlag.AlignCenter); preset_title.setStyleSheet("color:#7dd3fc;font-weight:700;")
         preset_list.addWidget(preset_title)
-        for name,preset in PRESETS.items():
-            button=PresetPreviewButton(name,preset)
-            button.clicked.connect(lambda checked=False,n=name:self.apply_preset(n)); preset_list.addWidget(button); self.preset_buttons.append(button)
-        preset_list.addStretch(); pg.addWidget(style_controls,1); pg.addWidget(preset_panel)
+        
+        # Preset save / import / export actions
+        preset_actions = QHBoxLayout(); preset_actions.setSpacing(3)
+        self.preset_save = QPushButton("＋保存"); self.preset_save.setToolTip("保存当前字幕参数为自定义预设")
+        self.preset_save.setStyleSheet("font-size: 11px; padding: 2px;")
+        self.preset_save.clicked.connect(self._save_current_preset)
+        
+        self.preset_import = QPushButton("导入"); self.preset_import.setToolTip("从外部文件导入预设")
+        self.preset_import.setStyleSheet("font-size: 11px; padding: 2px;")
+        self.preset_import.clicked.connect(self._import_preset)
+        
+        self.preset_export = QPushButton("导出"); self.preset_export.setToolTip("将选中的预设导出到文件")
+        self.preset_export.setStyleSheet("font-size: 11px; padding: 2px;")
+        self.preset_export.clicked.connect(self._export_selected_preset)
+        
+        preset_actions.addWidget(self.preset_save)
+        preset_actions.addWidget(self.preset_import)
+        preset_actions.addWidget(self.preset_export)
+        preset_list.addLayout(preset_actions)
+        
+        self.preset_list_widget = QListWidget()
+        self.preset_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.preset_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.preset_list_widget.setStyleSheet("QListWidget { background: transparent; border: none; } QListWidget::item { background: transparent; padding: 0px; border: none; }")
+        self.preset_list_widget.model().rowsMoved.connect(
+            lambda parent, start, end, dest, row: QTimer.singleShot(50, self._preset_order_changed)
+        )
+        preset_list.addWidget(self.preset_list_widget, 1)
+        pg.addWidget(style_controls,1); pg.addWidget(preset_panel)
         settings_layout.addWidget(preset_group)
 
         # 🎵 5. 音频与背景音乐
@@ -2348,7 +2356,7 @@ class DynamicCaptionPage(QWidget):
         self._make_collapsible(layer_group,"layers_watermarks",False)
         self._make_collapsible(rename_group,"automatic_rename",False)
         self._make_collapsible(hardware_group,"hardware_acceleration",False)
-        self._make_collapsible(template_group,"templates",False)
+
 
         # Disable wheel events for all QComboBoxes and QSpinBoxes to prevent accidental scroll changes
         for combo in self.findChildren(QComboBox):
@@ -2407,7 +2415,7 @@ class DynamicCaptionPage(QWidget):
 
         self.preview_thread=None; self.preview_worker=None; self.timeline_thread=None; self.timeline_worker=None
         self._refresh_layer_list(0)
-        self._load_layer_schemes(); self._load_style_templates(); self._watermark_mode_changed(self.watermark_mode.currentText())
+        self._load_layer_schemes(); self._load_all_presets(); self._watermark_mode_changed(self.watermark_mode.currentText())
         self._refresh_task_queue()
         self._caption_mode_changed(self.caption_mode.currentText())
         self._group_sort_mode_changed(self.group_sort_mode.currentText())
@@ -2631,7 +2639,7 @@ class DynamicCaptionPage(QWidget):
             "resume": True,
             "encoder_backend": self.encoder_backend.currentText(),
             "encode_preset": self.encode_preset.currentText(),
-            "clean_metadata": self.group_clean_metadata.isChecked(),
+            "clean_metadata": self.clean_metadata.isChecked(),
         }
         watermark_fingerprint=watermark_config_fingerprint(self._watermark_entries)
         burn_watermark=bool(self.group_burn_watermark.isChecked() and watermark_fingerprint)
@@ -2906,18 +2914,210 @@ class DynamicCaptionPage(QWidget):
     def _style_settings_store(self):
         return QSettings("VideoToolkit","DynamicReels")
 
-    def _load_style_templates(self):
+    def _load_all_presets(self):
+        from PySide6.QtWidgets import QListWidgetItem
+        store = QSettings("VideoToolkit", "DynamicReels")
+        saved_presets_json = store.value("presets_list_json", "")
+        
+        self.preset_list_widget.clear()
+        self.preset_buttons = []
+        
+        self.all_presets = []
+        if saved_presets_json:
+            try:
+                self.all_presets = json.loads(saved_presets_json)
+            except Exception:
+                pass
+                
+        if not self.all_presets:
+            for name, preset_dict in PRESETS.items():
+                self.all_presets.append({
+                    "name": name,
+                    "is_custom": False,
+                    "data": preset_dict
+                })
+            store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
+            
+        for index, item in enumerate(self.all_presets):
+            name = item["name"]
+            is_custom = item["is_custom"]
+            data = item["data"]
+            
+            if is_custom:
+                repr_preset = {
+                    "text": data.get("text_color", "#FFFFFF"),
+                    "outline": data.get("outline_color", "#111827"),
+                    "highlight": data.get("highlight_color", "#8B5CF6"),
+                    "outline_width": data.get("outline_width", 3),
+                    "effect": data.get("free_animation", "word_color"),
+                    "font": data.get("font", "Arial"),
+                    "font_size": data.get("font_size", 58)
+                }
+                anim = repr_preset["effect"]
+                if anim == "卡点单行":
+                    repr_preset["effect"] = "descript"
+                elif anim == "逐字弹出":
+                    repr_preset["effect"] = "pop"
+                elif anim == "逐字渐出":
+                    repr_preset["effect"] = "glow"
+                elif anim == "智能卡点":
+                    repr_preset["effect"] = "highlight"
+                else:
+                    repr_preset["effect"] = "word_color"
+            else:
+                repr_preset = data
+                
+            button = PresetPreviewButton(name, repr_preset)
+            button.setFixedWidth(135)
+            button.clicked.connect(lambda checked=False, idx=index: self._apply_preset_by_index(idx))
+            self.preset_buttons.append(button)
+            
+            item_widget = QWidget()
+            item_layout = QHBoxLayout(item_widget)
+            item_layout.setContentsMargins(1, 1, 1, 1)
+            item_layout.setSpacing(2)
+            item_layout.addWidget(button, 1)
+            
+            del_btn = QPushButton("×")
+            del_btn.setFixedSize(20, 58)
+            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            del_btn.setStyleSheet("""
+                QPushButton {
+                    background: #111827;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    color: #94a3b8;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background: #991b1b;
+                    border-color: #f87171;
+                    color: white;
+                }
+            """)
+            del_btn.clicked.connect(lambda checked=False, idx=index: self._delete_preset_by_index(idx))
+            item_layout.addWidget(del_btn)
+            
+            list_item = QListWidgetItem(self.preset_list_widget)
+            list_item.setSizeHint(item_widget.sizeHint())
+            self.preset_list_widget.addItem(list_item)
+            self.preset_list_widget.setItemWidget(list_item, item_widget)
+
+    def _preset_order_changed(self):
+        new_presets = []
+        for i in range(self.preset_list_widget.count()):
+            list_item = self.preset_list_widget.item(i)
+            item_widget = self.preset_list_widget.itemWidget(list_item)
+            if not item_widget:
+                continue
+            button = item_widget.findChild(PresetPreviewButton)
+            if button:
+                for item in self.all_presets:
+                    if item["name"] == button.name:
+                        new_presets.append(item)
+                        break
+        self.all_presets = new_presets
+        store = QSettings("VideoToolkit", "DynamicReels")
+        store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
+        self._load_all_presets()
+
+    def _apply_preset_by_index(self, idx):
+        if idx < 0 or idx >= len(self.all_presets):
+            return
+        item = self.all_presets[idx]
+        name = item["name"]
+        for btn in self.preset_buttons:
+            btn.setChecked(btn.name == name)
+        if item["is_custom"]:
+            self._apply_style_template_data(item["data"])
+            self._append_run_log(f"已应用自定义预设：{name}")
+        else:
+            self.apply_preset(name)
+
+    def _delete_preset_by_index(self, idx):
+        if idx < 0 or idx >= len(self.all_presets):
+            return
+        name = self.all_presets[idx]["name"]
+        if QMessageBox.question(self, "删除预设", f"确定要删除预设“{name}”吗？") != QMessageBox.StandardButton.Yes:
+            return
+        self.all_presets.pop(idx)
+        store = QSettings("VideoToolkit", "DynamicReels")
+        store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
+        self._load_all_presets()
+        self._append_run_log(f"已删除预设：{name}")
+
+    def _save_current_preset(self):
+        name, ok = QInputDialog.getText(self, "保存预设", "请输入预设名称:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        for item in self.all_presets:
+            if item["name"] == name:
+                if QMessageBox.question(self, "覆盖预设", f"已存在名为“{name}”的预设，是否覆盖？") != QMessageBox.StandardButton.Yes:
+                    return
+                self.all_presets.remove(item)
+                break
+        snapshot = self._style_template_snapshot()
+        self.all_presets.insert(0, {
+            "name": name,
+            "is_custom": True,
+            "data": snapshot
+        })
+        store = QSettings("VideoToolkit", "DynamicReels")
+        store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
+        self._load_all_presets()
+        self._append_run_log(f"已保存自定义预设：{name}")
+
+    def _import_preset(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入字幕样式预设", "", "样式预设 (*.json)")
+        if not path:
+            return
         try:
-            saved=json.loads(self._style_settings_store().value("subtitle_style_templates","{}") or "{}")
-            self._style_templates=saved if isinstance(saved,dict) else {}
-        except Exception:
-            self._style_templates={}
-        if not hasattr(self,"style_template_combo"): return
-        current=self.style_template_combo.currentText().strip()
-        self.style_template_combo.blockSignals(True); self.style_template_combo.clear()
-        self.style_template_combo.addItems(sorted(self._style_templates,key=natural_key))
-        if current: self.style_template_combo.setCurrentText(current)
-        self.style_template_combo.blockSignals(False)
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            name = data.get("preset_name", Path(path).stem)
+            if "preset_name" not in data and "style" in data:
+                data = data["style"]
+            for item in self.all_presets:
+                if item["name"] == name:
+                    if QMessageBox.question(self, "覆盖预设", f"已存在名为“{name}”的预设，是否覆盖？") != QMessageBox.StandardButton.Yes:
+                        return
+                    self.all_presets.remove(item)
+                    break
+            self.all_presets.insert(0, {
+                "name": name,
+                "is_custom": True,
+                "data": data
+            })
+            store = QSettings("VideoToolkit", "DynamicReels")
+            store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
+            self._load_all_presets()
+            self._append_run_log(f"已成功导入预设：{name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导入失败", f"无法解析预设文件：{exc}")
+
+    def _export_selected_preset(self):
+        selected_name = next((btn.name for btn in self.preset_buttons if btn.isChecked()), None)
+        if not selected_name:
+            QMessageBox.information(self, "未选择预设", "请先在右侧预设列表中点击选中一个要导出的预设。")
+            return
+        preset_item = next((item for item in self.all_presets if item["name"] == selected_name), None)
+        if not preset_item:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出字幕样式预设", f"{selected_name}.json", "样式预设 (*.json)")
+        if not path:
+            return
+        try:
+            if preset_item["is_custom"]:
+                export_data = dict(preset_item["data"])
+            else:
+                export_data = self._style_template_snapshot()
+                export_data["preset"] = selected_name
+            export_data["preset_name"] = selected_name
+            Path(path).write_text(json.dumps(export_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._append_run_log(f"已成功导出预设到：{Path(path).name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"无法保存预设文件：{exc}")
 
     def _style_template_snapshot(self):
         """Return portable visual settings only; media/timelines never enter a template."""
@@ -2988,14 +3188,7 @@ class DynamicCaptionPage(QWidget):
         self._sync_preview_margin(self.margin_v.value()); self.update_style_preview(); self._refresh_live_preview()
         self._save_style_preferences()
 
-    def _save_style_template(self):
-        name=self.style_template_combo.currentText().strip()
-        if not name:
-            QMessageBox.information(self,"请输入名称","请先在模板框中输入一个模板名称。"); return
-        self._style_templates[name]=self._style_template_snapshot()
-        self._style_settings_store().setValue("subtitle_style_templates",json.dumps(self._style_templates,ensure_ascii=False))
-        self._load_style_templates(); self.style_template_combo.setCurrentText(name)
-        self._append_run_log(f"已保存字幕样式模板：{name}")
+
     def _load_rename_prefix_presets(self):
         try:
             presets = json.loads(self._style_settings_store().value("rename_prefix_presets", "{}") or "{}")
@@ -3030,46 +3223,13 @@ class DynamicCaptionPage(QWidget):
         if name in self._rename_prefix_presets:
             self.rename_prefix.setText(self._rename_prefix_presets[name])
 
-    def _apply_style_template(self):
-        name=self.style_template_combo.currentText().strip(); saved=self._style_templates.get(name)
-        if not saved:
-            QMessageBox.information(self,"没有模板","请选择已保存的模板，或先输入名称并保存当前样式。"); return
-        try: self._apply_style_template_data(saved)
-        except Exception as exc: QMessageBox.critical(self,"应用模板失败",str(exc)); return
-        self._append_run_log(f"已应用字幕样式模板：{name}")
 
-    def _delete_style_template(self):
-        name=self.style_template_combo.currentText().strip()
-        if name not in self._style_templates: return
-        self._style_templates.pop(name,None)
-        self._style_settings_store().setValue("subtitle_style_templates",json.dumps(self._style_templates,ensure_ascii=False))
-        self._load_style_templates(); self.style_template_combo.setCurrentText("")
-        self._append_run_log(f"已删除字幕样式模板：{name}")
 
-    def _export_style_template(self):
-        name=self.style_template_combo.currentText().strip() or "当前字幕样式"
-        style=self._style_templates.get(name) or self._style_template_snapshot()
-        path,_=QFileDialog.getSaveFileName(self,"导出字幕样式模板",f"{name}.json","字幕样式模板 (*.json)")
-        if not path: return
-        payload={"format":"VideoToolkitSubtitleStyle","version":1,"name":name,"style":style}
-        try: Path(path).write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
-        except Exception as exc: QMessageBox.critical(self,"导出失败",str(exc)); return
-        self._append_run_log(f"字幕样式模板已导出：{path}")
 
-    def _import_style_template(self):
-        path,_=QFileDialog.getOpenFileName(self,"导入字幕样式模板","","字幕样式模板 (*.json)")
-        if not path: return
-        try:
-            payload=json.loads(Path(path).read_text(encoding="utf-8-sig"))
-            if payload.get("format")!="VideoToolkitSubtitleStyle" or not isinstance(payload.get("style"),dict):
-                raise ValueError("这不是视频工具合集的字幕样式模板文件")
-            name=str(payload.get("name") or Path(path).stem).strip() or Path(path).stem
-            self._style_templates[name]=payload["style"]
-            self._style_settings_store().setValue("subtitle_style_templates",json.dumps(self._style_templates,ensure_ascii=False))
-            self._load_style_templates(); self.style_template_combo.setCurrentText(name)
-            self._apply_style_template_data(payload["style"])
-        except Exception as exc: QMessageBox.critical(self,"导入失败",str(exc)); return
-        self._append_run_log(f"已导入并应用字幕样式模板：{name}")
+
+
+
+
 
     def _load_saved_font_files(self):
         folder=render_font_dir()

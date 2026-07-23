@@ -201,18 +201,12 @@ class VideoTool(QMainWindow):
         self.btn_local = QPushButton("＋ 添加本地视频")
         self.btn_local.clicked.connect(self.add_local_videos)
         self.btn_folder = QPushButton("＋ 添加文件夹"); self.btn_folder.clicked.connect(self.add_local_folder)
-        self.btn_parent = QPushButton("选择父目录"); self.btn_parent.clicked.connect(self.choose_parent_folder)
         input_head.addWidget(self.btn_local)
         input_head.addWidget(self.btn_folder)
-        input_head.addWidget(self.btn_parent)
         layout.addLayout(input_head)
         self.url_input = DropTextEdit(); self.url_input.paths_dropped.connect(self.add_local_paths)
         self.url_input.setPlaceholderText("粘贴网络链接，或直接拖入本地视频/文件夹")
         layout.addWidget(self.url_input)
-        subfolder_row = QHBoxLayout(); subfolder_row.addWidget(QLabel("子文件夹"))
-        self.subfolders = QComboBox(); self.subfolders.setEnabled(False)
-        add_selected = QPushButton("添加所选目录"); add_selected.clicked.connect(self.add_selected_folder)
-        subfolder_row.addWidget(self.subfolders, 1); subfolder_row.addWidget(add_selected); layout.addLayout(subfolder_row)
 
         # 參數設置
         params = QHBoxLayout()
@@ -310,15 +304,7 @@ class VideoTool(QMainWindow):
         existing.extend(path for path in files if path not in existing)
         self.url_input.setPlainText("\n".join(existing))
 
-    def choose_parent_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择父目录")
-        if folder:
-            try: load_subfolders(self.subfolders, folder)
-            except OSError as exc: QMessageBox.warning(self, "无法读取目录", str(exc))
 
-    def add_selected_folder(self):
-        folder = self.subfolders.currentData()
-        if folder: self.add_local_paths([folder])
 
     def clear_history(self):
         path = str(app_data_dir() / "screenshot_history.json")

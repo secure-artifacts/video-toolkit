@@ -141,13 +141,8 @@ class SmartCutPage(QWidget):
         row = QHBoxLayout()
         add = QPushButton("选择视频"); add.clicked.connect(self.add_files)
         add_folder = QPushButton("选择文件夹"); add_folder.clicked.connect(self.add_folder)
-        parent = QPushButton("选择父目录"); parent.clicked.connect(self.choose_parent_folder)
         clear = QPushButton("清空"); clear.clicked.connect(self.files.clear)
-        row.addWidget(add); row.addWidget(add_folder); row.addWidget(parent); row.addWidget(clear); row.addStretch(); layout.addLayout(row)
-        folder_row = QHBoxLayout(); folder_row.addWidget(QLabel("子文件夹"))
-        self.subfolders = QComboBox(); self.subfolders.setEnabled(False)
-        add_selected = QPushButton("添加所选目录"); add_selected.clicked.connect(self.add_selected_folder)
-        folder_row.addWidget(self.subfolders, 1); folder_row.addWidget(add_selected); layout.addLayout(folder_row)
+        row.addWidget(add); row.addWidget(add_folder); row.addWidget(clear); row.addStretch(); layout.addLayout(row)
         form = QFormLayout()
         out_row = QHBoxLayout()
         self.output = QLineEdit(str(default_output_path("智能剪辑输出")))
@@ -185,15 +180,7 @@ class SmartCutPage(QWidget):
         for path in files:
             if path not in current: self.files.addItem(path); current.add(path)
 
-    def choose_parent_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择父目录")
-        if folder:
-            try: load_subfolders(self.subfolders, folder)
-            except OSError as exc: QMessageBox.warning(self, "无法读取目录", str(exc))
 
-    def add_selected_folder(self):
-        folder = self.subfolders.currentData()
-        if folder: self.add_paths([folder])
 
     def choose_output(self):
         path = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output.text())

@@ -11,6 +11,10 @@ os.environ["VIDEO_TOOLKIT_DISABLE_STYLE_MEMORY"] = "1"
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 import app as toolkit
+from PySide6.QtWidgets import QMessageBox, QInputDialog
+QMessageBox.question = lambda *a, **kw: QMessageBox.StandardButton.Yes
+QMessageBox.warning = lambda *a, **kw: QMessageBox.StandardButton.Ok
+QMessageBox.information = lambda *a, **kw: QMessageBox.StandardButton.Ok
 from modules.rename_page import SmartTitleWorker
 
 QSettings.setDefaultFormat(QSettings.Format.IniFormat)
@@ -66,7 +70,7 @@ assert window.dynamic_caption_page.group_burn_watermark.isChecked() is False
 assert Path(window.dynamic_caption_page.output.text()).is_absolute()
 assert Path(window.dynamic_caption_page.output.text()).parent != Path(Path(window.dynamic_caption_page.output.text()).anchor)
 assert any(button.text() == "清空" for button in window.dynamic_caption_page.source_stack.widget(0).findChildren(toolkit.QPushButton))
-assert hasattr(window.dynamic_caption_page,"style_template_combo")
+assert hasattr(window.dynamic_caption_page,"preset_list_widget")
 style_page=window.dynamic_caption_page
 style_page.font_size.setValue(73); style_page.letter_spacing.setValue(6)
 style_page.layers=[{"type":"caption","name":"字幕层"},{"type":"mask","name":"测试蒙版","x":2,"y":3,"w":90,"h":20,"opacity":50,"radius":10,"color":"#000000"}]
@@ -75,21 +79,31 @@ style_page.font_size.setValue(42); style_page.letter_spacing.setValue(-2); style
 style_page._apply_style_template_data(snapshot)
 assert style_page.font_size.value()==73 and style_page.letter_spacing.value()==6
 assert any(layer.get("name")=="测试蒙版" for layer in style_page.layers)
-style_page.style_template_combo.setCurrentText("测试样式")
-style_page._save_style_template()
-assert "测试样式" in style_page._style_templates
-style_export=Path(root)/"subtitle-style.json"
+from PySide6.QtWidgets import QInputDialog, QMessageBox
+original_get_text = QInputDialog.getText
+QInputDialog.getText = lambda *a, **kw: ("测试样式", True)
+original_question = QMessageBox.question
+QMessageBox.question = lambda *a, **kw: QMessageBox.StandardButton.Yes
+style_page._save_current_preset()
+QInputDialog.getText = original_get_text
+QMessageBox.question = original_question
+assert any(item["name"] == "测试样式" for item in style_page.all_presets)
+style_export=Path(root)/"subtitle-preset.json"
 original_save_file=toolkit.QFileDialog.getSaveFileName
 original_open_file=toolkit.QFileDialog.getOpenFileName
-toolkit.QFileDialog.getSaveFileName=lambda *args,**kwargs:(str(style_export),"字幕样式模板 (*.json)")
-style_page._export_style_template()
-assert style_export.is_file() and "VideoToolkitSubtitleStyle" in style_export.read_text(encoding="utf-8")
-style_page._style_templates={}; style_page._load_style_templates()
-toolkit.QFileDialog.getOpenFileName=lambda *args,**kwargs:(str(style_export),"字幕样式模板 (*.json)")
-style_page._import_style_template()
+toolkit.QFileDialog.getSaveFileName=lambda *args,**kwargs:(str(style_export),"样式预设 (*.json)")
+style_page.preset_buttons[0].setChecked(True)
+style_page._export_selected_preset()
+assert style_export.is_file()
+QSettings("VideoToolkit", "DynamicReels").remove("presets_list_json")
+style_page.all_presets = []
+style_page._load_all_presets()
+assert not any(item["name"] == "测试样式" for item in style_page.all_presets)
+toolkit.QFileDialog.getOpenFileName=lambda *args,**kwargs:(str(style_export),"样式预设 (*.json)")
+style_page._import_preset()
 toolkit.QFileDialog.getSaveFileName=original_save_file
 toolkit.QFileDialog.getOpenFileName=original_open_file
-assert "测试样式" in style_page._style_templates and style_page.font_size.value()==73
+assert any(item["name"] == "测试样式" for item in style_page.all_presets) and style_page.font_size.value()==73
 extract_calls=[]
 style_page.extract_all_timelines=lambda:extract_calls.append("all")
 style_page._load_group_merge_outputs(auto_extract=True)
@@ -131,7 +145,7 @@ window._add_media_paths([str(media_root.parent)])
 assert window.file_list.count() == 2
 assert window.file_list.item(0).text().endswith("2.mp4")
 assert window.file_list.item(1).text().endswith("10.mp3")
-assert window.subfolder_combo is not None
+
 window.smartcut_page.add_paths([str(media_root.parent)])
 assert window.smartcut_page.files.count() == 1
 window.screenshot_page.add_local_paths([str(media_root.parent)])

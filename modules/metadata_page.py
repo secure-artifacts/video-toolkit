@@ -150,15 +150,10 @@ class MetadataPage(QWidget):
         buttons = QHBoxLayout()
         add_files = QPushButton("添加文件"); add_files.clicked.connect(self.choose_files)
         add_folder = QPushButton("添加文件夹"); add_folder.clicked.connect(self.choose_folder)
-        parent = QPushButton("选择父目录"); parent.clicked.connect(self.choose_parent)
         remove = QPushButton("移除选中"); remove.clicked.connect(lambda: [self.list.takeItem(i.row()) for i in reversed(self.list.selectedIndexes())])
         clear = QPushButton("清空"); clear.clicked.connect(self.list.clear)
-        for button in (add_files, add_folder, parent, remove, clear): buttons.addWidget(button)
+        for button in (add_files, add_folder, remove, clear): buttons.addWidget(button)
         source_layout.addLayout(buttons)
-        child = QHBoxLayout(); child.addWidget(QLabel("子文件夹"))
-        self.subfolders = QComboBox(); self.subfolders.setEnabled(False)
-        add_child = QPushButton("添加所选目录"); add_child.clicked.connect(self.add_child)
-        child.addWidget(self.subfolders, 1); child.addWidget(add_child); source_layout.addLayout(child)
 
         options = QGroupBox("输出与执行"); options_layout = QVBoxLayout(options)
         form = QFormLayout()
@@ -291,12 +286,7 @@ class MetadataPage(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "选择素材文件夹")
         if folder: self.add_paths([folder])
 
-    def choose_parent(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择父目录")
-        if folder: load_subfolders(self.subfolders, folder)
 
-    def add_child(self):
-        if self.subfolders.currentData(): self.add_paths([self.subfolders.currentData()])
 
     def choose_output(self):
         folder = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output.text())

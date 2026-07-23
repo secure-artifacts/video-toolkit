@@ -544,15 +544,12 @@ class MainWindow(QMainWindow):
         row.setSpacing(4)
         add_files = QPushButton("添加文件")
         add_folder = QPushButton("添加文件夹")
-        parent_folder = QPushButton("选择父目录")
         clear_files = QPushButton("清空")
         add_files.clicked.connect(self.add_files)
         add_folder.clicked.connect(self.add_folder)
-        parent_folder.clicked.connect(self.choose_parent_folder)
         clear_files.clicked.connect(self.clear_files)
         row.addWidget(add_files)
         row.addWidget(add_folder)
-        row.addWidget(parent_folder)
         row.addWidget(clear_files)
         self.file_table = DropTableWidget(0, 3); self.file_table.paths_dropped.connect(self.add_dropped_paths)
         self.file_table.setHorizontalHeaderLabels(["文件名", "类型", "路径"])
@@ -560,11 +557,6 @@ class MainWindow(QMainWindow):
         self.file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         source_layout.addLayout(row)
-        folder_row = QHBoxLayout(); folder_row.addWidget(QLabel("子文件夹"))
-        self.subfolders = QComboBox(); self.subfolders.setEnabled(False)
-        add_selected = QPushButton("添加所选目录"); add_selected.clicked.connect(self.add_selected_folder)
-        folder_row.addWidget(self.subfolders, 1); folder_row.addWidget(add_selected)
-        source_layout.addLayout(folder_row)
         source_layout.addWidget(self.file_table)
 
         output_group = QGroupBox("输出设置")
@@ -983,15 +975,7 @@ class MainWindow(QMainWindow):
     def add_dropped_paths(self, paths):
         self.add_paths(collect_files(paths, predicate=is_media))
 
-    def choose_parent_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择父目录", str(Path.home()))
-        if folder:
-            try: load_subfolders(self.subfolders, folder)
-            except OSError as exc: QMessageBox.warning(self, "无法读取目录", str(exc))
 
-    def add_selected_folder(self):
-        folder = self.subfolders.currentData()
-        if folder: self.add_dropped_paths([folder])
 
     def add_paths(self, paths):
         seen = set(self.files)

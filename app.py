@@ -2308,22 +2308,13 @@ class MainWindow(QMainWindow):
         add = QPushButton("添加视频 / 音频")
         add.clicked.connect(self._add_media)
         add_folder = QPushButton("添加文件夹"); add_folder.clicked.connect(self._add_media_folder)
-        choose_parent = QPushButton("选择父目录"); choose_parent.clicked.connect(self._choose_parent_folder)
         remove = QPushButton("移除选中")
         remove.clicked.connect(self._remove_selected_media)
         file_buttons.addWidget(add)
         file_buttons.addWidget(add_folder)
-        file_buttons.addWidget(choose_parent)
         file_buttons.addWidget(remove)
         control_layout.addWidget(self.file_list)
         control_layout.addLayout(file_buttons)
-
-        folder_row = QHBoxLayout(); folder_row.addWidget(QLabel("子文件夹"))
-        self.subfolder_combo = QComboBox(); self.subfolder_combo.setEnabled(False)
-        self.subfolder_combo.setPlaceholderText("先选择父目录")
-        add_subfolder = QPushButton("添加所选目录"); add_subfolder.clicked.connect(self._add_selected_subfolder)
-        folder_row.addWidget(self.subfolder_combo, 1); folder_row.addWidget(add_subfolder)
-        control_layout.addLayout(folder_row)
 
         url_header = QHBoxLayout(); url_header.addWidget(QLabel("网络视频链接（每行一个）")); url_header.addStretch()
         paste_urls = QPushButton("粘贴"); paste_urls.clicked.connect(
@@ -2420,14 +2411,9 @@ class MainWindow(QMainWindow):
         source_buttons = QHBoxLayout()
         add_files = QPushButton("添加视频"); add_files.clicked.connect(self._pipeline_choose_files)
         add_folder = QPushButton("添加文件夹"); add_folder.clicked.connect(self._pipeline_choose_folder)
-        parent_folder = QPushButton("选择父目录"); parent_folder.clicked.connect(self._pipeline_choose_parent)
         clear = QPushButton("清空"); clear.clicked.connect(self.pipeline_files.clear)
-        for button in (add_files, add_folder, parent_folder, clear): source_buttons.addWidget(button)
+        for button in (add_files, add_folder, clear): source_buttons.addWidget(button)
         left_layout.addLayout(source_buttons)
-        child_row = QHBoxLayout(); child_row.addWidget(QLabel("子文件夹"))
-        self.pipeline_subfolders = QComboBox(); self.pipeline_subfolders.setEnabled(False)
-        add_child = QPushButton("添加所选目录"); add_child.clicked.connect(self._pipeline_add_selected_folder)
-        child_row.addWidget(self.pipeline_subfolders, 1); child_row.addWidget(add_child); left_layout.addLayout(child_row)
 
         settings = QGroupBox("2. 流程设置"); form = QFormLayout(settings)
         output_row = QHBoxLayout(); self.pipeline_output = QLineEdit(str(default_output_path("流水线输出")))
@@ -2680,27 +2666,7 @@ class MainWindow(QMainWindow):
             self.file_list.takeItem(index.row())
         self.media_source_hint.setText(f"共 {self.file_list.count()} 个")
 
-    def _choose_parent_folder(self):
-        parent = QFileDialog.getExistingDirectory(self, "选择父目录")
-        if not parent:
-            return
-        parent_path = Path(parent)
-        try:
-            children = sorted((path for path in parent_path.iterdir() if path.is_dir()),
-                              key=lambda path: natural_path_key(path.name))
-        except (OSError, PermissionError) as exc:
-            QMessageBox.warning(self, "无法读取目录", str(exc)); return
-        self.subfolder_combo.clear()
-        self.subfolder_combo.addItem(f"[父目录本身] {parent_path.name}", str(parent_path))
-        for child in children:
-            self.subfolder_combo.addItem(child.name, str(child))
-        self.subfolder_combo.setEnabled(True)
-        self.media_source_hint.setText(f"已加载 {len(children)} 个子文件夹")
 
-    def _add_selected_subfolder(self):
-        folder = self.subfolder_combo.currentData()
-        if folder:
-            self._add_media_paths([folder])
 
     def _pipeline_choose_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -2726,22 +2692,7 @@ class MainWindow(QMainWindow):
         for path in candidates:
             if path not in existing: self.pipeline_files.addItem(path); existing.add(path)
 
-    def _pipeline_choose_parent(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择父目录")
-        if not folder: return
-        parent = Path(folder)
-        try:
-            children = sorted((path for path in parent.iterdir() if path.is_dir()),
-                              key=lambda path: natural_path_key(path.name))
-        except OSError as exc:
-            QMessageBox.warning(self, "无法读取目录", str(exc)); return
-        self.pipeline_subfolders.clear(); self.pipeline_subfolders.addItem(f"[父目录本身] {parent.name}", str(parent))
-        for child in children: self.pipeline_subfolders.addItem(child.name, str(child))
-        self.pipeline_subfolders.setEnabled(True)
 
-    def _pipeline_add_selected_folder(self):
-        folder = self.pipeline_subfolders.currentData()
-        if folder: self._pipeline_add_paths([folder])
 
     def _pipeline_choose_output(self):
         folder = QFileDialog.getExistingDirectory(self, "选择流水线输出目录", self.pipeline_output.text())
