@@ -60,7 +60,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.4").strip().lstrip("v") or "1.7.4"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.5").strip().lstrip("v") or "1.7.5"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]

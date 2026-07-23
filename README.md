@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.4**
+当前版本：**v1.7.5**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,9 +10,9 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.4.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.4/video-toolkit-windows-x64-v1.7.4.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.4.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.4/video-toolkit-macos-arm64-v1.7.4.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.4.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.4/video-toolkit-macos-x64-v1.7.4.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.5.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.5/video-toolkit-windows-x64-v1.7.5.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.5.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.5/video-toolkit-macos-arm64-v1.7.5.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.5.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.5/video-toolkit-macos-x64-v1.7.5.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
 

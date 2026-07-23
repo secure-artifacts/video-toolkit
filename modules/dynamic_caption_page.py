@@ -944,8 +944,8 @@ def escape_ffmpeg_filter_path(path):
     brackets and colons in a user folder can otherwise be parsed as filters.
     """
     value=str(path).replace("\\","/")
-    for source,target in (("\\",r"\\"),("'",r"\'"),(":",r"\:"),
-                          (",",r"\,"),(";",r"\;"),("[",r"\["),("]",r"\]")):
+    for source,target in (("'",r"\'"),(":",r"\:"),(",",r"\,"),(";",r"\;"),
+                          ("[",r"\["),("]",r"\]"),("(",r"\("),(")",r"\)"),(" ",r"\ ")):
         value=value.replace(source,target)
     return value
 
@@ -1040,7 +1040,8 @@ def write_ass(path, srt, settings, word_srt=""):
     metric_font=caption_layout_context(settings)[0]
     font = QFontInfo(metric_font).family().replace(",", "")
     alignment = {"底部": 2, "画面中间": 5, "顶部": 8}.get(settings.get("position", "底部"), 2)
-    bold_flag=-1 if caption_uses_bold_face(settings) else 0
+    is_static_bold = any(key in font for key in STATIC_BOLD_FONT_FILES)
+    bold_flag=-1 if (caption_uses_bold_face(settings) or is_static_bold) else 0
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080

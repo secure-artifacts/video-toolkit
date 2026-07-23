@@ -1,13 +1,13 @@
 [Setup]
 AppName=VideoToolkit
-AppVersion=1.7.4
+AppVersion=1.7.5
 DefaultDirName={localappdata}\Programs\VideoToolkit
 DefaultGroupName=VideoToolkit
 UninstallDisplayIcon={app}\VideoToolkit.exe
 Compression=lzma2
 SolidCompression=yes
 OutputDir=.
-OutputBaseFilename=VideoToolkit_Setup_v1.7.4
+OutputBaseFilename=VideoToolkit_Setup_v1.7.5
 SetupIconFile=modules\icon.ico
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest

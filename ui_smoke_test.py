@@ -308,7 +308,7 @@ rename_intake.mkdir()
 window._open_folder_in_batch_rename(str(rename_intake))
 assert window.pages.currentWidget() is window.rename_page
 assert Path(window.rename_page.input.text()).resolve() == rename_intake.resolve()
-assert "001.mp4" in window.rename_page.preview.toPlainText()
+assert window.rename_page.preview.rowCount() > 0 and window.rename_page.preview.item(0, 1).text() == "001.mp4"
 assert hasattr(window.dynamic_caption_page, "output_to_rename")
 assert not hasattr(window.dynamic_caption_page, "group_resume")
 assert window.dynamic_caption_page.group_trim_mode.currentText() == "智能混合边界（推荐）"
