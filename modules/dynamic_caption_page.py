@@ -384,12 +384,14 @@ class PresetPreviewButton(QPushButton):
         if self.isChecked(): background = QColor("#172554")
         painter.setPen(QPen(QColor("#38BDF8" if self.isChecked() else "#334155"), 2 if self.isChecked() else 1))
         painter.setBrush(background); painter.drawRoundedRect(self.rect().adjusted(1,1,-1,-1),6,6)
-        painter.fillRect(2,7,6,max(10,self.height()-14),QColor(self.preset["highlight"]))
+        effect = self.preset.get("effect", "word_color")
+        indicator_color = self.preset["text"] if effect == "double_outline" else self.preset["highlight"]
+        painter.fillRect(2,7,6,max(10,self.height()-14),QColor(indicator_color))
         name_font = QFont(self.font()); name_font.setPixelSize(11); name_font.setBold(False); painter.setFont(name_font)
         painter.setPen(QColor("#CBD5E1")); painter.drawText(QRectF(14,4,self.width()-20,18),Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter,self.name)
         sample = "字幕样式"; font = QFont(self.preset.get("font","Arial")); font.setPixelSize(17); font.setBold(True)
         painter.setFont(font); metrics=QFontMetricsF(font); width=metrics.horizontalAdvance(sample); x=14; baseline=48
-        effect=self.preset.get("effect","word_color"); text_color=QColor(self.preset["text"]); highlight=QColor(self.preset["highlight"]); outline=QColor(self.preset["outline"])
+        text_color=QColor(self.preset["text"]); highlight=QColor(self.preset["highlight"]); outline=QColor(self.preset["outline"])
         if effect in ("descript","heygen","highlight"):
             painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(highlight); painter.drawRoundedRect(QRectF(x-3,27,width+8,24),5,5)
             painter.setPen(text_color); painter.drawText(x,baseline,sample)
