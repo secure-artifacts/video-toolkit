@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.6.9**
+当前版本：**v1.7.0**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,13 +10,24 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.9.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.9/video-toolkit-windows-x64-v1.6.9.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.9.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.9/video-toolkit-macos-arm64-v1.6.9.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.6.9.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.9/video-toolkit-macos-x64-v1.6.9.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.0.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.0/video-toolkit-windows-x64-v1.7.0.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.0.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.0/video-toolkit-macos-arm64-v1.7.0.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.0.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.0/video-toolkit-macos-x64-v1.7.0.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
 
-### 最新更新 (v1.6.9)
+### 最新更新 (v1.7.0)
+* **批量重命名工作流极简化**：
+  * 彻底移除了“添加队列”、“任务队列列表”、“移除选中”等冗余的操作步骤，让改名体验一步到位。
+  * 选择文件夹并配置命名规则后，可以直接在右侧以超高预览区域（最小高度提升至 `350`）实时查看改名结果。
+  * 点击顶部正上方的亮蓝色 **“开始重命名”** 按钮即可一键直接在后台执行改名，极大提高了日常操作效率。
+* **Reels 导出跳转重命名一键流**：
+  * 在 Reels 编辑页面最下方的“7. 自动重命名（使用文案标题）”中，新增了高亮紫色按钮 **“导入已生成成品并转到 [批量重命名] 板块”**。
+  * 该功能允许用户在不启用自动重命名时，导出保留原文件名，并在渲染完成后，一键把本次生成的成品视频及其路径无缝导入到重命名板块中进行个性化修改。
+* **Reels 导出断点缓存自动清理**：
+  * 优化了 Reels 视频渲染完成后的缓存清理逻辑。全部渲染成功后，系统会自动安全删除留在输出目录下的 `reels_checkpoint.json` 缓存文件，只保留成品视频，保持文件夹的绝对清爽，避免进行批量重命名时该文件被误改名。
+
+### 历史更新 (v1.6.9)
 * **Reels 自由文案提取同步优化**：
   * 解决在“自由文案动画（不对口型）”模式下，点击“重新提取选中素材”或“批量提取全部”生成字幕后，文案状态依然显示“待填写”且合成报错的问题。提取或载入 SRT 后的字幕文本现在会自动强同步到自由文案数据集中。
 * **参数修改防误触与焦点锁定设计**：

@@ -214,12 +214,11 @@ class RenamePage(QWidget):
         header = QHBoxLayout()
         title_box = QVBoxLayout(); title_box.setSpacing(1)
         title = QLabel("视频 / 文件批量重命名"); title.setStyleSheet("font-size:24px;font-weight:800;")
-        title_box.addWidget(title); title_box.addWidget(QLabel("选文件夹、看预览、加入队列、统一执行"))
+        title_box.addWidget(title); title_box.addWidget(QLabel("选择文件夹、配置命名规则、一键执行重命名"))
         header.addLayout(title_box); header.addStretch()
         top_preview = QPushButton("刷新预览"); top_preview.clicked.connect(self.update_preview)
-        top_add = QPushButton("添加队列"); top_add.clicked.connect(self.add_task)
-        self.run_btn = QPushButton("执行全部"); self.run_btn.setObjectName("primary"); self.run_btn.clicked.connect(self.run_tasks)
-        header.addWidget(top_preview); header.addWidget(top_add); header.addWidget(self.run_btn)
+        self.run_btn = QPushButton("开始重命名"); self.run_btn.setObjectName("primary"); self.run_btn.clicked.connect(self.run_tasks)
+        header.addWidget(top_preview); header.addWidget(self.run_btn)
         layout.addLayout(header)
 
         content = QSplitter(Qt.Orientation.Horizontal); content.setChildrenCollapsible(False)
@@ -267,24 +266,15 @@ class RenamePage(QWidget):
         self.smart_titles_btn.setToolTip("按自然排序批量识别视频内容，每个视频生成一行标题；识别后仍可手动修改")
         self.smart_titles_btn.clicked.connect(self.load_smart_titles)
         self.smart_titles_btn.setEnabled(callable(self.transcribe_callable))
-        add = QPushButton("添加到队列"); add.clicked.connect(self.add_task)
-        buttons.addWidget(load); buttons.addWidget(self.smart_titles_btn); buttons.addWidget(preview); buttons.addWidget(add); buttons.addStretch()
+        buttons.addWidget(load); buttons.addWidget(self.smart_titles_btn); buttons.addWidget(preview); buttons.addStretch()
         title_layout.addLayout(buttons); left_layout.addWidget(title_group, 1)
         left_scroll.setWidget(left); content.addWidget(left_scroll)
 
         right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(10, 8, 10, 8); right_layout.setSpacing(8)
-        preview_group = QGroupBox("预览（先确认生成结果，再加入队列）")
+        preview_group = QGroupBox("重命名结果预览")
         preview_layout = QVBoxLayout(preview_group); preview_layout.setContentsMargins(10, 10, 10, 10)
-        self.preview = QPlainTextEdit(); self.preview.setReadOnly(True); self.preview.setMinimumHeight(190)
+        self.preview = QPlainTextEdit(); self.preview.setReadOnly(True); self.preview.setMinimumHeight(350)
         preview_layout.addWidget(self.preview); right_layout.addWidget(preview_group, 1)
-        queue_group = QGroupBox("任务队列")
-        queue_layout = QVBoxLayout(queue_group); queue_layout.setContentsMargins(10, 10, 10, 10)
-        self.queue = QTableWidget(0, 4); self.queue.setHorizontalHeaderLabels(["任务", "文件数", "输出目录", "状态"])
-        self.queue.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch); queue_layout.addWidget(self.queue)
-        action = QHBoxLayout(); remove = QPushButton("移除选中"); remove.clicked.connect(self.remove_task)
-        self.queue_run_btn = QPushButton("执行全部"); self.queue_run_btn.clicked.connect(self.run_tasks)
-        action.addWidget(remove); action.addStretch(); action.addWidget(self.queue_run_btn)
-        queue_layout.addLayout(action); right_layout.addWidget(queue_group, 1)
         content.addWidget(right); content.setSizes([610, 720]); content.setStretchFactor(0, 5); content.setStretchFactor(1, 6)
         layout.addWidget(content, 1)
 
@@ -437,30 +427,28 @@ class RenamePage(QWidget):
         self.smart_titles_btn.setText("智能读取视频内容为标题")
         self.title_worker = None; self.title_thread = None
 
-    def add_task(self):
-        try:
-            task = self.task_from_form(); count = sum(1 for x in task.input_dir.iterdir() if x.is_file())
-            if not count: raise ValueError("源文件夹没有文件")
-            self.tasks.append(task); row = self.queue.rowCount(); self.queue.insertRow(row)
-            for col, value in enumerate((task.task_name, str(count), str(task.output_folder()), "就绪")):
-                self.queue.setItem(row, col, QTableWidgetItem(value))
-        except Exception as exc: QMessageBox.warning(self, "无法添加任务", str(exc))
-
-    def remove_task(self):
-        rows = sorted({x.row() for x in self.queue.selectedIndexes()}, reverse=True)
-        for row in rows: self.queue.removeRow(row); self.tasks.pop(row)
-
     def run_tasks(self):
-        if not self.tasks:
-            QMessageBox.information(self, "无任务", "请先添加任务。")
+        try:
+            task = self.task_from_form()
+            count = sum(1 for x in task.input_dir.iterdir() if x.is_file())
+            if not count:
+                raise ValueError("源文件夹中没有任何文件")
+        except Exception as exc:
+            QMessageBox.warning(self, "无法开始重命名", str(exc))
             return
-        self.thread = QThread(self); self.worker = RenameWorker(list(self.tasks)); self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run); self.worker.log.connect(self.log.appendPlainText)
-        self.worker.progress.connect(self.progress.setValue); self.worker.finished.connect(self.done)
-        self.worker.finished.connect(self.thread.quit); self.thread.finished.connect(self.thread.deleteLater)
-        self.run_btn.setEnabled(False); self.queue_run_btn.setEnabled(False); self.thread.start()
+        self.thread = QThread(self)
+        self.worker = RenameWorker([task])
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.log.connect(self.log.appendPlainText)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.finished.connect(self.done)
+        self.worker.finished.connect(self.thread.quit)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.run_btn.setEnabled(False)
+        self.thread.start()
 
     def done(self, ok, message):
-        self.run_btn.setEnabled(True); self.queue_run_btn.setEnabled(True); self.log.appendPlainText(message)
-        for row in range(self.queue.rowCount()): self.queue.setItem(row, 3, QTableWidgetItem("已完成" if ok else "失败"))
+        self.run_btn.setEnabled(True)
+        self.log.appendPlainText(message)
         (QMessageBox.information if ok else QMessageBox.critical)(self, "执行完成" if ok else "执行失败", message)

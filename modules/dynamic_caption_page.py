@@ -1522,7 +1522,12 @@ class CaptionWorker(QObject):
                 self.result.emit(str(destination), original, chinese)
                 self.progress.emit(round((index + 1) / len(self.videos) * 100))
                 self.log.emit(f"成品：{destination}")
-            checkpoint["status"]="render_completed"; _write_reels_checkpoint(self.output,checkpoint)
+            try:
+                checkpoint_path = Path(self.output) / "reels_checkpoint.json"
+                if checkpoint_path.is_file():
+                    checkpoint_path.unlink()
+            except Exception:
+                pass
             self.finished.emit(True, f"批处理完成，共生成 {len(self.videos)} 个动态文案视频。\n{self.output}")
         except Exception as exc:
             self.finished.emit(False, str(exc))
@@ -2478,6 +2483,26 @@ class DynamicCaptionPage(QWidget):
         rename_form.addRow("序列号配置", rename_num_row)
         
         rename_layout.addLayout(rename_form)
+        
+        # Add the jump button inside Section 7
+        self.output_to_rename = QPushButton("👉 导入已生成成品并转到 [批量重命名] 板块")
+        self.output_to_rename.setMinimumHeight(28)
+        self.output_to_rename.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8b5cf6, stop:1 #6d28d9);
+                border: 1px solid #a78bfa;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #a78bfa, stop:1 #8b5cf6);
+            }
+        """)
+        self.output_to_rename.clicked.connect(self._send_export_output_to_rename)
+        rename_layout.addWidget(self.output_to_rename)
+
         settings_layout.addWidget(rename_group)
         settings_layout.addWidget(hardware_group)
 
@@ -2516,8 +2541,6 @@ class DynamicCaptionPage(QWidget):
         self.cloud_sync_check.toggled.connect(self._update_cloud_sync_hint)
         self.cloud_sync_profile.currentTextChanged.connect(self._update_cloud_sync_hint)
         og.addWidget(self.cloud_sync_hint)
-        self.output_to_rename=QPushButton("加入批量重命名")
-        self.output_to_rename.hide()
         self.log_status=QLabel(); self.log_status.hide()
         self.log=QPlainTextEdit(); self.log.setReadOnly(True)
         self.log.setMinimumHeight(92); self.log.setMaximumHeight(145)
