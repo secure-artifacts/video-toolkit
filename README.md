@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.6.8**
+当前版本：**v1.6.9**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,13 +10,25 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.8.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.8/video-toolkit-windows-x64-v1.6.8.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.8.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.8/video-toolkit-macos-arm64-v1.6.8.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.6.8.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.8/video-toolkit-macos-x64-v1.6.8.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.6.9.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.9/video-toolkit-windows-x64-v1.6.9.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.6.9.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.9/video-toolkit-macos-arm64-v1.6.9.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.6.9.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.6.9/video-toolkit-macos-x64-v1.6.9.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
 
-### 最新更新 (v1.6.8)
+### 最新更新 (v1.6.9)
+* **Reels 自由文案提取同步优化**：
+  * 解决在“自由文案动画（不对口型）”模式下，点击“重新提取选中素材”或“批量提取全部”生成字幕后，文案状态依然显示“待填写”且合成报错的问题。提取或载入 SRT 后的字幕文本现在会自动强同步到自由文案数据集中。
+* **参数修改防误触与焦点锁定设计**：
+  * 右侧设置面板中的全部下拉选择框 (`QComboBox`)、数值微调框 (`QSpinBox`)、透明度滑动条 (`QSlider`) 强制采用“仅点击激活” (`ClickFocus`) 焦点策略，移除了悬浮误操作的问题。
+  * 新增鼠标离开自动清焦机制。当鼠标移出设置项时立即释放焦点并锁定控件，彻底杜绝翻页扫过时误滚动修改参数的烦恼。
+* **多线程与硬件加速日志直观化**：
+  * 在 CPU 兼容编码时，强制加入 `-threads 0` 参数，确保榨干所有 CPU 核心并行处理；并在日志中实时展示所启用的多核心并行优化状态。
+  * 显卡硬件加速（NVIDIA NVENC, Intel QSV, AMD AMF）的使用状态将直观呈现在导出渲染的第一行日志中，便于随时确认加速状态。
+* **重命名日期自动同步**：
+  * 针对在跨天使用软件时重命名自动附加的历史日期没有自动更新的问题，修改为启动加载时直接获取并显示当天最新的系统日期。
+
+### 历史更新 (v1.6.8)
 * **Reels 预设与模板合并及交互重构**：
   * 彻底合并字幕样式模板与样式预设。移除多余的模板板块，在右侧内置统一的预设列表管理。
   * 预设保存与导入将以高优先级自动置顶，并支持**用鼠标手柄拖动卡片上下调整预设的先后顺序**（自动保存）。

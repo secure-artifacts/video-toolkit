@@ -1278,7 +1278,16 @@ class CaptionWorker(QObject):
             checkpoint = _read_reels_checkpoint(self.output)
             completed = checkpoint.setdefault("rendered", {})
             encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
-            self.log.emit(f"视频编码：{ENCODER_LABELS[encoder]}（自动检测，硬件不可用时使用 CPU）")
+            if encoder == "cpu":
+                self.log.emit("视频编码：CPU 兼容模式（已启用 FFmpeg 多线程优化，利用全部 CPU 核心并行处理）")
+            elif encoder == "nvenc":
+                self.log.emit("视频编码：NVIDIA NVENC（已启用 NVIDIA 显卡硬解与硬件加速编码，大幅提升导出效率）")
+            elif encoder == "qsv":
+                self.log.emit("视频编码：Intel Quick Sync（已启用 Intel 核显硬件加速，提升导出效率）")
+            elif encoder == "amf":
+                self.log.emit("视频编码：AMD AMF（已启用 AMD 显卡硬件加速，提升导出效率）")
+            else:
+                self.log.emit(f"视频编码：{ENCODER_LABELS[encoder]}（已启用自动硬件加速）")
             for index, video in enumerate(self.videos):
                 if self.cancelled: raise RuntimeError("任务已停止；已完成的动态文案视频仍保留。")
                 self.progress.emit(round(index / max(1,len(self.videos)) * 100))
@@ -1660,6 +1669,26 @@ class PreviewWorker(QObject):
         finally:
             try: ass.unlink()
             except OSError: pass
+class ScrollRedirectFilter(QObject):
+    def __init__(self, scroll_area):
+        super().__init__(scroll_area)
+        self.scroll_area = scroll_area
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.Wheel:
+            # If the widget currently has focus (clicked), allow the wheel event to modify its value
+            if hasattr(obj, "hasFocus") and obj.hasFocus():
+                return False
+            # Otherwise (hovering without focus), redirect the event to the scroll area
+            if self.scroll_area:
+                QApplication.sendEvent(self.scroll_area.viewport(), event)
+                return True
+        elif event.type() == QEvent.Type.Leave:
+            # Drop focus immediately when the mouse leaves the widget to prevent accidental sweeps
+            if hasattr(obj, "clearFocus"):
+                obj.clearFocus()
+        return super().eventFilter(obj, event)
 
 
 class TimelineWorker(QObject):
@@ -2463,11 +2492,12 @@ class DynamicCaptionPage(QWidget):
         self._make_collapsible(hardware_group,"hardware_acceleration",False)
 
 
-        # Disable wheel events for all QComboBoxes and QSpinBoxes to prevent accidental scroll changes
-        for combo in self.findChildren(QComboBox):
-            combo.wheelEvent = lambda event: event.ignore()
-        for spin in self.findChildren(QSpinBox):
-            spin.wheelEvent = lambda event: event.ignore()
+        # Disable wheel events for all QComboBoxes, QSpinBoxes, and QSliders to prevent accidental scroll changes
+        self._wheel_redirector = ScrollRedirectFilter(settings_scroll)
+        for widget_class in (QComboBox, QSpinBox, QSlider):
+            for widget in settings_body.findChildren(widget_class):
+                widget.installEventFilter(self._wheel_redirector)
+                widget.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
         # 左下角的输出与日志保持窄而完整，不再横跨整个窗口挤压预览。
         output_group=QGroupBox("2. 输出与运行"); og=QVBoxLayout(output_group); og.setContentsMargins(8,10,8,8); og.setSpacing(6)
@@ -3538,8 +3568,8 @@ class DynamicCaptionPage(QWidget):
             self.rename_prefix.setText(str(saved["rename_prefix"]))
         if "rename_date_enabled" in saved:
             self.rename_date_enabled.setChecked(bool(saved["rename_date_enabled"]))
-        if "rename_date" in saved:
-            self.rename_date.setText(str(saved["rename_date"]))
+        import datetime
+        self.rename_date.setText(datetime.date.today().strftime("%Y%m%d"))
         if "rename_suffix_enabled" in saved:
             self.rename_suffix_enabled.setChecked(bool(saved["rename_suffix_enabled"]))
         if "rename_suffix" in saved:
@@ -4413,6 +4443,8 @@ class DynamicCaptionPage(QWidget):
         key=self._timeline_key(source); phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
         self.timeline_words[key]=srt; self.timeline_overrides[key]=phrase_srt
         if chinese: self.timeline_chinese[key]=chinese
+        if self.caption_mode.currentText() == "自由文案动画（不对口型）":
+            self.free_texts[key]=phrase_srt
         self.extract_all_btn.setText(f"排队提取 {index}/{total}")
         self.log.appendPlainText(f"[{index}/{total}] 时间轴已归档到：{Path(source).name}")
         if fixes: self._append_run_log(f"[{index}/{total}] 已自动修正 {fixes} 处逐句字幕时间重叠。")
@@ -4432,6 +4464,8 @@ class DynamicCaptionPage(QWidget):
         key=self._timeline_key(source)
         phrase_srt,fixes=fix_srt_overlaps(phrase_srt)
         self.timeline_words[key]=word_srt; self.timeline_overrides[key]=phrase_srt
+        if self.caption_mode.currentText() == "自由文案动画（不对口型）":
+            self.free_texts[key]=phrase_srt
         if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠：{Path(source).name}")
         if self._timeline_key(self._timeline_source())==key:
             self._loading_timeline=True
@@ -4455,6 +4489,8 @@ class DynamicCaptionPage(QWidget):
             if source:
                 key=self._timeline_key(source); self.timeline_words[key]=result; self.timeline_overrides[key]=phrase_srt
                 if chinese: self.timeline_chinese[key]=chinese
+                if self.caption_mode.currentText() == "自由文案动画（不对口型）":
+                    self.free_texts[key]=phrase_srt
                 if self._timeline_key(self._timeline_source())==key:
                     self._loading_timeline=True
                     try: self.override_text.setPlainText(phrase_srt)
@@ -4477,7 +4513,11 @@ class DynamicCaptionPage(QWidget):
         if not path: return
         try:
             text=Path(path).read_text(encoding="utf-8-sig"); text,fixes=fix_srt_overlaps(text); self.override_text.setPlainText(text); source=self._timeline_source()
-            if source: self.timeline_overrides[self._timeline_key(source)]=text
+            if source:
+                key=self._timeline_key(source)
+                self.timeline_overrides[key]=text
+                if self.caption_mode.currentText() == "自由文案动画（不对口型）":
+                    self.free_texts[key]=text
             self._append_run_log(f"已载入 SRT：{Path(path).name}"
                                  +(f"，并自动修正 {fixes} 处时间重叠。" if fixes else "，未检测到时间重叠。"))
         except Exception as exc: QMessageBox.critical(self,"无法读取字幕",str(exc))

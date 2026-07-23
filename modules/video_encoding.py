@@ -70,4 +70,4 @@ def encoder_args(key, cpu_preset="veryfast", preview=False):
                 "-rc", "cqp", "-qp_i", "25" if preview else "21", "-qp_p", "25" if preview else "21",
                 "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-preset", "ultrafast" if preview else cpu_preset,
-            "-crf", "25" if preview else "20", "-pix_fmt", "yuv420p"]
+            "-crf", "25" if preview else "20", "-pix_fmt", "yuv420p", "-threads", "0"]
