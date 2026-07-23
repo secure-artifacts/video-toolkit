@@ -60,7 +60,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.5").strip().lstrip("v") or "1.7.5"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.6").strip().lstrip("v") or "1.7.6"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -2023,6 +2023,56 @@ class FullTextToolTipFilter(QObject):
         return super().eventFilter(watched, event)
 
 
+
+class UpdateCheckWorker(QObject):
+    finished = Signal(bool, str, str, str) # has_new_version, latest_version, download_url, error_message
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version.strip().lstrip("v")
+
+    def run(self):
+        try:
+            import requests
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            response = requests.get(
+                "https://api.github.com/repos/secure-artifacts/video-toolkit/releases/latest",
+                headers=headers,
+                timeout=10
+            )
+            if response.status_code != 200:
+                self.finished.emit(False, "", "", f"HTTP {response.status_code}")
+                return
+            data = response.json()
+            tag_name = data.get("tag_name", "").strip()
+            latest_version = tag_name.lstrip("v")
+            if not latest_version:
+                self.finished.emit(False, "", "", "无法获取最新版本号")
+                return
+            
+            def parse_ver(v):
+                try: return [int(x) for x in v.split(".")]
+                except Exception: return [0, 0, 0]
+            
+            current_parts = parse_ver(self.current_version)
+            latest_parts = parse_ver(latest_version)
+            has_new = latest_parts > current_parts
+            
+            download_url = ""
+            assets = data.get("assets", [])
+            for asset in assets:
+                name = asset.get("name", "")
+                if name.endswith(".exe") and "Setup" in name:
+                    download_url = asset.get("browser_download_url", "")
+                    break
+            if not download_url and assets:
+                download_url = assets[0].get("browser_download_url", "")
+                
+            self.finished.emit(has_new, latest_version, download_url, "")
+        except Exception as e:
+            self.finished.emit(False, "", "", str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2059,6 +2109,8 @@ class MainWindow(QMainWindow):
         _startup_trace("UI built")
         self._refresh_keys()
         _startup_trace("keys refreshed")
+        # 启动后自动在后台静默检查更新（延迟3秒，不阻塞主UI展示）
+        QTimer.singleShot(3000, lambda: self._check_update(manual=False))
 
     def _build_ui(self):
         root = QWidget()
@@ -2225,9 +2277,12 @@ class MainWindow(QMainWindow):
         components = QPushButton("检查设置与组件")
         components.setObjectName("primary")
         components.clicked.connect(lambda: self._show_page(7))
+        update_btn = QPushButton("在线检测更新")
+        update_btn.clicked.connect(lambda: self._check_update(manual=True))
         actions.addWidget(logs)
         actions.addWidget(keys)
         actions.addWidget(components)
+        actions.addWidget(update_btn)
         actions.addStretch()
         layout.addLayout(actions)
         scroll = QScrollArea()

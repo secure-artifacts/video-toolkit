@@ -2211,7 +2211,7 @@ class DynamicCaptionPage(QWidget):
         self.font=QComboBox(); self.font.addItems(QFontDatabase.families())
         if self.font.findText("Arial") < 0: self.font.insertItem(0,"Arial")
         self.font.setCurrentText("Arial")
-        self.font_size=QSpinBox(); self.font_size.setRange(20,160); self.font_size.setValue(58)
+        self.font_size=QSpinBox(); self.font_size.setRange(10,600); self.font_size.setValue(58)
         font_line=QHBoxLayout(); font_line.addWidget(self.font,1)
         font_line.addWidget(QLabel("字号")); font_line.addWidget(self.font_size)
         self.line_length=QSpinBox(); self.line_length.setRange(6,60); self.line_length.setValue(18)
