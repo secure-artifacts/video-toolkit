@@ -4078,7 +4078,11 @@ class DynamicCaptionPage(QWidget):
         self.seek.setRange(0,max(0,value)); self._preview_position_changed(self.player.position())
 
     def _current_settings(self):
-        preset=next(button.text() for button in self.preset_buttons if button.isChecked())
+        preset = next((button.text() for button in self.preset_buttons if button.isChecked()), None)
+        if not preset and self.preset_buttons:
+            preset = self.preset_buttons[0].text()
+        if not preset:
+            preset = "Descript 💬"
         watermark_fingerprint=watermark_config_fingerprint(self._watermark_entries)
         baked_videos=[]
         if watermark_fingerprint and hasattr(self,"videos"):
