@@ -157,17 +157,20 @@ class GroupMergeWorker(QObject):
         self.transcribe = transcribe
         self.settings = dict(settings)
         self.cancelled = False
-        self._current_process = None
+        import threading
+        self._active_processes = set()
+        self._lock = threading.Lock()
         self.encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
 
     def cancel(self):
         self.cancelled = True
-        process = self._current_process
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-            except Exception:
-                pass
+        with self._lock:
+            for process in list(self._active_processes):
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
 
     @property
     def ffprobe(self):
@@ -181,7 +184,8 @@ class GroupMergeWorker(QObject):
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace", **hidden_kwargs(),
         )
-        self._current_process = process
+        with self._lock:
+            self._active_processes.add(process)
         try:
             while True:
                 try:
@@ -198,8 +202,8 @@ class GroupMergeWorker(QObject):
                         stdout, stderr = process.communicate()
                     raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
         finally:
-            if self._current_process is process:
-                self._current_process = None
+            with self._lock:
+                self._active_processes.discard(process)
         if self.cancelled:
             raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
         if process.returncode:
@@ -453,13 +457,24 @@ class GroupMergeWorker(QObject):
                         self.log.emit("已启用合成时烧录水印：水印将在片段统一编码时一次完成，后续导出不重复烧录。")
                     else:
                         watermark = None
-                normalized = []
-                for clip_index, clip in enumerate(clips):
-                    normalized.append(self._normalize(
-                        clip, clip_index, cache_dir, analyses[str(clip.resolve())], target_w, target_h, watermark,
-                    ))
-                    completed_steps += 1
-                    self.progress.emit(round(completed_steps / total_steps * 100))
+                from concurrent.futures import ThreadPoolExecutor
+                import os
+                max_workers = min(4, os.cpu_count() or 4)
+                self.log.emit(f"正在启动多线程并行编码加速（最大并行线程数：{max_workers}）...")
+                def run_norm(args):
+                    clip, clip_index = args
+                    return self._normalize(
+                        clip, clip_index, cache_dir, analyses[str(clip.resolve())], target_w, target_h, watermark
+                    )
+                tasks = [(clip, clip_index) for clip_index, clip in enumerate(clips)]
+                normalized = [None] * len(clips)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(run_norm, task): i for i, task in enumerate(tasks)}
+                    for future in futures:
+                        i = futures[future]
+                        normalized[i] = future.result()
+                        completed_steps += 1
+                        self.progress.emit(round(completed_steps / total_steps * 100))
                 if any(not self._probe(path)["audio"] for path in normalized):
                     raise RuntimeError(f"{folder.name} 中存在没有音轨的片段，无法保证无缝合并声音。")
                 concat_file = cache_dir / "concat.txt"

@@ -1736,13 +1736,16 @@ class DynamicCaptionPage(QWidget):
         group.setCheckable(True)
         group.setChecked(expanded)
         group.setToolTip("点击标题可展开或折叠此设置区")
+        original_title = group.title()
         def apply(opened):
             group.setMaximumHeight(16777215 if opened else 32)
             store.setValue(f"section_expanded/{key}",bool(opened))
+            arrow = "▼ " if opened else "▶ "
+            group.setTitle(arrow + original_title)
             if opened:
-                group.setStyleSheet("QGroupBox { border: 2px solid #2563eb; background-color: #111e36; margin-top:8px; padding-top:7px; font-weight:700; } QGroupBox::title { subcontrol-origin:margin; left:9px; padding:0 4px; color:#60a5fa; }")
+                group.setStyleSheet("QGroupBox { border: 2px solid #2563eb; background-color: #111e36; margin-top:8px; padding-top:7px; font-weight:700; } QGroupBox::title { subcontrol-origin:margin; left:9px; padding:0 4px; color:#60a5fa; } QGroupBox::indicator { width:0px; height:0px; }")
             else:
-                group.setStyleSheet("QGroupBox { border: 1px solid #1e293b; background-color: #0b0f19; margin-top:8px; padding-top:7px; font-weight:normal; } QGroupBox::title { subcontrol-origin:margin; left:9px; padding:0 4px; color:#64748b; }")
+                group.setStyleSheet("QGroupBox { border: 1px solid #1e293b; background-color: #0b0f19; margin-top:8px; padding-top:7px; font-weight:normal; } QGroupBox::title { subcontrol-origin:margin; left:9px; padding:0 4px; color:#64748b; } QGroupBox::indicator { width:0px; height:0px; }")
             group.updateGeometry()
         group.toggled.connect(apply)
         apply(expanded)
@@ -2106,10 +2109,8 @@ class DynamicCaptionPage(QWidget):
         form.addRow("字幕模式",self.caption_mode); form.addRow("自由动画",free_line)
         form.addRow("字体",font_line); form.addRow("自然分句",phrase_line); form.addRow("排版宽度",width_line); form.addRow("字幕间距",spacing_line)
         form.addRow("行间距",line_spacing_line); form.addRow("色块留白",effect_line); form.addRow("跟读动画",self.animation_speed)
-        form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width); form.addRow("音频匹配",self.audio_match_mode); form.addRow("音频处理",self.audio_mode); form.addRow("音轨音量",audio_volume_line)
-        form.addRow("音频淡化",self.audio_fade_mode); form.addRow("淡化时长",fade_time_line)
-        form.addRow("编码加速",self.encoder_backend); form.addRow("CPU 质量",self.encode_preset); form.addRow("素材清理",self.clean_metadata)
-        batch_style_hint=QLabel("✓ 每个视频、匹配音频和文案组成独立任务；这里只批量套用字幕样式、蒙版和动画，最后统一批量导出。")
+        form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width)
+        batch_style_hint=QLabel("✓ 每个视频、匹配音频和文案组成独立任务；这里只批量套用字幕样式、蒙版 and 动画，最后统一批量导出。")
         batch_style_hint.setWordWrap(True); batch_style_hint.setStyleSheet("color:#67e8f9;background:#0b1830;padding:6px;border-radius:5px;")
         colors=QGridLayout(); self.text_color=QPushButton("文字 #FFFFFF"); self.outline_color=QPushButton("描边 #111827"); self.highlight_color=QPushButton("跟读背景 #8B5CF6")
         for index,button in enumerate((self.text_color,self.outline_color,self.highlight_color)):
@@ -2127,7 +2128,30 @@ class DynamicCaptionPage(QWidget):
         preset_list.addStretch(); pg.addWidget(style_controls,1); pg.addWidget(preset_panel)
         settings_layout.addWidget(preset_group)
 
-        layer_group = QGroupBox("🛡️ 5. 蒙版、防伪水印与图层顺序")
+        # 🎵 5. 音频与背景音乐
+        audio_group = QGroupBox("🎵 5. 音频与背景音乐")
+        audio_layout = QVBoxLayout(audio_group); audio_layout.setContentsMargins(10,12,10,10); audio_layout.setSpacing(7)
+        audio_form = QFormLayout(); audio_form.setVerticalSpacing(9); audio_form.setHorizontalSpacing(8)
+        audio_form.addRow("音频匹配", self.audio_match_mode)
+        audio_form.addRow("音频处理", self.audio_mode)
+        audio_form.addRow("音轨音量", audio_volume_line)
+        audio_form.addRow("音频淡化", self.audio_fade_mode)
+        audio_form.addRow("淡化时长", fade_time_line)
+        audio_layout.addLayout(audio_form)
+        settings_layout.addWidget(audio_group)
+        self.audio_group = audio_group
+
+        # ⚙️ 8. 运行与编码加速
+        hardware_group = QGroupBox("⚙️ 8. 运行与编码加速")
+        hardware_layout = QVBoxLayout(hardware_group); hardware_layout.setContentsMargins(10,12,10,10); hardware_layout.setSpacing(7)
+        hardware_form = QFormLayout(); hardware_form.setVerticalSpacing(9); hardware_form.setHorizontalSpacing(8)
+        hardware_form.addRow("编码加速", self.encoder_backend)
+        hardware_form.addRow("CPU 质量", self.encode_preset)
+        hardware_form.addRow("素材清理", self.clean_metadata)
+        hardware_layout.addLayout(hardware_form)
+        self.hardware_group = hardware_group
+
+        layer_group = QGroupBox("🛡️ 6. 蒙版、防伪水印与图层顺序")
         layer_layout = QVBoxLayout(layer_group); layer_layout.setContentsMargins(9,11,9,8); layer_layout.setSpacing(6)
         layer_tip = QLabel("列表上方会覆盖下方；字幕、文字和蒙版都可调整层级，并保存为常用方案。")
         layer_tip.setStyleSheet("color:#7dd3fc;"); layer_tip.setWordWrap(True); layer_layout.addWidget(layer_tip)
@@ -2257,7 +2281,7 @@ class DynamicCaptionPage(QWidget):
         revise_layout.addWidget(caption_edit_tabs)
         # 视频素材列表和任务对应队列本来就是同一组数据。把任务表移动到左侧“视频”页，
         # 点击一行会同时切换预览、匹配音频和右侧字幕，避免在两个区域重复展示。
-        rename_group = QGroupBox("🏷️ 6. 自动重命名（使用文案标题）")
+        rename_group = QGroupBox("🏷️ 7. 自动重命名（使用文案标题）")
         rename_layout = QVBoxLayout(rename_group); rename_layout.setContentsMargins(9,11,9,8); rename_layout.setSpacing(6)
         self.rename_enabled = QCheckBox("启用自动重命名最终成品")
         self.rename_enabled.setChecked(False)
@@ -2313,15 +2337,24 @@ class DynamicCaptionPage(QWidget):
         
         rename_layout.addLayout(rename_form)
         settings_layout.addWidget(rename_group)
+        settings_layout.addWidget(hardware_group)
 
         queue_title.hide(); self.videos.hide()
         vg.insertWidget(0,self.task_queue,1)
         settings_layout.insertWidget(0,revise_group); settings_layout.addStretch(); settings_scroll.setWidget(settings_body)
         self._make_collapsible(revise_group,"captions",True)
         self._make_collapsible(preset_group,"style",True)
-        self._make_collapsible(template_group,"templates",False)
+        self._make_collapsible(audio_group,"audio_settings",True)
         self._make_collapsible(layer_group,"layers_watermarks",False)
         self._make_collapsible(rename_group,"automatic_rename",False)
+        self._make_collapsible(hardware_group,"hardware_acceleration",False)
+        self._make_collapsible(template_group,"templates",False)
+
+        # Disable wheel events for all QComboBoxes and QSpinBoxes to prevent accidental scroll changes
+        for combo in self.findChildren(QComboBox):
+            combo.wheelEvent = lambda event: event.ignore()
+        for spin in self.findChildren(QSpinBox):
+            spin.wheelEvent = lambda event: event.ignore()
 
         # 左下角的输出与日志保持窄而完整，不再横跨整个窗口挤压预览。
         output_group=QGroupBox("2. 输出与运行"); og=QVBoxLayout(output_group); og.setContentsMargins(8,10,8,8); og.setSpacing(6)
@@ -2664,9 +2697,7 @@ class DynamicCaptionPage(QWidget):
             return
         self.videos.clear()
         self._add(self.videos, outputs, VIDEO_EXTENSIONS)
-        self.audio_match_mode.setCurrentText("每个视频使用自身音频")
-        self.audio_mode.setCurrentText("保留视频原音")
-        self.caption_mode.setCurrentText("语音同步字幕")
+
         self._refresh_task_queue()
         # Automatic extraction is deliberately started by _group_merge_ended(),
         # after the merge worker thread is fully released.  This method only loads
