@@ -229,6 +229,9 @@ class RenamePage(QWidget):
         self.input = DropFolderLineEdit(); self.input.setPlaceholderText("可把文件夹拖到这里")
         self.input.folder_dropped.connect(self.set_input_folder)
         form.addRow("源文件夹", self.path_row(self.input, self.choose_input))
+        self.output = DropFolderLineEdit(); self.output.setPlaceholderText("可把输出文件夹拖到这里（留空默认在源文件夹同级生成成品目录）")
+        self.output.folder_dropped.connect(self.set_output_folder)
+        form.addRow("输出文件夹", self.path_row(self.output, self.choose_output))
         preset_row = QHBoxLayout()
         self.preset_combo = QComboBox(); self.preset_combo.currentTextChanged.connect(self.apply_preset)
         save_preset = QPushButton("保存当前方案"); save_preset.clicked.connect(self.save_preset)
@@ -344,7 +347,17 @@ class RenamePage(QWidget):
 
     def set_input_folder(self, path):
         self.input.setText(path)
+        if hasattr(self, "output") and not self.output.text():
+            self.output.setText(str(Path(path).parent / (Path(path).name + "_成品")))
         self.update_preview()
+
+    def set_output_folder(self, path):
+        self.output.setText(path)
+        self.update_preview()
+
+    def choose_output(self):
+        path = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
+        if path: self.set_output_folder(path)
 
     def _direct_replace_changed(self, enabled):
         for control in (self.prefix, self.date_enabled, self.suffix_enabled, self.start_index, self.padding):
@@ -357,7 +370,15 @@ class RenamePage(QWidget):
         input_dir = Path(self.input.text())
         if not input_dir.is_dir():
             raise ValueError("请选择有效的源文件夹")
-        return RenameTask(str(input_dir), str(input_dir.parent), input_dir.name, self.prefix.text(),
+        output_dir = self.output.text().strip()
+        if not output_dir:
+            output_parent = input_dir.parent
+            task_name = input_dir.name + "_成品"
+        else:
+            out_path = Path(output_dir)
+            output_parent = out_path.parent
+            task_name = out_path.name
+        return RenameTask(str(input_dir), str(output_parent), task_name, self.prefix.text(),
                           self.titles.toPlainText(), self.date.text() if self.date_enabled.isChecked() else "",
                           self.suffix.text() if self.suffix_enabled.isChecked() else "",
                           self.start_index.value(), self.padding.value(), self.copy.isChecked(),

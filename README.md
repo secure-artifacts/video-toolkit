@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.1**
+当前版本：**v1.7.3**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,13 +10,19 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.1.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.1/video-toolkit-windows-x64-v1.7.1.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.1.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.1/video-toolkit-macos-arm64-v1.7.1.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.1.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.1/video-toolkit-macos-x64-v1.7.1.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.3.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.3/video-toolkit-windows-x64-v1.7.3.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.3.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.3/video-toolkit-macos-arm64-v1.7.3.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.3.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.3/video-toolkit-macos-x64-v1.7.3.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
 
-### 最新更新 (v1.7.1)
+### 最新更新 (v1.7.2)
+* **【批量重命名】输出目录选择框恢复**：
+  * 恢复了在重构改名队列时被不小心隐藏掉的 **“输出文件夹”** 选择输入框（同样支持文件夹拖拽和拖入）。
+  * 用户现在可以自由指定输出文件夹，当选择源文件夹时，系统还会自动友好地为您生成默认的 `源文件夹_成品` 路径。
+  * 如果勾选了“复制到输出目录”，重命名文件将会复制并整理到该指定目录下；如果留空则默认在源文件夹同级生成成品目录，保证功能完全契合实际使用。
+
+### 历史更新 (v1.7.1)
 * **预设选中崩溃保护（StopIteration 修复）**：
   * 彻底修复了在用户未保存/未勾选任何字幕预设（或列表为空）时，启动视频渲染导出引发 `StopIteration` 报错导致闪退/崩溃的问题。
   * 新增安全回退保护机制，无勾选或空配置时自动安全降级使用列表首项或内置默认的 `"Descript 💬"` 预设。

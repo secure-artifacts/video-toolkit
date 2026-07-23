@@ -4560,21 +4560,20 @@ class DynamicCaptionPage(QWidget):
         if folder: self._add(widget, [folder], extensions)
 
     def generate_tts(self):
-        text = self.tts_text.toPlainText().strip()
-        if not text:
+        scripts = []
+        for r in range(self.tts_text.rowCount()):
+            item = self.tts_text.item(r, 1)
+            if item and item.text().strip():
+                scripts.append(item.text().strip())
+        if not scripts:
             QMessageBox.information(self, "没有文案", "请先输入需要转成语音的文案。")
             return
         videos = [Path(self.videos.item(i).text()) for i in range(self.videos.count())]
-        scripts = [block.strip() for block in re.split(r"(?:\r?\n\s*---\s*\r?\n|(?:\r?\n\s*){2,})", text)
-                   if block.strip()]
-        if len(scripts) == 1 and len(videos) > 1:
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if len(lines) == len(videos): scripts = lines
         if videos and len(scripts) not in (1, len(videos)):
             QMessageBox.warning(
                 self, "文案数量不匹配",
                 f"当前有 {len(videos)} 个视频、{len(scripts)} 段文案。\n"
-                "请让文案数量与视频一致；每段之间用空行或单独一行 --- 分隔。\n"
+                "请让文案数量与视频一致。\n"
                 "若只提供一段文案，则会生成一条共享配音。")
             return
         output = Path(self.output.text()); output.mkdir(parents=True, exist_ok=True)

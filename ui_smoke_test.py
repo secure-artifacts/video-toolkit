@@ -113,7 +113,7 @@ style_page._group_merge_ended(); qt.processEvents()
 assert extract_calls==["all"]
 assert window.rename_page.date_enabled.isChecked() and window.rename_page.suffix_enabled.isChecked()
 assert not window.rename_page.direct_replace.isChecked()
-assert not hasattr(window.rename_page,"subfolders") and not hasattr(window.rename_page,"output") and not hasattr(window.rename_page,"task_name")
+assert not hasattr(window.rename_page,"subfolders") and not hasattr(window.rename_page,"task_name")
 reels_buttons=[button.text() for button in window.dynamic_caption_page.findChildren(toolkit.QPushButton)]
 assert "本地字体…" not in reels_buttons and "开源字体…" not in reels_buttons
 settings_buttons=[button.text() for button in window.font_settings_page.findChildren(toolkit.QPushButton)]
