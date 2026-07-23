@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QGroupBox, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
+    QAbstractItemView,
 )
 from .path_picker import DropFolderLineEdit
 from .platform_utils import app_data_dir
@@ -276,7 +277,26 @@ class RenamePage(QWidget):
         right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(10, 8, 10, 8); right_layout.setSpacing(8)
         preview_group = QGroupBox("重命名结果预览")
         preview_layout = QVBoxLayout(preview_group); preview_layout.setContentsMargins(10, 10, 10, 10)
-        self.preview = QPlainTextEdit(); self.preview.setReadOnly(True); self.preview.setMinimumHeight(350)
+        self.preview_title = QLabel("待处理文件总数：0 个")
+        self.preview_title.setStyleSheet("font-weight: bold; color: #3b82f6;")
+        preview_layout.addWidget(self.preview_title)
+        
+        self.preview = QTableWidget(0, 3)
+        self.preview.setHorizontalHeaderLabels(["序号", "源文件名", "替换后的文件名"])
+        self.preview.verticalHeader().setVisible(False)
+        self.preview.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.preview.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.preview.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.preview.setColumnWidth(0, 46)
+        self.preview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.preview.setAlternatingRowColors(True)
+        self.preview.setMinimumHeight(350)
+        self.preview.setStyleSheet(
+            "QTableWidget{background:#0b1424;alternate-background-color:#13223d;gridline-color:#1e293b;}"
+            "QTableWidget::item{background:transparent;color:#e5edf8;padding:4px;}"
+            "QTableWidget::item:selected{background:#2563eb;color:#ffffff;}"
+        )
         preview_layout.addWidget(self.preview); right_layout.addWidget(preview_group, 1)
         content.addWidget(right); content.setSizes([610, 720]); content.setStretchFactor(0, 5); content.setStretchFactor(1, 6)
         layout.addWidget(content, 1)
@@ -388,13 +408,37 @@ class RenamePage(QWidget):
         try:
             task = self.task_from_form()
             files = sorted((x for x in task.input_dir.iterdir() if x.is_file()), key=lambda x: natural_key(x.name))
-            lines = [f"共 {len(files)} 个文件，预览前 8 个：", ""]
-            for offset, item in enumerate(files[:8]):
+            
+            # Update file count label
+            self.preview_title.setText(f"待处理文件总数：{len(files)} 个")
+            
+            self.preview.setRowCount(0)
+            self.preview.setRowCount(len(files))
+            
+            for offset, item in enumerate(files):
                 name, adjusted = task.render_name_info(item.name, task.start_index + offset)
-                note = "  ⚠ 已自动清洗/截断" if adjusted else ""
-                lines.append(f"{item.name}  →  {name}{note}")
-            self.preview.setPlainText("\n".join(lines))
-        except Exception as exc: self.preview.setPlainText(str(exc))
+                note = " (已自动清洗/截断)" if adjusted else ""
+                
+                # Column 0: Index
+                idx_item = QTableWidgetItem(f"{offset + 1:02d}")
+                idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.preview.setItem(offset, 0, idx_item)
+                
+                # Column 1: Source filename
+                src_item = QTableWidgetItem(item.name)
+                src_item.setFlags(src_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.preview.setItem(offset, 1, src_item)
+                
+                # Column 2: Replaced filename
+                dst_item = QTableWidgetItem(f"{name}{note}")
+                dst_item.setFlags(dst_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.preview.setItem(offset, 2, dst_item)
+                
+        except Exception as exc:
+            self.preview_title.setText("待处理文件总数：0 个")
+            self.preview.setRowCount(0)
+            if hasattr(self, "log"):
+                self.log.appendPlainText(f"预览刷新错误: {exc}")
 
     def load_titles(self):
         folder = Path(self.input.text())

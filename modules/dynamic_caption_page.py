@@ -591,6 +591,31 @@ def replacement_audio_filter(fade_mode="直接加入（无淡入淡出）", fade
     return f"[1:a:0]{','.join(filters)}[aout]"
 
 
+def bgm_mix_audio_filter(dialogue_input, bgm_input, original_volume=100, background_volume=25,
+                         fade_mode="直接加入（无淡入淡出）", fade_in_ms=500, fade_out_ms=500, duration=0):
+    dialogue_vol = max(0, min(200, int(original_volume))) / 100
+    bgm_vol = max(0, min(200, int(background_volume))) / 100
+    bgm_filters = ["aresample=48000", "aformat=channel_layouts=stereo", f"volume={bgm_vol:.3f}"]
+    bgm_filters.extend(added_audio_fade_filters(fade_mode, fade_in_ms, fade_out_ms, duration))
+    return (
+        f"{dialogue_input}aresample=48000,aformat=channel_layouts=stereo,volume={dialogue_vol:.3f}[dialogue_audio];"
+        f"{bgm_input}{','.join(bgm_filters)}[bgm_audio];"
+        "[dialogue_audio][bgm_audio]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[aout]"
+    )
+
+
+def find_bgm_file(bgm_dir, index):
+    if not bgm_dir: return None
+    path = Path(bgm_dir)
+    if not path.is_dir(): return None
+    bgm_files = sorted(
+        [x for x in path.iterdir() if x.is_file() and x.suffix.lower() in AUDIO_EXTENSIONS],
+        key=lambda x: natural_key(x.name)
+    )
+    if not bgm_files: return None
+    return bgm_files[index % len(bgm_files)]
+
+
 def media_video_size(ffmpeg, path, fallback=(1080,1920)):
     ffmpeg_path=Path(ffmpeg); ffprobe=ffmpeg_path.with_name("ffprobe"+ffmpeg_path.suffix)
     try:
@@ -1449,6 +1474,13 @@ class CaptionWorker(QObject):
                     if mix_audio: command += ["-stream_loop", "-1"]
                     if audio_offset_ms > 0: command += ["-ss", f"{audio_offset_ms / 1000:.3f}"]
                     command += ["-i", str(audio)]
+
+                bgm_file = find_bgm_file(self.settings.get("bgm_dir"), index)
+                if bgm_file:
+                    bgm_input_index = 2 if external else 1
+                    command += ["-stream_loop", "-1", "-i", str(bgm_file)]
+                else:
+                    bgm_input_index = None
                 watermark_entries=[] if watermark_already_baked else (self.settings.get("watermarks") or [])
                 watermark_paths=[] if watermark_already_baked else (self.settings.get("watermark_paths") or [self.settings.get("watermark_path","")])
                 watermark = (prepared_watermark_composite(self.ffmpeg,render_video,watermark_entries,self.output)
@@ -1463,18 +1495,33 @@ class CaptionWorker(QObject):
                         self.ffmpeg,render_video,watermark,self.output,self.settings.get("watermark_opacity",90))
                     render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 已使用预缩放公司水印缓存，跳过逐帧缩放。")
-                watermark_input = 2 if external else 1
+                watermark_input = 1
+                if external: watermark_input += 1
+                if bgm_file: watermark_input += 1
                 video_duration = media_duration(self.ffmpeg, render_video)
-                audio_graph = (mixed_audio_filter(self.settings.get("original_volume", 100),
-                                                  self.settings.get("background_volume", 25),
-                                                  self.settings.get("audio_fade_mode"),
-                                                  self.settings.get("audio_fade_in_ms",500),
-                                                  self.settings.get("audio_fade_out_ms",500),video_duration)
-                               if mix_audio and source_has_audio else
-                               (replacement_audio_filter(self.settings.get("audio_fade_mode"),
-                                                        self.settings.get("audio_fade_in_ms",500),
-                                                        self.settings.get("audio_fade_out_ms",500),video_duration)
-                                if replace_audio else ""))
+                if bgm_file:
+                    dialogue_input = "[1:a:0]" if replace_audio else "[0:a:0]"
+                    bgm_input = f"[{bgm_input_index}:a:0]"
+                    audio_graph = bgm_mix_audio_filter(
+                        dialogue_input, bgm_input,
+                        self.settings.get("original_volume", 100),
+                        self.settings.get("background_volume", 25),
+                        self.settings.get("audio_fade_mode"),
+                        self.settings.get("audio_fade_in_ms", 500),
+                        self.settings.get("audio_fade_out_ms", 500),
+                        video_duration
+                    )
+                else:
+                    audio_graph = (mixed_audio_filter(self.settings.get("original_volume", 100),
+                                                      self.settings.get("background_volume", 25),
+                                                      self.settings.get("audio_fade_mode"),
+                                                      self.settings.get("audio_fade_in_ms",500),
+                                                      self.settings.get("audio_fade_out_ms",500),video_duration)
+                                   if mix_audio and source_has_audio else
+                                   (replacement_audio_filter(self.settings.get("audio_fade_mode"),
+                                                             self.settings.get("audio_fade_in_ms",500),
+                                                             self.settings.get("audio_fade_out_ms",500),video_duration)
+                                    if replace_audio else ""))
                 if watermark_enabled:
                     # Decode the static PNG once; overlay=eof_action=repeat keeps that frame
                     # for the whole video without decoding/scaling the same image every frame.
@@ -1488,7 +1535,10 @@ class CaptionWorker(QObject):
                     if audio_graph: command += ["-filter_complex", audio_graph]
                 if audio_graph:
                     command += ["-map", "[aout]", "-shortest"]
-                    if mix_audio:
+                    if bgm_file:
+                        self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在混音：添加配音音量 {self.settings.get('original_volume',100)}%，"
+                                      f"背景音乐({bgm_file.name})音量 {self.settings.get('background_volume',25)}%。")
+                    elif mix_audio:
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在混合原声与背景音："
                                       f"原声 {self.settings.get('original_volume',100)}%，"
                                       f"背景音 {self.settings.get('background_volume',25)}%，"
@@ -1504,7 +1554,7 @@ class CaptionWorker(QObject):
                 # 不指定 -ac，保留源音频声道；字幕烧录只重编码画面。
                 command += encoder_args(encoder, self.settings["encode_preset"])
                 command += ["-c:a", "aac", "-b:a", "192k"]
-                if external and audio_mode in ("替换为添加的音频", "原声＋背景音混合"):
+                if (external or bgm_file) and audio_mode in ("替换为添加的音频", "原声＋背景音混合"):
                     command += ["-ac", "2"]
                 if self.settings.get("clean_metadata", True):
                     command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
@@ -2172,7 +2222,7 @@ class DynamicCaptionPage(QWidget):
         self.word_spacing.setToolTip("调整单词与单词之间的距离；可设为负数，不会强制保留额外空白")
         self.line_spacing=QSpinBox(); self.line_spacing.setRange(70,180); self.line_spacing.setValue(116); self.line_spacing.setSuffix(" %")
         self.line_spacing.setToolTip("调整两排字幕基线之间的距离，100% 约等于一行文字高度")
-        self.max_words=QSpinBox(); self.max_words.setRange(3,12); self.max_words.setValue(7)
+        self.max_words=QSpinBox(); self.max_words.setRange(1,20); self.max_words.setValue(7)
         self.highlight_padding=QSpinBox(); self.highlight_padding.setRange(0,120); self.highlight_padding.setValue(18); self.highlight_padding.setSuffix(" px")
         self.highlight_padding.setToolTip("跟读色块左右留白")
         self.highlight_padding_y=QSpinBox(); self.highlight_padding_y.setRange(0,120); self.highlight_padding_y.setValue(10); self.highlight_padding_y.setSuffix(" px")
@@ -2183,6 +2233,8 @@ class DynamicCaptionPage(QWidget):
         self.margin_v=QSpinBox(); self.margin_v.setRange(20,900); self.margin_v.setValue(250)
         self.margin_v.valueChanged.connect(self._sync_preview_margin)
         position_line=QHBoxLayout(); position_line.addWidget(self.position); position_line.addWidget(QLabel("边距")); position_line.addWidget(self.margin_v)
+        self.bgm_dir_input = DropFolderLineEdit(); self.bgm_dir_input.setPlaceholderText("留空不添加背景音乐")
+        self.bgm_dir_input.folder_dropped.connect(self._bgm_folder_dropped)
         self.audio_mode=QComboBox(); self.audio_mode.addItems(["保留视频原音","替换为添加的音频","原声＋背景音混合"])
         self.audio_mode.currentTextChanged.connect(self._rematch_current_video)
         self.audio_mode.currentTextChanged.connect(self._audio_mode_changed)
@@ -2281,6 +2333,11 @@ class DynamicCaptionPage(QWidget):
         audio_form = QFormLayout(); audio_form.setVerticalSpacing(9); audio_form.setHorizontalSpacing(8)
         audio_form.addRow("音频匹配", self.audio_match_mode)
         audio_form.addRow("音频处理", self.audio_mode)
+        bgm_picker = QHBoxLayout()
+        bgm_btn = QPushButton("浏览…"); bgm_btn.clicked.connect(self._choose_bgm_folder)
+        bgm_picker.addWidget(self.bgm_dir_input); bgm_picker.addWidget(bgm_btn)
+        bgm_widget = QWidget(); bgm_widget.setLayout(bgm_picker)
+        audio_form.addRow("背景音乐", bgm_widget)
         audio_form.addRow("音轨音量", audio_volume_line)
         audio_form.addRow("音频淡化", self.audio_fade_mode)
         audio_form.addRow("淡化时长", fade_time_line)
@@ -3576,6 +3633,7 @@ class DynamicCaptionPage(QWidget):
             if key in saved:
                 try: control.setValue(float(saved[key]) if isinstance(control.value(),float) else int(saved[key]))
                 except (TypeError,ValueError): pass
+        if "bgm_dir" in saved: self.bgm_dir_input.setText(str(saved["bgm_dir"]))
         self.clean_metadata.setChecked(bool(saved.get("clean_metadata",self.clean_metadata.isChecked())))
         offsets=saved.get("audio_offsets",{})
         if isinstance(offsets,dict):
@@ -4106,6 +4164,7 @@ class DynamicCaptionPage(QWidget):
                 "original_volume":self.original_volume.value(),"background_volume":self.background_volume.value(),
                 "audio_fade_mode":self.audio_fade_mode.currentText(),
                 "audio_fade_in_ms":self.audio_fade_in.value(),"audio_fade_out_ms":self.audio_fade_out.value(),
+                "bgm_dir": self.bgm_dir_input.text().strip(),
                 "audio_offsets":dict(self.audio_offsets),
                 "clean_metadata":self.clean_metadata.isChecked(),
                 "override_text":self.override_text.toPlainText().strip(),"encode_preset":self.encode_preset.currentText(),
@@ -4125,7 +4184,8 @@ class DynamicCaptionPage(QWidget):
                 "watermark_width":self.watermark_width.value(),
                 "watermark_opacity":self.watermark_opacity.value(),
                 "watermark_margin":self.watermark_margin.value(),
-                "text_color":self._hex(self.text_color),"outline_color":self._hex(self.outline_color),
+                "bgm_dir": self.bgm_dir_input.text().strip(),
+            "text_color":self._hex(self.text_color),"outline_color":self._hex(self.outline_color),
                 "highlight_color":self._hex(self.highlight_color),"provider":self.provider.currentText(),
                 "rename_enabled": self.rename_enabled.isChecked(),
                 "rename_prefix": self.rename_prefix.text(),
@@ -4271,8 +4331,18 @@ class DynamicCaptionPage(QWidget):
         item=self.videos.currentItem() if hasattr(self,"videos") else None
         if item: self._video_selection_changed(item.text())
 
+    def _bgm_folder_dropped(self, path):
+        self.bgm_dir_input.setText(path)
+        self._audio_mode_changed(self.audio_mode.currentText())
+
+    def _choose_bgm_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "选择背景音乐文件夹")
+        if path:
+            self.bgm_dir_input.setText(path)
+            self._audio_mode_changed(self.audio_mode.currentText())
+
     def _audio_mode_changed(self, mode):
-        mixing = mode == "原声＋背景音混合"
+        mixing = mode == "原声＋背景音混合" or (hasattr(self, "bgm_dir_input") and bool(self.bgm_dir_input.text().strip()))
         self.original_volume.setEnabled(mixing)
         self.background_volume.setEnabled(mixing)
         if (mode in ("替换为添加的音频", "原声＋背景音混合")
