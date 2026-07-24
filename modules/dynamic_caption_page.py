@@ -2505,13 +2505,22 @@ class DynamicCaptionPage(QWidget):
         self.layers = [{"type": "caption", "name": "字幕层"}]
         self.selection_debounce_timer = QTimer(self)
         self.selection_debounce_timer.setSingleShot(True)
-        self.selection_debounce_timer.setInterval(220)
+        # 稍长防抖：快速连点队列/反复合成时合并加载请求，减轻 QMediaPlayer 压力
+        self.selection_debounce_timer.setInterval(280)
         self.selection_debounce_timer.timeout.connect(self._on_debounce_load_media)
         
         self.audio_debounce_timer = QTimer(self)
         self.audio_debounce_timer.setSingleShot(True)
-        self.audio_debounce_timer.setInterval(220)
+        self.audio_debounce_timer.setInterval(280)
         self.audio_debounce_timer.timeout.connect(self._on_debounce_load_audio)
+        # 预览会话：世代号作废过期回调；串行加载避免频繁 setSource 卡死/报错
+        self._preview_token = 0
+        self._preview_suppress_errors = False
+        self._preview_load_timer = QTimer(self)
+        self._preview_load_timer.setSingleShot(True)
+        self._preview_load_timer.setInterval(90)
+        self._preview_load_timer.timeout.connect(self._apply_pending_preview_load)
+        self._pending_preview_load = None  # dict | None
         self._mask_counter = 0
         self._text_counter = 0; self._layer_schemes = {}
         self._build_ui(default_provider)
@@ -2756,7 +2765,9 @@ class DynamicCaptionPage(QWidget):
         self.video_sink = QVideoSink(self); self.player.setVideoOutput(self.video_sink)
         self.video_sink.videoFrameChanged.connect(self._video_frame_changed)
         self.player.positionChanged.connect(self._preview_position_changed); self.player.durationChanged.connect(self._preview_duration_changed)
-        self.player.errorOccurred.connect(lambda _error,message:self.log.appendPlainText(f"播放器错误：{message}") if hasattr(self,"log") else None)
+        self.player.errorOccurred.connect(self._on_preview_player_error)
+        if hasattr(self, "audio_player"):
+            self.audio_player.errorOccurred.connect(self._on_preview_player_error)
         self.preview_capture = None
         self.preview_base_image = QImage()
         self.preview_frame_timer = QTimer(self); self.preview_frame_timer.setInterval(80); self.preview_frame_timer.timeout.connect(self._render_preview_frame)
@@ -3128,6 +3139,16 @@ class DynamicCaptionPage(QWidget):
         self.resolution = QComboBox(); self.resolution.addItems(["默认最高", "720p", "1080p", "2K", "4K"])
         self.video_extend_mode = QComboBox(); self.video_extend_mode.addItems(["不处理", "循环播放视频", "最后一帧延长/冻结", "速度拉伸（减速延长）"])
         self.transition_name = QComboBox(); self.transition_name.addItems(["无转场", "淡入淡出", "溶解", "向左滑动", "向右滑动", "向上滑动", "向下滑动", "直线向左擦除", "直线向右擦除", "直线向上擦除", "直线向下擦除"])
+        self.aspect_ratio.setToolTip("分组合成与批量导出都会统一到此画面比例。")
+        self.resolution.setToolTip("分组合成与批量导出都会统一到此分辨率。")
+        self.video_extend_mode.setToolTip(
+            "仅「开始批量导出」生效：当替换/混合音频比画面更长时，如何把视频拉长对齐音频。"
+            "左侧「合成」多片段合并不使用此项。"
+        )
+        self.transition_name.setToolTip(
+            "仅左侧「合成」多片段合并时生效（xfade）。单片段组无转场；"
+            "「开始批量导出」不再做片段间转场。"
+        )
         for combo in (self.aspect_ratio, self.resolution, self.video_extend_mode, self.transition_name):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(8); combo.setMinimumWidth(0)
@@ -3514,6 +3535,13 @@ class DynamicCaptionPage(QWidget):
             ffmpeg = self.find_ffmpeg()
         except Exception as exc:
             QMessageBox.critical(self, "缺少组件", str(exc)); return
+        # 第二次合成会覆盖 00_分组合成 下同名成品；若预览播放器仍占用该文件，
+        # Windows 上 FFmpeg 写入会得到残缺 mp4，随后 QMediaPlayer 报
+        # “Invalid data found when processing input”。
+        if hasattr(self, "selection_debounce_timer"):
+            self.selection_debounce_timer.stop()
+        self._pending_video_path = None
+        self._clear_previews_and_releases()
         output = Path(self.output.text()) / "00_分组合成"
         provider = self.provider.currentText()
         callback = lambda path: self.transcribe_callable(path, provider)
@@ -3530,6 +3558,11 @@ class DynamicCaptionPage(QWidget):
             "encoder_backend": self.encoder_backend.currentText(),
             "encode_preset": self.encode_preset.currentText(),
             "clean_metadata": self.clean_metadata.isChecked(),
+            # 第 7 节选项：此前未传入合成 Worker，导致合并转场/比例/分辨率一直不生效
+            "transition_name": self.transition_name.currentText(),
+            "aspect_ratio": self.aspect_ratio.currentText(),
+            "resolution": self.resolution.currentText(),
+            "video_extend_mode": self.video_extend_mode.currentText(),
         }
         watermark_fingerprint=watermark_config_fingerprint(self._watermark_entries)
         burn_watermark=bool(self.group_burn_watermark.isChecked() and watermark_fingerprint)
@@ -3569,6 +3602,14 @@ class DynamicCaptionPage(QWidget):
                 self._append_run_log("开始快速分组合成：文件名自然排序 → 本地检测首尾声音 → 去口气音 → 无缝合成。")
         else:
             self._append_run_log("开始文案匹配合成：识别片段文字 → 按文案排序 → 去口气音 → 无缝合成。")
+        transition = settings.get("transition_name") or "无转场"
+        if transition and transition != "无转场":
+            self._append_run_log(
+                f"合并转场：{transition}（多片段组内使用 xfade；仅 1 个片段的组无转场）。"
+                f" 画面 {settings.get('aspect_ratio')} / {settings.get('resolution')}。"
+            )
+        else:
+            self._append_run_log("合并转场：无（硬切拼接）。")
         self.group_merge_thread.start()
 
     def stop_group_merge(self):
@@ -3590,13 +3631,26 @@ class DynamicCaptionPage(QWidget):
         self.log.appendPlainText(f"[{index}/{total}] {group_name} 已加入合成结果队列。")
 
     def _load_group_merge_outputs(self, auto_extract=False):
-        outputs = [path for path in self.group_merge_outputs if Path(path).is_file()]
+        outputs = [
+            path for path in self.group_merge_outputs
+            if Path(path).is_file() and Path(path).stat().st_size > 1024
+        ]
         if not outputs:
             return
+        # 加载前松手，防止立刻选中队列第一项时仍锁着旧句柄
+        if hasattr(self, "selection_debounce_timer"):
+            self.selection_debounce_timer.stop()
+        self._pending_video_path = None
+        self._clear_previews_and_releases()
         self.videos.clear()
         self._add(self.videos, outputs, VIDEO_EXTENSIONS)
 
         self._refresh_task_queue()
+        # 队列变更会触发选中 → 防抖加载；再延迟一拍确保文件句柄已释放
+        if self.videos.count() > 0:
+            QTimer.singleShot(180, lambda: self._video_selection_changed(
+                self.videos.item(0).text() if self.videos.item(0) else ""
+            ))
         # Automatic extraction is deliberately started by _group_merge_ended(),
         # after the merge worker thread is fully released.  This method only loads
         # finished files into the normal video/task queue.
@@ -3750,27 +3804,171 @@ class DynamicCaptionPage(QWidget):
         ])
         self.tts_voice.setToolTip("Gemini 官方预置音色；可使用现有 Gemini 密钥轮询生成。")
 
+    def _on_preview_player_error(self, _error=None, message=""):
+        """切换/覆盖文件时的瞬时 Invalid data 不刷屏；仅记录仍有效会话中的真实错误。"""
+        if getattr(self, "_preview_suppress_errors", False):
+            return
+        text = str(message or "").strip()
+        if not text:
+            return
+        # 常见：源被清空、文件刚被覆盖、尚未写完
+        lower = text.casefold()
+        if any(k in lower for k in (
+            "invalid data", "could not open", "no media", "resource error",
+            "无法打开", "无效", "not open",
+        )):
+            return
+        if hasattr(self, "log") and self.log is not None:
+            self.log.appendPlainText(f"播放器错误：{text}")
+
+    def _bump_preview_token(self):
+        self._preview_token = int(getattr(self, "_preview_token", 0)) + 1
+        return self._preview_token
+
+    def _release_preview_media(self, placeholder=None, suppress_ms=120):
+        """停止解码并释放文件句柄，便于合成覆盖同名成品。"""
+        self._preview_suppress_errors = True
+        if hasattr(self, "preview_frame_timer"):
+            self.preview_frame_timer.stop()
+        if hasattr(self, "live_refresh_timer"):
+            self.live_refresh_timer.stop()
+        if hasattr(self, "preview_load_timer") or hasattr(self, "_preview_load_timer"):
+            try:
+                self._preview_load_timer.stop()
+            except Exception:
+                pass
+        for player in (getattr(self, "player", None), getattr(self, "audio_player", None)):
+            if player is None:
+                continue
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                player.setSource(QUrl())
+            except Exception:
+                pass
+        if getattr(self, "preview_capture", None) is not None:
+            try:
+                self.preview_capture.release()
+            except Exception:
+                pass
+            self.preview_capture = None
+        self.preview_base_image = QImage()
+        if hasattr(self, "seek"):
+            self.seek.setRange(0, 0)
+        if placeholder and hasattr(self, "video_widget") and self.video_widget:
+            self.video_widget.setText(placeholder)
+            self.video_widget.setPixmap(QPixmap())
+        # 短时抑制：setSource(空) 与切换瞬间的 Invalid data
+        QTimer.singleShot(max(40, int(suppress_ms)), self._end_preview_error_suppress)
+
+    def _end_preview_error_suppress(self):
+        self._preview_suppress_errors = False
+
     def load_video_preview(self, path, external_audio="", precise=False, mix_audio=False, audio_offset_ms=0):
-        if not path or not Path(path).is_file(): return
+        """对外入口：作废旧会话 → 释放句柄 → 延迟串行加载，支持频繁切换。"""
+        media = Path(path) if path else None
+        if not media or not media.is_file():
+            return
+        try:
+            if media.stat().st_size < 1024:
+                return
+        except OSError:
+            return
+        token = self._bump_preview_token()
         self._precise_preview_active = bool(precise)
-        if self.preview_capture is not None:
-            self.preview_capture.release()
-        self.preview_capture = None
-        self.preview_base_image = QImage(); self.seek.setRange(0,0)
-        self._preview_external_audio = bool(external_audio and Path(external_audio).is_file())
-        self._preview_audio_offset_ms = max(0,int(audio_offset_ms)) if self._preview_external_audio else 0
-        self.audio_output.setVolume(
-            self.original_volume.value()/100 if self._preview_external_audio and mix_audio else
-            (0 if self._preview_external_audio else .65))
-        self.player.setSource(QUrl.fromLocalFile(path)); self.player.play()
-        if self._preview_external_audio:
-            self.audio_player.setSource(QUrl.fromLocalFile(external_audio))
-            self.audio_preview_output.setVolume(
-                self.background_volume.value()/100 if mix_audio else .8)
-            self.audio_player.setPosition(self._preview_audio_offset_ms); self.audio_player.play(); self.audio_play_btn.setText("暂停配音")
-        else:
-            self.audio_player.pause()
-        self.preview_frame_timer.stop(); self._seek_preview(0); self.play_btn.setText("暂停")
+        self._pending_preview_load = {
+            "token": token,
+            "path": str(media.resolve()),
+            "external_audio": str(external_audio or ""),
+            "precise": bool(precise),
+            "mix_audio": bool(mix_audio),
+            "audio_offset_ms": max(0, int(audio_offset_ms or 0)),
+        }
+        self._release_preview_media(
+            placeholder="正在加载预览…",
+            suppress_ms=160,
+        )
+        # 给 Windows 一点时间松开上一段文件，再 setSource
+        self._preview_load_timer.start(90)
+
+    def _apply_pending_preview_load(self):
+        job = getattr(self, "_pending_preview_load", None)
+        if not job:
+            return
+        token = job.get("token")
+        if token != getattr(self, "_preview_token", 0):
+            return  # 已被更新的切换请求作废
+        media = Path(job.get("path", ""))
+        if not media.is_file():
+            return
+        try:
+            size = media.stat().st_size
+        except OSError:
+            return
+        # 文件可能仍在被 FFmpeg 写入：稍后重试（同 token）
+        if size < 1024 or media.name.endswith(".tmp") or ".tmp_" in media.name:
+            if token == self._preview_token:
+                self._preview_load_timer.start(160)
+            return
+        # 短暂稳定：两次体积一致才加载，避免半截文件
+        prev = job.get("_size")
+        if prev is None or prev != size:
+            job["_size"] = size
+            job["_stable"] = 0
+            self._pending_preview_load = job
+            if token == self._preview_token:
+                self._preview_load_timer.start(100)
+            return
+        job["_stable"] = int(job.get("_stable", 0)) + 1
+        if job["_stable"] < 1:
+            self._pending_preview_load = job
+            if token == self._preview_token:
+                self._preview_load_timer.start(80)
+            return
+
+        external = job.get("external_audio") or ""
+        mix_audio = bool(job.get("mix_audio"))
+        audio_offset_ms = int(job.get("audio_offset_ms") or 0)
+        self._precise_preview_active = bool(job.get("precise"))
+        self._preview_external_audio = bool(external and Path(external).is_file())
+        self._preview_audio_offset_ms = audio_offset_ms if self._preview_external_audio else 0
+        abs_path = str(media.resolve())
+        try:
+            self.audio_output.setVolume(
+                self.original_volume.value() / 100 if self._preview_external_audio and mix_audio else
+                (0 if self._preview_external_audio else .65)
+            )
+            self.player.setSource(QUrl.fromLocalFile(abs_path))
+            if token != self._preview_token:
+                return
+            self.player.play()
+            if self._preview_external_audio:
+                self.audio_player.setSource(QUrl.fromLocalFile(str(Path(external).resolve())))
+                if token != self._preview_token:
+                    return
+                self.audio_preview_output.setVolume(
+                    self.background_volume.value() / 100 if mix_audio else .8)
+                self.audio_player.setPosition(self._preview_audio_offset_ms)
+                self.audio_player.play()
+                if hasattr(self, "audio_play_btn"):
+                    self.audio_play_btn.setText("暂停配音")
+            else:
+                self.audio_player.pause()
+            if token != self._preview_token:
+                return
+            self.preview_frame_timer.stop()
+            self._seek_preview(0)
+            if hasattr(self, "play_btn"):
+                self.play_btn.setText("暂停")
+            # 加载成功：清空 pending，允许正常收帧
+            if token == self._preview_token:
+                self._pending_preview_load = None
+                self._preview_suppress_errors = False
+        except Exception as exc:
+            if token == self._preview_token and hasattr(self, "log") and self.log is not None:
+                self.log.appendPlainText(f"预览加载失败（可忽略并重选视频）：{exc}")
 
     def toggle_preview(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -3789,15 +3987,25 @@ class DynamicCaptionPage(QWidget):
         # QVideoSink 会在跳转完成后送来对应帧；短暂等待期间保留上一帧，不阻塞界面。
 
     def _video_frame_changed(self, frame):
-        if not frame or not frame.isValid(): return
+        if not frame or not frame.isValid():
+            return
+        # 加载切换中忽略旧解码器冲刷出来的帧，避免闪一下错图或异常
+        if getattr(self, "_preview_suppress_errors", False):
+            return
+        if getattr(self, "_pending_preview_load", None):
+            # 仍在排队加载时忽略
+            job = self._pending_preview_load
+            if job and job.get("token") == getattr(self, "_preview_token", 0) and job.get("_stable", 0) < 1:
+                return
         # Throttle: if the timer is already active, we are processing a queued frame.
         # Skip this frame to save GUI CPU and memory copy overhead!
         if self.live_refresh_timer.isActive():
             return
-            
+
         image = frame.toImage()
-        if image.isNull(): return
-        
+        if image.isNull():
+            return
+
         # Scale the image immediately to the size of self.video_widget!
         # Since the widget size is small, scaling here is extremely fast and light.
         target_size = self.video_widget.size()
@@ -3807,7 +4015,7 @@ class DynamicCaptionPage(QWidget):
                 Qt.TransformationMode.FastTransformation)
         else:
             self.preview_base_image = image.copy()
-            
+
         self.live_refresh_timer.start()
 
     def _display_cached_preview(self):
@@ -3843,7 +4051,9 @@ class DynamicCaptionPage(QWidget):
         for control in (self.font, self.position, self.free_animation, self.caption_mode,
                         self.audio_match_mode, self.audio_mode, self.audio_fade_mode,
                         self.encoder_backend, self.encode_preset,
-                        self.watermark_mode, self.watermark_position, self.writing_language):
+                        self.watermark_mode, self.watermark_position, self.writing_language,
+                        # 第 7 节：此前改了不记忆，重启后回默认
+                        self.aspect_ratio, self.resolution, self.video_extend_mode, self.transition_name):
             control.currentTextChanged.connect(self._refresh_live_preview)
             control.currentTextChanged.connect(self._save_style_preferences)
         self.rtl_word_highlight.toggled.connect(self._save_style_preferences)
@@ -3867,6 +4077,7 @@ class DynamicCaptionPage(QWidget):
         self.rename_custom_titles.textChanged.connect(self._save_style_preferences)
         self.group_burn_watermark.toggled.connect(self._save_style_preferences)
         self.output.textChanged.connect(self._save_style_preferences)
+        self.bgm_dir_input.textChanged.connect(self._save_style_preferences)
         self.override_text.textChanged.connect(self._refresh_live_preview)
 
     def _style_settings_store(self):
@@ -4349,6 +4560,7 @@ class DynamicCaptionPage(QWidget):
             "watermark_margin":self.watermark_margin.value(),"text_color":self._hex(self.text_color),
             "outline_color":self._hex(self.outline_color),"highlight_color":self._hex(self.highlight_color),
             "audio_offsets":dict(self.audio_offsets),
+            "bgm_dir": self.bgm_dir_input.text().strip() if hasattr(self, "bgm_dir_input") else "",
             "aspect_ratio": self.aspect_ratio.currentText(),
             "resolution": self.resolution.currentText(),
             "video_extend_mode": self.video_extend_mode.currentText(),
@@ -5687,18 +5899,17 @@ class DynamicCaptionPage(QWidget):
     def _hex(self, button): return re.search(r"#[0-9A-Fa-f]{6}", button.text()).group()
 
     def _clear_previews_and_releases(self):
-        if hasattr(self, "player") and self.player:
-            self.player.stop()
-            self.player.setSource(QUrl())
-        if hasattr(self, "audio_player") and self.audio_player:
-            self.audio_player.stop()
-            self.audio_player.setSource(QUrl())
-        if hasattr(self, "preview_capture") and self.preview_capture is not None:
-            self.preview_capture.release()
-            self.preview_capture = None
-        if hasattr(self, "video_widget") and self.video_widget:
-            self.video_widget.setText("正在执行批量合成中，预览已暂停以释放资源")
-            self.video_widget.setPixmap(QPixmap())
+        self._bump_preview_token()
+        self._pending_preview_load = None
+        if hasattr(self, "selection_debounce_timer"):
+            self.selection_debounce_timer.stop()
+        if hasattr(self, "audio_debounce_timer"):
+            self.audio_debounce_timer.stop()
+        self._pending_video_path = None
+        self._release_preview_media(
+            placeholder="正在执行任务，预览已暂停以释放文件…",
+            suppress_ms=200,
+        )
 
     def run(self):
         videos = [self.videos.item(i).text() for i in range(self.videos.count())]

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -209,6 +211,61 @@ class GroupMergeWorker(QObject):
         if process.returncode:
             raise RuntimeError(stderr[-1200:].strip() or "FFmpeg 处理失败")
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    def _write_final_output(self, command, destination: Path):
+        """Write via a temp file then atomically replace, so a locked/in-use final
+        path (preview player still open from a previous run) cannot leave a
+        half-written mp4 that Qt later rejects as “Invalid data…”."""
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.stem + f".tmp_{os.getpid()}.mp4")
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+        # Point FFmpeg output at the temp path (last arg is always destination)
+        if not command:
+            raise RuntimeError("内部错误：空的合成命令")
+        command = list(command[:-1]) + [str(temporary)]
+        try:
+            self._run(command)
+            if not temporary.is_file() or temporary.stat().st_size < 1024:
+                raise RuntimeError(f"合成输出无效或过小：{temporary.name}")
+            # Replace may fail if the destination is still open; retry briefly.
+            last_error = None
+            for attempt in range(8):
+                try:
+                    os.replace(str(temporary), str(destination))
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    time.sleep(0.12 * (attempt + 1))
+            if last_error is not None:
+                # Fall back to a unique name rather than leave a broken final file
+                alt = destination.with_name(
+                    f"{destination.stem}_{int(time.time())}{destination.suffix}"
+                )
+                try:
+                    os.replace(str(temporary), str(alt))
+                    self.log.emit(
+                        f"提醒：原成品文件被占用无法覆盖，已改存为 {alt.name}。"
+                        "请先停止预览后再合成，以便覆盖同名文件。"
+                    )
+                    return alt
+                except OSError:
+                    raise RuntimeError(
+                        f"无法写入成品（文件可能被播放器占用）：{destination.name}\n"
+                        f"请先停止预览/关闭占用该文件的程序后重试。\n{last_error}"
+                    ) from last_error
+            return destination
+        finally:
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
 
     def _probe(self, path):
         result = self._run([
@@ -490,7 +547,9 @@ class GroupMergeWorker(QObject):
                     "files": [self._signature(path) for path in normalized],
                     "clean_metadata": bool(self.settings.get("clean_metadata", True)),
                     "transition_name": self.settings.get("transition_name", "无转场"),
-                    "version": 3,
+                    "aspect_ratio": self.settings.get("aspect_ratio", "原始比例"),
+                    "resolution": self.settings.get("resolution", "默认最高"),
+                    "version": 4,
                 }, sort_keys=True).encode("utf-8")).hexdigest()
                 state_file = cache_dir / "final.json"
                 try:
@@ -521,6 +580,10 @@ class GroupMergeWorker(QObject):
                         segment_infos = [self._probe(path) for path in normalized]
                         min_segment_dur = min(info["duration"] for info in segment_infos)
                         actual_transition_duration = min(transition_duration, min_segment_dur * 0.5)
+                        self.log.emit(
+                            f"应用合并转场「{transition_name}」→ {transition_key}，"
+                            f"时长 {actual_transition_duration:.2f}s，共 {len(normalized)} 段。"
+                        )
                         
                         concat_command = [
                             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"
@@ -565,6 +628,8 @@ class GroupMergeWorker(QObject):
                                                "-map_chapters", "-1"]
                         concat_command += ["-movflags", "+faststart", str(destination)]
                     else:
+                        if transition_name and transition_name != "无转场" and len(normalized) <= 1:
+                            self.log.emit(f"本组仅 1 个片段，跳过转场「{transition_name}」。")
                         concat_command = [
                             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
                             "-i", str(concat_file), "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
@@ -575,7 +640,7 @@ class GroupMergeWorker(QObject):
                                                "-map_chapters", "-1"]
                         concat_command += ["-movflags", "+faststart", str(destination)]
                         
-                    self._run(concat_command)
+                    destination = self._write_final_output(concat_command, destination)
                     state_file.write_text(json.dumps({"fingerprint": final_fingerprint}, indent=2), encoding="utf-8")
                 else:
                     self.log.emit(f"续接：复用已完成合成视频 {destination.name}")
