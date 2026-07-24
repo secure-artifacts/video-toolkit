@@ -8,9 +8,11 @@ import urllib.request
 import ctypes
 import logging
 import tempfile
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
-                             QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, 
-                             QProgressBar, QMessageBox)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
+    QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
+    QFrame, QFormLayout, QGroupBox, QScrollArea, QSplitter,
+)
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QIcon
 from .path_picker import DropTextEdit, VIDEO_EXTENSIONS, collect_files, load_subfolders
@@ -163,91 +165,131 @@ class VideoTool(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("視頻截圖專業版 v3.1 (全功能維護版)")
+        # 与自动流水线一致：左参数配置，右输出日志
+        self.setWindowTitle("批量截图")
         self.setMinimumSize(760, 620)
-        
         self.setStyleSheet("")
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(18, 12, 18, 12)
-        layout.setSpacing(6)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(8)
 
-        # --- 頂部強化的維護工具欄 ---
-        tools_layout = QHBoxLayout()
-        
-        self.btn_upd = QPushButton("🆙 1. 更新 Yt-DLP 組件")
-        self.btn_upd.setObjectName("toolBtn")
-        self.btn_upd.clicked.connect(self.update_ytdlp)
-        
-        self.btn_chk = QPushButton("🎞️ 2. 檢查 FFmpeg 解碼器")
-        self.btn_chk.setObjectName("toolBtn")
-        self.btn_chk.clicked.connect(self.check_ffmpeg)
-        
-        self.btn_log = QPushButton("📄 3. 查看完整執行日誌")
-        self.btn_log.setObjectName("toolBtn")
-        self.btn_log.clicked.connect(self.view_log)
-        
-        tools_layout.addWidget(self.btn_log)
-        tools_layout.addWidget(QLabel("依赖与 FFmpeg/FFprobe 请在顶部“设置与组件”统一管理"))
-        tools_layout.addStretch()
-        layout.addLayout(tools_layout)
+        title = QLabel("📷 批量截图")
+        title.setObjectName("heading")
+        root.addWidget(title)
+        sub = QLabel("支持网络链接与本地视频；左侧配置参数，右侧查看执行日志。依赖与 FFmpeg 请在顶部「设置与组件」管理。")
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color:#94a3b8;")
+        root.addWidget(sub)
 
-        # 链接 / 本地文件输入区
-        input_head = QHBoxLayout()
-        input_head.addWidget(QLabel("视频来源（每行一个；支持 YouTube / Facebook / Instagram / TikTok 链接）"))
-        input_head.addStretch()
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+
+        left = QFrame()
+        left.setObjectName("panel")
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 10, 12, 10)
+        left_layout.setSpacing(8)
+
+        left_layout.addWidget(QLabel("1. 视频来源（每行一个；支持 YouTube / Facebook / Instagram / TikTok）"))
+        self.url_input = DropTextEdit()
+        self.url_input.paths_dropped.connect(self.add_local_paths)
+        self.url_input.setPlaceholderText("粘贴网络链接，或直接拖入本地视频/文件夹")
+        self.url_input.setMinimumHeight(120)
+        left_layout.addWidget(self.url_input, 1)
+        source_btns = QHBoxLayout()
         self.btn_local = QPushButton("＋ 添加本地视频")
         self.btn_local.clicked.connect(self.add_local_videos)
-        self.btn_folder = QPushButton("＋ 添加文件夹"); self.btn_folder.clicked.connect(self.add_local_folder)
-        input_head.addWidget(self.btn_local)
-        input_head.addWidget(self.btn_folder)
-        layout.addLayout(input_head)
-        self.url_input = DropTextEdit(); self.url_input.paths_dropped.connect(self.add_local_paths)
-        self.url_input.setPlaceholderText("粘贴网络链接，或直接拖入本地视频/文件夹")
-        layout.addWidget(self.url_input)
+        self.btn_folder = QPushButton("＋ 添加文件夹")
+        self.btn_folder.clicked.connect(self.add_local_folder)
+        source_btns.addWidget(self.btn_local)
+        source_btns.addWidget(self.btn_folder)
+        source_btns.addStretch()
+        left_layout.addLayout(source_btns)
 
-        # 參數設置
-        params = QHBoxLayout()
-        self.count_in = QLineEdit("10"); params.addWidget(QLabel("截圖數量:")); params.addWidget(self.count_in)
-        self.interval_in = QLineEdit("0.5"); params.addWidget(QLabel("間隔(秒):")); params.addWidget(self.interval_in)
-        self.prefix_in = QLineEdit("Shot"); params.addWidget(QLabel("保存前綴:")); params.addWidget(self.prefix_in)
-        layout.addLayout(params)
-
-        # 路徑選擇
-        path_box = QHBoxLayout()
+        params_group = QGroupBox("2. 截图参数")
+        form = QFormLayout(params_group)
+        form.setContentsMargins(10, 12, 10, 10)
+        form.setSpacing(8)
+        self.count_in = QLineEdit("10")
+        self.interval_in = QLineEdit("0.5")
+        self.prefix_in = QLineEdit("Shot")
+        form.addRow("截图数量", self.count_in)
+        form.addRow("间隔（秒）", self.interval_in)
+        form.addRow("保存前缀", self.prefix_in)
+        path_row = QHBoxLayout()
         self.path_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Pictures"))
-        btn_path = QPushButton("選擇目錄")
+        btn_path = QPushButton("选择目录")
         btn_path.clicked.connect(self.select_dir)
-        path_box.addWidget(self.path_edit); path_box.addWidget(btn_path)
-        layout.addLayout(path_box)
+        path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(btn_path)
+        path_widget = QWidget()
+        path_widget.setLayout(path_row)
+        form.addRow("输出目录", path_widget)
+        left_layout.addWidget(params_group)
 
-        # 執行按鈕
-        self.run_btn = QPushButton("🚀 開始執行批量截圖任務")
-        self.run_btn.setStyleSheet("background-color: #198754; font-size: 15px; min-height: 45px;")
-        self.run_btn.clicked.connect(self.start_task)
-        layout.addWidget(self.run_btn)
+        tools = QGroupBox("3. 维护与输出")
+        tools_layout = QVBoxLayout(tools)
+        tools_layout.setContentsMargins(10, 10, 10, 10)
+        tools_layout.setSpacing(6)
+        tool_row = QHBoxLayout()
+        self.btn_upd = QPushButton("更新 yt-dlp")
+        self.btn_upd.clicked.connect(self.update_ytdlp)
+        self.btn_chk = QPushButton("检查 FFmpeg")
+        self.btn_chk.clicked.connect(self.check_ffmpeg)
+        self.btn_log = QPushButton("完整执行日志")
+        self.btn_log.clicked.connect(self.view_log)
+        tool_row.addWidget(self.btn_upd)
+        tool_row.addWidget(self.btn_chk)
+        tool_row.addWidget(self.btn_log)
+        tools_layout.addLayout(tool_row)
+        out_row = QHBoxLayout()
+        self.btn_open = QPushButton("打开完成文件夹")
+        self.btn_open.setEnabled(False)
+        self.btn_open.clicked.connect(lambda: open_local_path(self.last_folder))
+        btn_clear = QPushButton("清空历史查重")
+        btn_clear.clicked.connect(self.clear_history)
+        out_row.addWidget(self.btn_open)
+        out_row.addWidget(btn_clear)
+        out_row.addStretch()
+        tools_layout.addLayout(out_row)
+        left_layout.addWidget(tools)
 
         self.pbar = QProgressBar()
-        layout.addWidget(self.pbar)
+        left_layout.addWidget(self.pbar)
+        self.run_btn = QPushButton("开始批量截图")
+        self.run_btn.setObjectName("primary")
+        self.run_btn.setMinimumHeight(36)
+        self.run_btn.clicked.connect(self.start_task)
+        left_layout.addWidget(self.run_btn)
 
-        # 實時日誌窗口
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setWidget(left)
+
+        right = QFrame()
+        right.setObjectName("panel")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 10, 12, 10)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(QLabel("运行日志"))
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("background-color: black; color: #00ff00; font-family: 'Consolas';")
-        layout.addWidget(self.log_view)
+        self.log_view.setPlaceholderText("任务进度与错误信息会显示在这里…")
+        self.log_view.setStyleSheet(
+            "background:#0b1424;color:#86efac;font-family:Consolas,'Microsoft YaHei UI';font-size:12px;"
+        )
+        right_layout.addWidget(self.log_view, 1)
 
-        # 底部清理
-        bot_layout = QHBoxLayout()
-        self.btn_open = QPushButton("📂 打開完成文件夾"); self.btn_open.setEnabled(False)
-        self.btn_open.clicked.connect(lambda: open_local_path(self.last_folder))
-        
-        btn_clear = QPushButton("🧹 清空歷史查重數據")
-        btn_clear.clicked.connect(self.clear_history)
-        
-        bot_layout.addWidget(self.btn_open); bot_layout.addWidget(btn_clear)
-        layout.addLayout(bot_layout)
+        split.addWidget(left_scroll)
+        split.addWidget(right)
+        split.setSizes([560, 720])
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        root.addWidget(split, 1)
 
     # --- 功能邏輯 ---
     def update_ytdlp(self):

@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, Signal
-from PySide6.QtWidgets import QAbstractItemView, QLineEdit, QListWidget, QTableWidget, QTextEdit
+from PySide6.QtWidgets import QAbstractItemView, QLineEdit, QListWidget, QTableWidget, QTextEdit, QPushButton
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v", ".flv", ".ts"}
@@ -125,3 +125,9 @@ class DropFolderLineEdit(QLineEdit):
             folder = path if path.is_dir() else path.parent
             self.setText(str(folder)); self.folder_dropped.emit(str(folder)); event.acceptProposedAction(); return
         event.ignore()
+
+
+class DropButton(_DropPathsMixin, QPushButton):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_drop_paths()

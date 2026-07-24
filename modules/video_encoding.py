@@ -71,3 +71,55 @@ def encoder_args(key, cpu_preset="veryfast", preview=False):
                 "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-preset", "ultrafast" if preview else cpu_preset,
             "-crf", "25" if preview else "20", "-pix_fmt", "yuv420p", "-threads", "0"]
+
+
+def calculate_target_size(src_w, src_h, aspect_ratio_str, resolution_str):
+    # Determine orientation
+    is_portrait = src_h > src_w
+    
+    # Determine aspect ratio
+    if aspect_ratio_str == "16:9":
+        ratio = 9/16 if is_portrait else 16/9
+    elif aspect_ratio_str == "3:4":
+        ratio = 3/4 if is_portrait else 4/3
+    elif aspect_ratio_str == "1:1":
+        ratio = 1.0
+    else:
+        ratio = src_w / src_h
+        
+    # Determine target height based on resolution selection
+    if resolution_str == "720p":
+        h = 720
+    elif resolution_str == "1080p":
+        h = 1080
+    elif resolution_str == "2K":
+        h = 1440
+    elif resolution_str == "4K":
+        h = 2160
+    else:
+        # "默认最高/原始" -> use the source's max dimension
+        if is_portrait:
+            h = src_h
+        else:
+            h = int(src_w / ratio)
+            
+    # Calculate target width
+    if ratio == 1.0:
+        if resolution_str == "720p":
+            w, h = 720, 720
+        elif resolution_str == "1080p":
+            w, h = 1080, 1080
+        elif resolution_str == "2K":
+            w, h = 1440, 1440
+        elif resolution_str == "4K":
+            w, h = 2160, 2160
+        else:
+            max_dim = max(src_w, src_h)
+            w, h = max_dim, max_dim
+    else:
+        w = int(h * ratio)
+            
+    # Ensure w and h are even numbers (FFmpeg requires even dimensions for yuv420p)
+    w = (w // 2) * 2
+    h = (h // 2) * 2
+    return w, h

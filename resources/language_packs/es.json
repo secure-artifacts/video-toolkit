@@ -1,0 +1,15 @@
+{
+  "code": "es",
+  "name": "Español",
+  "rtl": false,
+  "quote_open": "«",
+  "quote_close": "»",
+  "single_open": "‘",
+  "single_close": "’",
+  "normalize_ascii_quotes": true,
+  "ensure_inverted_marks": true,
+  "font_hints": [
+    "Arial",
+    "Segoe UI"
+  ]
+}

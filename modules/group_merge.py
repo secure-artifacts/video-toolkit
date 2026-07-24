@@ -11,7 +11,7 @@ from PySide6.QtCore import QObject, Signal
 
 from .path_picker import VIDEO_EXTENSIONS, collect_files, natural_key
 from .settings_page import hidden_kwargs
-from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder
+from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder, calculate_target_size
 
 
 def discover_groups(parent):
@@ -345,8 +345,8 @@ class GroupMergeWorker(QObject):
             f"crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1,fps=30,format=yuv420p"
         )
         command = [
-            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}",
-            "-i", str(clip),
+            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(clip), "-ss", f"{start:.3f}",
         ]
         if watermark:
             command += ["-loop", "1", "-i", str(watermark)]
@@ -448,7 +448,11 @@ class GroupMergeWorker(QObject):
                     else:
                         self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
                 first_probe = self._probe(clips[0])
-                target_w, target_h = ((1920, 1080) if first_probe["width"] > first_probe["height"] else (1080, 1920))
+                target_w, target_h = calculate_target_size(
+                    first_probe["width"], first_probe["height"],
+                    self.settings.get("aspect_ratio", "原始比例"),
+                    self.settings.get("resolution", "默认最高")
+                )
                 watermark = None
                 prepare_watermark = self.settings.get("watermark_prepare")
                 if self.settings.get("burn_watermark") and callable(prepare_watermark):
@@ -484,7 +488,9 @@ class GroupMergeWorker(QObject):
                 destination = self.output / f"{_safe_name(folder.name)}_去口气音合成.mp4"
                 final_fingerprint = hashlib.sha256(json.dumps({
                     "files": [self._signature(path) for path in normalized],
-                    "clean_metadata": bool(self.settings.get("clean_metadata", True)), "version": 2,
+                    "clean_metadata": bool(self.settings.get("clean_metadata", True)),
+                    "transition_name": self.settings.get("transition_name", "无转场"),
+                    "version": 3,
                 }, sort_keys=True).encode("utf-8")).hexdigest()
                 state_file = cache_dir / "final.json"
                 try:
@@ -494,15 +500,81 @@ class GroupMergeWorker(QObject):
                 if not (self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024
                         and state.get("fingerprint") == final_fingerprint):
                     self.log.emit(f"正在合并文件夹“{folder.name}”的 {len(normalized)} 个片段，请等待…")
-                    concat_command = [
-                        self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
-                        "-i", str(concat_file), "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
-                    ]
-                    if self.settings.get("clean_metadata", True):
-                        concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
-                                           "-map_metadata:p", "-1", "-map_metadata:c", "-1",
-                                           "-map_chapters", "-1"]
-                    concat_command += ["-movflags", "+faststart", str(destination)]
+                    
+                    TRANSITIONS_MAP = {
+                        "淡入淡出": "fade",
+                        "溶解": "dissolve",
+                        "向左滑动": "slideleft",
+                        "向右滑动": "slideright",
+                        "向上滑动": "slideup",
+                        "向下滑动": "slidedown",
+                        "直线向左擦除": "wipeleft",
+                        "直线向右擦除": "wiperight",
+                        "直线向上擦除": "wipeup",
+                        "直线向下擦除": "wipedown",
+                    }
+                    transition_name = self.settings.get("transition_name", "无转场")
+                    transition_key = TRANSITIONS_MAP.get(transition_name)
+                    
+                    if transition_key and len(normalized) > 1:
+                        transition_duration = 0.5
+                        segment_infos = [self._probe(path) for path in normalized]
+                        min_segment_dur = min(info["duration"] for info in segment_infos)
+                        actual_transition_duration = min(transition_duration, min_segment_dur * 0.5)
+                        
+                        concat_command = [
+                            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"
+                        ]
+                        for path in normalized:
+                            concat_command += ["-i", str(path)]
+                            
+                        # Build filter complex
+                        v_in = "[0:v]"
+                        a_in = "[0:a]"
+                        current_offset = segment_infos[0]["duration"] - actual_transition_duration
+                        
+                        filter_parts = []
+                        for i in range(1, len(normalized)):
+                            next_v = f"[{i}:v]"
+                            next_a = f"[{i}:a]"
+                            out_v = f"[v_out_{i}]"
+                            out_a = f"[a_out_{i}]"
+                            
+                            filter_parts.append(
+                                f"{v_in}{next_v}xfade=transition={transition_key}:duration={actual_transition_duration}:offset={current_offset:.3f}{out_v}"
+                            )
+                            filter_parts.append(
+                                f"{a_in}{next_a}acrossfade=d={actual_transition_duration}:c1=tri:c2=tri{out_a}"
+                            )
+                            
+                            v_in = out_v
+                            a_in = out_a
+                            current_offset = current_offset + segment_infos[i]["duration"] - actual_transition_duration
+                            
+                        filter_complex_str = ";".join(filter_parts)
+                        concat_command += [
+                            "-filter_complex", filter_complex_str,
+                            "-map", v_in,
+                            "-map", a_in
+                        ]
+                        concat_command += encoder_args(self.encoder, self.settings.get("encode_preset", "veryfast"))
+                        concat_command += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+                        if self.settings.get("clean_metadata", True):
+                            concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                                               "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                                               "-map_chapters", "-1"]
+                        concat_command += ["-movflags", "+faststart", str(destination)]
+                    else:
+                        concat_command = [
+                            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+                            "-i", str(concat_file), "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+                        ]
+                        if self.settings.get("clean_metadata", True):
+                            concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                                               "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                                               "-map_chapters", "-1"]
+                        concat_command += ["-movflags", "+faststart", str(destination)]
+                        
                     self._run(concat_command)
                     state_file.write_text(json.dumps({"fingerprint": final_fingerprint}, indent=2), encoding="utf-8")
                 else:

@@ -181,9 +181,11 @@ class SettingsPage(QWidget):
     def build_ui(self):
         layout = QVBoxLayout(self); self.main_layout = layout
         layout.setContentsMargins(24, 16, 24, 16); layout.setSpacing(8)
-        title = QLabel("设置与组件管理"); title.setObjectName("heading")
+        title = QLabel("🛠 组件检测与安装"); title.setObjectName("heading")
         layout.addWidget(title)
-        layout.addWidget(QLabel("集中检查整个软件需要的组件；安装过程静默执行，不弹出命令窗口。"))
+        sub = QLabel("集中检查整个软件需要的组件；安装过程静默执行，不弹出命令窗口。")
+        sub.setStyleSheet("color:#94a3b8;font-size:13px;")
+        layout.addWidget(sub)
         actions = QHBoxLayout()
         self.refresh_btn = QPushButton("重新检测全部"); self.refresh_btn.clicked.connect(self.refresh)
         self.install_btn = QPushButton("一键安装缺少组件"); self.install_btn.setObjectName("primary"); self.install_btn.clicked.connect(self.install_missing)
@@ -247,7 +249,9 @@ class SettingsPage(QWidget):
         self.log.clear(); self.progress.setValue(0)
         self.thread = QThread(self); self.worker = InstallWorker(packages, media); self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run); self.worker.log.connect(self.log.appendPlainText)
-        self.worker.progress.connect(self.progress.setValue); self.worker.finished.connect(self.done)
+        self.worker.progress.connect(self.progress.setValue)
+        from PySide6.QtCore import Qt
+        self.worker.finished.connect(self.done, Qt.ConnectionType.QueuedConnection)
         self.worker.finished.connect(self.thread.quit); self.thread.finished.connect(self._thread_ended)
         self.thread.finished.connect(self.thread.deleteLater)
         self.install_btn.setEnabled(False); self.media_btn.setEnabled(False); self.thread.start()
@@ -257,5 +261,8 @@ class SettingsPage(QWidget):
         (QMessageBox.information if ok else QMessageBox.critical)(self, "组件管理", message)
 
     def _thread_ended(self):
+        worker = self.worker
         self.worker = None
         self.thread = None
+        if worker is not None:
+            worker.deleteLater()

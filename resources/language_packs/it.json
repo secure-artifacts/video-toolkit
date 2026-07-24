@@ -1,0 +1,14 @@
+{
+  "code": "it",
+  "name": "Italiano",
+  "rtl": false,
+  "quote_open": "«",
+  "quote_close": "»",
+  "single_open": "‘",
+  "single_close": "’",
+  "normalize_ascii_quotes": true,
+  "font_hints": [
+    "Arial",
+    "Segoe UI"
+  ]
+}

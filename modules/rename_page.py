@@ -501,6 +501,13 @@ class RenamePage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "无法开始重命名", str(exc))
             return
+        if getattr(self, "thread", None):
+            try:
+                if self.thread.isRunning():
+                    QMessageBox.information(self, "任务进行中", "请等待当前重命名结束。")
+                    return
+            except RuntimeError:
+                self.thread = None
         self.thread = QThread(self)
         self.worker = RenameWorker([task])
         self.worker.moveToThread(self.thread)
@@ -509,6 +516,7 @@ class RenamePage(QWidget):
         self.worker.progress.connect(self.progress.setValue)
         self.worker.finished.connect(self.done)
         self.worker.finished.connect(self.thread.quit)
+        self.thread.finished.connect(self._ended)
         self.thread.finished.connect(self.thread.deleteLater)
         self.run_btn.setEnabled(False)
         self.thread.start()
@@ -517,3 +525,7 @@ class RenamePage(QWidget):
         self.run_btn.setEnabled(True)
         self.log.appendPlainText(message)
         (QMessageBox.information if ok else QMessageBox.critical)(self, "执行完成" if ok else "执行失败", message)
+
+    def _ended(self):
+        self.worker = None
+        self.thread = None

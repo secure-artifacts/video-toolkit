@@ -51,12 +51,17 @@ from PySide6.QtWidgets import (
 )
 
 from .path_picker import (
-    AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DropFolderLineEdit, DropListWidget, collect_files, default_output_path, natural_key,
+    AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DropFolderLineEdit, DropListWidget, DropButton, DropTableWidget, collect_files, default_output_path, natural_key,
 )
 from .group_merge import GroupMergeWorker, discover_groups, split_group_script
 from .settings_page import hidden_kwargs
-from .text_rules import normalize_required_capitalization
-from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder
+from .text_rules import normalize_required_capitalization, normalize_subtitle_text
+from .language_style import (
+    WRITING_LANGUAGE_OPTIONS, effective_letter_spacing, fill_writing_language_combo,
+    is_rtl_text, prepare_ass_dialogue_text, should_disable_word_highlight,
+    suggest_font_for_text, writing_language_from_ui,
+)
+from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder, calculate_target_size
 from .app_logging import write_app_log
 from .platform_utils import app_data_dir
 from .rename_page import clean_filename_part, safe_filename
@@ -430,7 +435,7 @@ def ass_time(seconds):
     return f"{hours}:{minutes:02d}:{seconds:05.2f}"
 
 
-def parse_srt(srt):
+def parse_srt(srt, language=None):
     blocks = re.split(r"\r?\n\s*\r?\n", srt.strip())
     result = []
     for block in blocks:
@@ -443,7 +448,8 @@ def parse_srt(srt):
         start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / (10 ** len(raw_values[3]))
         end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / (10 ** len(raw_values[7]))
         # 保留用户手动换行；自由整段字幕需要按输入排版显示全部行。
-        text = normalize_required_capitalization("\n".join(lines[timing_index + 1:]).strip())
+        # 专名大小写 + 语言包引号/书写规范（希腊 «»、中文标点等）。
+        text = normalize_subtitle_text("\n".join(lines[timing_index + 1:]).strip(), language=language)
         if text: result.append((start, max(start + .1, end), text))
     return result
 
@@ -793,11 +799,12 @@ def _write_reels_checkpoint(output,state):
 
 def free_caption_srt(text, duration, settings):
     """把不需要对口型的自由文案按两行一屏生成时间轴。"""
-    value = normalize_required_capitalization(str(text or "").strip())
+    lang = settings.get("caption_language") or settings.get("language")
+    value = normalize_subtitle_text(str(text or "").strip(), language=lang)
     if not value:
         return ""
     if "-->" in value:
-        return value
+        return normalize_subtitle_text(value, language=lang)
     if settings.get("free_animation") == "整段固定":
         available = max(.5, float(duration))
         milliseconds = round(available * 1000)
@@ -893,17 +900,17 @@ def rounded_rect_path(width, height, radius):
             f"l 0 {r} b 0 {r-k} {r-k} 0 {r} 0")
 
 
-def watermark_filter_graph(ass_filter, settings, watermark_input_index):
-    """Build one filter graph so preview and final export use the same watermark geometry."""
+def watermark_filter_graph(ass_filter, settings, watermark_input_index, v_filter_str=None):
     ass_expression=ass_filter_expression(ass_filter,settings)
     opacity = max(5, min(100, int(settings.get("watermark_opacity", 90)))) / 100
-    mode = settings.get("watermark_mode", "9:16 全屏覆盖")
-    if mode == "9:16 全屏覆盖" and settings.get("watermark_prepared"):
-        return (f"[0:v]{ass_expression}[captioned];"
+    mode = settings.get("watermark_mode", "9:16 ȫ")
+    video_prefix = f"[0:v]{v_filter_str + ',' if v_filter_str else ''}{ass_expression}[captioned];"
+    if mode == "9:16 ȫ" and settings.get("watermark_prepared"):
+        return (video_prefix +
                 f"[{watermark_input_index}:v]format=rgba[wm];"
                 "[captioned][wm]overlay=0:0:eof_action=repeat[outv]")
     prefix = (
-        f"[0:v]{ass_expression}[captioned];"
+        video_prefix +
         f"[{watermark_input_index}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wm_alpha];"
     )
     if mode == "9:16 全屏覆盖":
@@ -1037,24 +1044,38 @@ def write_ass(path, srt, settings, word_srt=""):
     # Use the face Qt actually selected for live preview.  If a requested font
     # is missing or has a different internal family name, libass now receives
     # the same resolved family instead of choosing an unrelated fallback.
-    metric_font=caption_layout_context(settings)[0]
+    lang = (settings.get("caption_language") or settings.get("writing_language")
+            or settings.get("language") or None)
+    sample_text = " ".join(text for _, _, text in parse_srt(srt, language=lang)[:8])
+    render_settings = dict(settings)
+    render_settings["caption_language"] = lang
+    render_settings["language"] = lang
+    spacing = effective_letter_spacing(render_settings, sample_text)
+    render_settings["letter_spacing"] = spacing
+    if is_rtl_text(sample_text, lang):
+        # 阿拉伯语等连写文：强制 0 字距，并建议可用字体（有则替换）
+        hinted = suggest_font_for_text(str(render_settings.get("font", "Arial")), sample_text, lang)
+        if hinted:
+            render_settings["font"] = hinted
+    metric_font = caption_layout_context(render_settings)[0]
     font = QFontInfo(metric_font).family().replace(",", "")
     alignment = {"底部": 2, "画面中间": 5, "顶部": 8}.get(settings.get("position", "底部"), 2)
     is_static_bold = any(key in font for key in STATIC_BOLD_FONT_FILES)
-    bold_flag=-1 if (caption_uses_bold_face(settings) or is_static_bold) else 0
+    bold_flag=-1 if (caption_uses_bold_face(render_settings) or is_static_bold) else 0
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
 ScaledBorderAndShadow: yes
+WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Base,{font},{settings['font_size']},{text_color},{text_color},{outline_color},&H90000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,{settings['outline_width']},2,{alignment},40,40,{settings['margin_v']},1
-Style: DoubleOuter,{font},{settings['font_size']},{highlight},{highlight},{highlight},&H90000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,{settings['outline_width'] + 3},2,{alignment},40,40,{settings['margin_v']},1
-Style: Active,{font},{settings['font_size']},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,0,0,{alignment},40,40,{settings['margin_v']},1
-Style: ActiveColor,{font},{settings['font_size']},{highlight},{highlight},{outline_color},&H90000000,{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,{settings['outline_width']},2,{alignment},40,40,{settings['margin_v']},1
-Style: HighlightBox,{font},{settings['font_size']},{highlight},{highlight},{highlight},{highlight},{bold_flag},0,0,0,100,100,{settings.get('letter_spacing',0)},0,1,0,0,7,0,0,0,1
+Style: Base,{font},{render_settings['font_size']},{text_color},{text_color},{outline_color},&H90000000,{bold_flag},0,0,0,100,100,{spacing},0,1,{render_settings['outline_width']},2,{alignment},40,40,{render_settings['margin_v']},1
+Style: DoubleOuter,{font},{render_settings['font_size']},{highlight},{highlight},{highlight},&H90000000,{bold_flag},0,0,0,100,100,{spacing},0,1,{render_settings['outline_width'] + 3},2,{alignment},40,40,{render_settings['margin_v']},1
+Style: Active,{font},{render_settings['font_size']},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,{bold_flag},0,0,0,100,100,{spacing},0,1,0,0,{alignment},40,40,{render_settings['margin_v']},1
+Style: ActiveColor,{font},{render_settings['font_size']},{highlight},{highlight},{outline_color},&H90000000,{bold_flag},0,0,0,100,100,{spacing},0,1,{render_settings['outline_width']},2,{alignment},40,40,{render_settings['margin_v']},1
+Style: HighlightBox,{font},{render_settings['font_size']},{highlight},{highlight},{highlight},{highlight},{bold_flag},0,0,0,100,100,{spacing},0,1,0,0,7,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1096,23 +1117,42 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         fr"\1c{color}\3c{outline}\bord{outline_width}\shad0\alpha&H{alpha}&}}")
             events.append(f"Dialogue: {index * 10},0:00:00.00,9:59:59.00,Base,,0,0,0,,{override}{safe_text}")
     precise_words = parse_srt(word_srt)
-    font_size = settings["font_size"]
-    layout_context=caption_layout_context(settings)
+    font_size = render_settings["font_size"]
+    layout_context=caption_layout_context(render_settings)
     _metric_font,metrics,word_gap,line_gap,max_line_width=layout_context
-    padding_x = int(settings.get("highlight_padding", max(12, font_size * .2)))
-    padding_y = max(0, int(settings.get("highlight_padding_y", max(7, font_size * .11))))
-    animation_ms = int(settings.get("animation_speed", 150))
-    position = settings.get("position", "底部")
-    free_mode = settings.get("caption_mode") == "自由文案动画（不对口型）"
-    free_animation = settings.get("free_animation", "淡入淡出")
-    for start, end, text in parse_srt(srt):
+    padding_x = int(render_settings.get("highlight_padding", max(12, font_size * .2)))
+    padding_y = max(0, int(render_settings.get("highlight_padding_y", max(7, font_size * .11))))
+    animation_ms = int(render_settings.get("animation_speed", 150))
+    position = render_settings.get("position", "底部")
+    free_mode = render_settings.get("caption_mode") == "自由文案动画（不对口型）"
+    free_animation = render_settings.get("free_animation", "淡入淡出")
+    for start, end, text in parse_srt(srt, language=lang):
         safe = text.replace("{", "（").replace("}", "）")
+        allow_rtl_words = bool(render_settings.get("rtl_word_highlight", False))
+        # RTL 默认整句 + 方向标记；勾选「RTL 逐词高亮」时走下方逐词路径并对每个词包 RLE
+        if should_disable_word_highlight(safe, lang, allow_rtl_word_highlight=allow_rtl_words):
+            display = prepare_ass_dialogue_text(safe, lang).replace("\n", r"\N")
+            an = {"底部": 2, "画面中间": 5, "顶部": 8}.get(position, 2)
+            override = fr"{{\an{an}\fad(70,70)}}"
+            if preset["effect"] == "double_outline":
+                events.append(
+                    f"Dialogue: {caption_layer},{ass_time(start)},{ass_time(end)},"
+                    f"DoubleOuter,,0,0,0,,{override}{display}")
+                events.append(
+                    f"Dialogue: {caption_layer + 1},{ass_time(start)},{ass_time(end)},"
+                    f"Base,,0,0,0,,{override}{display}")
+            else:
+                events.append(
+                    f"Dialogue: {caption_layer},{ass_time(start)},{ass_time(end)},"
+                    f"Base,,0,0,0,,{override}{display}")
+            continue
         tokens = tokens_for(safe)
         if not tokens: continue
         effect = preset["effect"]
+        rtl_token_mode = is_rtl_text(safe, lang) and allow_rtl_words
         fixed_all = free_mode and free_animation == "整段固定"
         # 整段固定保留手动换行，且允许任意行数；其他模式继续自动排版分页。
-        lines=caption_wrapped_lines(safe,settings,fixed_all,layout_context)
+        lines=caption_wrapped_lines(safe,render_settings,fixed_all,layout_context)
 
         # Use the word midpoint to assign it to exactly one phrase.  Overlap
         # tolerances made boundary words appear in two adjacent phrases and
@@ -1134,11 +1174,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             next_index=token_index+page_token_count
             page_end=timings[next_index][0] if next_index < len(timings) else end
             page_end=max(page_start+.08,page_end)
-            geometry=caption_page_geometry(page_lines,settings,layout_context)
+            geometry=caption_page_geometry(page_lines,render_settings,layout_context)
             for line_index,(line_tokens,line_geometry) in enumerate(zip(page_lines,geometry)):
                 for local_index,(token,item) in enumerate(zip(line_tokens,line_geometry)):
                     width=item["width"]; x=item["x"]; y=item["y"]
                     token_start,token_end=timings[token_index]; token_index+=1
+                    # RTL 实验性逐词：每个词单独包方向标记
+                    draw = prepare_ass_dialogue_text(token, lang) if rtl_token_mode else token
                     if free_mode:
                         visible_start = page_start
                         override = fr"{{\an5\pos({x:.1f},{y:.1f})}}"
@@ -1156,22 +1198,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         if effect == "double_outline":
                             events.append(
                                 f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
-                                f"DoubleOuter,,0,0,0,,{override}{token}")
+                                f"DoubleOuter,,0,0,0,,{override}{draw}")
                             events.append(
                                 f"Dialogue: {caption_layer + 1},{ass_time(visible_start)},{ass_time(page_end)},"
-                                f"Base,,0,0,0,,{override}{token}")
+                                f"Base,,0,0,0,,{override}{draw}")
                         else:
                             events.append(
                                 f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
-                                f"Base,,0,0,0,,{override}{token}")
+                                f"Base,,0,0,0,,{override}{draw}")
                         continue
                     intro=fr"{{\an5\pos({x:.1f},{y:.1f})\fad(70,70)}}"
                     if effect == "glow": intro=fr"{{\an5\pos({x:.1f},{y:.1f})\blur3\fad(70,70)}}"
                     if effect == "double_outline":
-                        events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},DoubleOuter,,0,0,0,,{intro}{token}")
-                        events.append(f"Dialogue: {caption_layer + 1},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{token}")
+                        events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},DoubleOuter,,0,0,0,,{intro}{draw}")
+                        events.append(f"Dialogue: {caption_layer + 1},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{draw}")
                         continue
-                    events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{token}")
+                    events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{draw}")
                     if effect in ("outline","glow","double_outline"): continue
 
                     active_style="Active"
@@ -1193,7 +1235,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                                          fr"\t({animation_ms},{animation_ms+90},\fscx100\fscy100)}}")
                     elif effect == "underline": active_override=fr"{{\an5\pos({x:.1f},{y:.1f})\u1}}"
                     else: active_override=fr"{{\an5\pos({x:.1f},{y:.1f})}}"
-                    events.append(f"Dialogue: {caption_layer + 2},{ass_time(token_start)},{ass_time(token_end)},{active_style},,0,0,0,,{active_override}{token}")
+                    events.append(f"Dialogue: {caption_layer + 2},{ass_time(token_start)},{ass_time(token_end)},{active_style},,0,0,0,,{active_override}{draw}")
     path.write_text(header + "\n".join(events), encoding="utf-8-sig")
 
 
@@ -1451,19 +1493,59 @@ class CaptionWorker(QObject):
                 source_has_audio = media_has_audio(self.ffmpeg, render_video)
                 if audio_mode == "原声＋背景音混合" and not external:
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 未匹配到独立背景音，已保留视频原声继续处理。")
+                
+                # Target dimensions scaling
+                src_w, src_h = media_video_size(self.ffmpeg, render_video)
+                aspect_ratio = self.settings.get("aspect_ratio", "原始比例")
+                resolution = self.settings.get("resolution", "默认最高")
+                target_w, target_h = calculate_target_size(src_w, src_h, aspect_ratio, resolution)
+                need_resize = (aspect_ratio != "原始比例" or resolution != "默认最高")
+                
+                video_duration = media_duration(self.ffmpeg, render_video)
+                audio_duration = 0.0
+                if external and audio.is_file():
+                    audio_duration = media_duration(self.ffmpeg, audio)
+                
+                # Check video extension
+                extend_mode = self.settings.get("video_extend_mode", "不处理")
+                loop_video = False
+                extend_filters = []
+                
+                if audio_duration > video_duration and extend_mode != "不处理":
+                    diff = audio_duration - video_duration
+                    if extend_mode == "循环播放视频":
+                        loop_video = True
+                    elif extend_mode == "最后一帧延长/冻结":
+                        extend_filters.append(f"tpad=stop_duration={diff:.3f}:stop_mode=clone")
+                    elif extend_mode == "速度拉伸（减速延长）":
+                        speed_ratio = video_duration / audio_duration
+                        extend_filters.append(f"setpts=PTS/{speed_ratio:.4f}")
+                    video_duration = audio_duration
+                    
+                v_filters = []
+                if need_resize:
+                    v_filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1")
+                if extend_filters:
+                    v_filters.extend(extend_filters)
+                v_filter_str = ",".join(v_filters) if v_filters else ""
+                
+                command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+                if loop_video:
+                    command += ["-stream_loop", "-1"]
+                command += ["-i", str(render_video)]
+                
                 if external and self.settings.get("audio_match_mode") == "随机分配并随机截取时间段":
                     import random
-                    audio_duration = media_duration(self.ffmpeg, audio)
-                    video_duration = media_duration(self.ffmpeg, render_video)
-                    if audio_duration > video_duration:
-                        max_start = audio_duration - video_duration
+                    audio_dur = media_duration(self.ffmpeg, audio)
+                    if audio_dur > video_duration:
+                        max_start = audio_dur - video_duration
                         rnd = random.Random(hash(str(video.resolve())) + index + 777)
                         random_start = rnd.uniform(0.0, max_start)
                         audio_offset_ms = int(random_start * 1000)
                     else:
-                        if audio_duration > 1.0:
+                        if audio_dur > 1.0:
                             rnd = random.Random(hash(str(video.resolve())) + index + 777)
-                            random_start = rnd.uniform(0.0, min(5.0, audio_duration - 0.5))
+                            random_start = rnd.uniform(0.0, min(5.0, audio_dur - 0.5))
                             audio_offset_ms = int(random_start * 1000)
                         else:
                             audio_offset_ms = 0
@@ -1490,16 +1572,18 @@ class CaptionWorker(QObject):
                 render_settings=self.settings
                 if watermark_enabled and watermark_entries:
                     render_settings=dict(self.settings); render_settings.update({"watermark_prepared":True,"watermark_mode":"9:16 全屏覆盖"})
-                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 已合成 {len(watermark_entries)} 个独立水印图层缓存。")
                 elif watermark_enabled and self.settings.get("watermark_mode","9:16 全屏覆盖")=="9:16 全屏覆盖":
                     watermark=prepared_fullframe_watermark(
                         self.ffmpeg,render_video,watermark,self.output,self.settings.get("watermark_opacity",90))
                     render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
-                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 已使用预缩放公司水印缓存，跳过逐帧缩放。")
                 watermark_input = 1
                 if external: watermark_input += 1
                 if bgm_file: watermark_input += 1
-                video_duration = media_duration(self.ffmpeg, render_video)
+                
+                # Output limits
+                if loop_video:
+                    command += ["-t", f"{video_duration:.3f}"]
+                    
                 if bgm_file:
                     dialogue_input = "[1:a:0]" if replace_audio else "[0:a:0]"
                     bgm_input = f"[{bgm_input_index}:a:0]"
@@ -1527,12 +1611,15 @@ class CaptionWorker(QObject):
                     # Decode the static PNG once; overlay=eof_action=repeat keeps that frame
                     # for the whole video without decoding/scaling the same image every frame.
                     command += ["-i", str(watermark)]
-                    graph = watermark_filter_graph(ass_filter, render_settings, watermark_input)
+                    graph = watermark_filter_graph(ass_filter, render_settings, watermark_input, v_filter_str)
                     if audio_graph: graph += ";" + audio_graph
                     command += ["-filter_complex", graph,
                                 "-map", "[outv]"]
                 else:
-                    command += ["-vf", ass_filter_expression(ass_filter,self.settings), "-map", "0:v:0"]
+                    vf_expr = ass_filter_expression(ass_filter,self.settings)
+                    if v_filter_str:
+                        vf_expr = f"{v_filter_str},{vf_expr}"
+                    command += ["-vf", vf_expr, "-map", "0:v:0"]
                     if audio_graph: command += ["-filter_complex", audio_graph]
                 if audio_graph:
                     command += ["-map", "[aout]", "-shortest"]
@@ -1685,7 +1772,54 @@ class PreviewWorker(QObject):
                     self.ffmpeg,self.source,watermark,self.destination.parent,self.settings.get("watermark_opacity",90))
                 render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
             watermark_input = 2 if external else 1
-            preview_duration=min(8.0,media_duration(self.ffmpeg,self.source))
+            # Target dimensions scaling
+            src_w, src_h = media_video_size(self.ffmpeg, self.source)
+            aspect_ratio = self.settings.get("aspect_ratio", "原始比例")
+            resolution = self.settings.get("resolution", "默认最高")
+            target_w, target_h = calculate_target_size(src_w, src_h, aspect_ratio, resolution)
+            need_resize = (aspect_ratio != "原始比例" or resolution != "默认最高")
+            
+            video_dur = media_duration(self.ffmpeg, self.source)
+            audio_dur = 0.0
+            if external and preview_audio.is_file():
+                audio_dur = media_duration(self.ffmpeg, preview_audio)
+                
+            extend_mode = self.settings.get("video_extend_mode", "不处理")
+            loop_video = False
+            extend_filters = []
+            
+            if audio_dur > video_dur and extend_mode != "不处理":
+                diff = audio_dur - video_dur
+                if extend_mode == "循环播放视频":
+                    loop_video = True
+                elif extend_mode == "最后一帧延长/冻结":
+                    extend_filters.append(f"tpad=stop_duration={diff:.3f}:stop_mode=clone")
+                elif extend_mode == "速度拉伸（减速延长）":
+                    speed_ratio = video_dur / audio_dur
+                    extend_filters.append(f"setpts=PTS/{speed_ratio:.4f}")
+                video_dur = audio_dur
+                
+            preview_duration = min(8.0, video_dur)
+            
+            # Re-construct command dynamically to support loop_video
+            command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+            if loop_video:
+                command += ["-stream_loop", "-1"]
+            command += ["-i", str(self.source)]
+            if external:
+                if mix_audio: command += ["-stream_loop", "-1"]
+                preview_offset=max(0,int(self.settings.get("preview_audio_offset_ms",0)))
+                if preview_offset: command += ["-ss",f"{preview_offset/1000:.3f}"]
+                command += ["-i", str(preview_audio)]
+                
+            v_filters = []
+            if need_resize:
+                v_filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1")
+            if extend_filters:
+                v_filters.extend(extend_filters)
+            v_filter_str = ",".join(v_filters) if v_filters else ""
+            
+            # Build audio graph
             audio_graph = (mixed_audio_filter(self.settings.get("original_volume", 100),
                                               self.settings.get("background_volume", 25),
                                               self.settings.get("audio_fade_mode"),
@@ -1693,16 +1827,26 @@ class PreviewWorker(QObject):
                                               self.settings.get("audio_fade_out_ms",500),preview_duration)
                            if mix_audio and source_has_audio else
                            (replacement_audio_filter(self.settings.get("audio_fade_mode"),
-                                                    self.settings.get("audio_fade_in_ms",500),
-                                                    self.settings.get("audio_fade_out_ms",500),preview_duration)
+                                                     self.settings.get("audio_fade_in_ms",500),
+                                                     self.settings.get("audio_fade_out_ms",500),preview_duration)
                             if replace_audio else ""))
+            
+            # Output limits
+            if loop_video:
+                command += ["-t", f"{preview_duration:.3f}"]
+            else:
+                command += ["-t", "8"]
+                
             if watermark_enabled:
-                graph = watermark_filter_graph(ass_filter, render_settings, watermark_input)
+                graph = watermark_filter_graph(ass_filter, render_settings, watermark_input, v_filter_str)
                 if audio_graph: graph += ";" + audio_graph
-                command += ["-i", str(watermark), "-t", "8", "-filter_complex",
+                command += ["-i", str(watermark), "-filter_complex",
                             graph, "-map", "[outv]"]
             else:
-                command += ["-t", "8", "-vf", ass_filter_expression(ass_filter,self.settings), "-map", "0:v:0"]
+                vf_expr = ass_filter_expression(ass_filter,self.settings)
+                if v_filter_str:
+                    vf_expr = f"{v_filter_str},{vf_expr}"
+                command += ["-vf", vf_expr, "-map", "0:v:0"]
                 if audio_graph: command += ["-filter_complex", audio_graph]
             if audio_graph:
                 command += ["-map", "[aout]"]
@@ -1912,6 +2056,15 @@ class DynamicCaptionPage(QWidget):
         self._restoring_style = False
         # 图层列表按“上层在前”保存；渲染时反向绘制，便于用户理解上移/下移。
         self.layers = [{"type": "caption", "name": "字幕层"}]
+        self.selection_debounce_timer = QTimer(self)
+        self.selection_debounce_timer.setSingleShot(True)
+        self.selection_debounce_timer.setInterval(220)
+        self.selection_debounce_timer.timeout.connect(self._on_debounce_load_media)
+        
+        self.audio_debounce_timer = QTimer(self)
+        self.audio_debounce_timer.setSingleShot(True)
+        self.audio_debounce_timer.setInterval(220)
+        self.audio_debounce_timer.timeout.connect(self._on_debounce_load_audio)
         self._mask_counter = 0
         self._text_counter = 0; self._layer_schemes = {}
         self._build_ui(default_provider)
@@ -2108,9 +2261,14 @@ class DynamicCaptionPage(QWidget):
         source_tools=QVBoxLayout(); source_tools.setContentsMargins(4,0,0,0); source_tools.setSpacing(5)
         self.source_tool_buttons=[]
         for index,label in enumerate(("合成","视频","音频","文转音")):
-            button=QPushButton(label); button.setCheckable(True); button.setFixedSize(66,42)
+            button=DropButton(label) if index in (1, 2) else QPushButton(label)
+            button.setCheckable(True); button.setFixedSize(66,42)
             button.setToolTip({0:"分组去口气音并合成",1:"视频素材队列",2:"音频素材队列",3:"文案配音"}[index])
             button.clicked.connect(lambda checked=False,i=index:self._show_source_tool(i))
+            if index == 1:
+                button.paths_dropped.connect(lambda p: self._add(self.videos, p, VIDEO_EXTENSIONS))
+            elif index == 2:
+                button.paths_dropped.connect(lambda p: self._add(self.audios, p, AUDIO_EXTENSIONS))
             source_tools.addWidget(button); self.source_tool_buttons.append(button)
         source_tools.addStretch()
         source_rail=QWidget(); source_rail_layout=QVBoxLayout(source_rail); source_rail_layout.setContentsMargins(0,0,0,0); source_rail_layout.setSpacing(5)
@@ -2270,8 +2428,16 @@ class DynamicCaptionPage(QWidget):
         self.encoder_backend=QComboBox(); self.encoder_backend.addItems(list(ENCODER_LABELS.values()))
         self.encoder_backend.setToolTip("自动模式会实际测试显卡编码器；不可用时自动使用 CPU。")
         self.encode_preset=QComboBox(); self.encode_preset.addItems(["veryfast","faster","fast","medium"])
+        self.writing_language = QComboBox()
+        fill_writing_language_combo(self.writing_language, "")
+        self.writing_language.setToolTip(
+            "书写规范语言包：引号/标点/RTL 方向。自动检测根据文案字符判断；"
+            "可选手动指定希腊、阿拉伯、希伯来等。规则内置，无需系统语言包。")
+        self.rtl_word_highlight = QCheckBox("RTL 逐词高亮（实验）")
+        self.rtl_word_highlight.setToolTip(
+            "阿拉伯语/希伯来语默认整句烧录以免破坏连写；勾选后尝试逐词高亮（可能影响字形连接）。")
         for combo in (self.caption_mode,self.free_animation,self.font,self.position,self.audio_match_mode,self.audio_mode,
-                      self.audio_fade_mode,self.encoder_backend,self.encode_preset):
+                      self.audio_fade_mode,self.encoder_backend,self.encode_preset,self.writing_language):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(8); combo.setMinimumWidth(0)
         phrase_line=QHBoxLayout(); phrase_line.addWidget(QLabel("每句词数")); phrase_line.addWidget(self.max_words); phrase_line.addWidget(QLabel("每行字符")); phrase_line.addWidget(self.line_length)
@@ -2280,6 +2446,8 @@ class DynamicCaptionPage(QWidget):
         line_spacing_line=QHBoxLayout(); line_spacing_line.addWidget(QLabel("行距")); line_spacing_line.addWidget(self.line_spacing); line_spacing_line.addStretch(1)
         effect_line=QHBoxLayout(); effect_line.addWidget(QLabel("左右")); effect_line.addWidget(self.highlight_padding); effect_line.addWidget(QLabel("上下")); effect_line.addWidget(self.highlight_padding_y)
         form.addRow("字幕模式",self.caption_mode); form.addRow("自由动画",free_line)
+        form.addRow("书写语言", self.writing_language)
+        form.addRow("", self.rtl_word_highlight)
         form.addRow("字体",font_line); form.addRow("自然分句",phrase_line); form.addRow("排版宽度",width_line); form.addRow("字幕间距",spacing_line)
         form.addRow("行间距",line_spacing_line); form.addRow("色块留白",effect_line); form.addRow("跟读动画",self.animation_speed)
         form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width)
@@ -2347,7 +2515,7 @@ class DynamicCaptionPage(QWidget):
         self.audio_group = audio_group
 
         # ⚙️ 8. 运行与编码加速
-        hardware_group = QGroupBox("⚙️ 8. 运行与编码加速")
+        hardware_group = QGroupBox("⚙️ 9. 运行与编码加速")
         hardware_layout = QVBoxLayout(hardware_group); hardware_layout.setContentsMargins(10,12,10,10); hardware_layout.setSpacing(7)
         hardware_form = QFormLayout(); hardware_form.setVerticalSpacing(9); hardware_form.setHorizontalSpacing(8)
         hardware_form.addRow("编码加速", self.encoder_backend)
@@ -2450,7 +2618,8 @@ class DynamicCaptionPage(QWidget):
         revise_layout.addWidget(self.combination_label)
         queue_title=QLabel("批处理对应队列（序号相同即为同一组任务）")
         queue_title.setStyleSheet("color:#cbd5e1;")
-        self.task_queue=QTableWidget(0,4)
+        self.task_queue=DropTableWidget(0,4)
+        self.task_queue.paths_dropped.connect(self._on_task_queue_dropped)
         self.task_queue.setHorizontalHeaderLabels(["序号","视频","匹配音频","文案"])
         self.task_queue.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.task_queue.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -2486,7 +2655,25 @@ class DynamicCaptionPage(QWidget):
         revise_layout.addWidget(caption_edit_tabs)
         # 视频素材列表和任务对应队列本来就是同一组数据。把任务表移动到左侧“视频”页，
         # 点击一行会同时切换预览、匹配音频和右侧字幕，避免在两个区域重复展示。
-        rename_group = QGroupBox("🏷️ 7. 自动重命名（使用文案标题）")
+                # 🎬 7. 视频比例与分辨率/转场
+        video_opts_group = QGroupBox("🎬 7. 视频比例、分辨率与延长/转场")
+        video_opts_layout = QVBoxLayout(video_opts_group); video_opts_layout.setContentsMargins(10,12,10,10); video_opts_layout.setSpacing(7)
+        video_opts_form = QFormLayout(); video_opts_form.setVerticalSpacing(9); video_opts_form.setHorizontalSpacing(8)
+        self.aspect_ratio = QComboBox(); self.aspect_ratio.addItems(["原始比例", "16:9", "3:4", "1:1"])
+        self.resolution = QComboBox(); self.resolution.addItems(["默认最高", "720p", "1080p", "2K", "4K"])
+        self.video_extend_mode = QComboBox(); self.video_extend_mode.addItems(["不处理", "循环播放视频", "最后一帧延长/冻结", "速度拉伸（减速延长）"])
+        self.transition_name = QComboBox(); self.transition_name.addItems(["无转场", "淡入淡出", "溶解", "向左滑动", "向右滑动", "向上滑动", "向下滑动", "直线向左擦除", "直线向右擦除", "直线向上擦除", "直线向下擦除"])
+        for combo in (self.aspect_ratio, self.resolution, self.video_extend_mode, self.transition_name):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8); combo.setMinimumWidth(0)
+        video_opts_form.addRow("画面比例", self.aspect_ratio)
+        video_opts_form.addRow("画面分辨率", self.resolution)
+        video_opts_form.addRow("视频延长", self.video_extend_mode)
+        video_opts_form.addRow("合并转场", self.transition_name)
+        video_opts_layout.addLayout(video_opts_form)
+        self.video_opts_group = video_opts_group
+
+        rename_group = QGroupBox("🏷️ 8. 自动重命名（使用文案标题）")
         rename_layout = QVBoxLayout(rename_group); rename_layout.setContentsMargins(9,11,9,8); rename_layout.setSpacing(6)
         self.rename_enabled = QCheckBox("启用自动重命名最终成品")
         self.rename_enabled.setChecked(False)
@@ -2561,6 +2748,7 @@ class DynamicCaptionPage(QWidget):
         self.output_to_rename.clicked.connect(self._send_export_output_to_rename)
         rename_layout.addWidget(self.output_to_rename)
 
+        settings_layout.addWidget(video_opts_group)
         settings_layout.addWidget(rename_group)
         settings_layout.addWidget(hardware_group)
 
@@ -2571,6 +2759,7 @@ class DynamicCaptionPage(QWidget):
         self._make_collapsible(preset_group,"style",True)
         self._make_collapsible(audio_group,"audio_settings",True)
         self._make_collapsible(layer_group,"layers_watermarks",False)
+        self._make_collapsible(video_opts_group,"video_opts",False)
         self._make_collapsible(rename_group,"automatic_rename",False)
         self._make_collapsible(hardware_group,"hardware_acceleration",False)
 
@@ -2967,6 +3156,61 @@ class DynamicCaptionPage(QWidget):
             self._append_run_log("已启用“合成并转文字”：现在开始对全部合成成品提取字幕。")
             QTimer.singleShot(0,self.extract_all_timelines)
 
+    def _on_task_queue_dropped(self, paths):
+        videos = []
+        audios = []
+        for path in paths:
+            ext = Path(path).suffix.lower()
+            if ext in VIDEO_EXTENSIONS:
+                videos.append(path)
+            elif ext in AUDIO_EXTENSIONS:
+                audios.append(path)
+        if videos:
+            self._add(self.videos, videos, VIDEO_EXTENSIONS)
+        if audios:
+            self._add(self.audios, audios, AUDIO_EXTENSIONS)
+
+    def _on_debounce_load_media(self):
+        video_path = getattr(self, "_pending_video_path", None)
+        source = getattr(self, "_pending_video_source", None)
+        if not video_path: return
+        
+        mode = self.audio_mode.currentText()
+        external = (source if source and Path(source).is_file() and Path(source).resolve() != Path(video_path).resolve()
+                    and mode in ("替换为添加 of 音频", "原声＋背景音混合", "替换为添加的音频") else "")
+        offset = self.audio_offsets.get(self._timeline_key(external), 0) if external else 0
+        
+        self.load_video_preview(video_path, external, mix_audio=mode=="原声＋背景音混合", audio_offset_ms=offset)
+        
+        caption_source = self._caption_source_for_video(video_path)
+        self._active_timeline_source = caption_source
+        
+        # Sync audio selection
+        if source and hasattr(self, "audios"):
+            matches = self.audios.findItems(source, Qt.MatchFlag.MatchExactly)
+            if matches:
+                self._syncing_media_selection = True
+                try:
+                    self.audios.setCurrentItem(matches[0])
+                finally:
+                    self._syncing_media_selection = False
+                if not external:
+                    self.load_audio_preview(source)
+                    
+        if self.caption_mode.currentText() == "自由文案动画（不对口型）":
+            self._load_current_free_text()
+        else:
+            self._timeline_selection_changed(caption_source)
+
+    def _on_debounce_load_audio(self):
+        source = getattr(self, "_pending_audio_source", None)
+        if not source: return
+        self.load_audio_preview(source)
+        video_item = self.videos.currentItem() if hasattr(self, "videos") else None
+        caption_source = (self._caption_source_for_video(video_item.text()) if video_item else source)
+        self._active_timeline_source = caption_source
+        self._timeline_selection_changed(caption_source)
+
     def _add(self, widget, paths, extensions):
         existing = {widget.item(i).text() for i in range(widget.count())}
         for path in collect_files(paths, extensions):
@@ -3061,21 +3305,31 @@ class DynamicCaptionPage(QWidget):
 
     def _video_frame_changed(self, frame):
         if not frame or not frame.isValid(): return
+        # Throttle: if the timer is already active, we are processing a queued frame.
+        # Skip this frame to save GUI CPU and memory copy overhead!
+        if self.live_refresh_timer.isActive():
+            return
+            
         image = frame.toImage()
         if image.isNull(): return
-        self.preview_base_image = image.copy()
-        # Drop obsolete decoded frames instead of queueing a full subtitle paint
-        # for every callback. The newest frame is displayed at about 30 FPS.
-        if not self.live_refresh_timer.isActive():
-            self.live_refresh_timer.start()
+        
+        # Scale the image immediately to the size of self.video_widget!
+        # Since the widget size is small, scaling here is extremely fast and light.
+        target_size = self.video_widget.size()
+        if target_size.width() > 0 and target_size.height() > 0:
+            self.preview_base_image = image.scaled(
+                target_size, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation)
+        else:
+            self.preview_base_image = image.copy()
+            
+        self.live_refresh_timer.start()
 
     def _display_cached_preview(self):
         if self.preview_base_image.isNull():
             return
-        # 先缩到预览控件尺寸再绘制字幕，避免每帧在 1080x1920 原图上做昂贵的路径绘制。
-        image = self.preview_base_image.scaled(
-            self.video_widget.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation)
+        # Copy the pre-scaled image to paint on it. No need to scale again!
+        image = self.preview_base_image.copy()
         if getattr(self, "live_preview", None) and self.live_preview.isChecked() and not self._precise_preview_active:
             self._paint_live_layers(image, self.player.position() / 1000)
         self.video_widget.setPixmap(QPixmap.fromImage(image))
@@ -3104,9 +3358,11 @@ class DynamicCaptionPage(QWidget):
         for control in (self.font, self.position, self.free_animation, self.caption_mode,
                         self.audio_match_mode, self.audio_mode, self.audio_fade_mode,
                         self.encoder_backend, self.encode_preset,
-                        self.watermark_mode, self.watermark_position):
+                        self.watermark_mode, self.watermark_position, self.writing_language):
             control.currentTextChanged.connect(self._refresh_live_preview)
             control.currentTextChanged.connect(self._save_style_preferences)
+        self.rtl_word_highlight.toggled.connect(self._save_style_preferences)
+        self.rtl_word_highlight.toggled.connect(self._refresh_live_preview)
         for control in (self.font_size, self.line_length, self.line_width, self.letter_spacing, self.word_spacing,
                         self.line_spacing, self.max_words, self.highlight_padding, self.highlight_padding_y,
                         self.animation_speed, self.outline_width, self.margin_v, self.free_page_seconds,
@@ -3583,6 +3839,10 @@ class DynamicCaptionPage(QWidget):
             "watermark_margin":self.watermark_margin.value(),"text_color":self._hex(self.text_color),
             "outline_color":self._hex(self.outline_color),"highlight_color":self._hex(self.highlight_color),
             "audio_offsets":dict(self.audio_offsets),
+            "aspect_ratio": self.aspect_ratio.currentText(),
+            "resolution": self.resolution.currentText(),
+            "video_extend_mode": self.video_extend_mode.currentText(),
+            "transition_name": self.transition_name.currentText(),
             "rename_enabled": self.rename_enabled.isChecked(),
             "rename_prefix": self.rename_prefix.text(),
             "rename_date_enabled": self.rename_date_enabled.isChecked(),
@@ -3596,6 +3856,8 @@ class DynamicCaptionPage(QWidget):
             "watermarks": [dict(item) for item in self._watermark_entries],
             "timeline_chinese": dict(self.timeline_chinese),
             "output_dir": self.output.text(),
+            "writing_language": writing_language_from_ui(self.writing_language.currentText()),
+            "rtl_word_highlight": self.rtl_word_highlight.isChecked(),
         }
 
     def _save_style_preferences(self,*_args):
@@ -3619,7 +3881,9 @@ class DynamicCaptionPage(QWidget):
                 "position":self.position,"audio_match_mode":self.audio_match_mode,"audio_mode":self.audio_mode,
                 "audio_fade_mode":self.audio_fade_mode,
                 "encoder_backend":self.encoder_backend,"encode_preset":self.encode_preset,
-                "watermark_mode":self.watermark_mode,"watermark_position":self.watermark_position}
+                "watermark_mode":self.watermark_mode,"watermark_position":self.watermark_position,
+                "aspect_ratio":self.aspect_ratio,"resolution":self.resolution,
+                "video_extend_mode":self.video_extend_mode,"transition_name":self.transition_name}
         spins={"font_size":self.font_size,"free_page_seconds":self.free_page_seconds,"line_length":self.line_length,
                "line_width":self.line_width,"letter_spacing":self.letter_spacing,"word_spacing":self.word_spacing,
                "line_spacing":self.line_spacing,"max_words":self.max_words,"highlight_padding":self.highlight_padding,
@@ -3662,7 +3926,12 @@ class DynamicCaptionPage(QWidget):
             self.rename_padding.setValue(int(saved["rename_padding"]))
         if "group_burn_watermark" in saved:
             self.group_burn_watermark.setChecked(bool(saved["group_burn_watermark"]))
-            
+        if "writing_language" in saved or "caption_language" in saved:
+            code = str(saved.get("writing_language") or saved.get("caption_language") or "")
+            fill_writing_language_combo(self.writing_language, code)
+        if "rtl_word_highlight" in saved:
+            self.rtl_word_highlight.setChecked(bool(saved["rtl_word_highlight"]))
+
         if "output_dir" in saved and saved["output_dir"]:
             self.output.setText(str(saved["output_dir"]))
             self.output.setToolTip(str(saved["output_dir"]))
@@ -4149,10 +4418,15 @@ class DynamicCaptionPage(QWidget):
                 path=self.videos.item(index).text()
                 if self._baked_watermark_matches(path,watermark_fingerprint):
                     baked_videos.append(str(Path(path).resolve()))
+        writing_lang = writing_language_from_ui(self.writing_language.currentText())
         return {"preset":preset,"font":self.font.currentText(),"font_size":self.font_size.value(),
                 "caption_mode":self.caption_mode.currentText(),
                 "free_animation":self.free_animation.currentText(),
                 "free_page_seconds":self.free_page_seconds.value(),
+                "writing_language": writing_lang,
+                "caption_language": writing_lang,
+                "language": writing_lang,
+                "rtl_word_highlight": self.rtl_word_highlight.isChecked(),
                 "line_length":self.line_length.value(),"outline_width":self.outline_width.value(),
                 "line_width":self.line_width.value(),"letter_spacing":self.letter_spacing.value(),
                 "word_spacing":self.word_spacing.value(),
@@ -4188,6 +4462,10 @@ class DynamicCaptionPage(QWidget):
                 "bgm_dir": self.bgm_dir_input.text().strip(),
             "text_color":self._hex(self.text_color),"outline_color":self._hex(self.outline_color),
                 "highlight_color":self._hex(self.highlight_color),"provider":self.provider.currentText(),
+                "aspect_ratio": self.aspect_ratio.currentText(),
+                "resolution": self.resolution.currentText(),
+                "video_extend_mode": self.video_extend_mode.currentText(),
+                "transition_name": self.transition_name.currentText(),
                 "rename_enabled": self.rename_enabled.isChecked(),
                 "rename_prefix": self.rename_prefix.text(),
                 "rename_suffix_enabled": self.rename_suffix_enabled.isChecked(),
@@ -4292,41 +4570,28 @@ class DynamicCaptionPage(QWidget):
         if not video_path: return
         if hasattr(self,"task_queue") and self.videos.currentRow()>=0:
             self.task_queue.selectRow(self.videos.currentRow())
-        source=self._matched_source_for_video(video_path)
+        
+        # Save selection metadata immediately so UI labels update instantly
+        source = self._matched_source_for_video(video_path)
         if hasattr(self,"combination_label"):
-            saved=bool(self.free_texts.get(self._timeline_key(video_path),"").strip())
+            saved = bool(self.free_texts.get(self._timeline_key(video_path),"").strip())
             self.combination_label.setText(
                 f"当前任务组合：{Path(video_path).name}  ＋  {Path(source).name if source else '未匹配音频'}  ＋  "
                 f"{'已保存文案' if saved else '待填写文案'}")
-        mode=self.audio_mode.currentText()
-        external = (source if source and Path(source).is_file() and Path(source).resolve() != Path(video_path).resolve()
-                    and mode in ("替换为添加的音频", "原声＋背景音混合") else "")
-        offset=self.audio_offsets.get(self._timeline_key(external),0) if external else 0
-        self.load_video_preview(video_path, external, mix_audio=mode=="原声＋背景音混合",audio_offset_ms=offset)
-        caption_source=self._caption_source_for_video(video_path)
-        self._active_timeline_source=caption_source
-        # 同步高亮匹配音频，方便核对；阻断信号避免音频选择反过来覆盖视频关联。
-        if source and hasattr(self,"audios"):
-            matches=self.audios.findItems(source,Qt.MatchFlag.MatchExactly)
-            if matches:
-                self._syncing_media_selection=True
-                try: self.audios.setCurrentItem(matches[0])
-                finally: self._syncing_media_selection=False
-                if not external: self.load_audio_preview(source)
-        if self.caption_mode.currentText() == "自由文案动画（不对口型）":
-            self._load_current_free_text()
-        else:
-            self._timeline_selection_changed(caption_source)
+                
+        # Debounce the heavy media loading to prevent QMediaPlayer deadlocks
+        self._pending_video_path = video_path
+        self._pending_video_source = source
+        self.selection_debounce_timer.start()
 
     def _audio_selection_changed(self, source):
         if self._syncing_media_selection: return
         if not source:
             self._rematch_current_video(); return
-        self.load_audio_preview(source)
-        video_item=self.videos.currentItem() if hasattr(self,"videos") else None
-        caption_source=(self._caption_source_for_video(video_item.text()) if video_item else source)
-        self._active_timeline_source=caption_source
-        self._timeline_selection_changed(caption_source)
+            
+        # Debounce audio loading
+        self._pending_audio_source = source
+        self.audio_debounce_timer.start()
 
     def _rematch_current_video(self, *_args):
         item=self.videos.currentItem() if hasattr(self,"videos") else None
@@ -4655,6 +4920,13 @@ class DynamicCaptionPage(QWidget):
             start = len(list(output.glob("配音_*.mp3"))) + 1
             jobs = [(script, str(output / f"配音_{start + index:03d}.mp3"))
                     for index, script in enumerate(scripts)]
+        if getattr(self, "tts_thread", None):
+            try:
+                if self.tts_thread.isRunning():
+                    QMessageBox.information(self, "任务进行中", "请等待当前配音任务结束。")
+                    return
+            except RuntimeError:
+                self.tts_thread = None
         self.tts_generate.setEnabled(False); self.tts_generate.setText(f"排队生成 0/{len(jobs)}")
         self.tts_thread = QThread(self)
         self.tts_worker = BatchTtsWorker(self.tts_callable, jobs, self.tts_service.currentText(),
@@ -4820,6 +5092,13 @@ class DynamicCaptionPage(QWidget):
         videos = [self.videos.item(i).text() for i in range(self.videos.count())]
         audios = [self.audios.item(i).text() for i in range(self.audios.count())]
         if not videos: QMessageBox.information(self, "没有视频", "请先添加视频素材。"); return
+        if getattr(self, "thread", None):
+            try:
+                if self.thread.isRunning():
+                    QMessageBox.information(self, "任务进行中", "请等待当前批量导出结束，或先点停止。")
+                    return
+            except RuntimeError:
+                self.thread = None
         self._clear_previews_and_releases()
         try: ffmpeg = self.find_ffmpeg()
         except Exception as exc: QMessageBox.critical(self, "缺少组件", str(exc)); return

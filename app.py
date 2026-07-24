@@ -37,10 +37,10 @@ _startup_trace("requests ready")
 from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QInputDialog,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QToolTip,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox, QToolTip, QTextBrowser,
     QScrollArea, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 _startup_trace("PySide6 ready")
@@ -51,16 +51,21 @@ from modules.settings_page import SettingsPage, component_bin, hidden_kwargs
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
-from modules.text_rules import normalize_required_capitalization
+from modules.text_rules import normalize_required_capitalization, normalize_subtitle_text
 from modules.metadata_page import MetadataPage
 from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name, validate_media_tool
 from modules.path_picker import default_output_path
 from modules.app_logging import app_log_path, read_app_log, write_app_log
+from modules.help_content import FAQ_JUMP, HELP_CSS, HELP_FAQ_TAB_INDEX, HELP_TABS, SETTINGS_NAV
+from modules.language_style import (
+    fill_writing_language_combo, import_language_pack_file, reload_language_packs,
+    user_language_packs_dir, writing_language_from_ui,
+)
 _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.6").strip().lstrip("v") or "1.7.6"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.7").strip().lstrip("v") or "1.7.7"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -310,6 +315,30 @@ def probe_audio_layout(ffmpeg_path: str, media_path: str):
     return (int(match.group(1)), match.group(2).strip()) if match else None
 
 
+def detect_api_provider(key: str) -> str | None:
+    """根据密钥前缀/形态猜测所属服务；无法判断时返回 None。"""
+    value = (key or "").strip()
+    if not value:
+        return None
+    lower = value.casefold()
+    if value.startswith("gsk_") or lower.startswith("gsk-"):
+        return "Groq"
+    if value.startswith("AIza"):
+        return "Gemini"
+    # ElevenLabs 常见 sk_ 前缀（较长）
+    if value.startswith("sk_") and len(value) >= 24:
+        return "ElevenLabs"
+    if "gladia" in lower:
+        return "Gladia"
+    # Gladia 部分密钥为 UUID 形态
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    ):
+        return "Gladia"
+    return None
+
+
 def check_api_key(provider: str, key: str) -> tuple[bool, str]:
     # HTTP headers must be ASCII/Latin-1 encodable; APP_NAME contains Chinese.
     headers = {"User-Agent": "VideoToolkit/1.0"}
@@ -358,11 +387,11 @@ def timestamp_srt(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 
-def segments_to_srt(segments) -> str:
+def segments_to_srt(segments, language=None) -> str:
     blocks = []
     for i, seg in enumerate(segments, 1):
-        text = normalize_required_capitalization(
-            re.sub(r"\s+", " ", str(seg.get("text", ""))).strip())
+        text = normalize_subtitle_text(
+            re.sub(r"\s+", " ", str(seg.get("text", ""))).strip(), language=language)
         if not text:
             continue
         start = seg.get("start", 0)
@@ -395,13 +424,14 @@ def words_to_segments(words):
     return segments
 
 
-def clean_model_srt(text: str) -> str:
-    text = normalize_required_capitalization(text.strip())
-    text = re.sub(r"^```(?:srt)?\s*", "", text, flags=re.I)
+def clean_model_srt(text: str, language=None) -> str:
+    text = re.sub(r"^```(?:srt)?\s*", "", text.strip(), flags=re.I)
     text = re.sub(r"\s*```$", "", text)
     text = text.replace("\r\n", "\n")
+    text = normalize_subtitle_text(text, language=language)
     if "-->" not in text:
-        return f"1\n00:00:00,000 --> 99:59:59,000\n{text}\n"
+        body = normalize_subtitle_text(text.strip(), language=language)
+        return f"1\n00:00:00,000 --> 99:59:59,000\n{body}\n"
     return text.strip() + "\n"
 
 
@@ -825,11 +855,13 @@ class TranscribeWorker(QObject):
                                              cpu_threads=max(1, min(8, os.cpu_count() or 4)))
             self._local_device = "cpu"
             segments, info = transcribe_with(self._local_model)
-        plain = "\n".join(x["text"] for x in segments)
+        detected = getattr(info, "language", None) or language
+        plain = "\n".join(
+            normalize_subtitle_text(x["text"], language=detected) for x in segments)
         raw = {"provider": "Local Whisper", "model": self.model,
-               "language": getattr(info, "language", language), "segments": segments,
+               "language": detected, "segments": segments,
                "words": [word for segment in segments for word in segment.get("words", [])]}
-        return segments_to_srt(segments), plain, raw
+        return segments_to_srt(segments, language=detected), plain, raw
 
     def _groq(self, audio: Path, key: str, temp: Path):
         chunks_dir = temp / "chunks"
@@ -891,8 +923,10 @@ class TranscribeWorker(QObject):
                 offset += segment_seconds
         if not all_segments:
             all_segments = [{"start": 0, "end": max(2, offset), "text": "\n".join(texts)}]
-        return segments_to_srt(all_segments), "\n".join(texts), {"provider": "Groq", "chunks": raw_items,
-                                                                 "words": all_words}
+        lang = None if not self.language or self.language == "auto" else self.language
+        plain = "\n".join(normalize_subtitle_text(t, language=lang) for t in texts if t)
+        return segments_to_srt(all_segments, language=lang), plain or "\n".join(texts), {
+            "provider": "Groq", "chunks": raw_items, "words": all_words, "language": lang}
 
     def _gemini(self, audio: Path, key: str):
         size = audio.stat().st_size
@@ -944,10 +978,11 @@ class TranscribeWorker(QObject):
             payload = resp.json()
             text = "\n".join(part.get("text", "") for cand in payload.get("candidates", [])
                               for part in cand.get("content", {}).get("parts", []))
-            srt = clean_model_srt(text)
+            lang = None if not self.language or self.language == "auto" else self.language
+            srt = clean_model_srt(text, language=lang)
             plain = re.sub(r"(?m)^\d+\s*$|^\d{2}:\d{2}:\d{2},\d{3} --> .*?$", "", srt)
             plain = re.sub(r"\n{2,}", "\n", plain).strip()
-            return srt, plain, {"provider": "Gemini", "response": payload}
+            return srt, plain, {"provider": "Gemini", "response": payload, "language": lang}
         finally:
             if file_name:
                 try:
@@ -973,7 +1008,10 @@ class TranscribeWorker(QObject):
         text = payload.get("text", "").strip()
         if not segments:
             segments = [{"start": 0, "end": 5, "text": text}]
-        return segments_to_srt(segments), text, {"provider": "ElevenLabs", "response": payload}
+        lang = None if not self.language or self.language == "auto" else self.language
+        plain = normalize_subtitle_text(text, language=lang)
+        return segments_to_srt(segments, language=lang), plain, {
+            "provider": "ElevenLabs", "response": payload, "language": lang}
 
     def _gladia(self, audio: Path, key: str):
         headers = {"x-gladia-key": key}
@@ -1020,10 +1058,13 @@ class TranscribeWorker(QObject):
                             break
                 elif isinstance(subtitles, dict):
                     srt = subtitles.get("srt", "")
+                lang = None if not self.language or self.language == "auto" else self.language
                 if not srt:
                     utterances = transcription.get("utterances", []) if isinstance(transcription, dict) else []
-                    srt = segments_to_srt(utterances) if utterances else clean_model_srt(plain)
-                return clean_model_srt(srt), plain, {"provider": "Gladia", "response": payload}
+                    srt = (segments_to_srt(utterances, language=lang) if utterances
+                           else clean_model_srt(plain, language=lang))
+                return clean_model_srt(srt, language=lang), plain, {
+                    "provider": "Gladia", "response": payload, "language": lang}
             if status == "error":
                 raise ApiFailure(json.dumps(payload, ensure_ascii=False)[:800])
             time.sleep(5)
@@ -1737,9 +1778,64 @@ class PasteOptionsTable(QTableWidget):
 
 
 class NoWheelComboBox(QComboBox):
-    """下拉框仍可点击和键盘选择，但页面滚动时不会误切换值。"""
+    """与全局策略一致：未获焦点时滚轮不改值，便于页面滚动。"""
+
     def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class FocusOnlyWheelFilter(QObject):
+    """全局防误触：下拉框 / 数字框 / 滑条仅在点击获得焦点后才响应滚轮。
+
+    与 Reels 编辑器一致；未聚焦时把滚轮交给外层滚动区域，避免滚动页面时改参数。
+    """
+
+    _CONTROL_TYPES = (QComboBox, QAbstractSpinBox, QSlider)
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        control = self._find_control(obj)
+        if control is None:
+            return False
+        if control.focusPolicy() != Qt.FocusPolicy.ClickFocus:
+            control.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        if control.hasFocus():
+            return False
+        scroll = self._enclosing_scroll(control)
+        if scroll is not None:
+            QApplication.sendEvent(scroll.viewport(), event)
+            return True
         event.ignore()
+        return True
+
+    @classmethod
+    def _find_control(cls, obj):
+        widget = obj
+        while widget is not None:
+            if isinstance(widget, cls._CONTROL_TYPES):
+                return widget
+            widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+        return None
+
+    @staticmethod
+    def _enclosing_scroll(widget):
+        parent = widget.parentWidget() if widget else None
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+
+def apply_click_focus_to_wheel_controls(root: QWidget) -> None:
+    """把已有控件设为点击后才聚焦，配合 FocusOnlyWheelFilter。"""
+    for cls in (QComboBox, QAbstractSpinBox, QSlider):
+        for widget in root.findChildren(cls):
+            widget.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
 
 class VariableOptionsDialog(QDialog):
@@ -1802,18 +1898,47 @@ class GoogleSettingsPanel(QWidget):
         # 授权成功后直接复用本地 OAuth token / 服务账号，不要求每次启动重新点击检查。
 
     def _build(self):
-        root = QVBoxLayout(self); root.setContentsMargins(14, 12, 14, 12); root.setSpacing(7)
-        top = QHBoxLayout(); title = QLabel("Google Drive / Sheets 授权与同步方案"); title.setObjectName("heading")
-        top.addWidget(title); top.addStretch(); self.profile = QComboBox(); self.profile.setEditable(True); self.profile.setMinimumWidth(210)
+        # 与「组件 / 字体 / 密钥」分区统一：外边距、标题、副标题风格
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 16, 24, 16)
+        root.setSpacing(8)
+        top = QHBoxLayout()
+        title = QLabel("☁ Google Drive / Sheets 授权与同步方案")
+        title.setObjectName("heading")
+        top.addWidget(title)
+        top.addStretch()
+        self.profile = QComboBox()
+        self.profile.setEditable(True)
+        self.profile.setMinimumWidth(210)
         self.profile.currentTextChanged.connect(self.load_profile)
-        save = QPushButton("保存为当前方案"); save.setObjectName("primary"); save.clicked.connect(self.save_profile)
-        delete = QPushButton("删除方案"); delete.clicked.connect(self.delete_profile)
-        top.addWidget(QLabel("方案")); top.addWidget(self.profile); top.addWidget(save); top.addWidget(delete); root.addLayout(top)
-        hint = QLabel("把授权、Drive 文件夹、表格、Sheet、固定列和上传时选择项保存在同一方案。流水线开始前只需选择方案。")
-        hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;"); root.addWidget(hint)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter|Qt.AlignmentFlag.AlignTop)
-        body = QWidget(); body.setMaximumWidth(1180); body_layout = QVBoxLayout(body)
-        auth = QGroupBox("授权与 Drive"); auth_form = QFormLayout(auth)
+        save = QPushButton("保存为当前方案")
+        save.setObjectName("primary")
+        save.clicked.connect(self.save_profile)
+        delete = QPushButton("删除方案")
+        delete.clicked.connect(self.delete_profile)
+        top.addWidget(QLabel("方案"))
+        top.addWidget(self.profile)
+        top.addWidget(save)
+        top.addWidget(delete)
+        root.addLayout(top)
+        hint = QLabel(
+            "把授权、Drive 文件夹、表格、Sheet、固定列和上传时选择项保存在同一方案。"
+            "流水线 / Reels 开始前只需选择方案。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#94a3b8;font-size:13px;")
+        root.addWidget(hint)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        body = QWidget()
+        body.setStyleSheet("background:transparent;")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 4, 8, 8)
+        body_layout.setSpacing(10)
+        auth = QGroupBox("🔐 授权与 Drive"); auth_form = QFormLayout(auth)
+        auth_form.setContentsMargins(12, 12, 12, 12); auth_form.setSpacing(8)
         json_row = QHBoxLayout(); self.json_path = QLineEdit(); json_row.addWidget(self.json_path); browse = QPushButton("选择 JSON…")
         browse.clicked.connect(self.choose_json); json_row.addWidget(browse); auth_form.addRow("服务账号 / OAuth JSON", json_row)
         self.parent_folder = QLineEdit(); self.parent_folder.setPlaceholderText("Drive 父文件夹 ID 或链接"); auth_form.addRow("父文件夹", self.parent_folder)
@@ -1822,7 +1947,8 @@ class GoogleSettingsPanel(QWidget):
         auth_row = QHBoxLayout(); self.auth_status = QLabel("尚未检查"); self.auth_status.setWordWrap(True); self.auth_button = QPushButton("授权 / 重新检查")
         self.auth_button.clicked.connect(lambda: self.check_auth(True)); auth_row.addWidget(self.auth_status, 1); auth_row.addWidget(self.auth_button); auth_form.addRow("权限状态", auth_row)
         self.public_link = QCheckBox("允许知道链接的用户查看任务文件夹"); auth_form.addRow("共享", self.public_link); body_layout.addWidget(auth)
-        sheet = QGroupBox("Google Sheets 写入"); sheet_form = QFormLayout(sheet)
+        sheet = QGroupBox("📊 Google Sheets 写入"); sheet_form = QFormLayout(sheet)
+        sheet_form.setContentsMargins(12, 12, 12, 12); sheet_form.setSpacing(8)
         self.write_sheet = QCheckBox("上传完成后写入表格"); sheet_form.addRow("启用", self.write_sheet)
         self.spreadsheet = QLineEdit(); self.spreadsheet.setPlaceholderText("表格 ID 或完整链接")
         spreadsheet_row = QHBoxLayout(); spreadsheet_row.addWidget(self.spreadsheet, 1)
@@ -1832,7 +1958,8 @@ class GoogleSettingsPanel(QWidget):
         self.insert_row = QSpinBox(); self.insert_row.setRange(1,100000); self.insert_row.setValue(4)
         sheet_form.addRow("表格 ID", spreadsheet_row); sheet_form.addRow("写入 Sheet", self.sheet_name); sheet_form.addRow("数据起始行", self.insert_row)
         body_layout.addWidget(sheet)
-        mapping_group = QGroupBox("固定字段与列映射"); mapping_layout = QVBoxLayout(mapping_group)
+        mapping_group = QGroupBox("🗂 固定字段与列映射"); mapping_layout = QVBoxLayout(mapping_group)
+        mapping_layout.setContentsMargins(12, 12, 12, 12)
         self.mapping_table = QTableWidget(0, 4); self.mapping_table.setHorizontalHeaderLabels(["字段名称", "写入列", "类型", "固定内容"])
         self.mapping_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.mapping_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1841,9 +1968,10 @@ class GoogleSettingsPanel(QWidget):
         mapping_layout.addWidget(self.mapping_table); mbuttons = QHBoxLayout(); madd = QPushButton("新增固定字段"); madd.clicked.connect(self.add_mapping)
         mdel = QPushButton("删除选中"); mdel.clicked.connect(lambda: self.remove_rows(self.mapping_table)); mbuttons.addWidget(madd); mbuttons.addWidget(mdel); mbuttons.addStretch(); mapping_layout.addLayout(mbuttons)
         body_layout.addWidget(mapping_group)
-        variable_group = QGroupBox("本次上传可选择字段"); variable_layout = QVBoxLayout(variable_group)
+        variable_group = QGroupBox("☑ 本次上传可选择字段"); variable_layout = QVBoxLayout(variable_group)
+        variable_layout.setContentsMargins(12, 12, 12, 12)
         variable_hint=QLabel("字段名称和写入列在下表维护；具体选项在独立窗口中按列批量粘贴。")
-        variable_hint.setStyleSheet("color:#7dd3fc;"); variable_layout.addWidget(variable_hint)
+        variable_hint.setStyleSheet("color:#94a3b8;font-size:12px;"); variable_layout.addWidget(variable_hint)
         self.variable_table = QTableWidget(0, 3); self.variable_table.setHorizontalHeaderLabels(["字段名称", "写入列", "可选项数量"])
         self.variable_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
         self.variable_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.ResizeToContents)
@@ -1867,8 +1995,12 @@ class GoogleSettingsPanel(QWidget):
         config=config or self.read_ui(); self._sheet_read_mode=mode
         self.read_sheets_button.setEnabled(False); self.read_sheets_button.setText("正在读取…")
         self.sheet_thread=QThread(self); self.sheet_worker=GoogleSheetReadWorker(config,mode); self.sheet_worker.moveToThread(self.sheet_thread)
-        self.sheet_thread.started.connect(self.sheet_worker.run); self.sheet_worker.finished.connect(self._sheet_read_done); self.sheet_worker.finished.connect(self.sheet_thread.quit)
-        self.sheet_thread.finished.connect(self._sheet_read_ended); self.sheet_thread.finished.connect(self.sheet_thread.deleteLater); self.sheet_thread.start()
+        self.sheet_thread.started.connect(self.sheet_worker.run)
+        self.sheet_worker.finished.connect(self._sheet_read_done, Qt.ConnectionType.QueuedConnection)
+        self.sheet_worker.finished.connect(self.sheet_thread.quit)
+        self.sheet_thread.finished.connect(self._sheet_read_ended)
+        self.sheet_thread.finished.connect(self.sheet_thread.deleteLater)
+        self.sheet_thread.start()
 
     def _sheet_read_done(self, ok, data, message):
         self.read_sheets_button.setEnabled(True); self.read_sheets_button.setText("读取 Sheet 名称")
@@ -1981,8 +2113,13 @@ class GoogleSettingsPanel(QWidget):
         if self.auth_thread and self.auth_thread.isRunning(): return
         config=self.read_ui(); self.auth_status.setText("正在检查 Google 权限…"); self.auth_button.setEnabled(False)
         self.auth_thread=QThread(self); self.auth_worker=GoogleAuthWorker(config, interactive); self.auth_worker.moveToThread(self.auth_thread)
-        self.auth_thread.started.connect(self.auth_worker.run); self.auth_worker.finished.connect(self.auth_done); self.auth_worker.finished.connect(self.auth_thread.quit)
-        self.auth_thread.finished.connect(self.auth_ended); self.auth_thread.finished.connect(self.auth_thread.deleteLater); self.auth_thread.start()
+        self.auth_thread.started.connect(self.auth_worker.run)
+        # 强制主线程处理 UI / 弹窗，避免跨线程崩溃
+        self.auth_worker.finished.connect(self.auth_done, Qt.ConnectionType.QueuedConnection)
+        self.auth_worker.finished.connect(self.auth_thread.quit)
+        self.auth_thread.finished.connect(self.auth_ended)
+        self.auth_thread.finished.connect(self.auth_thread.deleteLater)
+        self.auth_thread.start()
 
     def auth_done(self, ok, message):
         self.auth_button.setEnabled(True); config=self.read_ui(); config["auth_ok"]=ok; config["auth_identity"]=message if ok else ""; config["auth_checked"]=datetime.now().isoformat(timespec="seconds")
@@ -1994,7 +2131,12 @@ class GoogleSettingsPanel(QWidget):
         self.auth_status.setText(("授权成功：" if ok else "授权失败：")+message); self.auth_status.setStyleSheet("color:#86efac;" if ok else "color:#fca5a5;")
         if not ok: QMessageBox.warning(self,"Google 授权失败",message)
 
-    def auth_ended(self): self.auth_worker=None; self.auth_thread=None
+    def auth_ended(self):
+        worker = self.auth_worker
+        self.auth_worker = None
+        self.auth_thread = None
+        if worker is not None:
+            worker.deleteLater()
 
 
 class FullTextToolTipFilter(QObject):
@@ -2025,7 +2167,8 @@ class FullTextToolTipFilter(QObject):
 
 
 class UpdateCheckWorker(QObject):
-    finished = Signal(bool, str, str, str) # has_new_version, latest_version, download_url, error_message
+    """从 GitHub releases/latest 检查新版本（Setup .exe 优先）。"""
+    finished = Signal(bool, str, str, str)  # has_new, latest_version, download_url, error
 
     def __init__(self, current_version):
         super().__init__()
@@ -2034,11 +2177,14 @@ class UpdateCheckWorker(QObject):
     def run(self):
         try:
             import requests
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            headers = {
+                "User-Agent": "VideoToolkit-UpdateCheck/1.0",
+                "Accept": "application/vnd.github+json",
+            }
             response = requests.get(
                 "https://api.github.com/repos/secure-artifacts/video-toolkit/releases/latest",
                 headers=headers,
-                timeout=10
+                timeout=15,
             )
             if response.status_code != 200:
                 self.finished.emit(False, "", "", f"HTTP {response.status_code}")
@@ -2049,75 +2195,31 @@ class UpdateCheckWorker(QObject):
             if not latest_version:
                 self.finished.emit(False, "", "", "无法获取最新版本号")
                 return
-            
+
             def parse_ver(v):
-                try: return [int(x) for x in v.split(".")]
-                except Exception: return [0, 0, 0]
-            
-            current_parts = parse_ver(self.current_version)
-            latest_parts = parse_ver(latest_version)
-            has_new = latest_parts > current_parts
-            
+                parts = []
+                for x in str(v).split("."):
+                    try:
+                        parts.append(int(x))
+                    except Exception:
+                        parts.append(0)
+                return parts or [0]
+
+            has_new = parse_ver(latest_version) > parse_ver(self.current_version)
             download_url = ""
-            assets = data.get("assets", [])
-            for asset in assets:
+            for asset in data.get("assets", []) or []:
                 name = asset.get("name", "")
                 if name.endswith(".exe") and "Setup" in name:
                     download_url = asset.get("browser_download_url", "")
                     break
-            if not download_url and assets:
-                download_url = assets[0].get("browser_download_url", "")
-                
-            self.finished.emit(has_new, latest_version, download_url, "")
-        except Exception as e:
-            self.finished.emit(False, "", "", str(e))
-
-
-
-class UpdateCheckWorker(QObject):
-    finished = Signal(bool, str, str, str) # has_new_version, latest_version, download_url, error_message
-
-    def __init__(self, current_version):
-        super().__init__()
-        self.current_version = current_version.strip().lstrip("v")
-
-    def run(self):
-        try:
-            import requests
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            response = requests.get(
-                "https://api.github.com/repos/secure-artifacts/video-toolkit/releases/latest",
-                headers=headers,
-                timeout=10
-            )
-            if response.status_code != 200:
-                self.finished.emit(False, "", "", f"HTTP {response.status_code}")
-                return
-            data = response.json()
-            tag_name = data.get("tag_name", "").strip()
-            latest_version = tag_name.lstrip("v")
-            if not latest_version:
-                self.finished.emit(False, "", "", "无法获取最新版本号")
-                return
-            
-            def parse_ver(v):
-                try: return [int(x) for x in v.split(".")]
-                except Exception: return [0, 0, 0]
-            
-            current_parts = parse_ver(self.current_version)
-            latest_parts = parse_ver(latest_version)
-            has_new = latest_parts > current_parts
-            
-            download_url = ""
-            assets = data.get("assets", [])
-            for asset in assets:
-                name = asset.get("name", "")
-                if name.endswith(".exe") and "Setup" in name:
-                    download_url = asset.get("browser_download_url", "")
-                    break
-            if not download_url and assets:
-                download_url = assets[0].get("browser_download_url", "")
-                
+            if not download_url:
+                for asset in data.get("assets", []) or []:
+                    name = asset.get("name", "")
+                    if name.endswith(".exe"):
+                        download_url = asset.get("browser_download_url", "")
+                        break
+            if not download_url and data.get("assets"):
+                download_url = data["assets"][0].get("browser_download_url", "")
             self.finished.emit(has_new, latest_version, download_url, "")
         except Exception as e:
             self.finished.emit(False, "", "", str(e))
@@ -2158,106 +2260,6 @@ class DownloadWorker(QObject):
             self.finished.emit(False, "", str(e))
 
 
-class CollapsibleSection(QWidget):
-    def __init__(self, icon, title, body, parent=None):
-        super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)
-        
-        self.icon = icon
-        self.title = title
-        
-        self.btn = QPushButton(f"▶  {self.icon}  {self.title}")
-        self.btn.setStyleSheet("""
-            QPushButton {
-                background: #17243a;
-                border: 1px solid #30445f;
-                border-radius: 6px;
-                padding: 12px 18px;
-                text-align: left;
-                font-weight: bold;
-                font-size: 14px;
-                color: #e5edf9;
-            }
-            QPushButton:hover {
-                background: #223654;
-                border-color: #3b82f6;
-            }
-        """)
-        
-        self.body_widget = QWidget()
-        self.body_layout = QVBoxLayout(self.body_widget)
-        self.body_layout.setContentsMargins(20, 12, 20, 15)
-        self.body_text = QLabel(body)
-        self.body_text.setWordWrap(True)
-        self.body_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body_text.setStyleSheet("color:#cbd5e1; font-size:13px; line-height:1.65;")
-        self.body_layout.addWidget(self.body_text)
-        
-        self.body_widget.setStyleSheet("""
-            QWidget {
-                background: #0c1424;
-                border-left: 1px solid #30445f;
-                border-right: 1px solid #30445f;
-                border-bottom: 1px solid #30445f;
-                border-bottom-left-radius: 6px;
-                border-bottom-right-radius: 6px;
-            }
-        """)
-        
-        self.layout.addWidget(self.btn)
-        self.layout.addWidget(self.body_widget)
-        
-        self.body_widget.setVisible(False)
-        self.btn.clicked.connect(self.toggle)
-        
-    def toggle(self):
-        visible = not self.body_widget.isVisible()
-        self.body_widget.setVisible(visible)
-        if visible:
-            self.btn.setText(f"▼  {self.icon}  {self.title}")
-            self.btn.setStyleSheet("""
-                QPushButton {
-                    background: #1e293b;
-                    border-top: 1px solid #3b82f6;
-                    border-left: 1px solid #3b82f6;
-                    border-right: 1px solid #3b82f6;
-                    border-bottom: none;
-                    border-top-left-radius: 6px;
-                    border-top-right-radius: 6px;
-                    border-bottom-left-radius: 0px;
-                    border-bottom-right-radius: 0px;
-                    padding: 12px 18px;
-                    text-align: left;
-                    font-weight: bold;
-                    font-size: 14px;
-                    color: #f8fafc;
-                }
-                QPushButton:hover {
-                    background: #334155;
-                }
-            """)
-        else:
-            self.btn.setText(f"▶  {self.icon}  {self.title}")
-            self.btn.setStyleSheet("""
-                QPushButton {
-                    background: #17243a;
-                    border: 1px solid #30445f;
-                    border-radius: 6px;
-                    padding: 12px 18px;
-                    text-align: left;
-                    font-weight: bold;
-                    font-size: 14px;
-                    color: #e5edf9;
-                }
-                QPushButton:hover {
-                    background: #223654;
-                    border-color: #3b82f6;
-                }
-            """)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2291,6 +2293,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.full_text_tooltips = FullTextToolTipFilter(self)
         QApplication.instance().installEventFilter(self.full_text_tooltips)
+        # 全应用：下拉/数字/滑条需点击聚焦后才响应滚轮（同 Reels 逻辑）
+        self._focus_wheel_filter = FocusOnlyWheelFilter(self)
+        QApplication.instance().installEventFilter(self._focus_wheel_filter)
+        apply_click_focus_to_wheel_controls(self)
         _startup_trace("UI built")
         self._refresh_keys()
         _startup_trace("keys refreshed")
@@ -2326,6 +2332,20 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda checked=False, idx=page_index: self._show_page(idx))
             nav_layout.addWidget(btn)
             self.nav_buttons.append(btn)
+
+        # 帮助右侧：检查更新 → 查看软件日志（均不参与页面切换）
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.setObjectName("updateNavButton")
+        self.update_btn.setToolTip("检查是否有新版本；启动后也会在后台静默检查")
+        self.update_btn.clicked.connect(lambda: self._check_update(manual=True))
+        nav_layout.addWidget(self.update_btn)
+
+        self.log_nav_btn = QPushButton("查看软件日志")
+        self.log_nav_btn.setObjectName("logNavButton")
+        self.log_nav_btn.setToolTip("打开全局运行日志，排查批处理与 API 报错")
+        self.log_nav_btn.clicked.connect(self._show_app_log)
+        nav_layout.addWidget(self.log_nav_btn)
+
         nav_layout.addStretch()
         privacy = QLabel("密钥仅存本机")
         privacy.setStyleSheet("color:#64748b;font-size:11px;")
@@ -2353,18 +2373,14 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.rename_page)
         self.pages.addWidget(self._subtitle_page())
         _startup_trace("subtitle page ready")
-        # 保留原页面索引 6 作为兼容入口；_show_page(6) 会转到设置中的“API 密钥管理”标签。
+        # 保留原页面索引 6 作为兼容入口；_show_page(6) 会转到设置中的密钥分区。
         self.pages.addWidget(QWidget())
         _startup_trace("keys page ready")
-        self.settings_page = QTabWidget()
         self.key_settings_page = self._keys_page()
         self.component_settings_page = SettingsPage()
         self.font_settings_page = self._font_settings_page()
         self.google_settings_page = GoogleSettingsPanel(self.store)
-        self.settings_page.addTab(self.component_settings_page, "组件检测与安装")
-        self.settings_page.addTab(self.font_settings_page, "字体管理")
-        self.settings_page.addTab(self.google_settings_page, "Google 授权与同步方案")
-        self.settings_page.addTab(self.key_settings_page, "API 密钥管理")
+        self.settings_page = self._build_settings_shell()
         _startup_trace("settings page ready")
         self.pages.addWidget(self.settings_page)
         self.pages.addWidget(self._pipeline_page())
@@ -2379,30 +2395,212 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.pages, 1)
         self._show_page(0)
 
+    def _side_nav_button_style(self):
+        return (
+            "QPushButton{text-align:left;padding:11px 12px;border:1px solid transparent;"
+            "border-radius:8px;color:#cbd5e1;font-size:13px;font-weight:600;background:transparent;}"
+            "QPushButton:hover{background:#1e293b;color:#f1f5f9;}"
+            "QPushButton:checked{background:#1d4ed8;color:white;border-color:#60a5fa;}"
+        )
+
+    def _build_settings_shell(self):
+        """设置页：左侧导航 + 右侧内容，与帮助页统一。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 18, 28, 18)
+        layout.setSpacing(10)
+        heading = QLabel("设置与组件")
+        heading.setObjectName("heading")
+        layout.addWidget(heading)
+        sub = QLabel("左侧切换分区：组件 · 字体与语言包 · Google · 密钥。布局与帮助页一致。")
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color:#94a3b8;font-size:14px;")
+        layout.addWidget(sub)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        nav_frame = QFrame()
+        nav_frame.setObjectName("helpSideNav")
+        nav_frame.setFixedWidth(220)
+        nav_frame.setStyleSheet(
+            "#helpSideNav{background:#0f172a;border:1px solid #334155;border-radius:10px;}"
+        )
+        nav_col = QVBoxLayout(nav_frame)
+        nav_col.setContentsMargins(10, 12, 10, 12)
+        nav_col.setSpacing(6)
+        nav_title = QLabel("分区")
+        nav_title.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:700;padding:0 4px 6px 4px;")
+        nav_col.addWidget(nav_title)
+
+        content_frame = QFrame()
+        content_frame.setObjectName("helpContentFrame")
+        content_frame.setStyleSheet(
+            "#helpContentFrame{background:#0b1220;border:1px solid #334155;border-radius:10px;}"
+        )
+        content_col = QVBoxLayout(content_frame)
+        content_col.setContentsMargins(0, 0, 0, 0)
+        self.settings_stack = QStackedWidget()
+        self.settings_stack.addWidget(self.component_settings_page)
+        self.settings_stack.addWidget(self.font_settings_page)
+        self.settings_stack.addWidget(self.google_settings_page)
+        self.settings_stack.addWidget(self.key_settings_page)
+        content_col.addWidget(self.settings_stack)
+
+        self._settings_nav_buttons = []
+        self._settings_section_widgets = [
+            self.component_settings_page,
+            self.font_settings_page,
+            self.google_settings_page,
+            self.key_settings_page,
+        ]
+        for index, item in enumerate(SETTINGS_NAV):
+            btn = QPushButton(item["title"])
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(self._side_nav_button_style())
+            btn.clicked.connect(lambda checked=False, i=index: self._show_settings_section(i))
+            nav_col.addWidget(btn)
+            self._settings_nav_buttons.append(btn)
+        nav_col.addStretch(1)
+
+        body.addWidget(nav_frame)
+        body.addWidget(content_frame, 1)
+        layout.addLayout(body, 1)
+
+        # 兼容旧代码：setCurrentWidget / count / tabText / currentWidget
+        page.setCurrentWidget = self._settings_set_current_widget  # type: ignore[attr-defined]
+        page.currentWidget = lambda: self.settings_stack.currentWidget()  # type: ignore[attr-defined]
+        page.count = lambda: self.settings_stack.count()  # type: ignore[attr-defined]
+        page.tabText = self._settings_tab_text  # type: ignore[attr-defined]
+        page.widget = lambda i: self.settings_stack.widget(i)  # type: ignore[attr-defined]
+
+        self._show_settings_section(0)
+        return page
+
+    def _settings_tab_text(self, index: int) -> str:
+        labels = [x["title"] for x in SETTINGS_NAV]
+        if 0 <= index < len(labels):
+            return labels[index]
+        return ""
+
+    def _settings_set_current_widget(self, widget):
+        try:
+            index = self._settings_section_widgets.index(widget)
+        except (ValueError, AttributeError):
+            return
+        self._show_settings_section(index)
+
+    def _show_settings_section(self, index: int):
+        if not hasattr(self, "settings_stack"):
+            return
+        if index < 0 or index >= self.settings_stack.count():
+            return
+        self.settings_stack.setCurrentIndex(index)
+        for i, btn in enumerate(getattr(self, "_settings_nav_buttons", [])):
+            btn.setChecked(i == index)
+
     def _font_settings_page(self):
         page, layout = self._page_shell(
-            "字幕字体管理",
-            "字体只需安装一次；安装后会自动出现在 Reels 编辑器的字体下拉框中，并用于预览和最终烧录。",
+            "🔤 字体与语言包",
+            "字体用于 Reels 预览与烧录；语言包控制字幕引号/RTL 等书写规范（无需系统语言包）。",
         )
-        group=QGroupBox("本地与开源字体")
-        group_layout=QVBoxLayout(group); group_layout.setContentsMargins(14,14,14,14); group_layout.setSpacing(10)
-        folder=QLineEdit(str(app_data_dir()/"fonts")); folder.setReadOnly(True)
-        folder_row=QHBoxLayout(); folder_row.addWidget(QLabel("字体保存目录")); folder_row.addWidget(folder,1)
+        group = QGroupBox("🔤 本地与开源字体")
+        group_layout = QVBoxLayout(group)
+        group_layout.setContentsMargins(14, 14, 14, 14)
+        group_layout.setSpacing(10)
+        folder = QLineEdit(str(app_data_dir() / "fonts"))
+        folder.setReadOnly(True)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("字体保存目录"))
+        folder_row.addWidget(folder, 1)
         group_layout.addLayout(folder_row)
-        buttons=QHBoxLayout()
-        import_button=QPushButton("导入本地字体…"); import_button.setObjectName("primary")
-        import_button.setToolTip("支持 TTF、OTF、TTC；复制到软件字体目录并长期记忆")
+        buttons = QHBoxLayout()
+        import_button = QPushButton("导入本地字体…")
+        import_button.setObjectName("primary")
+        import_button.setToolTip("支持 TTF、OTF、TTC")
         import_button.clicked.connect(self.dynamic_caption_page._import_local_fonts)
-        open_button=QPushButton("下载开源字体…")
+        open_button = QPushButton("下载开源字体…")
         open_button.setToolTip("从 Google Fonts 官方仓库下载，安装一次后可离线使用")
         open_button.clicked.connect(self.dynamic_caption_page._open_source_font_library)
-        buttons.addWidget(import_button); buttons.addWidget(open_button); buttons.addStretch()
+        buttons.addWidget(import_button)
+        buttons.addWidget(open_button)
+        buttons.addStretch()
         group_layout.addLayout(buttons)
-        note=QLabel("导入或下载完成后，无需重启软件；回到 Reels 编辑器即可在“字体”下拉框中选择。")
-        note.setWordWrap(True); note.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:8px;border-radius:5px;")
+        note = QLabel("导入后无需重启；回到 Reels「字体」下拉即可选择。阿拉伯/希伯来请选用支持该文种的字体。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:8px;border-radius:5px;")
         group_layout.addWidget(note)
-        layout.addWidget(group); layout.addStretch()
+        layout.addWidget(group)
+
+        lang_group = QGroupBox("🌐 字幕书写语言包")
+        lang_layout = QVBoxLayout(lang_group)
+        lang_layout.setContentsMargins(14, 14, 14, 14)
+        lang_layout.setSpacing(10)
+        lang_layout.addWidget(QLabel(
+            "内置：en / pt / es / fr / de / it / el / ru / tr / zh / ar / he。\n"
+            "导入 JSON 可扩展或覆盖（需含 code 字段，如 \"code\": \"my\"）。"
+        ))
+        pack_dir = QLineEdit(str(user_language_packs_dir()))
+        pack_dir.setReadOnly(True)
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("用户语言包目录"))
+        dir_row.addWidget(pack_dir, 1)
+        lang_layout.addLayout(dir_row)
+        lang_btns = QHBoxLayout()
+        import_pack = QPushButton("导入语言包 JSON…")
+        import_pack.setObjectName("primary")
+        import_pack.setToolTip("选择 .json 语言包文件，复制到用户目录并立即生效")
+        import_pack.clicked.connect(self._import_language_pack)
+        open_pack_dir = QPushButton("打开语言包目录")
+        open_pack_dir.clicked.connect(lambda: self._open_path(str(user_language_packs_dir())))
+        reload_pack = QPushButton("重新加载语言包")
+        reload_pack.clicked.connect(self._reload_language_packs)
+        lang_btns.addWidget(import_pack)
+        lang_btns.addWidget(open_pack_dir)
+        lang_btns.addWidget(reload_pack)
+        lang_btns.addStretch()
+        lang_layout.addLayout(lang_btns)
+        sample = QLabel(
+            "JSON 示例：\n"
+            '{ "code": "nl", "name": "Nederlands", "quote_open": "“", "quote_close": "”", "rtl": false }'
+        )
+        sample.setWordWrap(True)
+        sample.setStyleSheet(
+            "color:#94a3b8;background:#0c1424;padding:10px;border-radius:6px;"
+            "font-family:Consolas,'Microsoft YaHei UI';font-size:12px;"
+        )
+        lang_layout.addWidget(sample)
+        layout.addWidget(lang_group)
+        layout.addStretch()
         return page
+
+    def _import_language_pack(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入语言包", "", "语言包 JSON (*.json);;所有文件 (*.*)")
+        if not path:
+            return
+        ok, message = import_language_pack_file(path)
+        if ok:
+            QMessageBox.information(self, "导入成功", message)
+            write_app_log(message, "INFO", "语言包")
+            # 刷新 Reels / 字幕语言下拉
+            if hasattr(self, "dynamic_caption_page") and hasattr(self.dynamic_caption_page, "writing_language"):
+                cur = writing_language_from_ui(self.dynamic_caption_page.writing_language.currentText())
+                fill_writing_language_combo(self.dynamic_caption_page.writing_language, cur)
+            if hasattr(self, "language_edit"):
+                cur = writing_language_from_ui(self.language_edit.currentText())
+                fill_writing_language_combo(self.language_edit, cur)
+        else:
+            QMessageBox.warning(self, "导入失败", message)
+
+    def _reload_language_packs(self):
+        reload_language_packs()
+        QMessageBox.information(self, "已重新加载", "语言包缓存已刷新。新规则将在下次格式化字幕时生效。")
+        write_app_log("用户触发重新加载语言包", "INFO", "语言包")
+
+    def _open_path(self, path: str):
+        from modules.platform_utils import open_local_path
+        open_local_path(path)
 
     def _page_shell(self, title, subtitle):
         page = QWidget()
@@ -2453,97 +2651,119 @@ class MainWindow(QMainWindow):
         return page
 
     def _help_page(self):
-        page, layout = self._page_shell("帮助与使用说明", "从添加素材到导出成品的常用操作说明；遇到组件问题也可以在这里快速定位。")
-        actions = QHBoxLayout()
-        logs = QPushButton("查看软件日志")
-        logs.clicked.connect(self._show_app_log)
-        keys = QPushButton("打开密钥管理")
-        keys.clicked.connect(lambda: self._show_page(6))
-        components = QPushButton("检查设置与组件")
-        components.setObjectName("primary")
-        components.clicked.connect(lambda: self._show_page(7))
-        update_btn = QPushButton("在线检测更新")
-        update_btn.clicked.connect(lambda: self._check_update(manual=True))
-        actions.addWidget(logs)
-        actions.addWidget(keys)
-        actions.addWidget(components)
-        actions.addWidget(update_btn)
-        actions.addStretch()
-        layout.addLayout(actions)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 18, 28, 18)
+        layout.setSpacing(10)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("background: transparent;")
-        
-        content_widget = QWidget()
-        content_widget.setStyleSheet("background: transparent;")
-        content_layout = QVBoxLayout(content_widget)
-        content_layout.setContentsMargins(0, 10, 0, 20)
-        content_layout.setSpacing(12)
-        
-        sections = [
-            ("⚡", "快速开始", 
-             "① **选择业务功能**：在顶部导航栏选择您需要的工具页面（如 Reels 编辑器、智能剪辑、批量里命名等）。\n"
-             "② **导入素材文件**：直接拖入或点击按钮导入您的视频、音频、图片或整个素材文件夹。\n"
-             "③ **配置处理参数**：根据页面提示设置所需的输出规格，并在输出目录框检查/选择成品的存放位置。\n"
-             "④ **执行与查看**：强烈建议先点击 [预览] 检查效果，确定无误后点击 [开始批量执行]，等待进度条走满即可在成品目录查看结果。"),
-             
-            ("📁", "素材添加与拖拽", 
-             "① **拖拽与选择导入**：所有支持素材输入的页面均可直接拖拽文件或整个文件夹入内，或点击框旁按钮导入。\n"
-             "② **子目录筛选机制**：拖入一个父文件夹后，软件会在下方列表显示所有包含的子文件夹，您可以双击或勾选来指派具体要处理的子目录。\n"
-             "③ **网络链接批量抓取**：批量截图和字幕提取页面支持批量抓取网络视频，每行填写一个视频链接（支持 YouTube、TikTok、Instagram、Facebook 等）即可自动下载并开始处理。"),
-             
-            ("📝", "智能字幕提取", 
-             "① **导入待处理媒体**：在字幕提取页拖入需要提取字幕的视频、音频或整个素材文件夹，或者填入网页视频链接。\n"
-             "② **选择语音识别服务**：推荐选用「本地 Whisper（免费、无需密钥）」，配置较低建议选择 medium 模型并开启 VAD 静音加速；若有海外密钥，可使用 Groq, Gemini, ElevenLabs 等，支持轮询负载均衡。\n"
-             "③ **执行提取与精修**：点击 [开始提取]，识别出的双语字幕会排列在下方，您可以双击任意一行直接编辑、修正错别字。\n"
-             "④ **导出复制**：点击下方按钮一键复制全部原文、全部中英对照，或打包导出为标准的 `.srt` 视频字幕或 `.txt` 文本文件。"),
-             
-            ("🎬", "Reels 编辑器", 
-             "① **第一步：文案与视频一一配对**：在左侧导入文案文件夹（每行一个句子，对应每个视频）和视频文件夹。软件默认按顺序一一配对合成。\n"
-             "② **第二步：配音与背景音乐混合**：开启语音合成（选择您的 TTS 服务商和配音音色）。如果想加入背景音乐，可在音频设置中指定 BGM 文件夹，并选择“替换为添加的音频”来静音原视频噪音，实现 TTS 配音 + BGM 背景音乐的完美双路混音！\n"
-             "③ **第三步：字幕设计与定位**：选择您喜欢的字体、字号（字号范围已放开到 10 - 600）、文字颜色、描边粗细和字幕放置位置（顶部/中间/底部）。\n"
-             "④ **第四步：打包批量生成**：点击右侧的 [开始批量执行] 进行 FFmpeg 合成，第一个视频对应第一条配音与第一行字幕，以此类推，完成无缝合成输出。"),
-             
-            ("🧹", "素材元数据清理", 
-             "① **进入清理页面**：从顶部点击“清除元数据”进入该功能，也可在“视频/图片水印”页面下方打开对应子页。\n"
-             "② **拖入原始素材**：将需要清理的视频、音频或图片文件/整个文件夹拖入界面，程序会扫描并加载信息。\n"
-             "③ **一键无损清理**：点击 [开始清理元数据]，软件会采用无损流复制方式清除视频与音频的设备、定位、作者、章节等隐私元数据，并为图片重新生成纯净副本，彻底移除 EXIF 拍摄信息，原文件内容不会损坏。"),
-             
-            ("⚙️", "自动流水线", 
-             "① **定制您的流水线步骤**：在自动流水线页面，自由勾选您需要合并串联执行的步骤（如：智能场景剪辑 → 字幕提取 → AI 标题生成 → 批量重命名 → 一键上传云端 → 自动填写 Google 表格）。\n"
-             "② **设置全局配置**：导入原始长视频或素材文件夹，设置各项参数，保存同步方案以便下次直接复用。\n"
-             "③ **断点续接机制**：点击 [开始流水线] 执行，程序会自动按步骤顺序全自动批量产出并上传，遇到网络波动失败时，支持在页面上点击 [继续上传/继续填表] 进行断点续接。"),
-             
-            ("🔑", "密钥与云端授权", 
-             "① **管理接口密钥**：点击顶部导航的“设置与组件”进入设置，或在帮助页点击“打开密钥管理”按钮。\n"
-             "② **密钥粘贴与诊断**：支持一次性粘贴多枚密钥（每行一个），点击诊断系统会自动排查网络连接、失效状态，并开启轮询以避免 API 超限。\n"
-             "③ **Google 账户授权**：若需授权 Google Drive / Sheets 自动同步，导入您的 client_secrets.json 授权文件，软件会自动拉起浏览器让您点击授权，安全且防丢。"),
-             
-            ("🛡️", "组件检查与故障恢复", 
-             "① **组件异常排查**：运行过程中若提示 FFmpeg / FFprobe 或 Python 依赖组件异常，直接进入“设置与组件”页面。\n"
-             "② **一键环境恢复**：点击 [一键检测并修复] 或 [重试配置]，系统会自动从打包好的临时或预设路径一键恢复损坏的组件运行环境，免去手动配置环境变量的烦恼。\n"
-             "③ **解析引擎更新**：遇到网络链接无法解析下载视频，可在此一键点击“更新 yt-dlp”获取最新解析引擎。"),
-             
-            ("🔄", "长视频与断点续接", 
-             "① **防重复处理缓存**：字幕提取和自动流水线默认开启“自动续接”。\n"
-             "② **按进度断点续做**：重复导入同一批视频时，软件会自动读取本地 pipeline_checkpoint.json 缓存，自动跳过已经成功剪辑、重命名或上传成功的视频，只对失败或新增的媒体进行处理。\n"
-             "③ **重做全部流程**：如果您想要全部重新处理，只需在页面参数中取消勾选“自动续接”即可。"),
-             
-            ("🚀", "提高本地识别效率", 
-             "① **GPU 显卡硬件加速**：使用本地 Whisper 时，如果您的电脑配有英伟达（NVIDIA）显卡，会自动启用 CUDA GPU 加速；若提示显卡暂不支持 FP16，程序会自动降级切换为 CPU INT8 运行，确保正常完成。\n"
-             "② **静音过滤（VAD）加速**：尽量开启 VAD（静音过滤），它会智能过滤掉说话间隔的空白区，直接跳过无声片段，使识别速度提升一倍以上。\n"
-             "③ **分段并发处理**：长视频提取时，Groq 在线接口会自动分段 90 秒进行并发请求并保存阶段进度，防止单次请求超时出错。"),
-        ]
-        
-        for icon, title, body in sections:
-            sect = CollapsibleSection(icon, title, body)
-            content_layout.addWidget(sect)
-            
-        content_layout.addStretch()
-        scroll.setWidget(content_widget)
-        layout.addWidget(scroll, 1)
+        heading = QLabel("帮助与使用说明")
+        heading.setObjectName("heading")
+        layout.addWidget(heading)
+        sub = QLabel("最上方「更新日志」看新功能；「快速上手」入门；「常见问题」带图标分类，右侧可快速跳转。")
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color:#94a3b8;font-size:14px;")
+        layout.addWidget(sub)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        nav_frame = QFrame()
+        nav_frame.setObjectName("helpSideNav")
+        nav_frame.setFixedWidth(220)
+        nav_frame.setStyleSheet(
+            "#helpSideNav{background:#0f172a;border:1px solid #334155;border-radius:10px;}"
+        )
+        nav_col = QVBoxLayout(nav_frame)
+        nav_col.setContentsMargins(10, 12, 10, 12)
+        nav_col.setSpacing(6)
+        nav_title = QLabel("目录")
+        nav_title.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:700;padding:0 4px 6px 4px;")
+        nav_col.addWidget(nav_title)
+
+        content_frame = QFrame()
+        content_frame.setObjectName("helpContentFrame")
+        content_frame.setStyleSheet(
+            "#helpContentFrame{background:#0b1220;border:1px solid #334155;border-radius:10px;}"
+        )
+        content_col = QVBoxLayout(content_frame)
+        content_col.setContentsMargins(8, 8, 8, 8)
+        content_col.setSpacing(8)
+
+        # 右侧顶部：常见问题板块快速跳转（仅在「⑦ 常见问题」显示）
+        self._help_jump_bar = QFrame()
+        self._help_jump_bar.setObjectName("helpJumpBar")
+        self._help_jump_bar.setStyleSheet(
+            "#helpJumpBar{background:#111827;border:1px solid #334155;border-radius:8px;}"
+        )
+        jump_layout = QHBoxLayout(self._help_jump_bar)
+        jump_layout.setContentsMargins(10, 8, 10, 8)
+        jump_layout.setSpacing(6)
+        jump_label = QLabel("快速跳转")
+        jump_label.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:700;")
+        jump_layout.addWidget(jump_label)
+        self._help_jump_buttons = []
+        for anchor, label in FAQ_JUMP:
+            jbtn = QPushButton(label)
+            jbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            jbtn.setStyleSheet(
+                "QPushButton{background:#1e293b;border:1px solid #475569;border-radius:6px;"
+                "padding:6px 10px;color:#e2e8f0;font-size:12px;font-weight:600;}"
+                "QPushButton:hover{background:#2563eb;border-color:#60a5fa;color:white;}"
+            )
+            jbtn.clicked.connect(lambda checked=False, a=anchor: self._jump_help_faq(a))
+            jump_layout.addWidget(jbtn)
+            self._help_jump_buttons.append(jbtn)
+        jump_layout.addStretch(1)
+        self._help_jump_bar.setVisible(False)
+        content_col.addWidget(self._help_jump_bar)
+
+        self._help_browser = QTextBrowser()
+        self._help_browser.setOpenExternalLinks(False)
+        self._help_browser.setStyleSheet(
+            "QTextBrowser{background:transparent;border:none;padding:4px 8px;"
+            "font-size:15px;color:#e2e8f0;}"
+        )
+        self._help_browser.document().setDefaultStyleSheet(HELP_CSS)
+        content_col.addWidget(self._help_browser, 1)
+
+        self._help_nav_buttons = []
+        for index, tab in enumerate(HELP_TABS):
+            btn = QPushButton(tab["title"])
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(self._side_nav_button_style())
+            btn.clicked.connect(lambda checked=False, i=index: self._show_help_tab(i))
+            nav_col.addWidget(btn)
+            self._help_nav_buttons.append(btn)
+        nav_col.addStretch(1)
+
+        body.addWidget(nav_frame)
+        body.addWidget(content_frame, 1)
+        layout.addLayout(body, 1)
+
+        self._show_help_tab(0)
         return page
+
+    def _show_help_tab(self, index: int, anchor: str | None = None):
+        if index < 0 or index >= len(HELP_TABS):
+            return
+        for i, btn in enumerate(getattr(self, "_help_nav_buttons", [])):
+            btn.setChecked(i == index)
+        tab = HELP_TABS[index]
+        html = f"<html><head></head><body>{tab['html']}</body></html>"
+        if hasattr(self, "_help_browser"):
+            self._help_browser.setHtml(html)
+            if hasattr(self, "_help_jump_bar"):
+                self._help_jump_bar.setVisible(index == HELP_FAQ_TAB_INDEX)
+            if anchor and index == HELP_FAQ_TAB_INDEX:
+                # 等文档布局完成后再滚动，避免锚点尚未就绪
+                QTimer.singleShot(30, lambda a=anchor: self._help_browser.scrollToAnchor(a))
+            else:
+                self._help_browser.verticalScrollBar().setValue(0)
+
+    def _jump_help_faq(self, anchor: str):
+        """右侧顶部导航：进入常见问题并滚动到对应板块。"""
+        self._show_help_tab(HELP_FAQ_TAB_INDEX, anchor=anchor)
 
     def _show_app_log(self):
         dialog = QDialog(self)
@@ -2616,9 +2836,14 @@ class MainWindow(QMainWindow):
         form.addRow("识别服务", self.provider_combo)
         self.model_edit = QLineEdit("按优先级自动匹配")
         form.addRow("模型", self.model_edit)
-        self.language_edit = QLineEdit("auto")
-        self.language_edit.setPlaceholderText("auto / zh / en / pt …")
-        form.addRow("语言代码", self.language_edit)
+        self.language_edit = QComboBox()
+        self.language_edit.setEditable(True)
+        fill_writing_language_combo(self.language_edit, "")
+        # 第一项「自动检测」对识别也表示 auto
+        self.language_edit.setToolTip(
+            "识别语言提示（whisper 等）与书写规范共用。"
+            "选「自动检测」时由模型/文本判断；也可选希腊、阿拉伯、西语等，或直接输入 el/ar/pt。")
+        form.addRow("语言 / 书写规范", self.language_edit)
         self.diarize_check = QCheckBox("区分说话人（服务支持时启用）")
         form.addRow("说话人", self.diarize_check)
         priority_widget = QWidget(); priority_row = QHBoxLayout(priority_widget)
@@ -2703,7 +2928,10 @@ class MainWindow(QMainWindow):
         form.addRow("画面阈值", self.pipeline_threshold)
         self.pipeline_provider = QComboBox(); self.pipeline_provider.addItems(TRANSCRIPTION_PROVIDERS)
         form.addRow("字幕服务", self.pipeline_provider)
-        self.pipeline_language = QLineEdit("auto"); form.addRow("语言", self.pipeline_language)
+        self.pipeline_language = QComboBox(); self.pipeline_language.setEditable(True)
+        fill_writing_language_combo(self.pipeline_language, "")
+        self.pipeline_language.setToolTip("识别语言与书写规范；自动检测或手动选择/输入语言码")
+        form.addRow("语言 / 书写规范", self.pipeline_language)
         rename_line = QHBoxLayout()
         self.pipeline_prefix = QLineEdit(); self.pipeline_prefix.setPlaceholderText("前缀")
         self.pipeline_date = QLineEdit(datetime.now().strftime("%Y%m%d"))
@@ -2816,29 +3044,51 @@ class MainWindow(QMainWindow):
             pass
 
     def _keys_page(self):
-        page, layout = self._page_shell("API 密钥管理", "每个服务可添加多枚密钥；调用时轮询，失效或额度受限会自动切换。")
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setMaximumHeight(250)
-        key_container = QWidget(); key_grid = QGridLayout(key_container)
-        key_grid.setContentsMargins(0, 0, 0, 0); key_grid.setSpacing(8)
-        self.provider_inputs = {}
-        provider_notes = {
-            "Groq": "高速 Whisper 转写",
-            "Gemini": "长音频理解与字幕",
-            "ElevenLabs": "Scribe 高精度识别",
-            "Gladia": "字幕与说话人识别",
-        }
-        for index, provider in enumerate(PROVIDERS):
-            group = QGroupBox(f"{provider} · {provider_notes[provider]}")
-            group.setCheckable(True); group.setChecked(True)
-            group_layout = QVBoxLayout(group); group_layout.setContentsMargins(10, 8, 10, 8); group_layout.setSpacing(5)
-            edit = QPlainTextEdit(); edit.setPlaceholderText("可一次粘贴多个密钥，每行一个")
-            edit.setMaximumHeight(68); self.provider_inputs[provider] = edit
-            add_btn = QPushButton(f"批量添加 {provider} 密钥")
-            add_btn.clicked.connect(lambda checked=False, p=provider: self._add_keys_for_provider(p))
-            group_layout.addWidget(edit); group_layout.addWidget(add_btn)
-            group.toggled.connect(lambda checked, box=edit, button=add_btn: (box.setVisible(checked), button.setVisible(checked)))
-            key_grid.addWidget(group, index // 2, index % 2)
-        scroll.setWidget(key_container); layout.addWidget(scroll)
+        page, layout = self._page_shell(
+            "🔑 API 密钥管理",
+            "粘贴密钥即可自动识别服务（Groq / Gemini / ElevenLabs / Gladia）；也可手动指定。调用时轮询，失效会自动切换。",
+        )
+        add_group = QGroupBox("添加密钥")
+        add_layout = QVBoxLayout(add_group)
+        add_layout.setContentsMargins(12, 12, 12, 12)
+        add_layout.setSpacing(8)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("归类方式"))
+        self.key_assign_mode = QComboBox()
+        self.key_assign_mode.addItem("自动识别服务（推荐）", "auto")
+        for provider in PROVIDERS:
+            self.key_assign_mode.addItem(f"强制归入 {provider}", provider)
+        self.key_assign_mode.setMinimumWidth(220)
+        self.key_assign_mode.setToolTip(
+            "自动：按密钥前缀归类（gsk_→Groq，AIza→Gemini，sk_→ElevenLabs，UUID→Gladia）。\n"
+            "识别不出时请在下拉框手动指定服务再添加。"
+        )
+        mode_row.addWidget(self.key_assign_mode, 1)
+        add_layout.addLayout(mode_row)
+        self.key_bulk_input = QPlainTextEdit()
+        self.key_bulk_input.setPlaceholderText(
+            "在此粘贴密钥，每行一枚；可混合多个服务。\n"
+            "示例：\n"
+            "gsk_xxxx…          → 自动归入 Groq\n"
+            "AIzaxxxx…          → 自动归入 Gemini\n"
+            "sk_xxxx…           → 自动归入 ElevenLabs"
+        )
+        self.key_bulk_input.setMinimumHeight(100)
+        self.key_bulk_input.setMaximumHeight(140)
+        add_layout.addWidget(self.key_bulk_input)
+        action_row = QHBoxLayout()
+        add_btn = QPushButton("添加密钥")
+        add_btn.setObjectName("primary")
+        add_btn.clicked.connect(self._add_keys_unified)
+        hint = QLabel("规则：gsk_ → Groq · AIza → Gemini · sk_ → ElevenLabs · UUID → Gladia")
+        hint.setStyleSheet("color:#7dd3fc;font-size:12px;")
+        action_row.addWidget(add_btn)
+        action_row.addWidget(hint, 1)
+        add_layout.addLayout(action_row)
+        # 兼容旧代码引用（单输入框映射）
+        self.provider_inputs = {p: self.key_bulk_input for p in PROVIDERS}
+        layout.addWidget(add_group)
+
         panel = QFrame(); panel.setObjectName("panel")
         panel_layout = QVBoxLayout(panel); panel_layout.setContentsMargins(10, 10, 10, 10)
         self.key_table = QTableWidget(0, 7)
@@ -3358,7 +3608,7 @@ class MainWindow(QMainWindow):
         self.thread = QThread(self)
         self.worker = PipelineWorker(
             self.store, sources, self.pipeline_output.text(), self.pipeline_threshold.value(),
-            provider, model, self.pipeline_language.text(), ffmpeg,
+            provider, model, self._pipeline_language_code(), ffmpeg,
             self.pipeline_prefix.text(), self.pipeline_date.text(), self.pipeline_suffix.text(),
             self.pipeline_start.value(), self.pipeline_padding.value(), cloud_config,
             self.pipeline_resume_check.isChecked())
@@ -3895,7 +4145,7 @@ class MainWindow(QMainWindow):
         self.original_result.clear(); self.chinese_result.clear()
         self.thread = QThread(self)
         self.worker = TranscribeWorker(self.store, provider, model, files, "",
-                                       self.language_edit.text(), self.diarize_check.isChecked(), ffmpeg,
+                                       self._subtitle_language_code(), self.diarize_check.isChecked(), ffmpeg,
                                        self.subtitle_resume_check.isChecked())
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -3908,6 +4158,15 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.start_btn.setEnabled(False); self.cancel_btn.setEnabled(True)
         self.thread.start()
+
+    def _subtitle_language_code(self) -> str:
+        """UI 语言下拉 → whisper/书写用码；空则 auto。"""
+        code = writing_language_from_ui(self.language_edit.currentText())
+        return code or "auto"
+
+    def _pipeline_language_code(self) -> str:
+        code = writing_language_from_ui(self.pipeline_language.currentText())
+        return code or "auto"
 
     def _cancel_transcription(self):
         if self.worker:
@@ -3980,23 +4239,59 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "导出完成", f"已导出 {len(self.subtitle_results)} 组字幕到：\n{output}")
 
     def _add_keys_for_provider(self, provider):
-        edit = self.provider_inputs[provider]
+        """兼容旧入口：按指定服务添加（使用统一输入框）。"""
+        if hasattr(self, "key_assign_mode"):
+            index = self.key_assign_mode.findData(provider)
+            if index >= 0:
+                self.key_assign_mode.setCurrentIndex(index)
+        self._add_keys_unified(force_provider=provider)
+
+    def _add_keys_unified(self, force_provider=None):
+        edit = getattr(self, "key_bulk_input", None)
+        if edit is None and getattr(self, "provider_inputs", None):
+            # 极旧布局回退
+            edit = next(iter(self.provider_inputs.values()), None)
+        if edit is None:
+            return
         keys = [line.strip() for line in edit.toPlainText().splitlines() if line.strip()]
         if not keys:
             QMessageBox.information(self, "没有密钥", "请粘贴至少一枚密钥，每行一个。")
             return
-        added, skipped = 0, []
+        mode = "auto"
+        if force_provider in PROVIDERS:
+            mode = force_provider
+        elif hasattr(self, "key_assign_mode"):
+            mode = self.key_assign_mode.currentData() or "auto"
+
+        counts = {p: 0 for p in PROVIDERS}
+        skipped, unknown = [], []
         for key in keys:
+            if mode == "auto":
+                provider = detect_api_provider(key)
+                if not provider:
+                    unknown.append(masked_key(key))
+                    continue
+            else:
+                provider = mode
             try:
                 self.store.add_key(provider, key)
-                added += 1
+                counts[provider] = counts.get(provider, 0) + 1
             except Exception:
                 skipped.append(masked_key(key))
-        edit.clear(); self._refresh_keys()
-        message = f"已添加 {added} 枚 {provider} 密钥。"
+
+        edit.clear()
+        self._refresh_keys()
+        parts = [f"{p} {n} 枚" for p, n in counts.items() if n]
+        message = "已添加：" + ("、".join(parts) if parts else "0 枚") + "。"
+        if unknown:
+            message += (
+                f"\n未能识别 {len(unknown)} 枚（请在上方下拉框选择服务后重试）："
+                + "、".join(unknown[:5])
+                + ("…" if len(unknown) > 5 else "")
+            )
         if skipped:
             message += f"\n跳过 {len(skipped)} 枚重复或无效内容。"
-        QMessageBox.information(self, "批量添加完成", message)
+        QMessageBox.information(self, "添加完成", message)
 
     def _refresh_keys(self):
         if not hasattr(self, "key_table"):
@@ -4042,6 +4337,15 @@ class MainWindow(QMainWindow):
         if jobs: self._run_key_check(jobs)
 
     def _run_key_check(self, jobs):
+        # 使用独立线程，避免与字幕/流水线共用 self.thread 互相踩踏
+        if getattr(self, "_key_check_thread", None):
+            try:
+                if self._key_check_thread.isRunning():
+                    QMessageBox.information(self, "任务进行中", "请等待当前密钥检测结束。")
+                    return
+            except RuntimeError:
+                self._key_check_thread = None
+        # 兼容：字幕任务占用 self.thread 时也提示
         if self.thread:
             try:
                 if self.thread.isRunning():
@@ -4049,13 +4353,19 @@ class MainWindow(QMainWindow):
                     return
             except RuntimeError:
                 self.thread = None
-        self.thread = QThread(self); self.worker = KeyCheckWorker(jobs); self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self._key_check_result)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(lambda: QMessageBox.information(self, "检测完成", "密钥检测已完成。"))
-        self.thread.finished.connect(self._thread_ended)
-        self.thread.finished.connect(self.thread.deleteLater); self.thread.start()
+
+        self._key_check_thread = QThread(self)
+        self._key_check_worker = KeyCheckWorker(jobs)
+        self._key_check_worker.moveToThread(self._key_check_thread)
+        self._key_check_thread.started.connect(self._key_check_worker.run)
+        # 显式排队到主线程，禁止在工作线程弹窗/改 UI
+        self._key_check_worker.progress.connect(
+            self._key_check_result, Qt.ConnectionType.QueuedConnection)
+        self._key_check_worker.finished.connect(
+            self._key_check_done, Qt.ConnectionType.QueuedConnection)
+        self._key_check_worker.finished.connect(self._key_check_thread.quit)
+        self._key_check_thread.finished.connect(self._key_check_cleanup)
+        self._key_check_thread.start()
 
     def _key_check_result(self, provider, key_id, ok, message):
         if ok:
@@ -4070,7 +4380,23 @@ class MainWindow(QMainWindow):
             status = "异常"
         self.store.update_key(provider, key_id, status=status,
                               last_checked=datetime.now().strftime("%Y-%m-%d %H:%M"), last_error="" if ok else message)
+        # progress 经 QueuedConnection 回到主线程，可安全刷新表格
         self._refresh_keys()
+
+    def _key_check_done(self):
+        """必须在主线程执行：最终刷新并提示（禁止在工作线程弹窗）。"""
+        self._refresh_keys()
+        QMessageBox.information(self, "检测完成", "密钥检测已完成。")
+
+    def _key_check_cleanup(self):
+        worker = getattr(self, "_key_check_worker", None)
+        thread = getattr(self, "_key_check_thread", None)
+        self._key_check_worker = None
+        self._key_check_thread = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
 
     def _show_selected_key_error(self):
         rows = self.key_table.selectionModel().selectedRows()
@@ -4119,29 +4445,35 @@ class MainWindow(QMainWindow):
 
 
     def _check_update(self, manual=False):
-        if hasattr(self, "_update_thread") and self._update_thread.isRunning():
-            if manual:
-                QMessageBox.information(self, "检查更新", "正在检查中，请稍候...")
-            return
-        
+        thread = getattr(self, "_update_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    if manual:
+                        QMessageBox.information(self, "检查更新", "正在检查中，请稍候...")
+                    return
+            except RuntimeError:
+                self._update_thread = None
+
         self._update_manual_check = manual
         self._update_thread = QThread(self)
         self._update_worker = UpdateCheckWorker(APP_VERSION)
         self._update_worker.moveToThread(self._update_thread)
         self._update_thread.started.connect(self._update_worker.run)
-        self._update_worker.finished.connect(self._on_update_finished)
+        # 禁止在 finished 槽里 wait 自己的线程（会死锁/跨线程弹窗崩溃）
+        self._update_worker.finished.connect(
+            self._on_update_finished, Qt.ConnectionType.QueuedConnection)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_thread.finished.connect(self._update_thread_cleanup)
         self._update_thread.start()
 
     def _on_update_finished(self, has_new, latest_version, download_url, error):
-        self._update_thread.quit()
-        self._update_thread.wait()
-        
         manual = getattr(self, "_update_manual_check", False)
         if error:
             if manual:
                 QMessageBox.warning(self, "检查更新失败", f"检测失败，错误原因：\n{error}")
             return
-        
+
         if has_new:
             reply = QMessageBox.question(
                 self, "检测到新版本",
@@ -4156,57 +4488,82 @@ class MainWindow(QMainWindow):
             if manual:
                 QMessageBox.information(self, "已经是最新版本", f"当前版本 v{APP_VERSION} 已经是最新版本！")
 
+    def _update_thread_cleanup(self):
+        worker = getattr(self, "_update_worker", None)
+        thread = getattr(self, "_update_thread", None)
+        self._update_worker = None
+        self._update_thread = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+
     def _start_update_download(self, version, url):
-        from PySide6.QtWidgets import QProgressDialog
-        self._update_progress_dialog = QProgressDialog("正在下载升级安装包，请稍候...", "取消", 0, 100, self)
-        self._update_progress_dialog.setWindowTitle("下载更新")
-        self._update_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self._update_progress_dialog.setMinimumDuration(0)
-        self._update_progress_dialog.canceled.connect(self._on_download_cancelled)
-        self._update_progress_dialog.show()
-        
+        thread = getattr(self, "_download_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    QMessageBox.information(self, "下载进行中", "已有更新包正在下载，请稍候。")
+                    return
+            except RuntimeError:
+                self._download_thread = None
+
+        QMessageBox.information(
+            self, "开始下载",
+            "最新版更新包已在后台开始静默下载。下载期间您可以继续正常使用软件，下载完成后将会自动提示您安装。")
+
         self._download_thread = QThread(self)
         self._download_worker = DownloadWorker(url, version)
         self._download_worker.moveToThread(self._download_thread)
         self._download_thread.started.connect(self._download_worker.run)
-        
         self._download_worker.progress.connect(self._on_download_progress)
-        self._download_worker.finished.connect(self._on_download_finished)
+        self._download_worker.finished.connect(
+            self._on_download_finished, Qt.ConnectionType.QueuedConnection)
+        self._download_worker.finished.connect(self._download_thread.quit)
+        self._download_thread.finished.connect(self._download_thread_cleanup)
         self._download_thread.start()
 
     def _on_download_progress(self, val):
-        if hasattr(self, "_update_progress_dialog") and self._update_progress_dialog:
-            self._update_progress_dialog.setValue(val)
+        pass
 
     def _on_download_cancelled(self):
-        if hasattr(self, "_download_worker") and self._download_worker:
+        if getattr(self, "_download_worker", None):
             self._download_worker.cancelled = True
-        if hasattr(self, "_download_thread") and self._download_thread:
-            self._download_thread.quit()
-            self._download_thread.wait()
 
     def _on_download_finished(self, success, file_path, error):
-        if hasattr(self, "_update_progress_dialog") and self._update_progress_dialog:
-            self._update_progress_dialog.close()
-        
-        if hasattr(self, "_download_thread") and self._download_thread:
-            self._download_thread.quit()
-            self._download_thread.wait()
-            
         if success:
-            try:
-                import subprocess
-                subprocess.Popen([file_path], shell=True)
-                self.close()
-            except Exception as e:
-                QMessageBox.warning(self, "运行安装包失败", f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
+            reply = QMessageBox.question(
+                self, "新版本下载完成",
+                "最新版本的升级安装包已在后台下载完成！\n是否现在退出本软件并启动升级安装？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    import subprocess
+                    subprocess.Popen([file_path], shell=True)
+                    # 仅在用户确认安装时主动关闭（预期行为，非崩溃）
+                    self.close()
+                except Exception as e:
+                    QMessageBox.warning(
+                        self, "运行安装包失败",
+                        f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
         else:
-            is_cancelled = False
-            if hasattr(self, "_download_worker") and self._download_worker:
-                is_cancelled = self._download_worker.cancelled
+            is_cancelled = bool(
+                getattr(self, "_download_worker", None)
+                and self._download_worker.cancelled)
             if not is_cancelled:
-                QMessageBox.warning(self, "下载失败", f"下载升级安装包失败：\n{error}")
+                QMessageBox.warning(self, "下载失败", f"后台下载升级安装包失败：\n{error}")
 
+    def _download_thread_cleanup(self):
+        worker = getattr(self, "_download_worker", None)
+        thread = getattr(self, "_download_thread", None)
+        self._download_worker = None
+        self._download_thread = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
 
 STYLE = """
 QWidget { background:#080d19; color:#e5edf9; font-family:'Microsoft YaHei UI'; font-size:12px; }
@@ -4215,6 +4572,10 @@ QWidget { background:#080d19; color:#e5edf9; font-family:'Microsoft YaHei UI'; f
 #navButton { padding:8px 10px; border:1px solid transparent; border-radius:7px; color:#9cacbf; }
 #navButton:hover { background:#192844; color:#f3f7ff; border-color:#2b4268; }
 #navButton:checked { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #2563eb,stop:1 #7c3aed); color:white; font-weight:700; }
+#updateNavButton { padding:8px 12px; border:1px solid #3b82f6; border-radius:7px; color:#bfdbfe; background:#13233f; font-weight:700; }
+#updateNavButton:hover { background:#1d4ed8; color:white; border-color:#60a5fa; }
+#logNavButton { padding:8px 12px; border:1px solid #475569; border-radius:7px; color:#e2e8f0; background:#172033; font-weight:600; }
+#logNavButton:hover { background:#334155; color:white; border-color:#94a3b8; }
 #heading { font-size:24px; font-weight:800; color:#f8fbff; }
 #toolCard, #panel { background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #121d31,stop:1 #0d1627); border:1px solid #263957; border-radius:12px; }
 #toolCard:hover { border-color:#3b82f6; }
@@ -4263,7 +4624,9 @@ def main():
     write_app_log(f"启动 {APP_DISPLAY_NAME}","INFO","应用")
     original_hook=sys.excepthook
     def log_unhandled(exc_type,exc_value,exc_traceback):
-        write_app_log(f"未处理异常：{exc_type.__name__}: {exc_value}","ERROR","应用")
+        import traceback
+        detail="".join(traceback.format_exception(exc_type,exc_value,exc_traceback))
+        write_app_log(f"未处理异常：{exc_type.__name__}: {exc_value}\n{detail}","ERROR","应用")
         original_hook(exc_type,exc_value,exc_traceback)
     sys.excepthook=log_unhandled
     if os.name == "nt":

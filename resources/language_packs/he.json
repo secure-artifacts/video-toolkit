@@ -1,0 +1,19 @@
+{
+  "code": "he",
+  "name": "עברית",
+  "rtl": true,
+  "quote_open": "“",
+  "quote_close": "”",
+  "single_open": "‘",
+  "single_close": "’",
+  "normalize_ascii_quotes": true,
+  "disable_letter_spacing": true,
+  "disable_word_highlight": true,
+  "font_hints": [
+    "Segoe UI",
+    "Tahoma",
+    "Arial",
+    "Noto Sans Hebrew",
+    "David"
+  ]
+}

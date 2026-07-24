@@ -1,0 +1,19 @@
+{
+  "code": "zh",
+  "name": "中文",
+  "rtl": false,
+  "quote_open": "“",
+  "quote_close": "”",
+  "book_open": "《",
+  "book_close": "》",
+  "single_open": "‘",
+  "single_close": "’",
+  "normalize_ascii_quotes": true,
+  "prefer_cjk_punctuation": true,
+  "font_hints": [
+    "Microsoft YaHei",
+    "SimHei",
+    "Noto Sans SC",
+    "Arial"
+  ]
+}

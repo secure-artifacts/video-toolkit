@@ -311,6 +311,13 @@ class MetadataPage(QWidget):
         if not files:
             QMessageBox.information(self, "没有素材", "请先添加视频、音频或图片。")
             return
+        if getattr(self, "thread", None):
+            try:
+                if self.thread.isRunning():
+                    QMessageBox.information(self, "任务进行中", "请等待当前清理结束。")
+                    return
+            except RuntimeError:
+                self.thread = None
         self.log.clear(); self.progress.setValue(0)
         self.thread = QThread(self)
         self.worker = MetadataWorker(files, self.output.text(), self.keep_structure.isChecked(), self.preserve_time.isChecked())

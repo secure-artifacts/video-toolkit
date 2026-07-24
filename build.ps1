@@ -6,7 +6,7 @@ if ([string]::IsNullOrWhiteSpace($version)) { $version = $env:GITHUB_REF_NAME }
 if ([string]::IsNullOrWhiteSpace($version)) {
   try { $version = (& git -C $root describe --tags --abbrev=0 2>$null).Trim() } catch { $version = '' }
 }
-if ([string]::IsNullOrWhiteSpace($version)) { $version = '1.7.6' }
+if ([string]::IsNullOrWhiteSpace($version)) { $version = '1.7.7' }
 $version = $version.Trim().TrimStart('v')
 if ($version -notmatch '^[0-9A-Za-z._-]+$') { throw "Invalid application version: $version" }
 $versionHook = Join-Path $env:TEMP ("video_toolkit_version_" + [guid]::NewGuid().ToString('N') + '.py')
@@ -27,7 +27,9 @@ python -m PyInstaller --noconfirm --windowed --onedir --contents-directory 'inte
   --name 'VideoToolkit' `
   --icon (Join-Path $root 'logo.ico') `
   --add-data ((Join-Path $root 'logo.ico') + ';.') `
+  --add-data ((Join-Path $root 'VERSION') + ';.') `
   --add-data ((Join-Path $root 'resources\fonts') + ';resources\fonts') `
+  --add-data ((Join-Path $root 'resources\language_packs') + ';resources\language_packs') `
   --add-binary ((Join-Path $mediaBin 'ffmpeg.exe') + ';.') `
   --add-binary ((Join-Path $mediaBin 'ffprobe.exe') + ';.') `
   --collect-data 'faster_whisper' `

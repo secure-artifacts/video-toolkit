@@ -32,6 +32,11 @@ toolkit.requests.get = fake_get
 assert toolkit.check_api_key("Groq", "gsk_valid_ascii_key") == (True, "验证通过")
 assert captured_headers["User-Agent"] == "VideoToolkit/1.0"
 assert toolkit.check_api_key("Groq", "中文密钥")[1].startswith("密钥格式异常")
+assert toolkit.detect_api_provider("gsk_abc123xyz") == "Groq"
+assert toolkit.detect_api_provider("AIzaSyDummyGeminiKey123456") == "Gemini"
+assert toolkit.detect_api_provider("sk_" + "x" * 30) == "ElevenLabs"
+assert toolkit.detect_api_provider("550e8400-e29b-41d4-a716-446655440000") == "Gladia"
+assert toolkit.detect_api_provider("random-unknown") is None
 toolkit.requests.get = original_get
 
 qt = QApplication([])
@@ -42,12 +47,45 @@ window.resize(1600, 920)
 assert window.pages.count() == 11
 assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 7
 assert window.nav_buttons[-1].text() == "帮助"
+assert hasattr(window, "update_btn") and window.update_btn.text() == "检查更新"
+assert hasattr(window, "log_nav_btn") and window.log_nav_btn.text() == "查看软件日志"
 assert not any(button.text() == "密钥管理" for button in window.nav_buttons)
+# 帮助页：常见问题集中在 ⑦；右侧顶部有快速跳转；业务页不再塞 FAQ
+help_page = window.pages.widget(9)
+help_buttons = [b.text() for b in help_page.findChildren(toolkit.QPushButton)]
+assert "打开密钥管理" not in help_buttons
+assert "检查设置与组件" not in help_buttons
+assert hasattr(window, "_help_browser")
+assert any("常见问题" in b.text() for b in window._help_nav_buttons)
+assert hasattr(window, "_help_jump_bar")
+assert len(window._help_jump_buttons) >= 6
+window.pages.setCurrentIndex(9)
+window._show_help_tab(toolkit.HELP_FAQ_TAB_INDEX)
+assert not window._help_jump_bar.isHidden()
+window._show_help_tab(0)
+assert window._help_jump_bar.isHidden()
+window._jump_help_faq("faq-reels")
+assert not window._help_jump_bar.isHidden()
+plain = window._help_browser.toPlainText()
+assert "Reels" in plain or "去口气" in plain
+# 业务页不再带 FaqPanel
+from modules.faq_panel import FaqPanel
+assert not any(isinstance(w, FaqPanel) for w in window.dynamic_caption_page.findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.screenshot_page.findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.smartcut_page.findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.rename_page.findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.metadata_page.findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.pages.widget(5).findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.pages.widget(8).findChildren(FaqPanel))
+assert not any(isinstance(w, FaqPanel) for w in window.component_settings_page.findChildren(FaqPanel))
 assert window.pages.widget(3) is window.dynamic_caption_page
 assert any(button.text() == "Reels 编辑器" for button in window.nav_buttons)
 assert not hasattr(window, "watermark_tabs")
 assert window.dynamic_caption_page.source_stack.count() == 4
 assert window.dynamic_caption_page.font.currentText() == "Arial"
+assert hasattr(window.dynamic_caption_page, "writing_language")
+assert hasattr(window.dynamic_caption_page, "rtl_word_highlight")
+assert hasattr(window, "language_edit")
 assert window.dynamic_caption_page.font_size.value() == 90
 assert window.dynamic_caption_page.letter_spacing.value() == -4
 assert window.dynamic_caption_page.line_spacing.value() == 100
@@ -55,13 +93,18 @@ assert window.dynamic_caption_page.margin_v.value() == 500
 assert window.dynamic_caption_page.cloud_sync_check.isChecked() is False
 assert not window.dynamic_caption_page.log.isHidden()
 assert not hasattr(window.dynamic_caption_page, "view_log_btn")
-assert any(button.text() == "查看软件日志" for button in window.pages.widget(9).findChildren(toolkit.QPushButton))
+assert window.log_nav_btn.text() == "查看软件日志"
 assert window.settings_page.count() == 4
-assert window.settings_page.tabText(1) == "字体管理"
-assert window.settings_page.tabText(3) == "API 密钥管理"
+assert "字体" in window.settings_page.tabText(1)
+assert "密钥" in window.settings_page.tabText(3)
+assert hasattr(window, "settings_stack")
+assert len(window._settings_nav_buttons) == 4
 window._show_page(6)
 assert window.pages.currentIndex() == 7
 assert window.settings_page.currentWidget() is window.key_settings_page
+# 帮助页首项为更新日志
+assert "更新日志" in window._help_nav_buttons[0].text()
+assert any("常见问题" in b.text() for b in window._help_nav_buttons)
 assert window.dynamic_caption_page.videos.isHidden()
 assert window.dynamic_caption_page.task_queue.parent() is not None
 assert window.dynamic_caption_page.watermark_opacity.value() == 100
@@ -130,6 +173,8 @@ assert window.pipeline_resume_check.isChecked()
 assert window.provider_combo.itemText(0) == toolkit.AUTO_PROVIDER
 assert window._resolve_provider() == toolkit.LOCAL_PROVIDER
 assert window.key_table.columnCount() == 7
+assert hasattr(window, "key_bulk_input") and hasattr(window, "key_assign_mode")
+assert window.key_assign_mode.itemData(0) == "auto"
 assert toolkit.is_supported_video_url("https://www.youtube.com/watch?v=test")
 assert toolkit.is_supported_video_url("https://www.facebook.com/watch/?v=1")
 assert toolkit.is_supported_video_url("https://www.instagram.com/reel/test/")

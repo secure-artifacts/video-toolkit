@@ -7,10 +7,10 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QComboBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter,
     QVBoxLayout, QWidget,
 )
 from .path_picker import DropListWidget, VIDEO_EXTENSIONS, collect_files, default_output_path, load_subfolders
@@ -129,38 +129,108 @@ class SmartCutPage(QWidget):
         self.build_ui()
 
     def build_ui(self):
-        layout = QVBoxLayout(self)
-        title = QLabel("智能剪辑")
-        title.setStyleSheet("font-size:26px;font-weight:800;")
-        layout.addWidget(title)
-        layout.addWidget(QLabel("支持自定义时长序列与智能场景识别，多文件并行处理。"))
-        layout.addWidget(QLabel("视频队列（可拖入视频或整个文件夹）"))
-        self.files = DropListWidget(); self.files.setMinimumHeight(115)
+        # 与自动流水线一致：左参数配置，右输出日志
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(8)
+        title = QLabel("✂ 智能剪辑")
+        title.setObjectName("heading")
+        root.addWidget(title)
+        sub = QLabel("支持自定义时长序列与智能场景识别，多文件批量处理。左侧配置，右侧查看运行日志。")
+        sub.setStyleSheet("color:#94a3b8;")
+        sub.setWordWrap(True)
+        root.addWidget(sub)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+
+        left = QFrame()
+        left.setObjectName("panel")
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 10, 12, 10)
+        left_layout.setSpacing(8)
+
+        left_layout.addWidget(QLabel("1. 视频队列（可拖入视频或整个文件夹）"))
+        self.files = DropListWidget()
+        self.files.setMinimumHeight(140)
         self.files.paths_dropped.connect(self.add_paths)
-        layout.addWidget(self.files)
+        left_layout.addWidget(self.files, 1)
         row = QHBoxLayout()
-        add = QPushButton("选择视频"); add.clicked.connect(self.add_files)
-        add_folder = QPushButton("选择文件夹"); add_folder.clicked.connect(self.add_folder)
-        clear = QPushButton("清空"); clear.clicked.connect(self.files.clear)
-        row.addWidget(add); row.addWidget(add_folder); row.addWidget(clear); row.addStretch(); layout.addLayout(row)
-        form = QFormLayout()
+        add = QPushButton("选择视频")
+        add.clicked.connect(self.add_files)
+        add_folder = QPushButton("选择文件夹")
+        add_folder.clicked.connect(self.add_folder)
+        clear = QPushButton("清空")
+        clear.clicked.connect(self.files.clear)
+        row.addWidget(add)
+        row.addWidget(add_folder)
+        row.addWidget(clear)
+        row.addStretch()
+        left_layout.addLayout(row)
+
+        settings = QGroupBox("2. 剪辑参数")
+        form = QFormLayout(settings)
+        form.setContentsMargins(10, 12, 10, 10)
+        form.setSpacing(8)
         out_row = QHBoxLayout()
         self.output = QLineEdit(str(default_output_path("智能剪辑输出")))
-        choose = QPushButton("选择…"); choose.clicked.connect(self.choose_output)
-        out_row.addWidget(self.output); out_row.addWidget(choose)
-        out_widget = QWidget(); out_widget.setLayout(out_row); form.addRow("输出目录", out_widget)
-        self.mode = QComboBox(); self.mode.addItems(["自定义时长序列", "智能画面识别"])
-        self.mode.currentTextChanged.connect(self.mode_changed); form.addRow("剪辑模式", self.mode)
-        self.sequence = QLineEdit("5,10,15"); form.addRow("时长序列（秒）", self.sequence)
-        self.loop = QLineEdit("30"); form.addRow("序列用完后循环时长", self.loop)
-        self.threshold = QLineEdit("27"); self.threshold.setEnabled(False); form.addRow("场景检测阈值", self.threshold)
-        layout.addLayout(form)
-        self.progress = QProgressBar(); layout.addWidget(self.progress)
-        self.log = QPlainTextEdit(); self.log.setReadOnly(True); layout.addWidget(self.log, 1)
-        actions = QHBoxLayout(); actions.addStretch()
-        self.stop = QPushButton("停止"); self.stop.setEnabled(False); self.stop.clicked.connect(self.cancel)
-        self.start = QPushButton("开始处理"); self.start.setObjectName("primary"); self.start.clicked.connect(self.start_work)
-        actions.addWidget(self.stop); actions.addWidget(self.start); layout.addLayout(actions)
+        choose = QPushButton("选择…")
+        choose.clicked.connect(self.choose_output)
+        out_row.addWidget(self.output, 1)
+        out_row.addWidget(choose)
+        out_widget = QWidget()
+        out_widget.setLayout(out_row)
+        form.addRow("输出目录", out_widget)
+        self.mode = QComboBox()
+        self.mode.addItems(["自定义时长序列", "智能画面识别"])
+        self.mode.currentTextChanged.connect(self.mode_changed)
+        form.addRow("剪辑模式", self.mode)
+        self.sequence = QLineEdit("5,10,15")
+        form.addRow("时长序列（秒）", self.sequence)
+        self.loop = QLineEdit("30")
+        form.addRow("序列用完后循环时长", self.loop)
+        self.threshold = QLineEdit("27")
+        self.threshold.setEnabled(False)
+        form.addRow("场景检测阈值", self.threshold)
+        left_layout.addWidget(settings)
+
+        self.progress = QProgressBar()
+        left_layout.addWidget(self.progress)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.stop = QPushButton("停止")
+        self.stop.setEnabled(False)
+        self.stop.clicked.connect(self.cancel)
+        self.start = QPushButton("开始处理")
+        self.start.setObjectName("primary")
+        self.start.clicked.connect(self.start_work)
+        actions.addWidget(self.stop)
+        actions.addWidget(self.start)
+        left_layout.addLayout(actions)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setWidget(left)
+
+        right = QFrame()
+        right.setObjectName("panel")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 10, 12, 10)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(QLabel("运行日志"))
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("任务进度与错误信息会显示在这里…")
+        self.log.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;")
+        right_layout.addWidget(self.log, 1)
+
+        split.addWidget(left_scroll)
+        split.addWidget(right)
+        split.setSizes([560, 720])
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        root.addWidget(split, 1)
 
     def mode_changed(self, mode):
         smart = mode == "智能画面识别"
@@ -200,11 +270,19 @@ class SmartCutPage(QWidget):
         except ValueError:
             QMessageBox.warning(self, "参数错误", "时长和阈值必须是数字。")
             return
+        if getattr(self, "thread", None):
+            try:
+                if self.thread.isRunning():
+                    QMessageBox.information(self, "任务进行中", "请等待当前剪辑结束。")
+                    return
+            except RuntimeError:
+                self.thread = None
         self.thread = QThread(self)
         self.worker = SmartCutWorker(files, self.output.text(), self.mode.currentText(), self.sequence.text(), loop, threshold, ffmpeg)
         self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.log.appendPlainText); self.worker.progress.connect(self.progress.setValue)
         self.worker.finished.connect(self.done); self.worker.finished.connect(self.thread.quit)
+        self.thread.finished.connect(self._ended)
         self.thread.finished.connect(self.thread.deleteLater)
         self.start.setEnabled(False); self.stop.setEnabled(True); self.thread.start()
 
@@ -214,3 +292,7 @@ class SmartCutPage(QWidget):
     def done(self, ok, message):
         self.start.setEnabled(True); self.stop.setEnabled(False); self.log.appendPlainText(message)
         (QMessageBox.information if ok else QMessageBox.critical)(self, "处理完成" if ok else "处理失败", message)
+
+    def _ended(self):
+        self.worker = None
+        self.thread = None
