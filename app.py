@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.7").strip().lstrip("v") or "1.7.7"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.8").strip().lstrip("v") or "1.7.8"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -4566,7 +4566,7 @@ class MainWindow(QMainWindow):
             thread.deleteLater()
 
 STYLE = """
-QWidget { background:#080d19; color:#e5edf9; font-family:'Microsoft YaHei UI'; font-size:12px; }
+QWidget { background:#080d19; color:#e5edf9; font-family:'Segoe UI','Microsoft YaHei UI','Microsoft YaHei',sans-serif; font-size:12px; }
 #nav { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #101a35,stop:.55 #111b2e,stop:1 #0b1325); border-bottom:1px solid #263655; }
 #brand { font-size:18px; font-weight:800; color:#f8fbff; padding-right:8px; }
 #navButton { padding:8px 10px; border:1px solid transparent; border-radius:7px; color:#9cacbf; }
@@ -4584,7 +4584,16 @@ QPushButton:hover { background:#223654; border-color:#4d6d97; }
 QPushButton:disabled { color:#64748b; background:#172033; }
 #primary { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #0ea5e9,stop:1 #6366f1); border-color:#60a5fa; color:white; font-weight:700; padding:7px 15px; }
 #primary:hover { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #38bdf8,stop:1 #818cf8); }
-QLineEdit, QComboBox, QSpinBox, QListWidget, QPlainTextEdit, QTextEdit, QTableWidget { background:#0c1424; border:1px solid #2b3d58; border-radius:5px; padding:4px; selection-background-color:#2563eb; }
+QLineEdit, QComboBox, QListWidget, QPlainTextEdit, QTextEdit, QTableWidget { background:#0c1424; border:1px solid #2b3d58; border-radius:5px; padding:4px; selection-background-color:#2563eb; }
+/* SpinBox 单独保证数字区宽度：窄屏/高 DPI 下被压扁时数字会显示成 x/I/O 残影 */
+QSpinBox, QDoubleSpinBox {
+  background:#0c1424; border:1px solid #2b3d58; border-radius:5px;
+  padding:2px 6px 2px 4px; min-height:26px; min-width:70px;
+  selection-background-color:#2563eb;
+  font-family:'Segoe UI','Microsoft YaHei UI','Microsoft YaHei',Arial,sans-serif;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button { width:16px; }
 QGroupBox { background:#101a2b; border:1px solid #293d5c; border-radius:8px; margin-top:8px; padding-top:7px; font-weight:700; }
 QGroupBox::title { subcontrol-origin:margin; left:9px; padding:0 4px; color:#b8c8dc; }
 QHeaderView::section { background:#17243a; color:#cbd5e1; border:none; padding:6px; }
