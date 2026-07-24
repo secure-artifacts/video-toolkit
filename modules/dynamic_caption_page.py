@@ -44,7 +44,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QTabWidget,
     QStackedWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QVBoxLayout, QWidget,
@@ -53,7 +53,13 @@ from PySide6.QtWidgets import (
 from .path_picker import (
     AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DropFolderLineEdit, DropListWidget, DropButton, DropTableWidget, collect_files, default_output_path, natural_key,
 )
-from .group_merge import GroupMergeWorker, discover_groups, split_group_script
+from .group_merge import (
+    GroupMergeWorker,
+    discover_groups,
+    merge_transition_labels,
+    resolve_merge_transition,
+    split_group_script,
+)
 from .settings_page import hidden_kwargs
 from .text_rules import normalize_required_capitalization, normalize_subtitle_text
 from .language_style import (
@@ -3138,7 +3144,19 @@ class DynamicCaptionPage(QWidget):
         self.aspect_ratio = QComboBox(); self.aspect_ratio.addItems(["原始比例", "16:9", "3:4", "1:1"])
         self.resolution = QComboBox(); self.resolution.addItems(["默认最高", "720p", "1080p", "2K", "4K"])
         self.video_extend_mode = QComboBox(); self.video_extend_mode.addItems(["不处理", "循环播放视频", "最后一帧延长/冻结", "速度拉伸（减速延长）"])
-        self.transition_name = QComboBox(); self.transition_name.addItems(["无转场", "淡入淡出", "溶解", "向左滑动", "向右滑动", "向上滑动", "向下滑动", "直线向左擦除", "直线向右擦除", "直线向上擦除", "直线向下擦除"])
+        self.transition_name = QComboBox()
+        self.transition_name.addItems(merge_transition_labels())
+        self.transition_duration = QDoubleSpinBox()
+        self.transition_duration.setRange(0.10, 2.50)
+        self.transition_duration.setSingleStep(0.05)
+        self.transition_duration.setDecimals(2)
+        self.transition_duration.setValue(0.50)
+        self.transition_duration.setSuffix(" 秒")
+        self.transition_duration.setMinimumWidth(96)
+        self.transition_duration.setToolTip(
+            "片段之间转场持续时长。切换转场类型时会填入该类型推荐默认值，可再手动改。"
+            "实际时长不会超过最短片段的 45%，避免素材过短导致失败。"
+        )
         self.aspect_ratio.setToolTip("分组合成与批量导出都会统一到此画面比例。")
         self.resolution.setToolTip("分组合成与批量导出都会统一到此分辨率。")
         self.video_extend_mode.setToolTip(
@@ -3146,9 +3164,11 @@ class DynamicCaptionPage(QWidget):
             "左侧「合成」多片段合并不使用此项。"
         )
         self.transition_name.setToolTip(
-            "仅左侧「合成」多片段合并时生效（xfade）。单片段组无转场；"
+            "仅左侧「合成」且组内 ≥2 个片段时生效。\n"
+            "达芬奇风格：交叉叠化 / Cross Dissolve / Crash Zoom / 平滑剪接（hblur 近似，非光流 AI）。\n"
             "「开始批量导出」不再做片段间转场。"
         )
+        self.transition_name.currentTextChanged.connect(self._transition_name_changed)
         for combo in (self.aspect_ratio, self.resolution, self.video_extend_mode, self.transition_name):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(8); combo.setMinimumWidth(0)
@@ -3156,8 +3176,10 @@ class DynamicCaptionPage(QWidget):
         video_opts_form.addRow("画面分辨率", self.resolution)
         video_opts_form.addRow("视频延长", self.video_extend_mode)
         video_opts_form.addRow("合并转场", self.transition_name)
+        video_opts_form.addRow("转场时长", self.transition_duration)
         video_opts_layout.addLayout(video_opts_form)
         self.video_opts_group = video_opts_group
+        self._transition_name_changed(self.transition_name.currentText())
 
         rename_group = QGroupBox("🏷️ 8. 自动重命名（使用文案标题）")
         rename_layout = QVBoxLayout(rename_group); rename_layout.setContentsMargins(9,11,9,8); rename_layout.setSpacing(6)
@@ -3560,6 +3582,7 @@ class DynamicCaptionPage(QWidget):
             "clean_metadata": self.clean_metadata.isChecked(),
             # 第 7 节选项：此前未传入合成 Worker，导致合并转场/比例/分辨率一直不生效
             "transition_name": self.transition_name.currentText(),
+            "transition_duration": float(self.transition_duration.value()),
             "aspect_ratio": self.aspect_ratio.currentText(),
             "resolution": self.resolution.currentText(),
             "video_extend_mode": self.video_extend_mode.currentText(),
@@ -3604,13 +3627,27 @@ class DynamicCaptionPage(QWidget):
             self._append_run_log("开始文案匹配合成：识别片段文字 → 按文案排序 → 去口气音 → 无缝合成。")
         transition = settings.get("transition_name") or "无转场"
         if transition and transition != "无转场":
+            dur = float(settings.get("transition_duration") or 0.5)
             self._append_run_log(
-                f"合并转场：{transition}（多片段组内使用 xfade；仅 1 个片段的组无转场）。"
+                f"合并转场：{transition}，时长 {dur:.2f}s（多片段组内 xfade；仅 1 个片段的组无转场）。"
                 f" 画面 {settings.get('aspect_ratio')} / {settings.get('resolution')}。"
             )
         else:
             self._append_run_log("合并转场：无（硬切拼接）。")
         self.group_merge_thread.start()
+
+    def _transition_name_changed(self, name):
+        """切换转场类型时填入推荐默认时长；无转场时禁用时长框。"""
+        if not hasattr(self, "transition_duration"):
+            return
+        cfg = resolve_merge_transition(name)
+        enabled = cfg is not None
+        self.transition_duration.setEnabled(enabled)
+        if enabled:
+            default_dur = float(cfg.get("duration") or 0.5)
+            self.transition_duration.blockSignals(True)
+            self.transition_duration.setValue(default_dur)
+            self.transition_duration.blockSignals(False)
 
     def stop_group_merge(self):
         if self.group_merge_worker:
@@ -4056,6 +4093,7 @@ class DynamicCaptionPage(QWidget):
                         self.aspect_ratio, self.resolution, self.video_extend_mode, self.transition_name):
             control.currentTextChanged.connect(self._refresh_live_preview)
             control.currentTextChanged.connect(self._save_style_preferences)
+        self.transition_duration.valueChanged.connect(self._save_style_preferences)
         self.rtl_word_highlight.toggled.connect(self._save_style_preferences)
         self.rtl_word_highlight.toggled.connect(self._refresh_live_preview)
         for control in (self.font_size, self.line_length, self.line_width, self.letter_spacing, self.word_spacing,
@@ -4565,6 +4603,7 @@ class DynamicCaptionPage(QWidget):
             "resolution": self.resolution.currentText(),
             "video_extend_mode": self.video_extend_mode.currentText(),
             "transition_name": self.transition_name.currentText(),
+            "transition_duration": float(self.transition_duration.value()),
             "rename_enabled": self.rename_enabled.isChecked(),
             "rename_prefix": self.rename_prefix.text(),
             "rename_date_enabled": self.rename_date_enabled.isChecked(),
@@ -4616,7 +4655,8 @@ class DynamicCaptionPage(QWidget):
                "outline_width":self.outline_width,"margin_v":self.margin_v,"watermark_width":self.watermark_width,
                "original_volume":self.original_volume,"background_volume":self.background_volume,
                "audio_fade_in_ms":self.audio_fade_in,"audio_fade_out_ms":self.audio_fade_out,
-               "watermark_opacity":self.watermark_opacity,"watermark_margin":self.watermark_margin}
+               "watermark_opacity":self.watermark_opacity,"watermark_margin":self.watermark_margin,
+               "transition_duration":self.transition_duration}
         for key,control in combos.items():
             if key in saved: control.setCurrentText(str(saved[key]))
         for key,control in spins.items():
@@ -5270,6 +5310,7 @@ class DynamicCaptionPage(QWidget):
                 "resolution": self.resolution.currentText(),
                 "video_extend_mode": self.video_extend_mode.currentText(),
                 "transition_name": self.transition_name.currentText(),
+                "transition_duration": float(self.transition_duration.value()),
                 "rename_enabled": self.rename_enabled.isChecked(),
                 "rename_prefix": self.rename_prefix.text(),
                 "rename_suffix_enabled": self.rename_suffix_enabled.isChecked(),

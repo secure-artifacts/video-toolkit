@@ -16,6 +16,47 @@ from .settings_page import hidden_kwargs
 from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder, calculate_target_size
 
 
+# 合并转场预设：UI 显示名 → FFmpeg xfade 参数。
+# 达芬奇「平滑剪接」依赖光流，此处用 hblur 短过渡近似；Crash Zoom 用 zoomin 近似。
+MERGE_TRANSITION_PRESETS = {
+    "无转场": None,
+    # —— 达芬奇风格（与 Resolve 转场库对应）——
+    "交叉叠化": {"xfade": "dissolve", "duration": 0.65},
+    "Cross Dissolve": {"xfade": "dissolve", "duration": 0.65},
+    "Crash Zoom": {"xfade": "zoomin", "duration": 0.42},
+    "平滑剪接": {"xfade": "hblur", "duration": 0.28},
+    # —— 常用 xfade ——
+    "淡入淡出": {"xfade": "fade", "duration": 0.50},
+    "溶解": {"xfade": "dissolve", "duration": 0.55},
+    "淡入黑场": {"xfade": "fadeblack", "duration": 0.55},
+    "淡入白场": {"xfade": "fadewhite", "duration": 0.55},
+    "向左滑动": {"xfade": "slideleft", "duration": 0.50},
+    "向右滑动": {"xfade": "slideright", "duration": 0.50},
+    "向上滑动": {"xfade": "slideup", "duration": 0.50},
+    "向下滑动": {"xfade": "slidedown", "duration": 0.50},
+    "直线向左擦除": {"xfade": "wipeleft", "duration": 0.45},
+    "直线向右擦除": {"xfade": "wiperight", "duration": 0.45},
+    "直线向上擦除": {"xfade": "wipeup", "duration": 0.45},
+    "直线向下擦除": {"xfade": "wipedown", "duration": 0.45},
+    "圆形打开": {"xfade": "circleopen", "duration": 0.50},
+    "圆形关闭": {"xfade": "circleclose", "duration": 0.50},
+    "水平打开": {"xfade": "horzopen", "duration": 0.45},
+    "垂直打开": {"xfade": "vertopen", "duration": 0.45},
+    "像素化": {"xfade": "pixelize", "duration": 0.50},
+    "径向模糊": {"xfade": "radial", "duration": 0.50},
+}
+
+
+def merge_transition_labels():
+    """Ordered labels for the Reels transition combo box."""
+    return list(MERGE_TRANSITION_PRESETS.keys())
+
+
+def resolve_merge_transition(name):
+    """Return {xfade, duration} or None for hard cut."""
+    return MERGE_TRANSITION_PRESETS.get(str(name or "").strip())
+
+
 def discover_groups(parent):
     """Discover groups by child folder, or by a shared filename prefix plus numeric suffix."""
     root = Path(parent)
@@ -547,9 +588,10 @@ class GroupMergeWorker(QObject):
                     "files": [self._signature(path) for path in normalized],
                     "clean_metadata": bool(self.settings.get("clean_metadata", True)),
                     "transition_name": self.settings.get("transition_name", "无转场"),
+                    "transition_duration": float(self.settings.get("transition_duration") or 0),
                     "aspect_ratio": self.settings.get("aspect_ratio", "原始比例"),
                     "resolution": self.settings.get("resolution", "默认最高"),
-                    "version": 4,
+                    "version": 5,
                 }, sort_keys=True).encode("utf-8")).hexdigest()
                 state_file = cache_dir / "final.json"
                 try:
@@ -560,29 +602,27 @@ class GroupMergeWorker(QObject):
                         and state.get("fingerprint") == final_fingerprint):
                     self.log.emit(f"正在合并文件夹“{folder.name}”的 {len(normalized)} 个片段，请等待…")
                     
-                    TRANSITIONS_MAP = {
-                        "淡入淡出": "fade",
-                        "溶解": "dissolve",
-                        "向左滑动": "slideleft",
-                        "向右滑动": "slideright",
-                        "向上滑动": "slideup",
-                        "向下滑动": "slidedown",
-                        "直线向左擦除": "wipeleft",
-                        "直线向右擦除": "wiperight",
-                        "直线向上擦除": "wipeup",
-                        "直线向下擦除": "wipedown",
-                    }
                     transition_name = self.settings.get("transition_name", "无转场")
-                    transition_key = TRANSITIONS_MAP.get(transition_name)
+                    transition_cfg = resolve_merge_transition(transition_name)
+                    transition_key = (transition_cfg or {}).get("xfade") if transition_cfg else None
                     
                     if transition_key and len(normalized) > 1:
-                        transition_duration = 0.5
+                        # 优先用户在 UI 设置的时长；未设置时用该转场类型的推荐默认值
+                        user_dur = self.settings.get("transition_duration")
+                        try:
+                            user_dur = float(user_dur) if user_dur is not None else 0.0
+                        except (TypeError, ValueError):
+                            user_dur = 0.0
+                        preset_dur = float((transition_cfg or {}).get("duration") or 0.5)
+                        transition_duration = user_dur if user_dur >= 0.10 else preset_dur
+                        transition_duration = max(0.10, min(2.50, transition_duration))
                         segment_infos = [self._probe(path) for path in normalized]
                         min_segment_dur = min(info["duration"] for info in segment_infos)
-                        actual_transition_duration = min(transition_duration, min_segment_dur * 0.5)
+                        # 转场不得超过最短片段的 45%，避免过短素材 xfade 失败
+                        actual_transition_duration = min(transition_duration, max(0.12, min_segment_dur * 0.45))
                         self.log.emit(
-                            f"应用合并转场「{transition_name}」→ {transition_key}，"
-                            f"时长 {actual_transition_duration:.2f}s，共 {len(normalized)} 段。"
+                            f"应用合并转场「{transition_name}」→ xfade={transition_key}，"
+                            f"时长 {actual_transition_duration:.2f}s（设定 {transition_duration:.2f}s），共 {len(normalized)} 段。"
                         )
                         
                         concat_command = [
