@@ -103,6 +103,20 @@ PRESETS = {
     "外框字幕": {"text": "#FFFFFF", "outline": "#8B5CF6", "highlight": "#8B5CF6", "outline_width": 5, "effect": "outline"},
     "背景跟读": {"text": "#FFFFFF", "outline": "#111827", "highlight": "#2563EB", "outline_width": 2, "effect": "highlight"},
     "光晕字幕": {"text": "#F5F3FF", "outline": "#7C3AED", "highlight": "#A855F7", "outline_width": 6, "effect": "glow"},
+    # CapCut/Reels：先整句语义排版定稿（位置固定），再按语速逐词弹出；句末硬切防叠字
+    "Reels 语义重点": {
+        "text": "#FFFFFF", "outline": "#0A0A0A", "highlight": "#FFFFFF", "outline_width": 5,
+        "effect": "semantic_stack", "font": "Arial", "font_size": 86, "line_length": 22,
+        "letter_spacing": -1, "line_spacing": 115, "margin_v": 480,
+        "max_words": 7, "highlight_padding": 10, "animation_speed": 70,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 88,
+        # 重点词约 +18%，其余约 -22%，差距能看清又不过分
+        "semantic_large_ratio": 1.18,
+        "semantic_small_ratio": 0.78,
+        # 不再提前出字，严格跟词级时间，避免「字幕提前导致对不上」
+        "semantic_lead_ms": 0,
+    },
 }
 
 OPEN_SOURCE_FONTS = {
@@ -419,6 +433,13 @@ class PresetPreviewButton(QPushButton):
         elif effect == "word_color":
             painter.setPen(text_color); painter.drawText(x,baseline,"字幕"); x2=x+metrics.horizontalAdvance("字幕")
             painter.setPen(highlight); painter.drawText(x2,baseline,"样式")
+        elif effect in ("semantic_stack", "word_scale"):
+            # 预览卡：大号重点 + 小号陪衬，示意语义堆叠
+            small = QFont(font); small.setPixelSize(11); small.setBold(True)
+            big = QFont(font); big.setPixelSize(18); big.setBold(True)
+            painter.setFont(big); painter.setPen(text_color); painter.drawText(x, baseline - 2, "重点")
+            painter.setFont(small); painter.setPen(text_color)
+            painter.drawText(x + QFontMetricsF(big).horizontalAdvance("重点") + 3, baseline, "铺陈")
         else:
             painter.setPen(highlight); painter.drawText(x,baseline,sample)
         painter.end()
@@ -853,6 +874,297 @@ def tokens_for(text):
     return re.findall(r"\S+", text)
 
 
+# 虚词/功能词：语义重点排版时默认小号；内容词按得分挑大号
+_EMPHASIS_STOPWORDS = {
+    # English
+    "a", "an", "the", "and", "or", "but", "if", "of", "to", "in", "on", "for", "with", "as", "at",
+    "by", "from", "is", "are", "was", "were", "be", "been", "am", "do", "does", "did", "have", "has",
+    "had", "will", "would", "can", "could", "should", "may", "might", "must", "this", "that", "these",
+    "those", "it", "its", "my", "your", "his", "her", "our", "their", "me", "you", "him", "them",
+    "we", "they", "i", "not", "no", "so", "than", "then", "too", "very", "just", "also", "only",
+    "into", "about", "over", "after", "before", "when", "what", "who", "which", "how", "why", "all",
+    "any", "some", "more", "most", "other", "such", "own", "same", "both", "each", "few", "many",
+    "much", "up", "out", "off", "down", "again", "further", "once", "here", "there", "where", "while",
+    "because", "though", "although", "until", "unless", "whether", "nor", "yet", "per", "via",
+    # Portuguese / Spanish common function words
+    "o", "os", "as", "um", "uma", "uns", "umas", "de", "da", "do", "das", "dos", "e", "em", "no",
+    "na", "nos", "nas", "que", "se", "por", "para", "com", "sem", "ao", "aos", "ou", "mas", "como",
+    "já", "não", "nao", "mais", "el", "la", "los", "las", "un", "una", "del", "al", "y", "en",
+    "lo", "le", "les", "su", "sus", "mi", "tu", "me", "te", "nos", "vos", "es", "son", "está",
+    "esta", "são", "sao", "ser", "estar", "foi", "era", "há", "ha", "tem", "ter", "um", "uma",
+    "pra", "pro", "pela", "pelo", "pelas", "pelos", "entre", "sobre", "até", "ate", "depois",
+    "antes", "quando", "onde", "quem", "qual", "quais", "porque", "pois", "então", "entao",
+    # Chinese particles / light words
+    "的", "了", "着", "过", "在", "是", "和", "与", "或", "就", "都", "也", "还", "很", "把", "被",
+    "让", "给", "从", "向", "到", "对", "等", "及", "而", "并", "又", "再", "已", "将", "会", "能",
+    "要", "可", "这", "那", "哪", "什么", "怎么", "一个", "一些", "没有", "不是", "我们", "你们",
+    "他们", "她们", "它们", "自己",
+}
+
+
+def _token_core(token: str) -> str:
+    return re.sub(r"[^\w\u3400-\u9fff']+", "", str(token or ""), flags=re.UNICODE)
+
+
+def select_emphasis_words(tokens):
+    """按语义启发式挑选重点词（大号）；虚词/介词等小号。结果对同一句稳定可复现。"""
+    tokens = list(tokens or [])
+    n = len(tokens)
+    if n == 0:
+        return []
+    scores = []
+    for index, token in enumerate(tokens):
+        core = _token_core(token)
+        if not core:
+            scores.append(-100.0)
+            continue
+        low = core.casefold()
+        is_cjk = bool(re.search(r"[\u3400-\u9fff]", core))
+        if low in _EMPHASIS_STOPWORDS or core in _EMPHASIS_STOPWORDS:
+            scores.append(-12.0)
+            continue
+        # 过短的拉丁虚词倾向
+        if not is_cjk and len(core) <= 2:
+            scores.append(-4.0)
+            continue
+        score = 8.0 + min(len(core), 14)
+        if index == 0:
+            score += 2.5
+        if index == n - 1:
+            score += 3.5
+        # 稳定“随机”扰动：同一词在同一句里结果固定，不同句有变化
+        score += (abs(hash(f"{low}:{index}:{n}")) % 9)
+        scores.append(score)
+
+    content = [i for i, s in enumerate(scores) if s > 0]
+    if not content:
+        # 全是虚词时至少强调首尾有字的词，避免整屏全小
+        emph = [False] * n
+        for i in range(n):
+            if _token_core(tokens[i]):
+                emph[i] = True
+                break
+        for i in range(n - 1, -1, -1):
+            if _token_core(tokens[i]):
+                emph[i] = True
+                break
+        return emph
+
+    # 短句 1 个重点，中句 2 个，长句最多 3 个
+    if n <= 3:
+        k = 1
+    elif n <= 8:
+        k = 2
+    else:
+        k = 3
+    k = min(k, len(content))
+
+    # 优先句首/句尾实词做大号（更像参考：bless … safe），再用得分补足
+    picks = []
+    picks.append(content[0])
+    if k >= 2 and content[-1] != content[0]:
+        picks.append(content[-1])
+    ranked = sorted(content, key=lambda i: scores[i], reverse=True)
+    for i in ranked:
+        if len(picks) >= k:
+            break
+        if i in picks:
+            continue
+        # 尽量不与已选重点相邻，中间留给小号铺陈
+        if any(abs(i - p) == 1 for p in picks):
+            continue
+        picks.append(i)
+    if len(picks) < k:
+        for i in ranked:
+            if i in picks:
+                continue
+            picks.append(i)
+            if len(picks) >= k:
+                break
+    emph = [False] * n
+    for i in picks:
+        emph[i] = True
+    return emph
+
+
+def _semantic_non_overlapping_phrases(entries, gap=0.08):
+    """保证相邻句 end[i] <= start[i+1]-gap；必要时后移下一句，绝不把结束时间拉过下一句。"""
+    if not entries:
+        return []
+    gap = max(0.02, float(gap))
+    min_dur = 0.05
+    out = [[float(s), float(e), t] for s, e, t in entries]
+    # 1) 缩短过长的结束时间
+    for i in range(len(out) - 1):
+        limit = out[i + 1][0] - gap
+        if out[i][1] > limit:
+            out[i][1] = limit
+    # 2) 若缩短后无效，后移下一句起点（而不是拉长当前句）
+    for i in range(len(out) - 1):
+        if out[i][1] < out[i][0] + min_dur:
+            out[i][1] = out[i][0] + min_dur
+        if out[i][1] > out[i + 1][0] - gap:
+            out[i + 1][0] = out[i][1] + gap
+            if out[i + 1][1] < out[i + 1][0] + min_dur:
+                out[i + 1][1] = out[i + 1][0] + min_dur
+    # 3) 丢弃仍无效的空窗
+    cleaned = []
+    for s, e, t in out:
+        if e > s + 0.02 and str(t).strip():
+            cleaned.append((s, e, t))
+    return cleaned
+
+
+def semantic_stack_layout(tokens, emphasized, settings):
+    """
+    语义堆叠排版：
+    - 重点词：大号，独占一行
+    - 普通词：小号，成组排成一行（自动按宽度换行）
+    返回 lines: [[{token, large, size, width}, ...], ...]
+    """
+    tokens = list(tokens or [])
+    if not tokens:
+        return []
+    if not emphasized or len(emphasized) != len(tokens):
+        emphasized = select_emphasis_words(tokens)
+
+    # 重点约 +18%、其余约 -22%（相对 base），层次清晰又不过分
+    large_size, small_size = _semantic_font_sizes(settings)
+    max_width = 1080 * max(40, min(96, int(settings.get("line_width", 88)))) / 100
+    family = str(settings.get("font", "Arial"))
+    bold = caption_uses_bold_face(settings)
+    letter = float(settings.get("letter_spacing", 0))
+
+    def make_metrics(size):
+        font = QFont(family)
+        font.setPixelSize(size)
+        font.setBold(bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter)
+        return QFontMetricsF(font)
+
+    m_large = make_metrics(large_size)
+    m_small = make_metrics(small_size)
+    gap_large = max(2.0, m_large.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
+    gap_small = max(2.0, m_small.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
+
+    lines = []
+    small_buf = []
+    # 小号行不宜过长，参考图一般 2～4 词一行，更整齐
+    max_small_words = max(2, min(5, int(settings.get("semantic_small_words", 3))))
+
+    def flush_small():
+        nonlocal small_buf
+        if not small_buf:
+            return
+        current = []
+        current_w = 0.0
+        for item in small_buf:
+            extra = gap_small if current else 0.0
+            too_wide = current and current_w + extra + item["width"] > max_width * 0.90
+            too_many = current and len(current) >= max_small_words
+            if too_wide or too_many:
+                lines.append(current)
+                current = [item]
+                current_w = item["width"]
+            else:
+                current.append(item)
+                current_w += extra + item["width"]
+        if current:
+            lines.append(current)
+        small_buf = []
+
+    for token, is_large in zip(tokens, emphasized):
+        if is_large:
+            flush_small()
+            width = max(large_size * 0.4, m_large.horizontalAdvance(token))
+            lines.append([{
+                "token": token, "large": True, "size": large_size, "width": width,
+            }])
+        else:
+            width = max(small_size * 0.35, m_small.horizontalAdvance(token))
+            small_buf.append({
+                "token": token, "large": False, "size": small_size, "width": width,
+            })
+    flush_small()
+    return lines
+
+
+def _semantic_font_sizes(settings):
+    """与 layout 一致的大小号像素尺寸（重点明显大于其余，但不过分夸张）。"""
+    base = max(24, int(settings.get("font_size", 86)))
+    large_ratio = float(settings.get("semantic_large_ratio", 1.18))
+    small_ratio = float(settings.get("semantic_small_ratio", 0.78))
+    large_size = max(28, int(round(base * max(1.05, min(1.35, large_ratio)))))
+    small_size = max(20, int(round(base * max(0.65, min(0.92, small_ratio)))))
+    if small_size >= large_size - 4:
+        small_size = max(20, large_size - 12)
+    return large_size, small_size
+
+
+def semantic_stack_geometry(lines, settings):
+    """把语义堆叠行居中摆到 1080x1920 画布，返回与 lines 同结构的几何信息。"""
+    if not lines:
+        return []
+    large_size, small_size = _semantic_font_sizes(settings)
+    family = str(settings.get("font", "Arial"))
+    bold = caption_uses_bold_face(settings)
+    letter = float(settings.get("letter_spacing", 0))
+
+    def make_metrics(size):
+        font = QFont(family)
+        font.setPixelSize(size)
+        font.setBold(bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter)
+        return QFontMetricsF(font)
+
+    m_large = make_metrics(large_size)
+    m_small = make_metrics(small_size)
+    gap_large = max(2.0, m_large.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
+    gap_small = max(2.0, m_small.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
+    spacing = max(70, min(180, int(settings.get("line_spacing", 118)))) / 100.0
+
+    line_heights = []
+    for line in lines:
+        if any(item.get("large") for item in line):
+            line_heights.append(max(large_size * 1.05, m_large.height()) * spacing)
+        else:
+            line_heights.append(max(small_size * 1.15, m_small.height()) * spacing * 0.92)
+
+    total_h = sum(line_heights)
+    position = settings.get("position", "画面中间")
+    if position == "顶部":
+        top = float(settings.get("margin_v", 250))
+    elif position == "画面中间":
+        top = max(80.0, 960.0 - total_h / 2.0)
+    else:
+        top = max(80.0, 1920.0 - float(settings.get("margin_v", 250)) - total_h)
+
+    result = []
+    y_cursor = top
+    for line, height in zip(lines, line_heights):
+        gap = gap_large if any(item.get("large") for item in line) else gap_small
+        widths = [float(item["width"]) for item in line]
+        total_w = sum(widths) + gap * max(0, len(widths) - 1)
+        x_cursor = (1080.0 - total_w) / 2.0
+        center_y = y_cursor + height / 2.0
+        metrics = m_large if any(item.get("large") for item in line) else m_small
+        baseline = center_y + metrics.ascent() / 2.0 - metrics.descent() / 2.0
+        row = []
+        for item, width in zip(line, widths):
+            row.append({
+                **item,
+                "left": x_cursor,
+                "x": x_cursor + width / 2.0,
+                "y": center_y,
+                "baseline": baseline,
+                "width": width,
+            })
+            x_cursor += width + gap
+        result.append(row)
+        y_cursor += height
+    return result
+
+
 def replace_srt_copy(srt, copy_text):
     events = parse_srt(srt)
     if not events or not copy_text.strip(): return srt
@@ -1126,7 +1438,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     position = render_settings.get("position", "底部")
     free_mode = render_settings.get("caption_mode") == "自由文案动画（不对口型）"
     free_animation = render_settings.get("free_animation", "淡入淡出")
-    for start, end, text in parse_srt(srt, language=lang):
+    effect_name = preset.get("effect", "word_color")
+    phrase_entries = list(parse_srt(srt, language=lang))
+    # 语义堆叠：句与句时间窗必须互斥。绝不能用 max(start+min, end) 把结束时间
+    # 硬拉长越过下一句起点——那正是「只有这个效果叠字」的根因。
+    if effect_name in ("semantic_stack", "word_scale"):
+        # 句与句硬切空隙略大，上一句读完立刻让位，避免停留叠到下一句
+        phrase_entries = _semantic_non_overlapping_phrases(phrase_entries, gap=0.10)
+
+    for phrase_index, (start, end, text) in enumerate(phrase_entries):
         safe = text.replace("{", "（").replace("}", "）")
         allow_rtl_words = bool(render_settings.get("rtl_word_highlight", False))
         # RTL 默认整句 + 方向标记；勾选「RTL 逐词高亮」时走下方逐词路径并对每个词包 RLE
@@ -1151,8 +1471,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         effect = preset["effect"]
         rtl_token_mode = is_rtl_text(safe, lang) and allow_rtl_words
         fixed_all = free_mode and free_animation == "整段固定"
-        # 整段固定保留手动换行，且允许任意行数；其他模式继续自动排版分页。
-        lines=caption_wrapped_lines(safe,render_settings,fixed_all,layout_context)
 
         # Use the word midpoint to assign it to exactly one phrase.  Overlap
         # tolerances made boundary words appear in two adjacent phrases and
@@ -1163,6 +1481,102 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             timings=[(phrase_words[i][0],phrase_words[i][1]) for i in range(len(tokens))]
         else:
             duration=max(.08,(end-start)/len(tokens)); timings=[(start+duration*i,min(end,start+duration*(i+1))) for i in range(len(tokens))]
+
+        # —— 语义重点：底层先整句语义排版定稿（位置固定，相当于透明底稿），
+        # 上层按词级语速逐词弹出；本句 end 硬切，杜绝停留叠到下一句 ——
+        if effect in ("semantic_stack", "word_scale"):
+            geo_settings = dict(render_settings)
+            geo_settings["position"] = "画面中间"
+            for key in ("semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+                        "semantic_max_lines", "semantic_small_words"):
+                if key not in geo_settings and key in preset:
+                    geo_settings[key] = preset[key]
+            # 词时间夹进本句，并保证单调递增，避免抢先/乱序
+            clamped = []
+            prev_s = start
+            span = max(0.08, end - start)
+            for i, (w_start, w_end) in enumerate(timings):
+                cs = max(start, min(float(w_start), end - 0.04))
+                cs = max(cs, prev_s)
+                # 均匀兜底：若时间挤在一起，按序号拉开一点，仍不超出本句
+                ideal = start + span * i / max(1, len(timings))
+                if cs > ideal + 0.35:
+                    cs = max(prev_s, ideal)
+                ce = max(cs + 0.04, min(float(w_end), end))
+                clamped.append((cs, ce))
+                prev_s = cs + 0.02
+            timings = clamped
+
+            # ① 整句语义定稿：大小号 + 行位一次算死（未读词不显示，但占位已定）
+            emphasized = select_emphasis_words(tokens)
+            stack_lines = semantic_stack_layout(tokens, emphasized, geo_settings)
+            max_stack_lines = max(3, min(6, int(geo_settings.get("semantic_max_lines", 5))))
+            stack_pages = (
+                [stack_lines]
+                if fixed_all or len(stack_lines) <= max_stack_lines
+                else [stack_lines[i:i + max_stack_lines] for i in range(0, len(stack_lines), max_stack_lines)]
+            )
+            lead_ms = geo_settings.get("semantic_lead_ms", 0)
+            try:
+                lead_ms = float(lead_ms)
+            except (TypeError, ValueError):
+                lead_ms = 0.0
+            lead = max(0.0, min(0.08, lead_ms / 1000.0))
+            pop_ms = max(40, min(110, int(animation_ms)))
+            fad_in = max(15, min(45, pop_ms // 2))
+            token_index = 0
+            for page_lines in stack_pages:
+                page_token_count = sum(len(line) for line in page_lines)
+                if page_token_count <= 0:
+                    continue
+                page_first = token_index
+                next_index = token_index + page_token_count
+                # 本页硬结束于：下一页首词 / 本句 end（不向后拉）
+                if next_index < len(timings):
+                    page_end = min(end, timings[next_index][0])
+                else:
+                    page_end = end
+                page_end = min(page_end, end)
+                if page_end <= timings[page_first][0] + 0.02:
+                    page_end = min(end, timings[page_first][0] + 0.05)
+                if page_end <= start:
+                    token_index += page_token_count
+                    continue
+                # 整页几何按「全句已排好」的最终位置
+                geometry = semantic_stack_geometry(page_lines, geo_settings)
+                local_i = 0
+                for line, line_geo in zip(page_lines, geometry):
+                    for item, geo in zip(line, line_geo):
+                        ti = page_first + local_i
+                        token_start, _token_end = timings[ti] if ti < len(timings) else (start, end)
+                        # ② 上层逐词弹出：严格跟语速，默认不提前
+                        visible_start = max(start, token_start - lead)
+                        visible_start = min(visible_start, page_end - 0.03)
+                        # ③ 本页/本句结束立刻消失（硬切，无淡出尾巴）
+                        visible_end = page_end
+                        local_i += 1
+                        if visible_start >= visible_end - 0.015:
+                            continue
+                        draw = prepare_ass_dialogue_text(item["token"], lang) if rtl_token_mode else item["token"]
+                        size = int(item.get("size") or font_size)
+                        x, y = geo["x"], geo["y"]
+                        # 透明底稿不渲染；只在朗读时刻弹出到最终位置
+                        override = (
+                            fr"{{\an5\pos({x:.1f},{y:.1f})\fs{size}"
+                            fr"\fscx90\fscy90"
+                            fr"\t(0,{pop_ms},\fscx108\fscy108)"
+                            fr"\t({pop_ms},{pop_ms + 45},\fscx100\fscy100)"
+                            fr"\fad({fad_in},0)}}"
+                        )
+                        events.append(
+                            f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(visible_end)},"
+                            f"Base,,0,0,0,,{override}{draw}"
+                        )
+                token_index += page_token_count
+            continue
+
+        # 整段固定保留手动换行，且允许任意行数；其他模式继续自动排版分页。
+        lines=caption_wrapped_lines(safe,render_settings,fixed_all,layout_context)
 
         # 一个画面最多两行。若排版宽度产生第三行，从该行第一个完整单词的
         # 真实时间戳开始切换到下一画面，任何情况下都不拆开单词。
@@ -1319,7 +1733,11 @@ class CaptionWorker(QObject):
                 return
             audio,_reason=self._audio_selection(video,index)
             child_audios=[] if audio.resolve()==video.resolve() else [audio]
-            child=CaptionWorker([video],child_audios,self.output,self.ffmpeg,self.transcribe,dict(self.settings))
+            # 每个子任务只含 1 个视频时 index 恒为 0；把队列绝对序号写入 settings，
+            # 保证批量重命名序号 / 自定义标题按整批队列顺序递增。
+            child_settings = dict(self.settings)
+            child_settings["rename_batch_index"] = index
+            child=CaptionWorker([video],child_audios,self.output,self.ffmpeg,self.transcribe,child_settings)
             self._current_child=child; outcome=[]
             child.log.connect(lambda message,n=index+1,t=total:self.log.emit(f"[{n}/{t}] {message}"))
             child.progress.connect(lambda value,n=index,t=total:self.progress.emit(round((n+value/100)/max(1,t)*100)))
@@ -1441,22 +1859,48 @@ class CaptionWorker(QObject):
                     rename_date = self.settings.get("rename_date", "").strip() if rename_date_enabled else ""
                     rename_start_index = int(self.settings.get("rename_start_index", 1))
                     rename_padding = int(self.settings.get("rename_padding", 3))
+                    # 父 run() 为每个视频 spawn 单片 child 时 index 恒为 0；
+                    # 优先使用整批队列绝对序号，保证 001/002/003… 正确递增。
+                    batch_index = self.settings.get("rename_batch_index")
+                    if batch_index is None:
+                        batch_index = index
+                    else:
+                        try:
+                            batch_index = int(batch_index)
+                        except (TypeError, ValueError):
+                            batch_index = index
 
-                    prefix_part = clean_filename_part(rename_prefix) if rename_prefix else ""
-                    suffix_part = clean_filename_part(rename_suffix) if rename_suffix else ""
-                    date_part = clean_filename_part(rename_date) if rename_date else ""
+                    prefix_part = clean_filename_part(rename_prefix, fallback="") if rename_prefix else ""
+                    suffix_part = clean_filename_part(rename_suffix, fallback="") if rename_suffix else ""
+                    date_part = clean_filename_part(rename_date, fallback="") if rename_date else ""
 
-                    title_text = chinese
-                    if not title_text or title_text.strip().startswith("【"):
-                        short_orig = original[:200] if original else ""
-                        translated = translate_to_chinese_free(short_orig)
-                        if translated:
-                            title_text = translated
-                        else:
-                            title_text = original or video.stem
-                    title_part = clean_filename_part(title_text)
+                    # 自定义标题列表：按队列顺序每行一个；有内容时覆盖自动提取标题。
+                    # 空行占位保留位置（第 N 行对应第 N 个视频）；不限制标题字符数
+                    # （仅在 safe_filename 时按整名最大长度截断）。
+                    custom_titles = self.settings.get("rename_titles") or []
+                    if isinstance(custom_titles, str):
+                        custom_titles = [line.strip() for line in custom_titles.splitlines()]
+                    else:
+                        custom_titles = [str(x).strip() for x in list(custom_titles)]
 
-                    seq_str = str(rename_start_index + index).zfill(rename_padding)
+                    title_text = ""
+                    if 0 <= batch_index < len(custom_titles) and custom_titles[batch_index]:
+                        title_text = custom_titles[batch_index]
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 使用自定义标题列表第 {batch_index + 1} 行命名。"
+                        )
+                    if not title_text:
+                        title_text = chinese or ""
+                        if not title_text or title_text.strip().startswith("【"):
+                            short_orig = original[:200] if original else ""
+                            translated = translate_to_chinese_free(short_orig)
+                            if translated:
+                                title_text = translated
+                            else:
+                                title_text = original or video.stem
+                    title_part = clean_filename_part(title_text, fallback="", max_chars=None)
+
+                    seq_str = str(rename_start_index + batch_index).zfill(rename_padding)
 
                     parts = [seq_str]
                     for part in (prefix_part, title_part, date_part):
@@ -1465,9 +1909,12 @@ class CaptionWorker(QObject):
                     base = "-".join(parts)
                     if suffix_part:
                         base += suffix_part if suffix_part.startswith("-") else "-" + suffix_part
-                    
+
                     safe_name, _truncated = safe_filename(base + video.suffix, self.output)
                     destination = self.output / safe_name
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 成品重命名：{safe_name}（序号 {seq_str}）"
+                    )
                 else:
                     destination = bounded_output_path(self.output, video.stem, "_动态文案.mp4")
                 # Keep libass intermediate paths short. Long source titles can exceed
@@ -2392,6 +2839,17 @@ class DynamicCaptionPage(QWidget):
         self.margin_v=QSpinBox(); self.margin_v.setRange(20,900); self.margin_v.setValue(250)
         self.margin_v.valueChanged.connect(self._sync_preview_margin)
         position_line=QHBoxLayout(); position_line.addWidget(self.position); position_line.addWidget(QLabel("边距")); position_line.addWidget(self.margin_v)
+        # 窄栏/高 DPI 下 SpinBox 被压扁时，数字会残缺成 x/I/O；强制最小宽度保证可读
+        for spin, width in (
+            (self.font_size, 78), (self.max_words, 64), (self.line_length, 64),
+            (self.line_width, 88), (self.letter_spacing, 88), (self.word_spacing, 88),
+            (self.line_spacing, 88), (self.highlight_padding, 80), (self.highlight_padding_y, 80),
+            (self.animation_speed, 88), (self.outline_width, 64), (self.margin_v, 78),
+            (self.free_page_seconds, 96),
+        ):
+            spin.setMinimumWidth(width)
+            spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            spin.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.bgm_dir_input = DropFolderLineEdit(); self.bgm_dir_input.setPlaceholderText("留空不添加背景音乐")
         self.bgm_dir_input.folder_dropped.connect(self._bgm_folder_dropped)
         self.audio_mode=QComboBox(); self.audio_mode.addItems(["保留视频原音","替换为添加的音频","原声＋背景音混合"])
@@ -2399,6 +2857,9 @@ class DynamicCaptionPage(QWidget):
         self.audio_mode.currentTextChanged.connect(self._audio_mode_changed)
         self.original_volume=QSpinBox(); self.original_volume.setRange(0,200); self.original_volume.setValue(100); self.original_volume.setSuffix(" %")
         self.background_volume=QSpinBox(); self.background_volume.setRange(0,200); self.background_volume.setValue(25); self.background_volume.setSuffix(" %")
+        self.original_volume.setMinimumWidth(80); self.background_volume.setMinimumWidth(80)
+        self.original_volume.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.background_volume.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.original_volume.setEnabled(False); self.background_volume.setEnabled(False)
         self.original_volume.valueChanged.connect(self._update_preview_audio_levels)
         self.background_volume.valueChanged.connect(self._update_preview_audio_levels)
@@ -2409,6 +2870,9 @@ class DynamicCaptionPage(QWidget):
         ])
         self.audio_fade_in=QSpinBox(); self.audio_fade_in.setRange(0,10000); self.audio_fade_in.setValue(500); self.audio_fade_in.setSuffix(" ms")
         self.audio_fade_out=QSpinBox(); self.audio_fade_out.setRange(0,10000); self.audio_fade_out.setValue(500); self.audio_fade_out.setSuffix(" ms")
+        self.audio_fade_in.setMinimumWidth(88); self.audio_fade_out.setMinimumWidth(88)
+        self.audio_fade_in.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.audio_fade_out.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.audio_fade_mode.setToolTip("只处理当前视频匹配的外部音频；直接加入不改变音量曲线。")
         self.audio_fade_in.setToolTip("外部音频从静音到设定音量的时间")
         self.audio_fade_out.setToolTip("外部音频在视频结尾逐渐变为静音的时间")
@@ -2456,7 +2920,8 @@ class DynamicCaptionPage(QWidget):
         colors=QGridLayout(); self.text_color=QPushButton("文字 #FFFFFF"); self.outline_color=QPushButton("描边 #111827"); self.highlight_color=QPushButton("跟读背景 #8B5CF6")
         for index,button in enumerate((self.text_color,self.outline_color,self.highlight_color)):
             button.setMinimumHeight(32); button.clicked.connect(lambda checked=False,b=button:self.pick_color(b)); colors.addWidget(button,index//2,index%2)
-        style_controls=QWidget(); style_controls.setMinimumWidth(0); style_controls.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        # 样式参数区至少能放下 SpinBox 数字，避免被右侧预设列表挤扁
+        style_controls=QWidget(); style_controls.setMinimumWidth(280); style_controls.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Preferred)
         style_controls_layout=QVBoxLayout(style_controls); style_controls_layout.setContentsMargins(0,0,0,0); style_controls_layout.setSpacing(7)
         style_controls_layout.addLayout(form); style_controls_layout.addWidget(batch_style_hint); style_controls_layout.addLayout(colors); style_controls_layout.addStretch()
         preset_panel=QWidget(); preset_panel.setMinimumWidth(170); preset_panel.setMaximumWidth(195)
@@ -2728,6 +3193,26 @@ class DynamicCaptionPage(QWidget):
         rename_form.addRow("序列号配置", rename_num_row)
         
         rename_layout.addLayout(rename_form)
+
+        rename_titles_hint = QLabel(
+            "自定义标题列表（可选）：每行一个标题，按左侧队列顺序对应。"
+            "填写后导出时优先使用此处标题；序号 / 前缀 / 日期 / 后缀仍按上方规则拼接。"
+            "不限制标题长度（整名受系统文件名上限保护）。"
+        )
+        rename_titles_hint.setWordWrap(True)
+        rename_titles_hint.setStyleSheet("color:#94a3b8;font-size:11px;")
+        rename_layout.addWidget(rename_titles_hint)
+        self.rename_custom_titles = QPlainTextEdit()
+        self.rename_custom_titles.setPlaceholderText(
+            "例如队列有 3 个视频时可粘贴：\n"
+            "第一支成片标题\n"
+            "第二支成片标题\n"
+            "第三支成片标题\n"
+            "（留空则仍自动提取文案标题）"
+        )
+        self.rename_custom_titles.setMinimumHeight(88)
+        self.rename_custom_titles.setMaximumHeight(160)
+        rename_layout.addWidget(self.rename_custom_titles)
         
         # Add the jump button inside Section 7
         self.output_to_rename = QPushButton("👉 导入已生成成品并转到 [批量重命名] 板块")
@@ -3379,6 +3864,7 @@ class DynamicCaptionPage(QWidget):
         self.rename_suffix.textChanged.connect(self._save_style_preferences)
         self.rename_start_index.valueChanged.connect(self._save_style_preferences)
         self.rename_padding.valueChanged.connect(self._save_style_preferences)
+        self.rename_custom_titles.textChanged.connect(self._save_style_preferences)
         self.group_burn_watermark.toggled.connect(self._save_style_preferences)
         self.output.textChanged.connect(self._save_style_preferences)
         self.override_text.textChanged.connect(self._refresh_live_preview)
@@ -3414,6 +3900,30 @@ class DynamicCaptionPage(QWidget):
             original_len = len(self.all_presets)
             self.all_presets = [x for x in self.all_presets if x["name"] != "网红大红黄"]
             modified = len(self.all_presets) != original_len
+
+            # 迁移旧 Reels 预设名 → 语义重点堆叠
+            _reels_aliases = {"Reels 白字柔影", "Reels 重点放大"}
+            for item in self.all_presets:
+                if item.get("is_custom"):
+                    continue
+                if item.get("name") in _reels_aliases:
+                    item["name"] = "Reels 语义重点"
+                    item["data"] = dict(PRESETS["Reels 语义重点"])
+                    modified = True
+                elif item.get("name") in PRESETS and item.get("data") != PRESETS[item["name"]]:
+                    item["data"] = dict(PRESETS[item["name"]])
+                    modified = True
+            # 去重：迁移后可能出现多个同名系统预设
+            seen_names = set()
+            deduped = []
+            for item in self.all_presets:
+                name = item.get("name")
+                if name in seen_names and not item.get("is_custom"):
+                    modified = True
+                    continue
+                seen_names.add(name)
+                deduped.append(item)
+            self.all_presets = deduped
             
             # Auto-merge any new default system presets that are not in the user's config
             existing_names = {x["name"] for x in self.all_presets}
@@ -3851,6 +4361,7 @@ class DynamicCaptionPage(QWidget):
             "rename_suffix": self.rename_suffix.text(),
             "rename_start_index": self.rename_start_index.value(),
             "rename_padding": self.rename_padding.value(),
+            "rename_titles": self._rename_titles_list(),
             "group_burn_watermark": self.group_burn_watermark.isChecked(),
             "watermark_paths": list(self._watermark_paths),
             "watermarks": [dict(item) for item in self._watermark_entries],
@@ -3876,6 +4387,8 @@ class DynamicCaptionPage(QWidget):
                 saved.get("letter_spacing")==0 and saved.get("line_spacing")==116 and saved.get("margin_v")==250):
             return
         preset=saved.get("preset")
+        if preset in ("Reels 白字柔影", "Reels 重点放大"):
+            preset = "Reels 语义重点"
         if preset in PRESETS: self.apply_preset(preset)
         combos={"font":self.font,"caption_mode":self.caption_mode,"free_animation":self.free_animation,
                 "position":self.position,"audio_match_mode":self.audio_match_mode,"audio_mode":self.audio_mode,
@@ -3924,6 +4437,14 @@ class DynamicCaptionPage(QWidget):
             self.rename_start_index.setValue(int(saved["rename_start_index"]))
         if "rename_padding" in saved:
             self.rename_padding.setValue(int(saved["rename_padding"]))
+        if "rename_titles" in saved:
+            titles = saved.get("rename_titles") or []
+            if isinstance(titles, str):
+                self.rename_custom_titles.setPlainText(titles)
+            elif isinstance(titles, list):
+                self.rename_custom_titles.setPlainText(
+                    "\n".join(str(x) for x in titles if str(x).strip())
+                )
         if "group_burn_watermark" in saved:
             self.group_burn_watermark.setChecked(bool(saved["group_burn_watermark"]))
         if "writing_language" in saved or "caption_language" in saved:
@@ -4085,14 +4606,88 @@ class DynamicCaptionPage(QWidget):
 
     def _paint_live_caption(self, painter, image, seconds):
         if self._live_caption_style_cache is None:
-            settings=self._current_settings(); context=caption_layout_context(settings)
-            self._live_caption_style_cache={"settings":settings,"preset":PRESETS[settings["preset"]],"context":context}
+            settings=self._current_settings()
+            preset_name = settings.get("preset")
+            if preset_name in ("Reels 白字柔影", "Reels 重点放大"):
+                preset_name = "Reels 语义重点"
+            preset = PRESETS.get(preset_name) or next(iter(PRESETS.values()))
+            context=caption_layout_context(settings)
+            self._live_caption_style_cache={"settings":settings,"preset":preset,"context":context}
         settings=self._live_caption_style_cache["settings"]; preset=self._live_caption_style_cache["preset"]
         text, active_word = self._live_caption_data(seconds); tokens = tokens_for(text)
         if not tokens: return
         fixed_all = (settings.get("caption_mode") == "自由文案动画（不对口型）" and
                      settings.get("free_animation") == "整段固定")
         context=self._live_caption_style_cache["context"]; font,metrics,_gap,_line_gap,_max_line_width=context
+        base_color=QColor(settings["text_color"]); outline=QColor(settings["outline_color"]); highlight=QColor(settings["highlight_color"])
+        effect=preset["effect"]; active_used=False
+        pen_width=max(1.0,settings["outline_width"])
+
+        # 语义重点：整句定稿占位，只绘制已读到的词（位置与导出一致，不随逐词重排）
+        if effect in ("semantic_stack", "word_scale"):
+            geo_settings = dict(settings)
+            geo_settings["position"] = "画面中间"
+            preset_data = preset if isinstance(preset, dict) else {}
+            for key in ("semantic_large_ratio", "semantic_small_ratio", "semantic_max_lines"):
+                if key not in geo_settings and key in preset_data:
+                    geo_settings[key] = preset_data[key]
+            emphasized = select_emphasis_words(tokens)
+            # 底稿：整句排版
+            full_lines = semantic_stack_layout(tokens, emphasized, geo_settings)
+            max_stack_lines = max(3, min(6, int(geo_settings.get("semantic_max_lines", 5))))
+            full_pages = (
+                [full_lines]
+                if fixed_all or len(full_lines) <= max_stack_lines
+                else [full_lines[i:i + max_stack_lines] for i in range(0, len(full_lines), max_stack_lines)]
+            ) or [[]]
+            # 当前读到第几个词
+            cut = len(tokens)
+            if active_word:
+                for i, tok in enumerate(tokens):
+                    if tok == active_word:
+                        cut = i + 1
+                        break
+            spoken = set(range(cut))
+            # 落在哪一页：按词序号
+            page_index = 0
+            cursor = 0
+            for pi, page in enumerate(full_pages):
+                count = sum(len(line) for line in page)
+                if cut - 1 < cursor + count:
+                    page_index = pi
+                    break
+                cursor += count
+            page_lines = full_pages[page_index]
+            page_token_offset = sum(sum(len(line) for line in full_pages[i]) for i in range(page_index))
+            geometry = semantic_stack_geometry(page_lines, geo_settings)
+            family = str(settings.get("font", "Arial"))
+            bold = caption_uses_bold_face(settings)
+            letter = float(settings.get("letter_spacing", 0))
+            flat_i = 0
+            for line, line_geo in zip(page_lines, geometry):
+                for item, geo in zip(line, line_geo):
+                    global_i = page_token_offset + flat_i
+                    flat_i += 1
+                    if global_i not in spoken:
+                        continue  # 未读到的词：透明底稿不画
+                    size = int(item.get("size") or settings.get("font_size", 86))
+                    word_font = QFont(family)
+                    word_font.setPixelSize(size)
+                    word_font.setBold(bold)
+                    word_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter)
+                    path = QPainterPath()
+                    path.addText(0, 0, word_font, item["token"])
+                    painter.save()
+                    painter.translate(geo["left"], geo["baseline"])
+                    painter.setPen(QPen(outline, pen_width * 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawPath(path)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(base_color)
+                    painter.drawPath(path)
+                    painter.restore()
+            return
+
         lines=caption_wrapped_lines(text,settings,fixed_all,context)
         # 与最终导出一致：一个画面最多两排。根据当前朗读词切换到对应分页。
         pages=([lines] if fixed_all else [lines[index:index+2] for index in range(0,len(lines),2)]) or [[]]
@@ -4102,8 +4697,6 @@ class DynamicCaptionPage(QWidget):
                 if any(active_word == token for line in page for token in line):
                     active_page=page_index; break
         lines=pages[active_page]; geometry=caption_page_geometry(lines,settings,context)
-        base_color=QColor(settings["text_color"]); outline=QColor(settings["outline_color"]); highlight=QColor(settings["highlight_color"])
-        effect=preset["effect"]; active_used=False
         for line,line_geometry in zip(lines,geometry):
             for token,item in zip(line,line_geometry):
                 width=item["width"]; cursor=item["left"]; baseline=item["baseline"]
@@ -4123,7 +4716,6 @@ class DynamicCaptionPage(QWidget):
                 if path is None:
                     path=QPainterPath(); path.addText(0,0,font,token); path_cache[token]=path
                 painter.save(); painter.translate(cursor,baseline)
-                pen_width=max(1.0,settings["outline_width"])
                 if effect == "double_outline":
                     outer_pen_width = (pen_width + 3) * 2
                     painter.setPen(QPen(highlight, outer_pen_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -4473,7 +5065,15 @@ class DynamicCaptionPage(QWidget):
                 "rename_date_enabled": self.rename_date_enabled.isChecked(),
                 "rename_date": self.rename_date.text(),
                 "rename_start_index": self.rename_start_index.value(),
-                "rename_padding": self.rename_padding.value()}
+                "rename_padding": self.rename_padding.value(),
+                "rename_titles": self._rename_titles_list()}
+
+    def _rename_titles_list(self):
+        """按行解析自定义标题；保留中间空行作为占位，去掉末尾空行。"""
+        lines = [line.strip() for line in self.rename_custom_titles.toPlainText().splitlines()]
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
 
     def render_effect_preview(self):
         item=self.videos.currentItem()
@@ -4980,7 +5580,12 @@ class DynamicCaptionPage(QWidget):
     def apply_preset(self, name):
         preset = PRESETS[name]
         for button in self.preset_buttons: button.setChecked(button.text() == name)
-        highlight_label = "跟读文字" if preset["effect"] == "word_color" else "跟读背景"
+        if preset["effect"] == "word_color":
+            highlight_label = "跟读文字"
+        elif preset["effect"] in ("semantic_stack", "word_scale"):
+            highlight_label = "重点词"
+        else:
+            highlight_label = "跟读背景"
         self.text_color.setText(f"文字 {preset['text']}"); self.outline_color.setText(f"描边 {preset['outline']}"); self.highlight_color.setText(f"{highlight_label} {preset['highlight']}")
         self.outline_width.setValue(preset["outline_width"])
         if "font" in preset: self.font.setCurrentText(preset["font"])
@@ -4995,6 +5600,13 @@ class DynamicCaptionPage(QWidget):
         if "highlight_padding" in preset: self.highlight_padding.setValue(preset["highlight_padding"])
         self.highlight_padding_y.setValue(preset.get("highlight_padding_y",10))
         if "animation_speed" in preset: self.animation_speed.setValue(preset["animation_speed"])
+        if "position" in preset and hasattr(self, "position"):
+            self.position.setCurrentText(preset["position"])
+        # 出字方式类预设：一并切换字幕模式（如语音同步）
+        if "caption_mode" in preset and hasattr(self, "caption_mode"):
+            self.caption_mode.setCurrentText(preset["caption_mode"])
+        if "free_animation" in preset and hasattr(self, "free_animation"):
+            self.free_animation.setCurrentText(preset["free_animation"])
         if hasattr(self, "preview_position_slider"):
             self.preview_position_slider.blockSignals(True)
             self.preview_position_slider.setValue(self.margin_v.value())
