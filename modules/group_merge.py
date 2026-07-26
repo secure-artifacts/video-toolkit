@@ -92,10 +92,14 @@ def discover_groups(parent):
     return groups
 
 
-def split_group_script(text):
+def split_group_script(text, expected_count=None):
     value = str(text or "").strip()
     if not value:
         return []
+    if expected_count is not None:
+        lines = [line.strip() for line in value.splitlines() if line.strip() and line.strip() != "---"]
+        if len(lines) == expected_count:
+            return lines
     value = re.sub(r"(?m)^\s*---+\s*$", "\n\n", value)
     blocks = re.split(r"\r?\n\s*\r?\n", value)
     return [re.sub(r"\s+", " ", block).strip() for block in blocks if block.strip()]
@@ -107,7 +111,7 @@ def _plain_text(value):
 
 def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.22):
     """Greedily make a one-to-one match and return clips in script-segment order."""
-    segments = split_group_script(script_text)
+    segments = split_group_script(script_text, len(clips))
     clips = list(clips)
     if len(segments) != len(clips) or not clips:
         return None, "分段文案数量与视频片段数量不一致"
@@ -149,6 +153,59 @@ def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=120):
     start = max(0.0, spans[0][0] - max(0, head_padding_ms) / 1000.0)
     end = min(duration, spans[-1][1] + max(0, tail_padding_ms) / 1000.0)
     return start, max(start + 0.05, end), True
+
+
+def parse_srt_with_text(srt):
+    blocks = re.split(r"\r?\n\s*\r?\n", str(srt or "").strip())
+    result = []
+    timing_re = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        timing_index = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+        if timing_index < 0:
+            continue
+        match = timing_re.match(lines[timing_index])
+        if not match:
+            continue
+        raw_values = match.groups()
+        values = [int(value) for value in raw_values]
+        start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / (10 ** len(raw_values[3]))
+        end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / (10 ** len(raw_values[7]))
+        text = " ".join(lines[timing_index + 1:]).strip()
+        if text:
+            result.append((start, max(start + 0.05, end), text))
+    return result
+
+
+def find_matching_srt_bounds(srt, clip_script, duration, head_padding_ms=80, tail_padding_ms=120):
+    entries = parse_srt_with_text(srt)
+    duration = max(0.05, float(duration or 0.05))
+    if not entries:
+        return 0.0, duration, False
+    
+    clean_target = _plain_text(clip_script)
+    if not clean_target:
+        return speech_trim_bounds(srt, duration, head_padding_ms, tail_padding_ms)
+        
+    best_score = -1.0
+    best_range = (0, len(entries) - 1)
+    
+    for i in range(len(entries)):
+        for j in range(i, len(entries)):
+            subset_text = "".join(entry[2] for entry in entries[i:j+1])
+            clean_subset = _plain_text(subset_text)
+            score = SequenceMatcher(None, clean_subset, clean_target).ratio()
+            if score > best_score:
+                best_score = score
+                best_range = (i, j)
+                
+    if best_score > 0.3:
+        i, j = best_range
+        start = max(0.0, entries[i][0] - max(0, head_padding_ms) / 1000.0)
+        end = min(duration, entries[j][1] + max(0, tail_padding_ms) / 1000.0)
+        return start, max(start + 0.05, end), True
+        
+    return speech_trim_bounds(srt, duration, head_padding_ms, tail_padding_ms)
 
 
 def hybrid_trim_bounds(srt, duration, audio_bounds, head_padding_ms=80, tail_padding_ms=120,
@@ -400,17 +457,40 @@ class GroupMergeWorker(QObject):
         cache[key] = info
         return info
 
-    def _normalize(self, clip, index, cache_dir, analysis, target_w, target_h, watermark=None):
+    def _normalize(self, clip, index, total_count, cache_dir, analysis, target_w, target_h, watermark=None):
         probe = self._probe(clip)
-        if analysis.get("hybrid_bounds"):
-            start, end, detected = analysis["hybrid_bounds"]
-        elif analysis.get("bounds"):
-            start, end, detected = analysis["bounds"]
+        folder = clip.parent
+        group_script = self.settings.get("scripts", {}).get(str(folder.resolve()), "")
+        segments = split_group_script(group_script, total_count)
+        clip_script = segments[index] if index < len(segments) else ""
+        
+        manual_bounds = None
+        if clip_script:
+            match = re.search(r'\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]', clip_script)
+            if match:
+                manual_bounds = (float(match.group(1)), float(match.group(2)))
+                clip_script = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', clip_script).strip()
+
+        if manual_bounds is not None:
+            start = max(0.0, min(probe["duration"], manual_bounds[0]))
+            end = max(start + 0.05, min(probe["duration"], manual_bounds[1]))
+            detected = True
+            self.log.emit(f"切片功能：{clip.name} 已应用手动切片区间 {start:.2f}s - {end:.2f}s")
         else:
-            start, end, detected = speech_trim_bounds(
-                analysis.get("srt", ""), probe["duration"],
-                self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
-            )
+            if clip_script and self.settings.get("sort_mode") == "script":
+                start, end, detected = find_matching_srt_bounds(
+                    analysis.get("srt", ""), clip_script, probe["duration"],
+                    self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
+                )
+            elif analysis.get("hybrid_bounds"):
+                start, end, detected = analysis["hybrid_bounds"]
+            elif analysis.get("bounds"):
+                start, end, detected = analysis["bounds"]
+            else:
+                start, end, detected = speech_trim_bounds(
+                    analysis.get("srt", ""), probe["duration"],
+                    self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
+                )
         if not detected:
             self.log.emit(f"提醒：{clip.name} 未识别到说话时间，保留完整片段。")
         else:
@@ -564,11 +644,11 @@ class GroupMergeWorker(QObject):
                 max_workers = min(4, os.cpu_count() or 4)
                 self.log.emit(f"正在启动多线程并行编码加速（最大并行线程数：{max_workers}）...")
                 def run_norm(args):
-                    clip, clip_index = args
+                    clip, clip_index, total_count = args
                     return self._normalize(
-                        clip, clip_index, cache_dir, analyses[str(clip.resolve())], target_w, target_h, watermark
+                        clip, clip_index, total_count, cache_dir, analyses[str(clip.resolve())], target_w, target_h, watermark
                     )
-                tasks = [(clip, clip_index) for clip_index, clip in enumerate(clips)]
+                tasks = [(clip, clip_index, len(clips)) for clip_index, clip in enumerate(clips)]
                 normalized = [None] * len(clips)
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {executor.submit(run_norm, task): i for i, task in enumerate(tasks)}

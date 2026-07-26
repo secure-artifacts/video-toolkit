@@ -65,19 +65,22 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.10").strip().lstrip("v") or "1.7.10"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.11").strip().lstrip("v") or "1.7.11"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
-PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
+ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
+PROVIDERS = ASR_PROVIDERS + ["Luma", "Kling"]
 LOCAL_PROVIDER = "本地 Whisper（无需密钥）"
 AUTO_PROVIDER = "自动选择（按优先级）"
-TRANSCRIPTION_PROVIDERS = [AUTO_PROVIDER, LOCAL_PROVIDER] + PROVIDERS
+TRANSCRIPTION_PROVIDERS = [AUTO_PROVIDER, LOCAL_PROVIDER] + ASR_PROVIDERS
 DEFAULT_MODELS = {
     LOCAL_PROVIDER: "small",
     "Groq": "whisper-large-v3-turbo",
     "Gemini": "gemini-3.5-flash",
     "ElevenLabs": "scribe_v2",
     "Gladia": "default",
+    "Luma": "default",
+    "Kling": "default",
 }
 DEFAULT_SHEET_MAPPINGS = [
     {"field": "日期", "column": "A", "source": "date", "value": ""},
@@ -336,6 +339,10 @@ def detect_api_provider(key: str) -> str | None:
         value,
     ):
         return "Gladia"
+    if "luma" in lower:
+        return "Luma"
+    if "kling" in lower:
+        return "Kling"
     return None
 
 
@@ -354,6 +361,10 @@ def check_api_key(provider: str, key: str) -> tuple[bool, str]:
         elif provider == "ElevenLabs":
             resp = requests.get("https://api.elevenlabs.io/v1/user",
                                 headers={**headers, "xi-api-key": key}, timeout=20)
+        elif provider == "Luma":
+            return True, "密钥格式有效，免联机检测"
+        elif provider == "Kling":
+            return True, "密钥格式有效，免联机检测"
         else:
             resp = requests.get("https://api.gladia.io/v2/pre-recorded?limit=1",
                                 headers={**headers, "x-gladia-key": key}, timeout=20)
@@ -1281,13 +1292,14 @@ class GoogleCloudSync:
             values = [""] * (max_index + 1)
             context = {"date": datetime.now().strftime("%Y-%m-%d"), "folder_url": folder_url,
                        "file_name": path.name, "file_url": url, "zh": item.get("chinese", ""),
-                       "original": item.get("original", "")}
+                       "original": item.get("original", ""), "language": item.get("language", "")}
             for mapping in mappings:
                 column_index = column_to_index(mapping["column"]); source = mapping.get("source", "static")
                 if source == "date": cell_value = context["date"]
                 elif source == "file": cell_value = f'=HYPERLINK("{url}","{path.name.replace(chr(34), chr(34)*2)}")'
                 elif source == "chinese": cell_value = context["zh"]
                 elif source == "original": cell_value = context["original"]
+                elif source == "language": cell_value = context["language"]
                 elif source == "folder": cell_value = folder_url
                 else:
                     template = str(mapping.get("value", ""))
@@ -2362,7 +2374,8 @@ class MainWindow(QMainWindow):
         self.dynamic_caption_page = DynamicCaptionPage(
             self._caption_transcribe, self._text_to_speech, self._find_ffmpeg,
             TRANSCRIPTION_PROVIDERS, AUTO_PROVIDER,
-            self._reels_sync_profiles, self._start_reels_cloud_sync, self._open_google_settings)
+            self._reels_sync_profiles, self._start_reels_cloud_sync, self._open_google_settings,
+            store=self.store)
         self.dynamic_caption_page.rename_folder_requested.connect(self._open_folder_in_batch_rename)
         _startup_trace("watermark page ready")
         self.rename_page = RenamePage(self._rename_title_transcribe)
@@ -3135,8 +3148,13 @@ class MainWindow(QMainWindow):
         if not path.is_dir():
             QMessageBox.information(self,"文件夹不存在",f"无法加入批量重命名：\n{path}")
             return
-        self.rename_page.titles.clear()
         self.rename_page.set_input_folder(str(path.resolve()))
+        # Copy the custom titles from dynamic_caption_page if they exist
+        custom_titles = self.dynamic_caption_page.rename_custom_titles.toPlainText().strip()
+        if custom_titles:
+            self.rename_page.titles.setPlainText(custom_titles)
+        else:
+            self.rename_page.titles.clear()
         self._show_page(4)
         self.rename_page.input.setFocus()
         write_app_log(f"Reels 成品已加入批量重命名：{path.resolve()}","INFO","批量重命名")
@@ -3750,12 +3768,14 @@ class MainWindow(QMainWindow):
             for index, path in enumerate(files):
                 result = results[index] if index < len(results) else {}
                 records.append({"path": path, "original": result.get("original", ""),
-                                "chinese": result.get("chinese", "")})
+                                "chinese": result.get("chinese", ""),
+                                "language": self.dynamic_caption_page.writing_language.currentText()})
         else:
             by_path = {str(item.get("path", "")): item for item in records}
             records = [{"path": path,
                         "original": by_path.get(str(path), {}).get("original", ""),
-                        "chinese": by_path.get(str(path), {}).get("chinese", "")}
+                        "chinese": by_path.get(str(path), {}).get("chinese", ""),
+                        "language": by_path.get(str(path), {}).get("language", "") or self.dynamic_caption_page.writing_language.currentText()}
                        for path in files]
         self.pending_upload_files = list(files)
         self.pending_upload_records = list(records)

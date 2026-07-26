@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.7**
+当前版本：**v1.7.11**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -10,12 +10,12 @@
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.7.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.7/video-toolkit-windows-x64-v1.7.7.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.7/VideoToolkit_Setup_v1.7.7.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.7.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.7/video-toolkit-macos-arm64-v1.7.7.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.7.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.7/video-toolkit-macos-x64-v1.7.7.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.11.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.11/video-toolkit-windows-x64-v1.7.11.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.11/VideoToolkit_Setup_v1.7.11.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.11.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.11/video-toolkit-macos-arm64-v1.7.11.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.11.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.11/video-toolkit-macos-x64-v1.7.11.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
-v1.7.7 2026-07-24
+v1.7.11 2026-07-26
 多语言书写规范：内置 en/pt/es/fr/de/it/el/ru/tr/zh/ar/he；字幕/流水线/Reels 可选书写语言；希腊 «»、西语 ¿¡、阿/希 RTL 整句烧录。
 语言包导入：设置 → 字体与语言包，可导入 JSON 扩展新语言。
 API 密钥：合并录入 + 自动识别服务（gsk_/AIza/sk_/UUID）。
@@ -25,7 +25,14 @@ API 密钥：合并录入 + 自动识别服务（gsk_/AIza/sk_/UUID）。
 稳定性：密钥检测、检查更新/下载线程安全修复，避免检测后闪退。
 顶部「检查更新」与启动静默检查：从 GitHub Releases 拉取 Setup 安装包。
 
-### 最新更新 (v1.7.2)
+### 最新更新 (v1.7.11)
+* **自定义中文标题自动回填与重命名联动**：批量导出完成后，程序自动提取字幕第一行中文字幕填充为标题，并可一键复制回填到批量重命名板块。
+* **手动 [start-end] 物理切片与对口型平移**：Reels 编辑器和分组合成都已支持手动切片，直接裁剪前部杂音并自动进行字幕时间轴平移，确保音画字幕对齐。
+* **单换行行切分匹配**：分组合成字幕对应表支持单换行行级切分匹配，解决多视频自动匹配回退故障。
+* **高亮字体切换修复**：修复 Reels 语义重点预设下无法切换中文字体的问题，直接使用用户选定字体。
+* **并发防重复点击卡死保护**：合成线程入口部署防重入锁，彻底消除连击引起的主界面崩溃卡死隐患。
+
+### 历史更新 (v1.7.2)
 * **【批量重命名】输出目录选择框恢复**：
   * 恢复了在重构改名队列时被不小心隐藏掉的 **“输出文件夹”** 选择输入框（同样支持文件夹拖拽和拖入）。
   * 用户现在可以自由指定输出文件夹，当选择源文件夹时，系统还会自动友好地为您生成默认的 `源文件夹_成品` 路径。
