@@ -6804,6 +6804,7 @@ class DynamicCaptionPage(QWidget):
                 str(prepared_watermark_composite(ffmpeg, video, entries, cache))
             )
             
+        self._clear_previews_and_releases()
         self.project_start_btn.setEnabled(False)
         self.project_stop_btn.setEnabled(True)
         
@@ -7186,9 +7187,9 @@ class ProjectGroupWorker(QObject):
                         v_filter = f"scale={target_w*2}:{target_h*2}:force_original_aspect_ratio=increase,crop={target_w*2}:{target_h*2}"
                         anim_name = self.settings.get("image_animation", "智能慢速变焦（Ken Burns）")
                         if anim_name == "智能慢速变焦（Ken Burns）":
-                            v_filter += f",zoompan=z='min(zoom+0.0006,1.12)':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':d={int(single_dur * 30)}:s={target_w}x{target_h}:fps=30"
+                            v_filter += f",zoompan=z='min(zoom+0.0006,1.12)':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':d={int(single_dur * 30)}:s={target_w}x{target_h}:fps=30,setsar=1"
                         else:
-                            v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
+                            v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
                             
                         if anim_name == "智能慢速变焦（Ken Burns）":
                             cmd = [
@@ -7266,7 +7267,7 @@ class ProjectGroupWorker(QObject):
                             v_filter = f"scale={target_w*2}:{target_h*2}:force_original_aspect_ratio=increase,crop={target_w*2}:{target_h*2}"
                             anim_name = self.settings.get("image_animation", "智能慢速变焦（Ken Burns）")
                             if anim_name == "智能慢速变焦（Ken Burns）":
-                                v_filter += f",zoompan=z='min(zoom+0.0006,1.12)':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':d=150:s={target_w}x{target_h}:fps=30"
+                                v_filter += f",zoompan=z='min(zoom+0.0006,1.12)':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':d=150:s={target_w}x{target_h}:fps=30,setsar=1"
                                 cmd = [
                                     self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                                     "-i", str(mat),
@@ -7274,7 +7275,7 @@ class ProjectGroupWorker(QObject):
                                     str(scaled_dest)
                                 ]
                             else:
-                                v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
+                                v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
                                 cmd = [
                                     self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                                     "-loop", "1", "-t", "5.000", "-i", str(mat),
@@ -7282,7 +7283,7 @@ class ProjectGroupWorker(QObject):
                                     str(scaled_dest)
                                 ]
                         else:
-                            v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
+                            v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
                             cmd = [
                                 self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                                 "-i", str(mat),

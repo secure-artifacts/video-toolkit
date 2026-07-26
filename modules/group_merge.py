@@ -468,7 +468,9 @@ class GroupMergeWorker(QObject):
         if clip_script:
             match = re.search(r'\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]', clip_script)
             if match:
-                manual_bounds = (float(match.group(1)), float(match.group(2)))
+                val1, val2 = float(match.group(1)), float(match.group(2))
+                if val2 <= probe["duration"]:
+                    manual_bounds = (val1, val2)
                 clip_script = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', clip_script).strip()
 
         if manual_bounds is not None:
@@ -583,6 +585,15 @@ class GroupMergeWorker(QObject):
                 self.log.emit(f"[{group_index}/{len(self.groups)}] 开始处理文件夹：{folder.name}（{len(clips)} 段）")
                 script_mode = self.settings.get("sort_mode") == "script"
                 trim_mode = self.settings.get("trim_mode", "hybrid")
+                group_script = self.settings.get("scripts", {}).get(str(folder.resolve()), "")
+                group_manual_bounds = None
+                if group_script:
+                    match = re.search(r'\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]', group_script)
+                    if match:
+                        val1, val2 = float(match.group(1)), float(match.group(2))
+                        first_probe = self._probe(clips[0])
+                        if val2 > first_probe["duration"]:
+                            group_manual_bounds = (val1, val2)
                 for clip in clips:
                     if self.cancelled:
                         raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
@@ -671,7 +682,8 @@ class GroupMergeWorker(QObject):
                     "transition_duration": float(self.settings.get("transition_duration") or 0),
                     "aspect_ratio": self.settings.get("aspect_ratio", "原始比例"),
                     "resolution": self.settings.get("resolution", "默认最高"),
-                    "version": 5,
+                    "group_script": group_script,
+                    "version": 6,
                 }, sort_keys=True).encode("utf-8")).hexdigest()
                 state_file = cache_dir / "final.json"
                 try:
@@ -761,6 +773,38 @@ class GroupMergeWorker(QObject):
                         concat_command += ["-movflags", "+faststart", str(destination)]
                         
                     destination = self._write_final_output(concat_command, destination)
+                    if group_manual_bounds:
+                        self.log.emit(f"群组切片功能：正在对合并后的成品视频应用手动切片 {group_manual_bounds[0]:.2f}s - {group_manual_bounds[1]:.2f}s...")
+                        trimmed_dest = destination.with_name(destination.stem + "_trimmed.mp4")
+                        
+                        total_dur = self._probe(destination)["duration"]
+                        start = max(0.0, min(total_dur, group_manual_bounds[0]))
+                        end = max(start + 0.05, min(total_dur, group_manual_bounds[1]))
+                        dur = end - start
+                        
+                        trim_cmd = [
+                            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-ss", f"{start:.3f}", "-i", str(destination),
+                            "-t", f"{dur:.3f}", "-c", "copy"
+                        ]
+                        if self.settings.get("clean_metadata", True):
+                            trim_cmd += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                                         "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                                         "-map_chapters", "-1"]
+                        trim_cmd += ["-movflags", "+faststart", str(trimmed_dest)]
+                        
+                        creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                        res = subprocess.run(trim_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
+                        if res.returncode == 0:
+                            try:
+                                destination.unlink()
+                                trimmed_dest.rename(destination)
+                                self.log.emit(f"群组切片完成：已剪切保留 {start:.2f}s - {end:.2f}s 段。")
+                            except Exception as e:
+                                self.log.emit(f"群组切片重命名失败：{e}，保留未切片版本。")
+                        else:
+                            err = (res.stdout or b"").decode("utf-8", errors="replace")
+                            self.log.emit(f"群组切片失败：{err}，保留未切片版本。")
                     state_file.write_text(json.dumps({"fingerprint": final_fingerprint}, indent=2), encoding="utf-8")
                 else:
                     self.log.emit(f"续接：复用已完成合成视频 {destination.name}")
