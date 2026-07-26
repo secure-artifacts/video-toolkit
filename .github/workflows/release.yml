@@ -60,17 +60,21 @@ jobs:
           New-Item -ItemType Directory -Path 'dist_final' -Force | Out-Null
           $archive = "dist_final\video-toolkit-windows-x64-${{ github.ref_name }}.zip"
           Compress-Archive -Path 'dist_folder\VideoToolkit\*' -DestinationPath $archive -CompressionLevel Optimal
+          iscc VideoToolkit.iss
+          Move-Item -Path "VideoToolkit_Setup_${{ github.ref_name }}.exe" -Destination "dist_final\" -Force
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist_final/*.zip'
+          subject-path: |
+            dist_final/*.zip
+            dist_final/*.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: video-toolkit-windows-x64
-          path: dist_final/*.zip
+          path: dist_final/*
           if-no-files-found: error
 
   build-macos:
@@ -165,7 +169,9 @@ jobs:
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist_final/*.zip'
+          subject-path: |
+            dist_final/*.zip
+            dist_final/*.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -188,5 +194,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: |
+            artifacts/*.zip
+            artifacts/*.exe
           generate_release_notes: true
