@@ -478,6 +478,9 @@ class GroupMergeWorker(QObject):
             end = max(start + 0.05, min(probe["duration"], manual_bounds[1]))
             detected = True
             self.log.emit(f"切片功能：{clip.name} 已应用手动切片区间 {start:.2f}s - {end:.2f}s")
+        elif self.settings.get("trim_mode") == "none":
+            start, end, detected = 0.0, probe["duration"], True
+            self.log.emit(f"不裁剪：{clip.name} 保留完整片段。")
         else:
             if clip_script and self.settings.get("sort_mode") == "script":
                 start, end, detected = find_matching_srt_bounds(
@@ -552,7 +555,7 @@ class GroupMergeWorker(QObject):
         command += ["-sn", "-dn"]
         command += encoder_args(self.encoder, self.settings.get("encode_preset", "veryfast"))
         if probe["audio"]:
-            command += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+            command += ["-fps_mode", "cfr", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000"]
         else:
             command += ["-an"]
         command += ["-movflags", "+faststart", str(destination)]
@@ -597,7 +600,9 @@ class GroupMergeWorker(QObject):
                 for clip in clips:
                     if self.cancelled:
                         raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
-                    if script_mode or trim_mode in ("hybrid", "text"):
+                    if trim_mode == "none":
+                        analyses[str(clip.resolve())] = {}
+                    elif script_mode or trim_mode in ("hybrid", "text"):
                         try:
                             analysis = self._analysis(clip, analysis_cache)
                             if trim_mode == "hybrid":

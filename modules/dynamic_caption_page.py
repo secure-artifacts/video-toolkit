@@ -37,13 +37,14 @@ def translate_to_chinese_free(text):
         pass
     return ""
 
-from PySide6.QtCore import QObject, QRectF, QSettings, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QRectF, QSettings, QThread, QTimer, Qt, QUrl, Signal, QDate
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontDatabase, QFontInfo, QFontMetricsF, QImage, QPainter,
     QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
+    QDateEdit, QTextBrowser,
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QTabWidget,
@@ -2059,6 +2060,7 @@ class CaptionWorker(QObject):
                 v_filters = []
                 if need_resize:
                     v_filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1")
+                v_filters.append("fps=30")
                 if extend_filters:
                     v_filters.extend(extend_filters)
                 v_filter_str = ",".join(v_filters) if v_filters else ""
@@ -2204,7 +2206,7 @@ class CaptionWorker(QObject):
                     command += ["-map", "0:a?"]
                 # 不指定 -ac，保留源音频声道；字幕烧录只重编码画面。
                 command += encoder_args(encoder, self.settings["encode_preset"])
-                command += ["-c:a", "aac", "-b:a", "192k"]
+                command += ["-fps_mode", "cfr", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
                 if (external or bgm_file) and audio_mode in ("替换为添加的音频", "原声＋背景音混合"):
                     command += ["-ac", "2"]
                 if self.settings.get("clean_metadata", True):
@@ -2549,7 +2551,10 @@ class GroupCaptionDialog(QDialog):
         header.setSectionResizeMode(3,QHeaderView.ResizeMode.Stretch); header.setSectionResizeMode(4,QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5,QHeaderView.ResizeMode.ResizeToContents); layout.addWidget(self.table,1)
         actions=QHBoxLayout(); paste_all=QPushButton("从剪贴板一键按片段数分配"); paste_all.clicked.connect(self._paste_all)
-        actions.addWidget(paste_all); actions.addStretch()
+        actions.addWidget(paste_all)
+        calc_btn=QPushButton("🧮 时间换算工具"); calc_btn.clicked.connect(self._open_calc)
+        actions.addWidget(calc_btn)
+        actions.addStretch()
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存对应关系")
         buttons.accepted.connect(self._validate_accept); buttons.rejected.connect(self.reject); actions.addWidget(buttons); layout.addLayout(actions)
@@ -2574,6 +2579,10 @@ class GroupCaptionDialog(QDialog):
         for editor,(_folder,clips) in zip(self.editors,self.groups):
             count=len(clips); editor.setPlainText("\n".join(lines[offset:offset+count])); offset+=count
 
+    def _open_calc(self):
+        dialog = TimeCalculatorDialog(self)
+        dialog.exec()
+
     def _validate_accept(self):
         errors=[]
         for editor,(folder,clips) in zip(self.editors,self.groups):
@@ -2585,6 +2594,169 @@ class GroupCaptionDialog(QDialog):
 
     def scripts(self):
         return {str(folder.resolve()):"\n\n".join(self._lines(editor)) for editor,(folder,_clips) in zip(self.editors,self.groups)}
+
+
+class GroupMergeReportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("每日分组合成报表")
+        self.setMinimumSize(600, 450)
+        
+        layout = QVBoxLayout(self)
+        
+        # Date selector
+        date_layout = QHBoxLayout()
+        date_layout.addWidget(QLabel("选择日期:"))
+        self.date_picker = QDateEdit()
+        self.date_picker.setCalendarPopup(True)
+        self.date_picker.setDate(QDate.currentDate())
+        self.date_picker.dateChanged.connect(self.update_report)
+        date_layout.addWidget(self.date_picker)
+        date_layout.addStretch()
+        layout.addLayout(date_layout)
+        
+        # Report display
+        self.report_text = QTextBrowser()
+        self.report_text.setReadOnly(True)
+        self.report_text.setFont(QFont("Consolas", 10))
+        layout.addWidget(self.report_text)
+        
+        # Buttons layout
+        btn_layout = QHBoxLayout()
+        
+        self.copy_list_btn = QPushButton("详细列表 (TSV)")
+        self.copy_list_btn.clicked.connect(self.copy_detailed_list)
+        btn_layout.addWidget(self.copy_list_btn)
+        
+        self.copy_summary_btn = QPushButton("报表总结 (TSV)")
+        self.copy_summary_btn.clicked.connect(self.copy_summary)
+        btn_layout.addWidget(self.copy_summary_btn)
+        
+        self.copy_all_btn = QPushButton("复制全部")
+        self.copy_all_btn.clicked.connect(self.copy_all)
+        btn_layout.addWidget(self.copy_all_btn)
+        
+        self.clear_btn = QPushButton("清除今日历史")
+        self.clear_btn.setStyleSheet("color: #fca5a5;")
+        self.clear_btn.clicked.connect(self.clear_today_history)
+        btn_layout.addWidget(self.clear_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        self.update_report()
+        
+    def _get_history(self):
+        try:
+            from modules.platform_utils import app_data_dir
+            history_path = app_data_dir() / "group_merge_history.json"
+            if history_path.is_file():
+                return json.loads(history_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return []
+        
+    def _get_filtered_unique_entries(self):
+        selected_date = self.date_picker.date().toString("yyyy-MM-dd")
+        history = self._get_history()
+        
+        # Filter by selected date
+        date_entries = [e for e in history if e.get("date") == selected_date]
+        
+        # De-duplicate by group_name, keeping the latest successful attempt
+        unique_entries = {}
+        for entry in date_entries:
+            name = entry.get("group_name")
+            if name:
+                unique_entries[name] = entry
+                
+        return list(unique_entries.values())
+        
+    def update_report(self):
+        entries = self._get_filtered_unique_entries()
+        
+        # Calculate summary
+        total_videos = len(entries)
+        total_clips = sum(int(e.get("clip_count", 0)) for e in entries)
+        
+        # Build HTML for display
+        html = f"<h3>每日合成报表 ({self.date_picker.date().toString('yyyy-MM-dd')})</h3>"
+        html += "<h4>详细列表</h4>"
+        html += "<table border='1' cellpadding='4' style='border-collapse: collapse; border: 1px solid #334155;'>"
+        html += "<tr style='background: #1e293b;'><th>合成时间</th><th>视频组 (文件夹)</th><th>已合成片段数</th><th>成品文件名</th></tr>"
+        for e in entries:
+            html += f"<tr><td>{e.get('timestamp', '').split(' ')[1]}</td><td>{e.get('group_name')}</td><td align='center'>{e.get('clip_count')}</td><td>{e.get('output_name')}</td></tr>"
+        if not entries:
+            html += "<tr><td colspan='4' align='center' style='color:#a8a29e;'>当天无合成成功的历史记录 (数据为 0)</td></tr>"
+        html += "</table>"
+        
+        html += "<h4>报表总结</h4>"
+        html += "<table border='1' cellpadding='4' style='border-collapse: collapse; border: 1px solid #334155;'>"
+        html += f"<tr><td style='background: #1e293b;'><b>实际合成视频组数 (去重)</b></td><td align='center'>{total_videos}</td></tr>"
+        html += f"<tr><td style='background: #1e293b;'><b>实际合成总片段数 (去重)</b></td><td align='center'>{total_clips}</td></tr>"
+        html += "</table>"
+        
+        self.report_text.setHtml(html)
+        
+    def copy_detailed_list(self):
+        entries = self._get_filtered_unique_entries()
+        lines = ["合成时间\\t视频组(文件夹)\\t已合成片段数\\t成品文件名"]
+        for e in entries:
+            time_part = e.get('timestamp', '').split(' ')[1]
+            lines.append(f"{time_part}\\t{e.get('group_name')}\\t{e.get('clip_count')}\\t{e.get('output_name')}")
+        QApplication.clipboard().setText("\\n".join(lines))
+        QMessageBox.information(self, "复制成功", "详细列表已以 TSV 格式复制到剪贴板，可直接粘贴到 Google Sheets 或 Excel。")
+        
+    def copy_summary(self):
+        entries = self._get_filtered_unique_entries()
+        total_videos = len(entries)
+        total_clips = sum(int(e.get("clip_count", 0)) for e in entries)
+        
+        lines = [
+            "指标\\t数值",
+            f"实际合成视频组数 (去重)\\t{total_videos}",
+            f"实际合成总片段数 (去重)\\t{total_clips}"
+        ]
+        QApplication.clipboard().setText("\\n".join(lines))
+        QMessageBox.information(self, "复制成功", "总结已以 TSV 格式复制到剪贴板，可直接粘贴到 Google Sheets 或 Excel。")
+        
+    def copy_all(self):
+        entries = self._get_filtered_unique_entries()
+        total_videos = len(entries)
+        total_clips = sum(int(e.get("clip_count", 0)) for e in entries)
+        
+        selected_date = self.date_picker.date().toString("yyyy-MM-dd")
+        text = f"每日合成报表 ({selected_date})\\n\\n"
+        text += "详细列表\\n"
+        text += "合成时间\\t视频组(文件夹)\\t已合成片段数\\t成品文件名\\n"
+        for e in entries:
+            time_part = e.get('timestamp', '').split(' ')[1]
+            text += f"{time_part}\\t{e.get('group_name')}\\t{e.get('clip_count')}\\t{e.get('output_name')}\\n"
+        if not entries:
+            text += "(无数据)\\n"
+        text += "\\n报表总结\\n"
+        text += f"实际合成视频组数 (去重)\\t{total_videos}\\n"
+        text += f"实际合成总片段数 (去重)\\t{total_clips}\\n"
+        
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "复制成功", "所有报表内容已复制到剪贴板。")
+        
+    def clear_today_history(self):
+        selected_date = self.date_picker.date().toString("yyyy-MM-dd")
+        reply = QMessageBox.question(
+            self, "确认清除", f"是否确认清除 {selected_date} 的所有合成历史记录？该操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                from modules.platform_utils import app_data_dir
+                history_path = app_data_dir() / "group_merge_history.json"
+                if history_path.is_file():
+                    history = json.loads(history_path.read_text(encoding="utf-8"))
+                    new_history = [e for e in history if e.get("date") != selected_date]
+                    history_path.write_text(json.dumps(new_history, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.update_report()
+            except Exception as exc:
+                QMessageBox.critical(self, "清除失败", str(exc))
 
 
 class DynamicCaptionPage(QWidget):
@@ -2783,7 +2955,7 @@ class DynamicCaptionPage(QWidget):
         sort_row = QHBoxLayout(); sort_row.addWidget(QLabel("排序"))
         self.group_sort_mode = QComboBox(); self.group_sort_mode.addItems(["文件名自然排序（推荐）","按分段文案自动匹配"])
         self.group_sort_mode.currentTextChanged.connect(self._group_sort_mode_changed)
-        self.group_trim_mode = QComboBox(); self.group_trim_mode.addItems([
+        self.group_trim_mode = QComboBox(); self.group_trim_mode.addItems(["不裁剪（保留完整片段）", 
             "智能混合边界（推荐）", "仅按文案边界", "快速声音边界",
         ])
         self.group_trim_mode.setToolTip(
@@ -2820,13 +2992,15 @@ class DynamicCaptionPage(QWidget):
         group_action_panel=QWidget(); self.group_action_panel=group_action_panel
         group_action_layout=QVBoxLayout(group_action_panel); group_action_layout.setContentsMargins(2,4,2,2); group_action_layout.setSpacing(5)
         self.group_auto_timeline = QCheckBox("合成并转文字"); self.group_auto_timeline.setChecked(True)
-        self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(66,42); self.group_merge_start.clicked.connect(self.start_group_merge)
-        self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(66,42); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
+        self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(100,42); self.group_merge_start.clicked.connect(self.start_group_merge)
+        self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(100,42); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
+        self.group_merge_report_btn = QPushButton("合成报表"); self.group_merge_report_btn.setFixedSize(100,36); self.group_merge_report_btn.clicked.connect(self._show_group_merge_report)
         group_action_layout.addWidget(self.group_auto_timeline)
         compact_options=QHBoxLayout(); compact_options.setSpacing(3)
         compact_options.addWidget(self.group_burn_watermark)
         group_action_layout.addLayout(compact_options)
         group_action_layout.addWidget(self.group_merge_start); group_action_layout.addWidget(self.group_merge_stop)
+        group_action_layout.addWidget(self.group_merge_report_btn)
         group_action_layout.addStretch()
         group_action_panel.setFixedWidth(126)
 
@@ -2834,8 +3008,8 @@ class DynamicCaptionPage(QWidget):
         project_action_layout=QVBoxLayout(project_action_panel); project_action_layout.setContentsMargins(2,4,2,2); project_action_layout.setSpacing(5)
         self.proj_auto_timeline = QCheckBox("合成并转文字"); self.proj_auto_timeline.setChecked(True)
         self.proj_burn_watermark = QCheckBox("水印"); self.proj_burn_watermark.setChecked(False)
-        self.project_start_btn = QPushButton("合成"); self.project_start_btn.setObjectName("primary"); self.project_start_btn.setFixedSize(66,42); self.project_start_btn.clicked.connect(self.start_project_synthesis)
-        self.project_stop_btn = QPushButton("停止"); self.project_stop_btn.setFixedSize(66,42); self.project_stop_btn.setEnabled(False); self.project_stop_btn.clicked.connect(self.stop_project_synthesis)
+        self.project_start_btn = QPushButton("合成"); self.project_start_btn.setObjectName("primary"); self.project_start_btn.setFixedSize(100,42); self.project_start_btn.clicked.connect(self.start_project_synthesis)
+        self.project_stop_btn = QPushButton("停止"); self.project_stop_btn.setFixedSize(100,42); self.project_stop_btn.setEnabled(False); self.project_stop_btn.clicked.connect(self.stop_project_synthesis)
         project_action_layout.addWidget(self.proj_auto_timeline)
         project_action_layout.addWidget(self.proj_burn_watermark)
         project_action_layout.addWidget(self.project_start_btn); project_action_layout.addWidget(self.project_stop_btn)
@@ -3043,6 +3217,11 @@ class DynamicCaptionPage(QWidget):
         self.video_sink.videoFrameChanged.connect(self._video_frame_changed)
         self.player.positionChanged.connect(self._preview_position_changed); self.player.durationChanged.connect(self._preview_duration_changed)
         self.player.errorOccurred.connect(self._on_preview_player_error)
+        self.bgm_player = QMediaPlayer(self)
+        self.bgm_audio_output = QAudioOutput(self)
+        self.bgm_audio_output.setVolume(.4)
+        self.bgm_player.setAudioOutput(self.bgm_audio_output)
+        self.player.playbackStateChanged.connect(self._on_player_playback_state_changed)
         if hasattr(self, "audio_player"):
             self.audio_player.errorOccurred.connect(self._on_preview_player_error)
         self.preview_capture = None
@@ -3584,7 +3763,9 @@ class DynamicCaptionPage(QWidget):
         self.progress.valueChanged.connect(lambda value:self.progress_value.setText(f"{value}%"))
         progress_row.addWidget(self.progress); progress_row.addWidget(self.progress_value); og.addLayout(progress_row)
         self.cloud_sync_hint=QLabel("未开启：本次只批量生成本地 Reels 成品")
-        self.cloud_sync_hint.setWordWrap(False); self.cloud_sync_hint.setStyleSheet("color:#7dd3fc;font-size:11px;")
+        self.cloud_sync_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.cloud_sync_hint.setOpenExternalLinks(True)
+        self.cloud_sync_hint.setWordWrap(True); self.cloud_sync_hint.setStyleSheet("color:#7dd3fc;font-size:11px;")
         self.cloud_sync_check.toggled.connect(self._update_cloud_sync_hint)
         self.cloud_sync_profile.currentTextChanged.connect(self._update_cloud_sync_hint)
         og.addWidget(self.cloud_sync_hint)
@@ -3945,6 +4126,15 @@ class DynamicCaptionPage(QWidget):
             QSettings("VideoToolkit","DynamicReels").setValue(
                 "baked_watermarks",json.dumps(self._baked_watermarks,ensure_ascii=False))
         self.log.appendPlainText(f"[{index}/{total}] {group_name} 已加入合成结果队列。")
+        
+        # Calculate clip count and record history
+        clip_count = 0
+        if hasattr(self, "group_merge_groups"):
+            for folder, clips in self.group_merge_groups:
+                if folder.name == group_name:
+                    clip_count = len(clips)
+                    break
+        self._record_group_merge_history(group_name, clip_count, Path(output).name)
 
     def _load_group_merge_outputs(self, auto_extract=False):
         outputs = [
@@ -4153,7 +4343,7 @@ class DynamicCaptionPage(QWidget):
                 self._preview_load_timer.stop()
             except Exception:
                 pass
-        for player in (getattr(self, "player", None), getattr(self, "audio_player", None)):
+        for player in (getattr(self, "player", None), getattr(self, "audio_player", None), getattr(self, "bgm_player", None)):
             if player is None:
                 continue
             try:
@@ -4277,7 +4467,40 @@ class DynamicCaptionPage(QWidget):
                     self.player.setSource(QUrl())
                     self._preview_duration_changed(5000)
                     self._display_cached_preview()
+            
+            # Resolve BGM settings
+            self._preview_bgm_active = False
+            self._preview_bgm_file = None
+            self._preview_bgm_offset_ms = 0
+            
+            mode_text = self.audio_mode.currentText() if hasattr(self, "audio_mode") else ""
+            bgm_dir = self.bgm_dir_input.text().strip() if hasattr(self, "bgm_dir_input") else ""
+            if ("背景音乐" in mode_text or "背景音" in mode_text) and bgm_dir:
+                video_index = 0
+                for i in range(self.videos.count()):
+                    if self.videos.item(i).text() == str(media):
+                        video_index = i
+                        break
+                path_bgm = Path(bgm_dir)
+                if path_bgm.is_file():
+                    self._preview_bgm_file = path_bgm
+                elif path_bgm.is_dir():
+                    self._preview_bgm_file = find_bgm_file(str(path_bgm), video_index, str(media), randomize=True)
+                
+                if self._preview_bgm_file and self._preview_bgm_file.is_file():
+                    self._preview_bgm_active = True
+                    import hashlib
+                    h = hashlib.md5(f"{media.resolve()}_{video_index}".encode("utf-8")).hexdigest()
+                    self._preview_bgm_offset_ms = (int(h, 16) % 30) * 1000
+
+            if self._preview_bgm_active:
+                self.bgm_player.setSource(QUrl.fromLocalFile(str(self._preview_bgm_file.resolve())))
+                bgm_vol = self.background_volume.value() / 100 if hasattr(self, "background_volume") else 0.4
+                self.bgm_audio_output.setVolume(bgm_vol)
             else:
+                self.bgm_player.setSource(QUrl())
+
+            if not is_image:
                 self.audio_output.setVolume(
                     self.original_volume.value() / 100 if self._preview_external_audio and mix_audio else
                     (0 if self._preview_external_audio else .65)
@@ -4326,6 +4549,8 @@ class DynamicCaptionPage(QWidget):
         self.player.setPosition(int(milliseconds))
         if self._preview_external_audio:
             self.audio_player.setPosition(int(milliseconds)+self._preview_audio_offset_ms)
+        if getattr(self, "_preview_bgm_active", False) and hasattr(self, "bgm_player"):
+            self.bgm_player.setPosition(int(milliseconds) + self._preview_bgm_offset_ms)
         # QVideoSink 会在跳转完成后送来对应帧；短暂等待期间保留上一帧，不阻塞界面。
 
     def _video_frame_changed(self, frame):
@@ -5608,6 +5833,10 @@ class DynamicCaptionPage(QWidget):
         expected=value+self._preview_audio_offset_ms
         if self._preview_external_audio and abs(self.audio_player.position()-expected) > 250:
             self.audio_player.setPosition(expected)
+        if getattr(self, "_preview_bgm_active", False) and hasattr(self, "bgm_player"):
+            expected_bgm = value + self._preview_bgm_offset_ms
+            if abs(self.bgm_player.position() - expected_bgm) > 250:
+                self.bgm_player.setPosition(expected_bgm)
         self.time_label.setText(f"{self._clock(value)} / {self._clock(self.player.duration())}")
         if getattr(self, "_preview_is_image", False):
             self._display_cached_preview()
@@ -6874,6 +7103,53 @@ class DynamicCaptionPage(QWidget):
             QMessageBox.critical(self, "成片失败", f"批量制作发生错误：\n{message}")
 
 
+
+    def _record_group_merge_history(self, group_name, clip_count, output_name):
+        try:
+            from modules.platform_utils import app_data_dir
+            history_path = app_data_dir() / "group_merge_history.json"
+            history = []
+            if history_path.is_file():
+                try:
+                    history = json.loads(history_path.read_text(encoding="utf-8"))
+                except Exception:
+                    history = []
+            import datetime
+            now = datetime.datetime.now()
+            entry = {
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "date": now.strftime("%Y-%m-%d"),
+                "group_name": group_name,
+                "clip_count": clip_count,
+                "output_name": output_name
+            }
+            history.append(entry)
+            history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            if hasattr(self, "_append_run_log"):
+                self._append_run_log(f"记录分组合成历史失败：{exc}")
+
+    def _show_group_merge_report(self):
+        dialog = GroupMergeReportDialog(self)
+        dialog.exec()
+
+    def _on_player_playback_state_changed(self, state):
+        if state != QMediaPlayer.PlaybackState.PlayingState:
+            if getattr(self, "_preview_external_audio", False):
+                self.audio_player.pause()
+            if getattr(self, "_preview_bgm_active", False) and hasattr(self, "bgm_player"):
+                self.bgm_player.pause()
+            self.play_btn.setText("播放")
+        else:
+            if getattr(self, "_preview_external_audio", False):
+                self.audio_player.setPosition(self.player.position() + self._preview_audio_offset_ms)
+                self.audio_player.play()
+            if getattr(self, "_preview_bgm_active", False) and hasattr(self, "bgm_player"):
+                bgm_pos = self.player.position() + self._preview_bgm_offset_ms
+                self.bgm_player.setPosition(bgm_pos)
+                self.bgm_player.play()
+            self.play_btn.setText("暂停")
+
 class SlideshowWorker(QObject):
     log = Signal(str)
     finished = Signal(bool, str)
@@ -7756,3 +8032,105 @@ class ProjectAddDialog(QDialog):
                 })
         return results
 
+class TimeCalculatorDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("时间轴/切片换算小工具")
+        self.setMinimumSize(420, 360)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        
+        # Guide label
+        guide = QLabel(
+            "<b>使用说明：</b><br/>"
+            "支持输入：秒数（如 75）、分:秒（如 1:15）、分:秒.毫秒（如 1:15.30）<br/>"
+            "转换后将生成 <code>[开始-结束]</code> 格式的切片标记，复制到对应字幕前即可限制片段区间。"
+        )
+        guide.setWordWrap(True)
+        guide.setStyleSheet("color: #93c5fd; background: #1e293b; padding: 10px; border-radius: 5px;")
+        layout.addWidget(guide)
+        
+        # Form
+        form = QFormLayout()
+        self.start_input = QLineEdit()
+        self.start_input.setPlaceholderText("例如: 0:05 或 5")
+        self.start_input.setText("0:00")
+        
+        self.end_input = QLineEdit()
+        self.end_input.setPlaceholderText("例如: 1:30 或 90")
+        self.end_input.setText("0:30")
+        
+        form.addRow("开始时间 (Start):", self.start_input)
+        form.addRow("结束时间 (End):", self.end_input)
+        layout.addLayout(form)
+        
+        # Result display
+        result_layout = QHBoxLayout()
+        self.result_label = QLineEdit()
+        self.result_label.setReadOnly(True)
+        self.result_label.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
+        self.result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.result_label.setStyleSheet("color: #4ade80; background: #0f172a; padding: 8px;")
+        result_layout.addWidget(self.result_label)
+        
+        self.copy_btn = QPushButton("复制")
+        self.copy_btn.setFixedWidth(80)
+        self.copy_btn.clicked.connect(self.copy_result)
+        result_layout.addWidget(self.copy_btn)
+        layout.addLayout(result_layout)
+        
+        # Status message
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #fca5a5;")
+        layout.addWidget(self.status_label)
+        
+        # Connect signals
+        self.start_input.textChanged.connect(self.calculate)
+        self.end_input.textChanged.connect(self.calculate)
+        
+        self.calculate()
+        
+    def parse_time(self, text):
+        text = text.strip()
+        if not text:
+            return 0.0
+        if ":" in text:
+            parts = text.split(":")
+            if len(parts) == 2:
+                m = float(parts[0])
+                s = float(parts[1])
+                return m * 60 + s
+            elif len(parts) == 3:
+                h = float(parts[0])
+                m = float(parts[1])
+                s = float(parts[2])
+                return h * 3600 + m * 60 + s
+        else:
+            return float(text)
+            
+    def calculate(self):
+        try:
+            self.status_label.setText("")
+            start_sec = self.parse_time(self.start_input.text())
+            end_sec = self.parse_time(self.end_input.text())
+            
+            if start_sec < 0 or end_sec < 0:
+                raise ValueError("时间不能为负数")
+                
+            if start_sec >= end_sec:
+                self.result_label.setText("")
+                self.status_label.setText("开始时间必须小于结束时间")
+                return
+                
+            res = f"[{start_sec:.2f}-{end_sec:.2f}]"
+            self.result_label.setText(res)
+        except Exception as exc:
+            self.result_label.setText("")
+            self.status_label.setText(f"输入格式有误: {exc}")
+            
+    def copy_result(self):
+        text = self.result_label.text().strip()
+        if text:
+            QApplication.clipboard().setText(text)
+            QMessageBox.information(self, "复制成功", f"已复制：{text}\n可以粘贴到字幕文本对应的开头。")

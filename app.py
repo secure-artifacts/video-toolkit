@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.12").strip().lstrip("v") or "1.7.12"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.13").strip().lstrip("v") or "1.7.13"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -2748,6 +2748,30 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda checked=False, i=index: self._show_help_tab(i))
             nav_col.addWidget(btn)
             self._help_nav_buttons.append(btn)
+            
+        # Separator line
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine); sep.setFrameShadow(QFrame.Shadow.Sunken); sep.setStyleSheet("background:#334155;max-height:1px;margin:6px 0;")
+        nav_col.addWidget(sep)
+        
+        # Tools title
+        tools_title = QLabel("实用辅助")
+        tools_title.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:700;padding:4px 4px 6px 4px;")
+        nav_col.addWidget(tools_title)
+        
+        # Time calc button
+        calc_btn = QPushButton("🧮 时间换算工具")
+        calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        calc_btn.setStyleSheet(self._side_nav_button_style())
+        calc_btn.clicked.connect(self._open_help_time_calc)
+        nav_col.addWidget(calc_btn)
+        
+        # Feedback button
+        feedback_btn = QPushButton("💬 问题反馈表单")
+        feedback_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        feedback_btn.setStyleSheet(self._side_nav_button_style())
+        feedback_btn.clicked.connect(self._open_feedback_form)
+        nav_col.addWidget(feedback_btn)
+        
         nav_col.addStretch(1)
 
         body.addWidget(nav_frame)
@@ -2756,6 +2780,15 @@ class MainWindow(QMainWindow):
 
         self._show_help_tab(0)
         return page
+
+    def _open_help_time_calc(self):
+        from modules.dynamic_caption_page import TimeCalculatorDialog
+        dialog = TimeCalculatorDialog(self)
+        dialog.exec()
+        
+    def _open_feedback_form(self):
+        dialog = FeedbackDialog(self)
+        dialog.exec()
 
     def _show_help_tab(self, index: int, anchor: str | None = None):
         if index < 0 or index >= len(HELP_TABS):
@@ -3660,6 +3693,18 @@ class MainWindow(QMainWindow):
         self.store.data.pop("cloud_resume",None); self.store.save()
         self.pipeline_cloud_result.setText(
             f'云端同步完成：{summary}<br><a href="{folder_url}">打开 Google Drive 文件夹</a>')
+        if hasattr(self, "dynamic_caption_page"):
+            sheet_url = f"https://docs.google.com/spreadsheets/d/{extract_google_id(self._selected_sync_config().get('spreadsheet_id', ''))}"
+            self.dynamic_caption_page._append_run_log(
+                f"[云端同步成功] {summary}\n"
+                f"Google Drive 文件夹链接: {folder_url}\n"
+                f"Google Sheets 表格链接: {sheet_url}"
+            )
+            self.dynamic_caption_page.cloud_sync_hint.setText(
+                f'云端同步完成：{summary}<br>'
+                f'<a href="{folder_url}">[打开 Google Drive]</a> | '
+                f'<a href="{sheet_url}">[打开 Google Sheets]</a>'
+            )
 
     def _pipeline_sheet_pending(self, folder_url, uploaded, error):
         self.pending_upload_files=[]; self.pipeline_retry_upload.setEnabled(False)
@@ -3671,8 +3716,20 @@ class MainWindow(QMainWindow):
         self.pipeline_cloud_result.setStyleSheet("color:#fbbf24;padding:4px;")
         self.pipeline_cloud_result.setText(
             f'视频已上传成功，但写入表格失败：{error}<br><a href="{folder_url}">打开 Google Drive 文件夹</a><br>修正配置后点击“继续填表”，不会重新上传视频。')
+        if hasattr(self, "dynamic_caption_page"):
+            self.dynamic_caption_page._append_run_log(
+                f"[云端同步未完全成功] 视频已全部上传成功，但写入 Google Sheets 发生错误：{error}\n"
+                f"Google Drive 文件夹链接: {folder_url}"
+            )
+            self.dynamic_caption_page.cloud_sync_hint.setText(
+                f'已上传但写入表格失败：{error}<br>'
+                f'<a href="{folder_url}">[打开 Google Drive]</a>'
+            )
 
     def _pipeline_cloud_failed(self, final_dir, error):
+        if hasattr(self, "dynamic_caption_page"):
+            self.dynamic_caption_page._append_run_log(f"[云端同步失败] 同步发生错误：{error}")
+            self.dynamic_caption_page.cloud_sync_hint.setText(f"云端同步失败：{error}")
         self.pending_sheet_uploads=[]; self.pending_sheet_folder_url=""; self.pipeline_continue_sheet.setEnabled(False)
         video_extensions = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v", ".flv", ".ts"}
         self.pending_upload_files = [str(path) for path in sorted(Path(final_dir).iterdir(),
@@ -3723,7 +3780,10 @@ class MainWindow(QMainWindow):
             return
         self.cloud_thread=QThread(self); self.cloud_worker=SheetFillWorker(config,list(self.pending_sheet_uploads),self.pending_sheet_folder_url)
         self.cloud_worker.moveToThread(self.cloud_thread); self.cloud_thread.started.connect(self.cloud_worker.run)
-        self.cloud_worker.log.connect(self.pipeline_log.appendPlainText); self.cloud_worker.finished.connect(self._sheet_fill_done)
+        self.cloud_worker.log.connect(self.pipeline_log.appendPlainText)
+        if hasattr(self, "dynamic_caption_page"):
+            self.cloud_worker.log.connect(lambda msg: self.dynamic_caption_page._append_run_log(f"[云端同步] {msg}"))
+        self.cloud_worker.finished.connect(self._sheet_fill_done)
         self.cloud_worker.finished.connect(self.cloud_thread.quit); self.cloud_thread.finished.connect(self._cloud_thread_ended); self.cloud_thread.finished.connect(self.cloud_thread.deleteLater)
         self.pipeline_continue_sheet.setEnabled(False); self.pipeline_stop_upload.setEnabled(False)
         self.pipeline_cloud_result.setStyleSheet("color:#7dd3fc;padding:4px;"); self.pipeline_cloud_result.setText("正在继续填写 Google Sheets，不会重新上传视频…")
@@ -3736,10 +3796,24 @@ class MainWindow(QMainWindow):
             self.store.data.pop("cloud_resume",None); self.store.save()
             self.pipeline_cloud_result.setStyleSheet("color:#86efac;padding:4px;")
             self.pipeline_cloud_result.setText(f'{message}<br><a href="{folder_url}">打开 Google Drive 文件夹</a>')
+            if hasattr(self, "dynamic_caption_page"):
+                sheet_url = f"https://docs.google.com/spreadsheets/d/{extract_google_id(self._selected_sync_config().get('spreadsheet_id', ''))}"
+                self.dynamic_caption_page._append_run_log(
+                    f"[云端同步成功] {message}\n"
+                    f"Google Drive 文件夹链接: {folder_url}\n"
+                    f"Google Sheets 表格链接: {sheet_url}"
+                )
+                self.dynamic_caption_page.cloud_sync_hint.setText(
+                    f'云端同步完成：{message}<br>'
+                    f'<a href="{folder_url}">[打开 Google Drive]</a> | '
+                    f'<a href="{sheet_url}">[打开 Google Sheets]</a>'
+                )
         else:
             self.pipeline_continue_sheet.setEnabled(bool(self.pending_sheet_uploads))
             self.pipeline_cloud_result.setStyleSheet("color:#fca5a5;padding:4px;")
             self.pipeline_cloud_result.setText(f"继续填表失败：{message}<br>修正配置后可以再次点击继续填表。")
+            if hasattr(self, "dynamic_caption_page"):
+                self.dynamic_caption_page._append_run_log(f"[云端同步失败] 填表失败：{message}")
 
     def _mark_pending_sheet_complete(self, folder_url):
         try:
@@ -3783,8 +3857,10 @@ class MainWindow(QMainWindow):
                                          "records":[{**dict(item),"path":str(item.get("path",""))} for item in records]}
         self.store.save()
         self.cloud_thread = QThread(self); self.cloud_worker = CloudUploadWorker(config, files, records, files)
-        self.cloud_worker.moveToThread(self.cloud_thread); self.cloud_thread.started.connect(self.cloud_worker.run)
+        self.cloud_thread.started.connect(self.cloud_worker.run)
         self.cloud_worker.log.connect(self.pipeline_log.appendPlainText)
+        if hasattr(self, "dynamic_caption_page"):
+            self.cloud_worker.log.connect(lambda msg: self.dynamic_caption_page._append_run_log(f"[云端同步] {msg}"))
         self.cloud_worker.sheet_pending.connect(self._pipeline_sheet_pending)
         self.cloud_worker.finished.connect(self._cloud_upload_done); self.cloud_worker.finished.connect(self.cloud_thread.quit)
         self.cloud_thread.finished.connect(self._cloud_thread_ended); self.cloud_thread.finished.connect(self.cloud_thread.deleteLater)
@@ -4684,6 +4760,199 @@ def main():
     if os.environ.get("VIDEO_TOOLKIT_SMOKE_TEST", "").strip() == "1":
         QTimer.singleShot(1800, app.quit)
     sys.exit(app.exec())
+
+
+
+
+class FeedbackSubmitWorker(QObject):
+    log = Signal(str)
+    finished = Signal(bool, str)
+    
+    def __init__(self, settings, title, content, attachments):
+        super().__init__()
+        self.settings = settings
+        self.title = title
+        self.content = content
+        self.attachments = attachments
+        
+    def run(self):
+        try:
+            self.log.emit("正在准备反馈数据与附件...")
+            import base64
+            import mimetypes
+            import requests
+            
+            # Load credentials to get the user's identity
+            identity = "Anonymous"
+            try:
+                credentials, identity = load_google_credentials(self.settings, interactive=False)
+            except Exception:
+                pass
+                
+            attachments_payload = []
+            for idx, path in enumerate(self.attachments, 1):
+                p = Path(path)
+                if p.is_file():
+                    self.log.emit(f"正在读取并转换附件 ({idx}/{len(self.attachments)}): {p.name}...")
+                    file_bytes = p.read_bytes()
+                    base64_str = base64.b64encode(file_bytes).decode("utf-8")
+                    mimetype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+                    attachments_payload.append({
+                        "name": p.name,
+                        "mimeType": mimetype,
+                        "base64": base64_str
+                    })
+                    
+            payload = {
+                "user": identity,
+                "title": self.title,
+                "content": self.content,
+                "attachments": attachments_payload
+            }
+            
+            self.log.emit("正在通过 Web App 提交反馈（正在上传附件，这可能需要几分钟，请耐心等待）...")
+            url = "https://script.google.com/macros/s/AKfycbw43iki16bBIfruuF_9YrbrZplvKQgGyYExEtweoDMv7fCQtlMgjqlr9uyCNCapeN_o/exec"
+            
+            response = requests.post(url, json=payload, timeout=600)
+            if response.status_code == 200:
+                res_data = response.json()
+                if res_data.get("success"):
+                    self.finished.emit(True, "反馈已成功通过 Web App 提交！感谢您的反馈。")
+                else:
+                    error_msg = res_data.get("error", "未知错误")
+                    raise RuntimeError(error_msg)
+            else:
+                raise RuntimeError(f"HTTP 请求失败：状态码 {response.status_code}")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
+
+
+class FeedbackDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("💬 问题反馈与建议")
+        self.resize(500, 450)
+        self.settings = parent.settings if parent and hasattr(parent, "settings") else {}
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        
+        info = QLabel(
+            "<b>填写问题反馈：</b><br/>"
+            "支持上传截图与问题视频。<br/>"
+            "⚠️ <b>注意</b>：Google 限制单次上传最大 50MB。国内网络上传视频较慢，请优先使用图片截图；若上传视频，提交时请耐心等待几分钟。"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #93c5fd; background: #1e293b; padding: 10px; border-radius: 5px;")
+        layout.addWidget(info)
+        
+        form = QFormLayout()
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("一句话简述您的问题")
+        
+        self.content_input = QPlainTextEdit()
+        self.content_input.setPlaceholderText("请详细描述您遇到的问题、操作步骤或建议...")
+        
+        form.addRow("反馈标题:", self.title_input)
+        form.addRow("问题描述:", self.content_input)
+        layout.addLayout(form)
+        
+        att_label = QLabel("附件列表 (支持图片、视频):")
+        layout.addWidget(att_label)
+        
+        self.att_list = QListWidget()
+        self.att_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(self.att_list)
+        
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("添加图片/视频")
+        add_btn.clicked.connect(self.add_attachment)
+        btn_layout.addWidget(add_btn)
+        
+        self.remove_btn = QPushButton("删除选中")
+        self.remove_btn.clicked.connect(self.remove_attachment)
+        self.remove_btn.setEnabled(False)
+        self.att_list.itemSelectionChanged.connect(lambda: self.remove_btn.setEnabled(bool(self.att_list.selectedItems())))
+        btn_layout.addWidget(self.remove_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #bae6fd;")
+        layout.addWidget(self.status_label)
+        
+        actions = QHBoxLayout()
+        self.submit_btn = QPushButton("提交反馈")
+        self.submit_btn.setObjectName("primary")
+        self.submit_btn.setFixedSize(120, 36)
+        self.submit_btn.clicked.connect(self.submit_feedback)
+        
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setFixedSize(80, 36)
+        cancel_btn.clicked.connect(self.reject)
+        
+        actions.addStretch()
+        actions.addWidget(self.submit_btn)
+        actions.addWidget(cancel_btn)
+        layout.addLayout(actions)
+        
+        self.attachments = []
+        self.worker = None
+        self.thread = None
+        
+    def add_attachment(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择反馈附件", "",
+            "媒体文件 (*.png *.jpg *.jpeg *.mp4 *.mov *.avi *.mkv);;所有文件 (*.*)"
+        )
+        if paths:
+            for p in paths:
+                if p not in self.attachments:
+                    self.attachments.append(p)
+                    self.att_list.addItem(Path(p).name)
+                    
+    def remove_attachment(self):
+        selected = self.att_list.currentRow()
+        if selected != -1:
+            self.att_list.takeItem(selected)
+            self.attachments.pop(selected)
+            
+    def submit_feedback(self):
+        title = self.title_input.text().strip()
+        content = self.content_input.toPlainText().strip()
+        
+        if not title:
+            QMessageBox.warning(self, "信息不全", "请填写反馈标题！")
+            return
+            
+        self.submit_btn.setEnabled(False)
+        self.title_input.setEnabled(False)
+        self.content_input.setEnabled(False)
+        
+        self.thread = QThread()
+        self.worker = FeedbackSubmitWorker(self.settings, title, content, self.attachments)
+        self.worker.moveToThread(self.thread)
+        
+        self.thread.started.connect(self.worker.run)
+        self.worker.log.connect(self.status_label.setText)
+        self.worker.finished.connect(self.on_finished)
+        
+        self.thread.start()
+        
+    def on_finished(self, ok, msg):
+        self.thread.quit()
+        self.thread.wait()
+        
+        if ok:
+            QMessageBox.information(self, "提交成功", msg)
+            self.accept()
+        else:
+            QMessageBox.critical(self, "提交失败", f"发生错误：\n{msg}")
+            self.submit_btn.setEnabled(True)
+            self.title_input.setEnabled(True)
+            self.content_input.setEnabled(True)
+            self.status_label.setText("")
 
 
 if __name__ == "__main__":

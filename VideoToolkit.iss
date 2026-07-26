@@ -1,6 +1,6 @@
 [Setup]
 AppName=VideoToolkit
-AppVersion=1.7.12
+AppVersion=1.7.13
 AppPublisher=secure-artifacts
 AppPublisherURL=https://github.com/secure-artifacts/video-toolkit
 AppSupportURL=https://github.com/secure-artifacts/video-toolkit/issues
@@ -10,7 +10,7 @@ UninstallDisplayIcon={app}\VideoToolkit.exe
 Compression=lzma2
 SolidCompression=yes
 OutputDir=.
-OutputBaseFilename=VideoToolkit_Setup_v1.7.12
+OutputBaseFilename=VideoToolkit_Setup_v1.7.13
 SetupIconFile=logo.ico
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
