@@ -2220,22 +2220,48 @@ class UpdateCheckWorker(QObject):
             has_new = parse_ver(latest_version) > parse_ver(self.current_version)
             download_url = ""
             filename = ""
+            
+            import sys
+            import platform
+            is_win = sys.platform.startswith("win")
+            is_mac = sys.platform.startswith("dar")
+            
+            target_assets = []
             for asset in data.get("assets", []) or []:
+                name = asset.get("name", "").lower()
+                if is_win and ("windows" in name or "win" in name):
+                    target_assets.append(asset)
+                elif is_mac and ("macos" in name or "osx" in name):
+                    arch = "arm64" if "arm" in platform.machine().lower() or "aarch64" in platform.machine().lower() else "x64"
+                    if arch in name:
+                        target_assets.append(asset)
+                        
+            if not target_assets and data.get("assets"):
+                target_assets = data.get("assets")
+                
+            for asset in target_assets:
                 name = asset.get("name", "")
                 if name.endswith(".exe") and "Setup" in name:
                     download_url = asset.get("browser_download_url", "")
                     filename = name
                     break
             if not download_url:
-                for asset in data.get("assets", []) or []:
+                for asset in target_assets:
                     name = asset.get("name", "")
                     if name.endswith(".exe"):
                         download_url = asset.get("browser_download_url", "")
                         filename = name
                         break
-            if not download_url and data.get("assets"):
-                download_url = data["assets"][0].get("browser_download_url", "")
-                filename = data["assets"][0].get("name", "")
+            if not download_url and target_assets:
+                for asset in target_assets:
+                    name = asset.get("name", "")
+                    if name.endswith(".zip"):
+                        download_url = asset.get("browser_download_url", "")
+                        filename = name
+                        break
+                if not download_url:
+                    download_url = target_assets[0].get("browser_download_url", "")
+                    filename = target_assets[0].get("name", "")
             self.finished.emit(has_new, latest_version, download_url, filename, "")
         except Exception as e:
             self.finished.emit(False, "", "", "", str(e))
