@@ -2179,8 +2179,8 @@ class FullTextToolTipFilter(QObject):
 
 
 class UpdateCheckWorker(QObject):
-    """从 GitHub releases/latest 检查新版本（Setup .exe 优先）。"""
-    finished = Signal(bool, str, str, str)  # has_new, latest_version, download_url, error
+    """从 GitHub releases/latest 检查新版本（Setup .exe 优先，其次为 .zip 绿色包）。"""
+    finished = Signal(bool, str, str, str, str)  # has_new, latest_version, download_url, filename, error
 
     def __init__(self, current_version):
         super().__init__()
@@ -2199,13 +2199,13 @@ class UpdateCheckWorker(QObject):
                 timeout=15,
             )
             if response.status_code != 200:
-                self.finished.emit(False, "", "", f"HTTP {response.status_code}")
+                self.finished.emit(False, "", "", "", f"HTTP {response.status_code}")
                 return
             data = response.json()
             tag_name = data.get("tag_name", "").strip()
             latest_version = tag_name.lstrip("v")
             if not latest_version:
-                self.finished.emit(False, "", "", "无法获取最新版本号")
+                self.finished.emit(False, "", "", "", "无法获取最新版本号")
                 return
 
             def parse_ver(v):
@@ -2219,32 +2219,37 @@ class UpdateCheckWorker(QObject):
 
             has_new = parse_ver(latest_version) > parse_ver(self.current_version)
             download_url = ""
+            filename = ""
             for asset in data.get("assets", []) or []:
                 name = asset.get("name", "")
                 if name.endswith(".exe") and "Setup" in name:
                     download_url = asset.get("browser_download_url", "")
+                    filename = name
                     break
             if not download_url:
                 for asset in data.get("assets", []) or []:
                     name = asset.get("name", "")
                     if name.endswith(".exe"):
                         download_url = asset.get("browser_download_url", "")
+                        filename = name
                         break
             if not download_url and data.get("assets"):
                 download_url = data["assets"][0].get("browser_download_url", "")
-            self.finished.emit(has_new, latest_version, download_url, "")
+                filename = data["assets"][0].get("name", "")
+            self.finished.emit(has_new, latest_version, download_url, filename, "")
         except Exception as e:
-            self.finished.emit(False, "", "", str(e))
+            self.finished.emit(False, "", "", "", str(e))
 
 
 class DownloadWorker(QObject):
     progress = Signal(int)
     finished = Signal(bool, str, str) # success, file_path, error
     
-    def __init__(self, url, version):
+    def __init__(self, url, version, filename=""):
         super().__init__()
         self.url = url
         self.version = version
+        self.filename = filename
         self.cancelled = False
         
     def run(self):
@@ -2255,7 +2260,14 @@ class DownloadWorker(QObject):
             response.raise_for_status()
             total = int(response.headers.get('content-length', 0))
             
-            dest = Path(tempfile.gettempdir()) / f"VideoToolkit_Setup_v{self.version}.exe"
+            ext = ".exe"
+            if self.filename:
+                ext = Path(self.filename).suffix
+            else:
+                url_path = self.url.split("?")[0]
+                if url_path.endswith(".zip"):
+                    ext = ".zip"
+            dest = Path(tempfile.gettempdir()) / f"VideoToolkit_v{self.version}{ext}"
             downloaded = 0
             with open(dest, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=128 * 1024):
@@ -4628,22 +4640,33 @@ class MainWindow(QMainWindow):
 
     def _on_download_finished(self, success, file_path, error):
         if success:
-            reply = QMessageBox.question(
-                self, "新版本下载完成",
-                "最新版本的升级安装包已在后台下载完成！\n是否现在退出本软件并启动升级安装？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
-            )
-            if reply == QMessageBox.StandardButton.Yes:
+            is_exe = str(file_path).lower().endswith(".exe")
+            if is_exe:
+                reply = QMessageBox.question(
+                    self, "新版本下载完成",
+                    "最新版本的升级安装包已在后台下载完成！\n是否现在退出本软件并启动升级安装？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    try:
+                        import subprocess
+                        subprocess.Popen([file_path], shell=True)
+                        self.close()
+                    except Exception as e:
+                        QMessageBox.warning(
+                            self, "运行安装包失败",
+                            f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
+            else:
+                QMessageBox.information(
+                    self, "绿色免安装版下载完成",
+                    f"最新版本的绿色免安装压缩包已在后台下载完成！\n\n存储路径：\n{file_path}\n\n请解压该文件后使用新版。"
+                )
                 try:
-                    import subprocess
-                    subprocess.Popen([file_path], shell=True)
-                    # 仅在用户确认安装时主动关闭（预期行为，非崩溃）
-                    self.close()
-                except Exception as e:
-                    QMessageBox.warning(
-                        self, "运行安装包失败",
-                        f"启动升级安装程序失败，请手动打开文件安装：\n{file_path}\n错误信息: {e}")
+                    import os
+                    os.startfile(os.path.dirname(file_path))
+                except Exception:
+                    pass
         else:
             is_cancelled = bool(
                 getattr(self, "_download_worker", None)
