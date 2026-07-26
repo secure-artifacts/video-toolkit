@@ -4614,7 +4614,7 @@ class MainWindow(QMainWindow):
         self._update_thread.finished.connect(self._update_thread_cleanup)
         self._update_thread.start()
 
-    def _on_update_finished(self, has_new, latest_version, download_url, error):
+    def _on_update_finished(self, has_new, latest_version, download_url, filename, error):
         manual = getattr(self, "_update_manual_check", False)
         if error:
             if manual:
@@ -4630,7 +4630,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes
             )
             if reply == QMessageBox.StandardButton.Yes:
-                self._start_update_download(latest_version, download_url)
+                self._start_update_download(latest_version, download_url, filename)
         else:
             if manual:
                 QMessageBox.information(self, "已经是最新版本", f"当前版本 v{APP_VERSION} 已经是最新版本！")
@@ -4645,7 +4645,7 @@ class MainWindow(QMainWindow):
         if thread is not None:
             thread.deleteLater()
 
-    def _start_update_download(self, version, url):
+    def _start_update_download(self, version, url, filename):
         thread = getattr(self, "_download_thread", None)
         if thread is not None:
             try:
@@ -4660,7 +4660,7 @@ class MainWindow(QMainWindow):
             "最新版更新包已在后台开始静默下载。下载期间您可以继续正常使用软件，下载完成后将会自动提示您安装。")
 
         self._download_thread = QThread(self)
-        self._download_worker = DownloadWorker(url, version)
+        self._download_worker = DownloadWorker(url, version, filename)
         self._download_worker.moveToThread(self._download_thread)
         self._download_thread.started.connect(self._download_worker.run)
         self._download_worker.progress.connect(self._on_download_progress)
