@@ -3134,6 +3134,19 @@ class MainWindow(QMainWindow):
         self.key_bulk_input.setMinimumHeight(100)
         self.key_bulk_input.setMaximumHeight(140)
         add_layout.addWidget(self.key_bulk_input)
+        
+        # Quick key application links
+        links_label = QLabel(
+            "<b>🔑 快捷申请密钥链接：</b><br/>"
+            "• <b>Groq</b>: <a href='https://console.groq.com/keys' style='color:#60a5fa;'>console.groq.com</a>&nbsp;&nbsp;&nbsp;&nbsp;"
+            "• <b>Gemini</b>: <a href='https://aistudio.google.com/' style='color:#60a5fa;'>aistudio.google.com</a>&nbsp;&nbsp;&nbsp;&nbsp;"
+            "• <b>ElevenLabs</b>: <a href='https://elevenlabs.io/' style='color:#60a5fa;'>elevenlabs.io</a>&nbsp;&nbsp;&nbsp;&nbsp;"
+            "• <b>Gladia</b>: <a href='https://app.gladia.io/' style='color:#60a5fa;'>app.gladia.io</a>"
+        )
+        links_label.setOpenExternalLinks(True)
+        links_label.setStyleSheet("QLabel { line-height: 1.6; margin-top: 4px; margin-bottom: 4px; }")
+        add_layout.addWidget(links_label)
+        
         action_row = QHBoxLayout()
         add_btn = QPushButton("添加密钥")
         add_btn.setObjectName("primary")
