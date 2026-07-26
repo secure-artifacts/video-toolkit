@@ -680,10 +680,18 @@ class GroupMergeWorker(QObject):
                     "file '" + path.resolve().as_posix().replace("'", "'\\''") + "'" for path in normalized
                 ), encoding="utf-8")
                 destination = self.output / f"{_safe_name(folder.name)}_去口气音合成.mp4"
+                # Resolve group-specific transition name
+                group_key = folder.resolve().as_posix().lower()
+                custom_trans = self.settings.get("group_custom_transitions", {}).get(group_key, "跟随全局")
+                if custom_trans != "跟随全局":
+                    transition_name = custom_trans
+                else:
+                    transition_name = self.settings.get("transition_name", "无转场")
+
                 final_fingerprint = hashlib.sha256(json.dumps({
                     "files": [self._signature(path) for path in normalized],
                     "clean_metadata": bool(self.settings.get("clean_metadata", True)),
-                    "transition_name": self.settings.get("transition_name", "无转场"),
+                    "transition_name": transition_name,
                     "transition_duration": float(self.settings.get("transition_duration") or 0),
                     "aspect_ratio": self.settings.get("aspect_ratio", "原始比例"),
                     "resolution": self.settings.get("resolution", "默认最高"),
@@ -699,7 +707,7 @@ class GroupMergeWorker(QObject):
                         and state.get("fingerprint") == final_fingerprint):
                     self.log.emit(f"正在合并文件夹“{folder.name}”的 {len(normalized)} 个片段，请等待…")
                     
-                    transition_name = self.settings.get("transition_name", "无转场")
+                    # Use resolved transition_name
                     transition_cfg = resolve_merge_transition(transition_name)
                     transition_key = (transition_cfg or {}).get("xfade") if transition_cfg else None
                     

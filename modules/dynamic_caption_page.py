@@ -2941,7 +2941,7 @@ class DynamicCaptionPage(QWidget):
         group_path_row.addWidget(self.group_parent,1); group_path_row.addWidget(choose_group_parent); group_path_row.addWidget(clear_group_tasks)
         group_layout.addLayout(group_path_row)
         group_tools_row=QHBoxLayout(); group_tools_row.addWidget(scan_groups); group_tools_row.addWidget(map_captions,1); group_layout.addLayout(group_tools_row)
-        self.group_table = QTableWidget(0,4); self.group_table.setHorizontalHeaderLabels(["序号","文件夹","片段","文件列表"])
+        self.group_table = QTableWidget(0,5); self.group_table.setHorizontalHeaderLabels(["序号","文件夹","片段","文件列表","自定义转场"])
         self.group_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.group_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.group_table.setMaximumHeight(150); self.group_table.verticalHeader().setVisible(False)
@@ -2949,7 +2949,8 @@ class DynamicCaptionPage(QWidget):
         self.group_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch)
         self.group_table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeMode.Fixed)
         self.group_table.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeMode.Stretch)
-        self.group_table.setColumnWidth(0,42); self.group_table.setColumnWidth(2,46)
+        self.group_table.horizontalHeader().setSectionResizeMode(4,QHeaderView.ResizeMode.ResizeToContents)
+        self.group_table.setColumnWidth(0,42); self.group_table.setColumnWidth(2,46); self.group_table.setColumnWidth(4,100)
         self.group_table.currentCellChanged.connect(self._group_selection_changed)
         group_layout.addWidget(self.group_table)
         sort_row = QHBoxLayout(); sort_row.addWidget(QLabel("排序"))
@@ -2994,12 +2995,14 @@ class DynamicCaptionPage(QWidget):
         self.group_auto_timeline = QCheckBox("合成并转文字"); self.group_auto_timeline.setChecked(True)
         self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(100,42); self.group_merge_start.clicked.connect(self.start_group_merge)
         self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(100,42); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
+        self.group_merge_selected = QPushButton("重新合成选中组"); self.group_merge_selected.setFixedSize(100,36); self.group_merge_selected.clicked.connect(self.start_group_merge_selected)
         self.group_merge_report_btn = QPushButton("合成报表"); self.group_merge_report_btn.setFixedSize(100,36); self.group_merge_report_btn.clicked.connect(self._show_group_merge_report)
         group_action_layout.addWidget(self.group_auto_timeline)
         compact_options=QHBoxLayout(); compact_options.setSpacing(3)
         compact_options.addWidget(self.group_burn_watermark)
         group_action_layout.addLayout(compact_options)
         group_action_layout.addWidget(self.group_merge_start); group_action_layout.addWidget(self.group_merge_stop)
+        group_action_layout.addWidget(self.group_merge_selected)
         group_action_layout.addWidget(self.group_merge_report_btn)
         group_action_layout.addStretch()
         group_action_panel.setFixedWidth(126)
@@ -3954,6 +3957,10 @@ class DynamicCaptionPage(QWidget):
             file_names="；".join(Path(clip).name for clip in sorted(clips,key=lambda p:natural_key(Path(p).name)))
             for column, value in enumerate((f"{row + 1:02d}", group_folder.name, str(len(clips)),file_names)):
                 item = QTableWidgetItem(value); item.setToolTip(str(group_folder)); self.group_table.setItem(row, column, item)
+            combo = QComboBox()
+            combo.addItems(["跟随全局", *merge_transition_labels()])
+            combo.setStyleSheet("QComboBox { background: #1e293b; border: 1px solid #475569; border-radius: 4px; color: #cbd5e1; }")
+            self.group_table.setCellWidget(row, 4, combo)
         if self.group_merge_groups:
             self.group_table.selectRow(0); self.group_table.setCurrentCell(0, 0)
             self.log.appendPlainText(
@@ -3995,6 +4002,104 @@ class DynamicCaptionPage(QWidget):
             else "文件名自然排序会正确处理 1、2、3…10；裁剪方式可选择智能混合、仅文案或快速声音边界。"
         )
 
+    def start_group_merge_selected(self):
+        if self.group_merge_thread and self.group_merge_thread.isRunning():
+            return
+        self._save_current_group_script()
+        selected_row = self.group_table.currentRow()
+        if selected_row == -1 or not self.group_merge_groups or selected_row >= len(self.group_merge_groups):
+            QMessageBox.warning(self, "未选择视频组", "请先在列表中选中一个视频组（项目）！")
+            return
+            
+        group_folder, clips = self.group_merge_groups[selected_row]
+        if "文案" in self.group_sort_mode.currentText():
+            if not self.group_scripts.get(str(group_folder.resolve()), "").strip():
+                QMessageBox.information(self, "缺少分段文案", f"选中的“{group_folder.name}”组尚未填写分段文案！")
+                return
+                
+        try:
+            ffmpeg = self.find_ffmpeg()
+        except Exception as exc:
+            QMessageBox.critical(self, "缺少组件", str(exc)); return
+            
+        if hasattr(self, "selection_debounce_timer"):
+            self.selection_debounce_timer.stop()
+        self._pending_video_path = None
+        self._clear_previews_and_releases()
+        
+        output = Path(self.output.text()) / "00_分组合成"
+        provider = self.provider.currentText()
+        callback = lambda path: self.transcribe_callable(path, provider)
+        
+        group_custom_transitions = {}
+        for row in range(self.group_table.rowCount()):
+            folder_item = self.group_table.item(row, 1)
+            if folder_item:
+                folder_path = folder_item.toolTip()
+                combo = self.group_table.cellWidget(row, 4)
+                if isinstance(combo, QComboBox):
+                    resolved_key = Path(folder_path).resolve().as_posix().lower()
+                    group_custom_transitions[resolved_key] = combo.currentText()
+                    
+        settings = {
+            "sort_mode": "script" if "文案" in self.group_sort_mode.currentText() else "natural",
+            "trim_mode": ("none" if "不裁剪" in self.group_trim_mode.currentText()
+                          else "hybrid" if "混合" in self.group_trim_mode.currentText()
+                          else "text" if "文案" in self.group_trim_mode.currentText() else "fast"),
+            "scripts": dict(self.group_scripts),
+            "head_padding_ms": self.group_head_padding.value(),
+            "tail_padding_ms": self.group_tail_padding.value(),
+            "silence_threshold_db": self.group_silence_threshold.value(),
+            "silence_min_ms": self.group_silence_min.value(),
+            "resume": False,
+            "encoder_backend": self.encoder_backend.currentText(),
+            "encode_preset": self.encode_preset.currentText(),
+            "clean_metadata": self.clean_metadata.isChecked(),
+            "transition_name": self.transition_name.currentText(),
+            "transition_duration": float(self.transition_duration.value()),
+            "aspect_ratio": self.aspect_ratio.currentText(),
+            "resolution": self.resolution.currentText(),
+            "video_extend_mode": self.video_extend_mode.currentText(),
+            "group_custom_transitions": group_custom_transitions,
+        }
+        
+        watermark_fingerprint = watermark_config_fingerprint(self._watermark_entries)
+        burn_watermark = bool(self.group_burn_watermark.isChecked() and watermark_fingerprint)
+        settings["burn_watermark"] = burn_watermark
+        if burn_watermark:
+            watermark_entries = [dict(item) for item in self._watermark_entries]
+            settings["watermark_prepare"] = (
+                lambda video, cache, entries=watermark_entries:
+                str(prepared_watermark_composite(ffmpeg, video, entries, cache))
+            )
+            
+        self._active_group_watermark_fingerprint = watermark_fingerprint if burn_watermark else ""
+        self._group_auto_extract_requested = bool(self.group_auto_timeline.isChecked())
+        self._group_auto_extract_pending = False
+        self.group_merge_outputs = []
+        self.group_merge_thread = QThread(self)
+        
+        selected_groups = [self.group_merge_groups[selected_row]]
+        self.group_merge_worker = GroupMergeWorker(selected_groups, output, ffmpeg, callback, settings)
+        self.group_merge_worker.moveToThread(self.group_merge_thread)
+        self.group_merge_thread.started.connect(self.group_merge_worker.run)
+        self.group_merge_worker.log.connect(self._append_run_log)
+        self.group_merge_worker.progress.connect(self.progress.setValue)
+        self.group_merge_worker.item_done.connect(self._group_merge_item_done)
+        self.group_merge_worker.finished.connect(self._group_merge_finished)
+        self.group_merge_worker.finished.connect(self.group_merge_thread.quit)
+        self.group_merge_thread.finished.connect(self._group_merge_ended)
+        self.group_merge_thread.finished.connect(self.group_merge_thread.deleteLater)
+        
+        self.group_merge_start.setEnabled(False)
+        self.group_merge_stop.setEnabled(True)
+        self.group_merge_selected.setEnabled(False)
+        self.progress.setValue(0)
+        
+        self._append_run_log(f"开始单独重新合成组：{group_folder.name} (共 {len(clips)} 段)；强制覆盖缓存。")
+        self.group_merge_thread.start()
+
+
     def start_group_merge(self):
         if self.group_merge_thread and self.group_merge_thread.isRunning():
             return
@@ -4027,11 +4132,24 @@ class DynamicCaptionPage(QWidget):
         output = Path(self.output.text()) / "00_分组合成"
         provider = self.provider.currentText()
         callback = lambda path: self.transcribe_callable(path, provider)
+        
+        group_custom_transitions = {}
+        for row in range(self.group_table.rowCount()):
+            folder_item = self.group_table.item(row, 1)
+            if folder_item:
+                folder_path = folder_item.toolTip()
+                combo = self.group_table.cellWidget(row, 4)
+                if isinstance(combo, QComboBox):
+                    resolved_key = Path(folder_path).resolve().as_posix().lower()
+                    group_custom_transitions[resolved_key] = combo.currentText()
+                    
         settings = {
             "sort_mode": "script" if "文案" in self.group_sort_mode.currentText() else "natural",
-            "trim_mode": ("hybrid" if "混合" in self.group_trim_mode.currentText()
+            "trim_mode": ("none" if "不裁剪" in self.group_trim_mode.currentText()
+                          else "hybrid" if "混合" in self.group_trim_mode.currentText()
                           else "text" if "文案" in self.group_trim_mode.currentText() else "fast"),
             "scripts": dict(self.group_scripts),
+            "group_custom_transitions": group_custom_transitions,
             "head_padding_ms": self.group_head_padding.value(),
             "tail_padding_ms": self.group_tail_padding.value(),
             "silence_threshold_db": self.group_silence_threshold.value(),
@@ -4075,7 +4193,7 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_worker.finished.connect(self.group_merge_thread.quit)
         self.group_merge_thread.finished.connect(self._group_merge_ended)
         self.group_merge_thread.finished.connect(self.group_merge_thread.deleteLater)
-        self.group_merge_start.setEnabled(False); self.group_merge_stop.setEnabled(True); self.progress.setValue(0)
+        self.group_merge_start.setEnabled(False); self.group_merge_stop.setEnabled(True); self.group_merge_selected.setEnabled(False); self.progress.setValue(0)
         if settings["sort_mode"] == "natural":
             if settings["trim_mode"] == "hybrid":
                 self._append_run_log("开始智能混合分组合成：文件名自然排序 → 文案首尾定位 → 声音边界修正 → 自动去口气音 → 无缝合成；不核对字幕内容。")
@@ -4191,7 +4309,7 @@ class DynamicCaptionPage(QWidget):
 
     def _group_merge_ended(self):
         should_extract=bool(self._group_auto_extract_pending)
-        self.group_merge_start.setEnabled(True); self.group_merge_stop.setEnabled(False)
+        self.group_merge_start.setEnabled(True); self.group_merge_stop.setEnabled(False); self.group_merge_selected.setEnabled(True)
         self.group_merge_worker = None; self.group_merge_thread = None
         self._active_group_watermark_fingerprint=""
         self._group_auto_extract_pending=False
