@@ -2,20 +2,63 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.14**
+当前版本：**v1.7.15**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
+
+## Reels 编辑器界面结构
+
+Reels 工作区采用分层组件结构：媒体处理与导出逻辑继续保留在
+`modules/dynamic_caption_page.py`，Canva 风格多轨时间轴独立位于
+`modules/canva_timeline.py`。左侧负责分组合成、视频字幕、图文配音与批量设置；
+中间为播放器；右侧为字幕样式和转场预设；底部时间轴负责视频、字幕与 BGM
+的可视化校准。拖动字幕块边缘会回写原有 SRT 数据，不改变现有批处理与
+FFmpeg 导出流程。
+
+时间轴现包含视频、视频原声、字幕、BGM 和文字配音五类轨道，支持在播放头
+切片、删除片段、拖动位置及边缘裁剪。视频切片会在导出前生成剪辑缓存；
+BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合成视频默认关闭
+原声轨道，用户可在时间轴重新开启。
+字幕识别页中的 SRT 时间戳区域可直接编辑文字和起止时间；修改会双向同步到
+底部字幕轨道，并作为最终导出的人工修订版本。
+
+左侧工具栏采用固定顺序，不随分组合成、视频字幕或图文配音页面切换而隐藏。
+“设置”下方固定显示“批量上传、编码、输出与运行”三个二级按钮，上传方案仍
+保留在批量上传配置区，输出路径、进度和当前日志集中在输出与运行页。背景音乐
+改为独立入口，文件、文件夹、固定/随机方式、起始点、试听及音轨处理集中配置。
+声音合成方式简化为“视频原声、视频原声＋背景音乐、视频配音＋背景音乐”三种；
+涉及 BGM 的模式统一读取上方固定/随机来源。配音由当前任务的文字转语音结果
+或同名优先、队列兜底规则自动对应，不再显示额外的配音匹配下拉框。
+右侧按“字幕识别、字幕设置、字幕预设、蒙版、视频设置、视频效果、图片效果”
+拆成七个独立页面；字幕参数采用紧凑双列布局，蒙版页同时支持添加文字图层。
+文字图层拥有独立的内容、字体、字号、文字色、描边色、描边宽度、透明度及
+横纵位置设置，不会覆盖时间轴字幕样式。
+
+视频效果页只显示转场时长和预设网格：单击预设会设置批量统一转场；也可把
+预设拖到视频轨道，或在轨道时间点右键添加局部转场。局部转场会自动建立切点，
+保存到项目时间轴状态，并在导出前通过 FFmpeg `xfade/acrossfade` 实际渲染。
+图片之间的转场单独放在“图片效果”页，并以同样的预设网格展示；幻灯片和
+图文配音成片共享这套图片转场与图片动画参数。
+视频效果和图片效果页顶部均显示当前选中的默认效果，选中按钮同时使用蓝色
+高亮边框，避免点击后无法确认是否生效。
 
 ## 下载
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.14.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.14/video-toolkit-windows-x64-v1.7.14.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.14/VideoToolkit_Setup_v1.7.14.exe) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.15.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.15/video-toolkit-windows-x64-v1.7.15.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.15/VideoToolkit_Setup_v1.7.15.exe) |
 | macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.14.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.14/video-toolkit-macos-arm64-v1.7.14.zip) |
 | macOS Intel | [video-toolkit-macos-x64-v1.7.14.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.14/video-toolkit-macos-x64-v1.7.14.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
-v1.7.14 2026-07-26
+
+### v1.7.15 · 2026-07-27
+- 检查更新：优先 Setup 安装包；修复把 zip 文件名误报为检测失败。
+- 分组合成：按分段文案排序增强；排序与裁剪解耦；帮助文档补充模式说明。
+- 多轨时间轴：滚轮帧级缩放；左侧轨道名固定。
+- 批量导出后自动清空自定义标题列表。
+
+### v1.7.14 · 2026-07-26
 多语言书写规范：内置 en/pt/es/fr/de/it/el/ru/tr/zh/ar/he；字幕/流水线/Reels 可选书写语言；希腊 «»、西语 ¿¡、阿/希 RTL 整句烧录。
 语言包导入：设置 → 字体与语言包，可导入 JSON 扩展新语言。
 API 密钥：合并录入 + 自动识别服务（gsk_/AIza/sk_/UUID）。

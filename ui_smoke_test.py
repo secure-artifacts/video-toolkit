@@ -81,7 +81,40 @@ assert not any(isinstance(w, FaqPanel) for w in window.component_settings_page.f
 assert window.pages.widget(3) is window.dynamic_caption_page
 assert any(button.text() == "Reels 编辑器" for button in window.nav_buttons)
 assert not hasattr(window, "watermark_tabs")
-assert window.dynamic_caption_page.source_stack.count() == 4
+assert window.dynamic_caption_page.source_stack.count() == 8
+assert hasattr(window.dynamic_caption_page, "canva_timeline")
+assert not window.dynamic_caption_page.timeline_timestamp_view.isReadOnly()
+editable_srt = "1\n00:00:00,100 --> 00:00:01,200\n可编辑字幕\n"
+window.dynamic_caption_page.timeline_timestamp_view.setPlainText(editable_srt)
+assert window.dynamic_caption_page.override_text.toPlainText() == editable_srt
+assert window.dynamic_caption_page.canva_timeline.canvas.clips[0].text == "可编辑字幕"
+assert any(button.text() == "设置" for button in window.dynamic_caption_page.source_tool_buttons)
+assert len(window.dynamic_caption_page.transition_buttons) >= 4
+assert len(window.dynamic_caption_page.image_transition_buttons) >= 4
+video_effect_name, video_effect_button = window.dynamic_caption_page.transition_buttons[1]
+video_effect_button.click()
+assert video_effect_name in window.dynamic_caption_page.transition_selected_label.text()
+assert video_effect_button.isChecked()
+image_effect_name, image_effect_button = window.dynamic_caption_page.image_transition_buttons[1]
+image_effect_button.click()
+assert image_effect_name in window.dynamic_caption_page.image_transition_selected_label.text()
+assert image_effect_button.isChecked()
+assert window.dynamic_caption_page.right_settings_stack.count() == 7
+assert window.dynamic_caption_page.left_settings_stack.count() == 3
+assert [button.text() for button in window.dynamic_caption_page.right_setting_buttons] == [
+    "字幕识别", "字幕设置", "字幕预设", "蒙版", "视频设置", "视频效果", "图片效果",
+]
+window.dynamic_caption_page._show_right_setting(3)
+window.dynamic_caption_page._add_text_layer()
+text_row = window.dynamic_caption_page.layer_list.currentRow()
+assert window.dynamic_caption_page.layers[text_row]["type"] == "text"
+assert window.dynamic_caption_page.layer_text.isEnabled()
+window.dynamic_caption_page.layer_text.setText("测试文字图层")
+assert window.dynamic_caption_page.layers[text_row]["text"] == "测试文字图层"
+assert [button.text().replace("└ ", "") for button in window.dynamic_caption_page.left_setting_buttons] == [
+    "批量上传", "编码", "输出与运行",
+]
+assert window.merge_report_nav_btn.text() == "合成报表"
 assert window.dynamic_caption_page.font.currentText() == "Arial"
 assert hasattr(window.dynamic_caption_page, "writing_language")
 assert hasattr(window.dynamic_caption_page, "rtl_word_highlight")
@@ -92,6 +125,18 @@ assert window.dynamic_caption_page.line_spacing.value() == 100
 assert window.dynamic_caption_page.margin_v.value() == 500
 assert window.dynamic_caption_page.cloud_sync_check.isChecked() is False
 assert not window.dynamic_caption_page.log.isHidden()
+audio_match_before = window.dynamic_caption_page.audio_match_mode.currentText()
+window.dynamic_caption_page.bgm_selection_mode.setCurrentIndex(1)
+assert window.dynamic_caption_page.audio_match_mode.currentText() == audio_match_before
+window.dynamic_caption_page.audio_mode.setCurrentText("视频原声")
+assert window.dynamic_caption_page._current_settings()["bgm_enabled"] is False
+assert window.dynamic_caption_page.audio_match_mode.isHidden()
+window.dynamic_caption_page.audio_mode.setCurrentText("视频原声＋背景音乐")
+assert window.dynamic_caption_page._current_settings()["bgm_enabled"] is True
+assert window.dynamic_caption_page._get_audio_mode_internal() == "保留视频原音"
+window.dynamic_caption_page.audio_mode.setCurrentText("视频配音＋背景音乐")
+assert window.dynamic_caption_page._get_audio_mode_internal() == "替换为添加的音频"
+assert window.dynamic_caption_page.audio_match_mode.isHidden()
 assert not hasattr(window.dynamic_caption_page, "view_log_btn")
 assert window.log_nav_btn.text() == "查看软件日志"
 assert window.settings_page.count() == 4

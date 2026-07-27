@@ -105,31 +105,195 @@ def split_group_script(text, expected_count=None):
     return [re.sub(r"\s+", " ", block).strip() for block in blocks if block.strip()]
 
 
+def _script_key(folder):
+    """Stable key for scripts dict (resolve path)."""
+    try:
+        return str(Path(folder).resolve())
+    except Exception:
+        return str(folder)
+
+
+def lookup_group_script(scripts, folder):
+    """Find pasted group script even when path separators/casing differ."""
+    scripts = scripts or {}
+    if not scripts:
+        return ""
+    folder = Path(folder)
+    candidates = []
+    try:
+        resolved = folder.resolve()
+        candidates.extend([str(resolved), str(resolved).replace("\\", "/"), str(resolved).replace("/", "\\")])
+    except Exception:
+        resolved = folder
+    candidates.extend([str(folder), str(folder).replace("\\", "/"), folder.name])
+    for key in candidates:
+        value = scripts.get(key)
+        if str(value or "").strip():
+            return str(value)
+    # Path-equality scan (handles soft links / case differences on Windows)
+    try:
+        target = folder.resolve()
+    except Exception:
+        target = folder
+    for key, value in scripts.items():
+        if not str(value or "").strip():
+            continue
+        try:
+            if Path(key).resolve() == target:
+                return str(value)
+        except Exception:
+            if Path(key).name == folder.name:
+                return str(value)
+    return ""
+
+
 def _plain_text(value):
-    return re.sub(r"[^0-9a-z\u00c0-\u024f\u0370-\u03ff\u0400-\u04ff\u3400-\u9fff]+", "", str(value).casefold())
+    # Include Greek Extended (U+1F00–U+1FFF) used by polytonic / some ASR outputs.
+    return re.sub(
+        r"[^0-9a-z\u00c0-\u024f\u0370-\u03ff\u1f00-\u1fff\u0400-\u04ff\u3400-\u9fff]+",
+        "",
+        str(value).casefold(),
+    )
 
 
-def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.22):
-    """Greedily make a one-to-one match and return clips in script-segment order."""
+def _word_tokens(value):
+    return set(re.findall(r"[0-9a-z\u00c0-\u024f\u0370-\u03ff\u1f00-\u1fff\u0400-\u04ff\u3400-\u9fff]+", str(value).casefold()))
+
+
+def _text_similarity(source, target):
+    """Multi-signal similarity robust to ASR noise and long script vs short clip text."""
+    s_raw, t_raw = str(source or "").strip(), str(target or "").strip()
+    s, t = _plain_text(s_raw), _plain_text(t_raw)
+    if not s or not t:
+        return 0.0
+    full = SequenceMatcher(None, s, t).ratio()
+    # Opening words are often the most distinctive per segment.
+    plen = min(56, len(s), len(t))
+    prefix = SequenceMatcher(None, s[:plen], t[:plen]).ratio() if plen >= 6 else 0.0
+    # Partial / containment: shorter spoken text inside longer pasted script (or vice versa).
+    shorter, longer = (s, t) if len(s) <= len(t) else (t, s)
+    contain = 0.0
+    if len(shorter) >= 8 and shorter in longer:
+        contain = 0.95
+    elif len(shorter) >= 10 and len(longer) >= len(shorter):
+        best = 0.0
+        window = len(shorter)
+        step = max(1, window // 5)
+        for i in range(0, len(longer) - window + 1, step):
+            best = max(best, SequenceMatcher(None, shorter, longer[i:i + window]).ratio())
+            if best >= 0.92:
+                break
+        contain = best
+    ws, wt = _word_tokens(s_raw), _word_tokens(t_raw)
+    jacc = (len(ws & wt) / len(ws | wt)) if ws and wt else 0.0
+    # Weight distinctive signals higher than full-string ratio (length mismatch hurts full ratio).
+    return max(full, 0.94 * prefix, 0.92 * contain, 0.88 * jacc)
+
+
+def _transcript_variants(analysis_or_text):
+    """Collect all usable transcript strings for a clip (SRT preferred, then original)."""
+    if analysis_or_text is None:
+        return []
+    if isinstance(analysis_or_text, str):
+        text = analysis_or_text.strip()
+        return [text] if text else []
+    variants = []
+    entries = parse_srt_with_text(analysis_or_text.get("srt", ""))
+    srt_text = " ".join(text for _start, _end, text in entries).strip()
+    if srt_text:
+        variants.append(srt_text)
+    original = str(analysis_or_text.get("original") or "").strip()
+    if original and original not in variants:
+        variants.append(original)
+    return variants
+
+
+def _transcript_for_match(analysis_or_text):
+    """Best single transcript string (SRT first, then original)."""
+    variants = _transcript_variants(analysis_or_text)
+    return variants[0] if variants else ""
+
+
+def _resolve_transcript(transcripts, clip):
+    """Look up transcript by resolved path with a few fallback key forms."""
+    path = Path(clip)
+    keys = [str(path.resolve()), str(path), str(path.resolve()).replace("\\", "/")]
+    for key in keys:
+        if key in transcripts:
+            return transcripts[key]
+    try:
+        target = path.resolve()
+        for key, value in transcripts.items():
+            try:
+                if Path(key).resolve() == target:
+                    return value
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
+    """One-to-one match clips to script segments; return clips in script-segment order.
+
+    Final list order follows the pasted script segments (line/block 1 → first clip,
+    line 2 → second, …), not the original filename order.
+    """
     segments = split_group_script(script_text, len(clips))
     clips = list(clips)
     if len(segments) != len(clips) or not clips:
-        return None, "分段文案数量与视频片段数量不一致"
+        return None, "分段文案数量与视频片段数量不一致", []
     candidates = []
+    empty_sources = 0
+    source_previews = {}
     for clip_index, clip in enumerate(clips):
-        source = _plain_text(transcripts.get(str(Path(clip).resolve()), ""))
+        raw = _resolve_transcript(transcripts, clip)
+        variants = _transcript_variants(raw)
+        if not variants:
+            empty_sources += 1
+            source_previews[clip_index] = ""
+            for segment_index, _segment in enumerate(segments):
+                candidates.append((0.0, clip_index, segment_index))
+            continue
+        source_previews[clip_index] = variants[0][:80]
         for segment_index, segment in enumerate(segments):
-            score = SequenceMatcher(None, source, _plain_text(segment)).ratio() if source else 0.0
+            score = max(_text_similarity(variant, segment) for variant in variants)
             candidates.append((score, clip_index, segment_index))
-    assigned_clips = set(); assigned_segments = set(); mapping = {}
+    if empty_sources == len(clips):
+        return None, "片段识别文案为空，无法按分段文案匹配排序", []
+    assigned_clips = set()
+    assigned_segments = set()
+    mapping = {}
     for score, clip_index, segment_index in sorted(candidates, reverse=True):
         if clip_index in assigned_clips or segment_index in assigned_segments:
             continue
-        assigned_clips.add(clip_index); assigned_segments.add(segment_index)
-        mapping[segment_index] = (clips[clip_index], score)
-    if len(mapping) != len(clips) or min(score for _clip, score in mapping.values()) < minimum_score:
-        return None, "文案匹配可信度不足"
-    return [mapping[index][0] for index in range(len(segments))], "已按分段文案自动匹配排序"
+        assigned_clips.add(clip_index)
+        assigned_segments.add(segment_index)
+        mapping[segment_index] = (clips[clip_index], score, source_previews.get(clip_index, ""))
+    details = []
+    for index in range(len(segments)):
+        if index not in mapping:
+            continue
+        clip, score, preview = mapping[index]
+        details.append({
+            "segment_index": index,
+            "clip": clip,
+            "score": score,
+            "script_preview": segments[index][:60],
+            "transcript_preview": preview,
+        })
+    if len(mapping) != len(clips):
+        return None, "文案匹配未能建立一一对应", details
+    scores = [item["score"] for item in details]
+    if min(scores) < minimum_score:
+        weak = ", ".join(
+            f"第{item['segment_index'] + 1}段↔{item['clip'].name}({item['score']:.2f})"
+            for item in details if item["score"] < minimum_score
+        )
+        return None, f"文案匹配可信度不足（{weak}）", details
+    ordered = [mapping[index][0] for index in range(len(segments))]
+    return ordered, "已按分段文案自动匹配排序", details
 
 
 def _speech_spans(srt):
@@ -222,10 +386,12 @@ def hybrid_trim_bounds(srt, duration, audio_bounds, head_padding_ms=80, tail_pad
         srt, duration, head_padding_ms, tail_padding_ms,
     )
     if not text_detected:
-        return tuple(audio_bounds) if audio_bounds else (0.0, duration, False)
-    if not audio_bounds or not bool(audio_bounds[2]):
+        if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+            return float(audio_bounds[0]), float(audio_bounds[1]), True
+        return 0.0, duration, False
+    if not audio_bounds or len(audio_bounds) < 3 or not bool(audio_bounds[2]):
         return text_start, text_end, True
-    audio_start, audio_end, _detected = audio_bounds
+    audio_start, audio_end, _detected = audio_bounds[0], audio_bounds[1], audio_bounds[2]
     guard = max(0, int(word_guard_ms)) / 1000.0
     # Never move the start past the first timed word (minus a small consonant guard),
     # nor the end before the last timed word (plus the same guard).
@@ -233,6 +399,37 @@ def hybrid_trim_bounds(srt, duration, audio_bounds, head_padding_ms=80, tail_pad
     earliest_safe_end = min(duration, spans[-1][1] + guard)
     start = min(latest_safe_start, max(text_start, float(audio_start)))
     end = max(earliest_safe_end, min(text_end, float(audio_end)))
+    if end <= start + 0.05:
+        return text_start, text_end, True
+    return max(0.0, start), min(duration, end), True
+
+
+def refine_text_window_with_audio(text_start, text_end, text_ok, audio_bounds, duration,
+                                  edge_slack_ms=100):
+    """Tighten an already-chosen text window with leading/trailing silence bounds.
+
+    Used when the text window comes from script-segment matching (not the full SRT span),
+    so hybrid_trim_bounds' full-timeline word guards would be wrong.
+
+    Audio may only nibble the outer padding (about edge_slack_ms); it must not carve
+    into the middle of the matched phrase.
+    """
+    duration = max(0.05, float(duration or 0.05))
+    if not text_ok:
+        if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+            return float(audio_bounds[0]), float(audio_bounds[1]), True
+        return 0.0, duration, False
+    text_start = max(0.0, float(text_start))
+    text_end = max(text_start + 0.05, min(duration, float(text_end)))
+    if not audio_bounds or len(audio_bounds) < 3 or not bool(audio_bounds[2]):
+        return text_start, text_end, True
+    audio_start, audio_end = float(audio_bounds[0]), float(audio_bounds[1])
+    slack = max(0, int(edge_slack_ms)) / 1000.0
+    # Same structure as hybrid_trim_bounds: audio can pull edges inward, but only within slack.
+    latest_safe_start = min(duration, text_start + slack)
+    earliest_safe_end = max(0.0, text_end - slack)
+    start = min(latest_safe_start, max(text_start, audio_start))
+    end = max(earliest_safe_end, min(text_end, audio_end))
     if end <= start + 0.05:
         return text_start, text_end, True
     return max(0.0, start), min(duration, end), True
@@ -457,10 +654,12 @@ class GroupMergeWorker(QObject):
         cache[key] = info
         return info
 
-    def _normalize(self, clip, index, total_count, cache_dir, analysis, target_w, target_h, watermark=None):
+    def _normalize(self, clip, index, total_count, cache_dir, analysis, target_w, target_h, watermark=None, group_script=""):
         probe = self._probe(clip)
-        folder = clip.parent
-        group_script = self.settings.get("scripts", {}).get(str(folder.resolve()), "")
+        # Prefer the group-level script (virtual groups like 2-1/2-2 live under parent dir,
+        # so clip.parent is NOT the group key used when saving 分段文案).
+        if not str(group_script or "").strip():
+            group_script = lookup_group_script(self.settings.get("scripts", {}), clip.parent)
         segments = split_group_script(group_script, total_count)
         clip_script = segments[index] if index < len(segments) else ""
         
@@ -473,29 +672,74 @@ class GroupMergeWorker(QObject):
                     manual_bounds = (val1, val2)
                 clip_script = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', clip_script).strip()
 
+        trim_mode = self.settings.get("trim_mode", "hybrid")
+        head_ms = self.settings.get("head_padding_ms", 80)
+        tail_ms = self.settings.get("tail_padding_ms", 120)
+        srt = str(analysis.get("srt") or "")
+        media_duration = probe["duration"]
+
         if manual_bounds is not None:
-            start = max(0.0, min(probe["duration"], manual_bounds[0]))
-            end = max(start + 0.05, min(probe["duration"], manual_bounds[1]))
+            start = max(0.0, min(media_duration, manual_bounds[0]))
+            end = max(start + 0.05, min(media_duration, manual_bounds[1]))
             detected = True
             self.log.emit(f"切片功能：{clip.name} 已应用手动切片区间 {start:.2f}s - {end:.2f}s")
-        elif self.settings.get("trim_mode") == "none":
-            start, end, detected = 0.0, probe["duration"], True
+        elif trim_mode == "none":
+            start, end, detected = 0.0, media_duration, True
             self.log.emit(f"不裁剪：{clip.name} 保留完整片段。")
         else:
-            if clip_script and self.settings.get("sort_mode") == "script":
-                start, end, detected = find_matching_srt_bounds(
-                    analysis.get("srt", ""), clip_script, probe["duration"],
-                    self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
+            # Text window: prefer user-segment match when a clip_script is available,
+            # otherwise first/last spoken word from the full transcript.
+            if clip_script and srt:
+                text_start, text_end, text_ok = find_matching_srt_bounds(
+                    srt, clip_script, media_duration, head_ms, tail_ms,
                 )
-            elif analysis.get("hybrid_bounds"):
-                start, end, detected = analysis["hybrid_bounds"]
-            elif analysis.get("bounds"):
-                start, end, detected = analysis["bounds"]
+            elif srt:
+                text_start, text_end, text_ok = speech_trim_bounds(
+                    srt, media_duration, head_ms, tail_ms,
+                )
             else:
-                start, end, detected = speech_trim_bounds(
-                    analysis.get("srt", ""), probe["duration"],
-                    self.settings.get("head_padding_ms", 80), self.settings.get("tail_padding_ms", 120),
-                )
+                text_start, text_end, text_ok = 0.0, media_duration, False
+
+            audio_bounds = analysis.get("bounds")
+            hybrid_bounds = analysis.get("hybrid_bounds")
+
+            if trim_mode == "fast":
+                # 快速声音边界：以本地静音检测为准；没有 bounds 时再退回文案时间轴。
+                if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+                    start, end, detected = float(audio_bounds[0]), float(audio_bounds[1]), True
+                elif text_ok:
+                    start, end, detected = text_start, text_end, True
+                    self.log.emit(f"提醒：{clip.name} 未得到静音边界，已改用文案时间轴裁剪。")
+                else:
+                    start, end, detected = 0.0, media_duration, False
+            elif trim_mode == "text":
+                # 仅按文案边界：字幕/分段匹配时间轴；识别失败时再退回声音边界。
+                if text_ok:
+                    start, end, detected = text_start, text_end, True
+                elif audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+                    start, end, detected = float(audio_bounds[0]), float(audio_bounds[1]), True
+                    self.log.emit(f"提醒：{clip.name} 文案边界不可用，已改用本地声音边界。")
+                else:
+                    start, end, detected = 0.0, media_duration, False
+            else:
+                # 智能混合边界：文案窗口 + 首尾声音修正。
+                # 有分段文案时，按该段匹配窗口再与声音混合，避免被“整段 ASR”hybrid 覆盖。
+                if clip_script and text_ok:
+                    start, end, detected = refine_text_window_with_audio(
+                        text_start, text_end, text_ok, audio_bounds, media_duration,
+                    )
+                elif hybrid_bounds and len(hybrid_bounds) >= 3:
+                    start, end, detected = (
+                        float(hybrid_bounds[0]), float(hybrid_bounds[1]), bool(hybrid_bounds[2]),
+                    )
+                elif text_ok:
+                    start, end, detected = refine_text_window_with_audio(
+                        text_start, text_end, text_ok, audio_bounds, media_duration,
+                    )
+                elif audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+                    start, end, detected = float(audio_bounds[0]), float(audio_bounds[1]), True
+                else:
+                    start, end, detected = 0.0, media_duration, False
         if not detected:
             self.log.emit(f"提醒：{clip.name} 未识别到说话时间，保留完整片段。")
         else:
@@ -588,7 +832,12 @@ class GroupMergeWorker(QObject):
                 self.log.emit(f"[{group_index}/{len(self.groups)}] 开始处理文件夹：{folder.name}（{len(clips)} 段）")
                 script_mode = self.settings.get("sort_mode") == "script"
                 trim_mode = self.settings.get("trim_mode", "hybrid")
-                group_script = self.settings.get("scripts", {}).get(str(folder.resolve()), "")
+                group_script = lookup_group_script(self.settings.get("scripts", {}), folder)
+                if script_mode and not group_script:
+                    self.log.emit(
+                        f"提醒：未在 scripts 中找到「{folder}」的分段文案"
+                        f"（已登记 {len(self.settings.get('scripts') or {})} 组键）。"
+                    )
                 group_manual_bounds = None
                 if group_script:
                     match = re.search(r'\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]', group_script)
@@ -600,13 +849,21 @@ class GroupMergeWorker(QObject):
                 for clip in clips:
                     if self.cancelled:
                         raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
-                    if trim_mode == "none":
+                    # 裁剪模式需要的分析数据：
+                    # - none: 不需要（但文案排序仍要 ASR）
+                    # - text/hybrid: 需要 ASR 时间轴
+                    # - fast: 需要本地静音边界
+                    # - 文案排序: 无论裁剪模式都要 ASR（用于 match_clips_to_script）
+                    need_asr = script_mode or trim_mode in ("hybrid", "text")
+                    need_fast = trim_mode in ("hybrid", "fast")
+                    if trim_mode == "none" and not script_mode:
                         analyses[str(clip.resolve())] = {}
-                    elif script_mode or trim_mode in ("hybrid", "text"):
+                    elif need_asr:
                         try:
                             analysis = self._analysis(clip, analysis_cache)
-                            if trim_mode == "hybrid":
+                            if need_fast:
                                 analysis = self._fast_analysis(clip, analysis_cache)
+                            if trim_mode == "hybrid":
                                 media_duration = float(analysis.get("duration") or self._probe(clip)["duration"])
                                 analysis["hybrid_bounds"] = list(hybrid_trim_bounds(
                                     analysis.get("srt", ""), media_duration, analysis.get("bounds"),
@@ -615,7 +872,11 @@ class GroupMergeWorker(QObject):
                                 ))
                                 analysis_cache[str(clip.resolve())] = analysis
                                 self.log.emit(f"智能混合边界：文案时间轴 + 首尾声音检测已完成 {clip.name}")
-                            elif not script_mode:
+                            elif trim_mode == "fast":
+                                self.log.emit(f"快速声音边界：已完成本地首尾检测 {clip.name}")
+                            elif trim_mode == "none" and script_mode:
+                                self.log.emit(f"文案识别完成（不裁剪，仅用于按分段文案排序）：{clip.name}")
+                            else:
                                 self.log.emit(f"智能文案边界：已按首词/末词时间定位 {clip.name}")
                             analyses[str(clip.resolve())] = analysis
                         except Exception as exc:
@@ -626,21 +887,40 @@ class GroupMergeWorker(QObject):
                             )
                             analyses[str(clip.resolve())] = self._fast_analysis(clip, analysis_cache)
                     else:
+                        # 纯快速声音边界（文件名排序）：不调用 ASR
                         analyses[str(clip.resolve())] = self._fast_analysis(clip, analysis_cache)
                     cache_file.write_text(json.dumps(analysis_cache, ensure_ascii=False, indent=2), encoding="utf-8")
                     completed_steps += 1
                     self.progress.emit(round(completed_steps / total_steps * 100))
                 if self.settings.get("sort_mode") == "script":
-                    ordered, reason = match_clips_to_script(
-                        clips,
-                        {key: value.get("original", "") for key, value in analyses.items()},
-                        self.settings.get("scripts", {}).get(str(folder.resolve()), ""),
-                    )
-                    if ordered:
-                        clips = ordered
-                        self.log.emit(reason)
+                    if not str(group_script or "").strip():
+                        self.log.emit("提醒：本组未找到分段文案，自动回退为文件名自然排序。")
                     else:
-                        self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
+                        # Pass full analysis dicts so matching can use SRT + original variants.
+                        ordered, reason, details = match_clips_to_script(
+                            clips,
+                            analyses,
+                            group_script,
+                        )
+                        if ordered:
+                            clips = ordered
+                            self.log.emit(reason)
+                            for item in details:
+                                self.log.emit(
+                                    f"  文案第{item['segment_index'] + 1}段 ↔ {item['clip'].name}"
+                                    f" (相似度 {item['score']:.2f})｜文案: {item['script_preview']!s}"
+                                    f"｜识别: {item['transcript_preview']!s}"
+                                )
+                            order_desc = " → ".join(f"{i + 1}.{path.name}" for i, path in enumerate(clips))
+                            self.log.emit(f"合成顺序（按分段文案）：{order_desc}")
+                        else:
+                            if details:
+                                for item in details:
+                                    self.log.emit(
+                                        f"  候选 文案第{item['segment_index'] + 1}段 ↔ {item['clip'].name}"
+                                        f" (相似度 {item['score']:.2f})"
+                                    )
+                            self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
                 first_probe = self._probe(clips[0])
                 target_w, target_h = calculate_target_size(
                     first_probe["width"], first_probe["height"],
@@ -662,7 +942,8 @@ class GroupMergeWorker(QObject):
                 def run_norm(args):
                     clip, clip_index, total_count = args
                     return self._normalize(
-                        clip, clip_index, total_count, cache_dir, analyses[str(clip.resolve())], target_w, target_h, watermark
+                        clip, clip_index, total_count, cache_dir, analyses[str(clip.resolve())],
+                        target_w, target_h, watermark, group_script=group_script,
                     )
                 tasks = [(clip, clip_index, len(clips)) for clip_index, clip in enumerate(clips)]
                 normalized = [None] * len(clips)

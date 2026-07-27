@@ -45,11 +45,25 @@ def main():
             str(clips[0].resolve()): "Jesus está contigo",
             str(clips[1].resolve()): "Amen para sua família",
         }
-        ordered, reason = match_clips_to_script(
+        ordered, reason, details = match_clips_to_script(
             clips, transcripts, "Amen para sua família\n\n---\n\nJesus está contigo",
         )
         assert ordered == [clips[1], clips[0]], reason
+        assert details and details[0]["clip"] == clips[1]
         assert split_group_script("primeiro\n\n---\n\nsegundo") == ["primeiro", "segundo"]
+
+        # Greek-like script order must beat natural filename order.
+        g_clips = [group_2 / "1.mp4", group_2 / "2.mp4"]
+        g_transcripts = {
+            str(g_clips[0].resolve()): "Γράψε Αμήν και πίστευε",
+            str(g_clips[1].resolve()): "Προσευχή για το παιδί σου τρεις φορές",
+        }
+        g_script = (
+            "Προσευχή για το παιδί σου τρεις φορές, για να σπάσει κάθε κατάρα.\n\n"
+            "Γράψε Αμήν και πίστευε στον Θεό."
+        )
+        g_ordered, g_reason, _g_details = match_clips_to_script(g_clips, g_transcripts, g_script)
+        assert g_ordered == [g_clips[1], g_clips[0]], g_reason
 
         srt = "1\n00:00:00,300 --> 00:00:01,200\nOlá\n\n2\n00:00:01,300 --> 00:00:02,400\nmundo"
         start, end, detected = speech_trim_bounds(srt, 3.0, 80, 120)

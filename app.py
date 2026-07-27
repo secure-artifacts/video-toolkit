@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.14").strip().lstrip("v") or "1.7.14"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.15").strip().lstrip("v") or "1.7.15"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -2178,19 +2178,85 @@ class FullTextToolTipFilter(QObject):
 
 
 
+def _parse_version_parts(version):
+    """Parse '1.7.14' / 'v1.7.14-beta' into comparable int tuples."""
+    text = str(version or "").strip().lstrip("vV")
+    # Drop pre-release suffix: 1.7.14-beta -> 1.7.14
+    text = text.split("-", 1)[0].split("+", 1)[0]
+    parts = []
+    for chunk in text.split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts or (0,))
+
+
+def _select_release_asset(assets, *, is_win=True, is_mac=False, machine=""):
+    """Pick best download for this OS. Prefer Windows Setup .exe over green zip.
+
+    Returns (download_url, filename) or ("", "").
+    """
+    assets = list(assets or [])
+    machine_l = str(machine or "").lower()
+    mac_arch = "arm64" if ("arm" in machine_l or "aarch64" in machine_l) else "x64"
+
+    def score(asset):
+        name = str(asset.get("name") or "")
+        name_l = name.lower()
+        url = str(asset.get("browser_download_url") or "").strip()
+        if not url or not name:
+            return -1
+        if is_win:
+            # VideoToolkit_Setup_vX.Y.Z.exe  (no "windows" in name — previous bug)
+            if name_l.endswith(".exe") and "setup" in name_l:
+                return 100
+            if name_l.endswith(".exe") and ("windows" in name_l or "win64" in name_l or "win32" in name_l):
+                return 80
+            if name_l.endswith(".zip") and "windows" in name_l:
+                return 60
+            if name_l.endswith(".exe"):
+                return 40
+            if name_l.endswith(".zip"):
+                return 20
+            return -1
+        if is_mac:
+            if mac_arch not in name_l and "universal" not in name_l:
+                return -1
+            if name_l.endswith(".zip") and ("macos" in name_l or "darwin" in name_l or "osx" in name_l):
+                return 80
+            if name_l.endswith(".zip"):
+                return 40
+            if name_l.endswith(".dmg"):
+                return 70
+            return -1
+        if name_l.endswith((".zip", ".tar.gz", ".appimage")):
+            return 30
+        return -1
+
+    ranked = sorted(assets, key=score, reverse=True)
+    if not ranked or score(ranked[0]) < 0:
+        return "", ""
+    best = ranked[0]
+    return str(best.get("browser_download_url") or ""), str(best.get("name") or "")
+
+
 class UpdateCheckWorker(QObject):
     """从 GitHub releases/latest 检查新版本（Setup .exe 优先，其次为 .zip 绿色包）。"""
-    finished = Signal(bool, str, str, str, str)  # has_new, latest_version, download_url, filename, error
+    # has_new, latest_version, download_url, filename, error
+    finished = Signal(bool, str, str, str, str)
 
     def __init__(self, current_version):
         super().__init__()
-        self.current_version = current_version.strip().lstrip("v")
+        self.current_version = str(current_version or "").strip().lstrip("vV")
 
     def run(self):
         try:
+            import platform
+            import sys
+
             import requests
+
             headers = {
-                "User-Agent": "VideoToolkit-UpdateCheck/1.0",
+                "User-Agent": f"VideoToolkit-UpdateCheck/{self.current_version or '1.0'}",
                 "Accept": "application/vnd.github+json",
             }
             response = requests.get(
@@ -2199,115 +2265,102 @@ class UpdateCheckWorker(QObject):
                 timeout=15,
             )
             if response.status_code != 200:
-                self.finished.emit(False, "", "", "", f"HTTP {response.status_code}")
+                body = (response.text or "")[:180].replace("\n", " ")
+                self.finished.emit(
+                    False, "", "", "",
+                    f"GitHub 返回 HTTP {response.status_code}" + (f"：{body}" if body else ""),
+                )
                 return
+
             data = response.json()
-            tag_name = data.get("tag_name", "").strip()
-            latest_version = tag_name.lstrip("v")
+            tag_name = str(data.get("tag_name") or "").strip()
+            latest_version = tag_name.lstrip("vV")
             if not latest_version:
-                self.finished.emit(False, "", "", "", "无法获取最新版本号")
+                self.finished.emit(False, "", "", "", "无法从 GitHub 获取最新版本号")
                 return
 
-            def parse_ver(v):
-                parts = []
-                for x in str(v).split("."):
-                    try:
-                        parts.append(int(x))
-                    except Exception:
-                        parts.append(0)
-                return parts or [0]
+            has_new = _parse_version_parts(latest_version) > _parse_version_parts(self.current_version)
+            # 已是最新：不必解析安装包，避免把文件名误当成错误信息
+            if not has_new:
+                self.finished.emit(False, latest_version, "", "", "")
+                return
 
-            has_new = parse_ver(latest_version) > parse_ver(self.current_version)
-            download_url = ""
-            filename = ""
-            
-            import sys
-            import platform
             is_win = sys.platform.startswith("win")
             is_mac = sys.platform.startswith("dar")
-            
-            target_assets = []
-            for asset in data.get("assets", []) or []:
-                name = asset.get("name", "").lower()
-                if is_win and ("windows" in name or "win" in name):
-                    target_assets.append(asset)
-                elif is_mac and ("macos" in name or "osx" in name):
-                    arch = "arm64" if "arm" in platform.machine().lower() or "aarch64" in platform.machine().lower() else "x64"
-                    if arch in name:
-                        target_assets.append(asset)
-                        
-            if not target_assets and data.get("assets"):
-                target_assets = data.get("assets")
-                
-            for asset in target_assets:
-                name = asset.get("name", "")
-                if name.endswith(".exe") and "Setup" in name:
-                    download_url = asset.get("browser_download_url", "")
-                    filename = name
-                    break
+            download_url, filename = _select_release_asset(
+                data.get("assets") or [],
+                is_win=is_win,
+                is_mac=is_mac,
+                machine=platform.machine(),
+            )
             if not download_url:
-                for asset in target_assets:
-                    name = asset.get("name", "")
-                    if name.endswith(".exe"):
-                        download_url = asset.get("browser_download_url", "")
-                        filename = name
-                        break
-            if not download_url and target_assets:
-                for asset in target_assets:
-                    name = asset.get("name", "")
-                    if name.endswith(".zip"):
-                        download_url = asset.get("browser_download_url", "")
-                        filename = name
-                        break
-                if not download_url:
-                    download_url = target_assets[0].get("browser_download_url", "")
-                    filename = target_assets[0].get("name", "")
-            self.finished.emit(has_new, latest_version, download_url, filename, "")
-        except Exception as e:
-            self.finished.emit(False, "", "", "", str(e))
+                self.finished.emit(
+                    True, latest_version, "", "",
+                    f"发现新版本 v{latest_version}，但未找到当前系统可用的安装包。\n"
+                    "请到 GitHub Releases 页面手动下载。",
+                )
+                return
+
+            self.finished.emit(True, latest_version, download_url, filename, "")
+        except Exception as exc:
+            self.finished.emit(False, "", "", "", f"{type(exc).__name__}: {exc}")
 
 
 class DownloadWorker(QObject):
     progress = Signal(int)
-    finished = Signal(bool, str, str) # success, file_path, error
-    
+    finished = Signal(bool, str, str)  # success, file_path, error
+
     def __init__(self, url, version, filename=""):
         super().__init__()
         self.url = url
         self.version = version
         self.filename = filename
         self.cancelled = False
-        
+
     def run(self):
         try:
-            import requests
             import tempfile
+
+            import requests
+
+            if not str(self.url or "").strip():
+                self.finished.emit(False, "", "下载地址为空")
+                return
             response = requests.get(self.url, stream=True, timeout=60)
             response.raise_for_status()
-            total = int(response.headers.get('content-length', 0))
-            
+            total = int(response.headers.get("content-length", 0) or 0)
+
             ext = ".exe"
             if self.filename:
-                ext = Path(self.filename).suffix
+                ext = Path(self.filename).suffix or ext
             else:
                 url_path = self.url.split("?")[0]
-                if url_path.endswith(".zip"):
+                if url_path.lower().endswith(".zip"):
                     ext = ".zip"
             dest = Path(tempfile.gettempdir()) / f"VideoToolkit_v{self.version}{ext}"
             downloaded = 0
-            with open(dest, 'wb') as f:
+            with open(dest, "wb") as handle:
                 for chunk in response.iter_content(chunk_size=128 * 1024):
                     if self.cancelled:
+                        try:
+                            handle.close()
+                            dest.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        self.finished.emit(False, "", "下载已取消")
                         return
                     if chunk:
-                        f.write(chunk)
+                        handle.write(chunk)
                         downloaded += len(chunk)
                         if total > 0:
                             self.progress.emit(int(downloaded / total * 100))
-                            
+
+            if dest.stat().st_size < 1024:
+                self.finished.emit(False, "", "下载文件过小，可能不完整")
+                return
             self.finished.emit(True, str(dest), "")
-        except Exception as e:
-            self.finished.emit(False, "", str(e))
+        except Exception as exc:
+            self.finished.emit(False, "", f"{type(exc).__name__}: {exc}")
 
 
 class MainWindow(QMainWindow):
@@ -2372,7 +2425,7 @@ class MainWindow(QMainWindow):
         nav_layout.addSpacing(16)
         self.nav_buttons = []
         nav_items = (("首页", 0), ("批量截图", 1), ("智能剪辑", 2), ("Reels 编辑器", 3),
-                     ("批量重命名", 4), ("清除元数据", 10), ("字幕提取", 5), ("自动流水线", 8),
+                     ("清除元数据", 10), ("字幕提取", 5),
                      ("设置与组件", 7), ("帮助", 9))
         for text, page_index in nav_items:
             btn = QPushButton(text)
@@ -2396,6 +2449,12 @@ class MainWindow(QMainWindow):
         self.log_nav_btn.clicked.connect(self._show_app_log)
         nav_layout.addWidget(self.log_nav_btn)
 
+        self.merge_report_nav_btn = QPushButton("合成报表")
+        self.merge_report_nav_btn.setObjectName("logNavButton")
+        self.merge_report_nav_btn.setToolTip("查看 Reels 分组合成统计与成品记录")
+        self.merge_report_nav_btn.clicked.connect(self._show_reels_merge_report)
+        nav_layout.addWidget(self.merge_report_nav_btn)
+
         nav_layout.addStretch()
         privacy = QLabel("密钥仅存本机")
         privacy.setStyleSheet("color:#64748b;font-size:11px;")
@@ -2415,6 +2474,7 @@ class MainWindow(QMainWindow):
             self._reels_sync_profiles, self._start_reels_cloud_sync, self._open_google_settings,
             store=self.store)
         self.dynamic_caption_page.rename_folder_requested.connect(self._open_folder_in_batch_rename)
+        self.dynamic_caption_page.navigate_requested.connect(self._show_page)
         _startup_trace("watermark page ready")
         self.rename_page = RenamePage(self._rename_title_transcribe)
         _startup_trace("rename page ready")
@@ -2445,6 +2505,10 @@ class MainWindow(QMainWindow):
         _startup_trace("metadata page ready")
         outer.addWidget(self.pages, 1)
         self._show_page(0)
+
+    def _show_reels_merge_report(self):
+        if hasattr(self, "dynamic_caption_page"):
+            self.dynamic_caption_page._show_group_merge_report()
 
     def _side_nav_button_style(self):
         return (
@@ -4610,30 +4674,64 @@ class MainWindow(QMainWindow):
         # 禁止在 finished 槽里 wait 自己的线程（会死锁/跨线程弹窗崩溃）
         self._update_worker.finished.connect(
             self._on_update_finished, Qt.ConnectionType.QueuedConnection)
-        self._update_worker.finished.connect(self._update_thread.quit)
+        # quit 不接收参数，用 lambda 吞掉 signal 的 5 个参数，避免槽签名错位
+        self._update_worker.finished.connect(lambda *_args: self._update_thread and self._update_thread.quit())
         self._update_thread.finished.connect(self._update_thread_cleanup)
         self._update_thread.start()
 
     def _on_update_finished(self, has_new, latest_version, download_url, filename, error):
         manual = getattr(self, "_update_manual_check", False)
-        if error:
+        error_text = str(error or "").strip()
+        # 防御：历史上若槽参数错位，会把 zip/exe 文件名当成 error 弹出「检测失败」
+        if error_text and error_text.lower().endswith((".zip", ".exe", ".msi", ".dmg", ".pkg")):
+            if " " not in error_text and "://" not in error_text and len(error_text) < 160:
+                if latest_version and not has_new:
+                    error_text = ""
+                elif has_new and download_url:
+                    error_text = ""
+                else:
+                    error_text = (
+                        f"更新检查结果异常，请重试或到 GitHub Releases 手动下载。\n（内部信息：{error_text}）"
+                    )
+
+        if error_text:
             if manual:
-                QMessageBox.warning(self, "检查更新失败", f"检测失败，错误原因：\n{error}")
+                QMessageBox.warning(self, "检查更新失败", f"检测失败，错误原因：\n{error_text}")
             return
 
         if has_new:
-            reply = QMessageBox.question(
-                self, "检测到新版本",
+            if not str(download_url or "").strip():
+                if manual:
+                    QMessageBox.warning(
+                        self, "检查更新",
+                        f"发现新版本 v{latest_version}，但没有可用的下载地址。\n"
+                        "请到 GitHub Releases 页面手动下载。",
+                    )
+                return
+            package = str(filename or Path(str(download_url).split("?")[0]).name or "安装包")
+            is_setup = package.lower().endswith(".exe")
+            prompt = (
                 f"发现新版本 v{latest_version}（当前版本 v{APP_VERSION}）。\n"
-                f"是否立即下载并运行升级安装程序？",
+                f"安装包：{package}\n\n"
+                + ("是否立即下载并运行升级安装程序？" if is_setup else
+                   "是否立即下载绿色免安装包？（下载后请解压覆盖使用）")
+            )
+            reply = QMessageBox.question(
+                self, "检测到新版本", prompt,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
+                QMessageBox.StandardButton.Yes,
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self._start_update_download(latest_version, download_url, filename)
         else:
             if manual:
-                QMessageBox.information(self, "已经是最新版本", f"当前版本 v{APP_VERSION} 已经是最新版本！")
+                shown = latest_version or APP_VERSION
+                QMessageBox.information(
+                    self, "已经是最新版本",
+                    f"当前版本 v{APP_VERSION} 已经是最新版本"
+                    + (f"（远程 v{shown}）" if shown and shown != APP_VERSION else "")
+                    + "！",
+                )
 
     def _update_thread_cleanup(self):
         worker = getattr(self, "_update_worker", None)
@@ -4659,6 +4757,10 @@ class MainWindow(QMainWindow):
             self, "开始下载",
             "最新版更新包已在后台开始静默下载。下载期间您可以继续正常使用软件，下载完成后将会自动提示您安装。")
 
+        if not str(url or "").strip():
+            QMessageBox.warning(self, "无法下载", "下载地址为空，请到 GitHub Releases 手动下载。")
+            return
+
         self._download_thread = QThread(self)
         self._download_worker = DownloadWorker(url, version, filename)
         self._download_worker.moveToThread(self._download_thread)
@@ -4666,7 +4768,7 @@ class MainWindow(QMainWindow):
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.finished.connect(
             self._on_download_finished, Qt.ConnectionType.QueuedConnection)
-        self._download_worker.finished.connect(self._download_thread.quit)
+        self._download_worker.finished.connect(lambda *_args: self._download_thread and self._download_thread.quit())
         self._download_thread.finished.connect(self._download_thread_cleanup)
         self._download_thread.start()
 
@@ -5003,9 +5105,16 @@ class FeedbackDialog(QDialog):
         self.thread.start()
         
     def on_finished(self, ok, msg):
-        self.thread.quit()
-        self.thread.wait()
-        
+        # 勿在 UI 线程长时间 wait 工作线程，避免界面卡住
+        thread = getattr(self, "thread", None)
+        if thread is not None:
+            try:
+                thread.quit()
+                if not thread.wait(3000):
+                    thread.terminate()
+            except RuntimeError:
+                pass
+
         if ok:
             QMessageBox.information(self, "提交成功", msg)
             self.accept()
