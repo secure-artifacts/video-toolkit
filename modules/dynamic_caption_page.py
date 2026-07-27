@@ -58,10 +58,13 @@ from .path_picker import (
 ALLOWED_VIDEO_INPUTS = VIDEO_EXTENSIONS.union(IMAGE_EXTENSIONS)
 from .group_merge import (
     GroupMergeWorker,
+    build_segmented_edit_state,
     discover_groups,
+    load_group_segments_map,
     merge_transition_labels,
     resolve_merge_transition,
     split_group_script,
+    try_rebuild_segments_sidecar,
 )
 from .settings_page import hidden_kwargs
 from .text_rules import normalize_required_capitalization, normalize_subtitle_text
@@ -3147,6 +3150,8 @@ class DynamicCaptionPage(QWidget):
         self._preview_load_timer.setInterval(90)
         self._preview_load_timer.timeout.connect(self._apply_pending_preview_load)
         self._pending_preview_load = None  # dict | None
+        self._preview_loaded_path = ""  # 当前预览已绑定的源路径，避免过期 duration 回调错绑
+        self._media_duration_cache = {}  # path_key -> duration_ms
         self._mask_counter = 0
         self._text_counter = 0; self._layer_schemes = {}
         self._build_ui(default_provider)
@@ -5122,7 +5127,12 @@ class DynamicCaptionPage(QWidget):
         self._active_group_watermark_fingerprint = watermark_fingerprint if burn_watermark else ""
         self._group_auto_extract_requested = self._group_wants_auto_transcript()
         self._group_auto_extract_pending = False
-        self.group_merge_outputs = []
+        # 只更新选中组：不要清空已有合成列表与视频队列，避免其它组微调丢失
+        self._group_merge_replace_queue = False
+        self._group_merge_session_outputs = []
+        expected_name = f"{group_folder.name}_去口气音合成.mp4"
+        # 预计算成品路径，合成后仅替换这一条
+        self._group_merge_target_names = {expected_name}
         self.group_merge_thread = QThread(self)
         
         selected_groups = [self.group_merge_groups[selected_row]]
@@ -5142,7 +5152,10 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_selected.setEnabled(False)
         self.progress.setValue(0)
         
-        self._append_run_log(f"开始单独重新合成组：{group_folder.name} (共 {len(clips)} 段)；强制覆盖缓存。")
+        self._append_run_log(
+            f"开始单独重新合成组：{group_folder.name} (共 {len(clips)} 段)；强制覆盖该组缓存。"
+            f" 视频字幕队列中其它组保持不动，仅更新 {expected_name}。"
+        )
         self.group_merge_thread.start()
 
 
@@ -5227,6 +5240,10 @@ class DynamicCaptionPage(QWidget):
         # merge is running must not unexpectedly start or suppress transcription.
         self._group_auto_extract_requested=self._group_wants_auto_transcript()
         self._group_auto_extract_pending=False
+        # 全量合成：完成后用全部成品刷新队列；仍保留非分组合成的其它视频条目
+        self._group_merge_replace_queue = False
+        self._group_merge_session_outputs = []
+        self._group_merge_target_names = set()
         self.group_merge_outputs = []
         self.group_merge_thread = QThread(self)
         self.group_merge_worker = GroupMergeWorker(self.group_merge_groups, output, ffmpeg, callback, settings)
@@ -5339,12 +5356,26 @@ class DynamicCaptionPage(QWidget):
     def _group_merge_item_done(self, output, group_name, index, total):
         if output not in self.group_merge_outputs:
             self.group_merge_outputs.append(output)
+        session = getattr(self, "_group_merge_session_outputs", None)
+        if session is None:
+            self._group_merge_session_outputs = []
+            session = self._group_merge_session_outputs
+        if output not in session:
+            session.append(output)
         if self._active_group_watermark_fingerprint and Path(output).is_file():
             key=str(Path(output).resolve())
             self._baked_watermarks[key]={"source":_media_signature(output),
                                          "watermark":self._active_group_watermark_fingerprint}
             QSettings("VideoToolkit","DynamicReels").setValue(
                 "baked_watermarks",json.dumps(self._baked_watermarks,ensure_ascii=False))
+        # 成品被覆盖后，丢弃该条旧时间轴剪辑状态，下次加载会按 segments 重新拆段
+        try:
+            video_key = self._timeline_key(output)
+            if video_key in self.timeline_edit_states:
+                self.timeline_edit_states.pop(video_key, None)
+            # 若字幕源就是成品本身，保留已提取文案；仅清除剪辑分段
+        except Exception:
+            pass
         self.log.appendPlainText(f"[{index}/{total}] {group_name} 已加入合成结果队列。")
         
         # Calculate clip count / durations and record history
@@ -5380,9 +5411,16 @@ class DynamicCaptionPage(QWidget):
             output_duration_sec=round(output_duration, 3),
         )
 
-    def _load_group_merge_outputs(self, auto_extract=False):
+    def _load_group_merge_outputs(self, auto_extract=False, only_session=False):
+        """把合成成品放进视频字幕队列。
+
+        only_session=True（重新合成选中组）：只更新本次成品，不清空其它视频与微调。
+        only_session=False（全量合成）：确保全部成品在队列中，并保留队列里其它非本次条目。
+        """
+        session = list(getattr(self, "_group_merge_session_outputs", None) or [])
+        pool = session if only_session and session else list(self.group_merge_outputs)
         outputs = [
-            path for path in self.group_merge_outputs
+            path for path in pool
             if Path(path).is_file() and Path(path).stat().st_size > 1024
         ]
         if not outputs:
@@ -5392,40 +5430,104 @@ class DynamicCaptionPage(QWidget):
             self.selection_debounce_timer.stop()
         self._pending_video_path = None
         self._clear_previews_and_releases()
-        self.videos.clear()
-        self._add(self.videos, outputs, ALLOWED_VIDEO_INPUTS)
+
+        replace_queue = bool(getattr(self, "_group_merge_replace_queue", False))
+        if replace_queue and not only_session:
+            self.videos.clear()
+            self._add(self.videos, outputs, ALLOWED_VIDEO_INPUTS)
+        else:
+            # 就地更新：同名/同路径替换为最新成品，其它条目不动
+            existing_by_name = {}
+            for i in range(self.videos.count()):
+                text = self.videos.item(i).text()
+                existing_by_name[Path(text).name] = i
+            focus_path = outputs[-1]
+            for path in outputs:
+                name = Path(path).name
+                if name in existing_by_name:
+                    row = existing_by_name[name]
+                    self.videos.item(row).setText(path)
+                else:
+                    # 也按 resolve 路径去重
+                    resolved = str(Path(path).resolve())
+                    found = False
+                    for i in range(self.videos.count()):
+                        try:
+                            if str(Path(self.videos.item(i).text()).resolve()) == resolved:
+                                self.videos.item(i).setText(path)
+                                found = True
+                                break
+                        except Exception:
+                            continue
+                    if not found:
+                        self.videos.addItem(path)
+                # 尽量重建分段 sidecar（旧成品无 json 时从 cache 恢复）
+                try:
+                    try:
+                        ff = self.find_ffmpeg()
+                    except Exception:
+                        ff = None
+                    try_rebuild_segments_sidecar(path, ffmpeg=ff)
+                except Exception:
+                    pass
+            # 选中本次更新的最后一条
+            for i in range(self.videos.count()):
+                try:
+                    if Path(self.videos.item(i).text()).name == Path(focus_path).name:
+                        self.videos.setCurrentRow(i)
+                        break
+                except Exception:
+                    continue
 
         self._refresh_task_queue()
         # 队列变更会触发选中 → 防抖加载；再延迟一拍确保文件句柄已释放
         if self.videos.count() > 0:
-            QTimer.singleShot(180, lambda: self._video_selection_changed(
+            current = self.videos.currentItem()
+            pick = current.text() if current else (
                 self.videos.item(0).text() if self.videos.item(0) else ""
-            ))
+            )
+            if pick:
+                QTimer.singleShot(180, lambda p=pick: self._video_selection_changed(p))
         # Automatic extraction is deliberately started by _group_merge_ended(),
         # after the merge worker thread is fully released.  This method only loads
         # finished files into the normal video/task queue.
 
     def _group_merge_finished(self, ok, message):
+        only_session = not bool(getattr(self, "_group_merge_replace_queue", False))
+        # 选中组重合成：only_session 始终 True；全量合成也会用「合并进队列」策略
+        only_session = True
         if ok:
             try:
                 for path in json.loads(message).get("outputs", []):
-                    if path not in self.group_merge_outputs: self.group_merge_outputs.append(path)
+                    if path not in self.group_merge_outputs:
+                        self.group_merge_outputs.append(path)
+                    session = getattr(self, "_group_merge_session_outputs", None)
+                    if session is not None and path not in session:
+                        session.append(path)
             except Exception:
                 pass
-            self.progress.setValue(100); self._load_group_merge_outputs(auto_extract=False)
-            self._group_auto_extract_pending=bool(self._group_auto_extract_requested and self.group_merge_outputs)
-            self.log.appendPlainText(
-                f"分组合成完成：共 {len(self.group_merge_outputs)} 个完整视频。已进入视频队列，"
-                + ("线程释放后将继续批量提取字幕。" if self._group_auto_extract_pending else "未启用自动转文字，可稍后手动提取。")
+            self.progress.setValue(100)
+            self._load_group_merge_outputs(auto_extract=False, only_session=only_session)
+            session_n = len(getattr(self, "_group_merge_session_outputs", None) or self.group_merge_outputs)
+            # 自动转文字：仅针对本次会话新成品（避免重合成一组时重提全部字幕）
+            pending_paths = list(getattr(self, "_group_merge_session_outputs", None) or [])
+            self._group_auto_extract_paths = pending_paths if pending_paths else list(self.group_merge_outputs)
+            self._group_auto_extract_pending = bool(
+                self._group_auto_extract_requested and self._group_auto_extract_paths
             )
-            self.run_status.setText("当前状态：分组合成完成" + ("，等待批量提取字幕" if self._group_auto_extract_pending else ""))
+            self.log.appendPlainText(
+                f"分组合成完成：本次更新 {session_n} 个完整视频（队列中其它条目未清空）。"
+                + (" 线程释放后将仅为本次成品提取字幕。" if self._group_auto_extract_pending else " 未启用自动转文字，可稍后手动提取。")
+            )
+            self.run_status.setText("当前状态：分组合成完成" + ("，等待提取字幕" if self._group_auto_extract_pending else ""))
         else:
             self._group_auto_extract_pending=False
-            if self.group_merge_outputs:
-                # 停止或失败时只保留已完成的视频，不要在后台又启动字幕提取，
-                # 否则用户会误以为停止失效，也无法立即开始下一次分组合成。
-                self._load_group_merge_outputs(auto_extract=False)
-                message += f"\n\n已完成的 {len(self.group_merge_outputs)} 组仍已加入视频队列，可修复后断点续接。"
+            self._group_auto_extract_paths = []
+            if self.group_merge_outputs or getattr(self, "_group_merge_session_outputs", None):
+                # 停止或失败时只并入已完成的视频，不要在后台又启动字幕提取
+                self._load_group_merge_outputs(auto_extract=False, only_session=True)
+                done_n = len(getattr(self, "_group_merge_session_outputs", None) or self.group_merge_outputs)
+                message += f"\n\n已完成的 {done_n} 组仍已并入视频队列，其它条目未清空，可修复后断点续接。"
             if "已停止" in message:
                 self._append_run_log(message)
                 self.run_status.setText("当前状态：已停止，可直接再次开始并断点续接")
@@ -5435,15 +5537,25 @@ class DynamicCaptionPage(QWidget):
 
     def _group_merge_ended(self):
         should_extract=bool(self._group_auto_extract_pending)
+        extract_paths = list(getattr(self, "_group_auto_extract_paths", None) or [])
         self.group_merge_start.setEnabled(True); self.group_merge_stop.setEnabled(False); self.group_merge_selected.setEnabled(True)
         self.group_merge_worker = None; self.group_merge_thread = None
         self._active_group_watermark_fingerprint=""
         self._group_auto_extract_pending=False
+        self._group_auto_extract_paths = []
+        self._group_merge_session_outputs = []
+        self._group_merge_target_names = set()
         self._append_run_log("分组合成任务已释放，可以直接开始下一次任务。")
         if should_extract:
-            self.run_status.setText("当前状态：合成完成，正在批量提取字幕")
-            self._append_run_log("已启用“合成并转文字”：现在开始对全部合成成品提取字幕。")
-            QTimer.singleShot(0,self.extract_all_timelines)
+            self.run_status.setText("当前状态：合成完成，正在提取字幕")
+            if extract_paths and len(extract_paths) < max(1, self.videos.count()):
+                self._append_run_log(
+                    f"已启用“合成并转文字”：仅为本次 {len(extract_paths)} 个成品提取字幕，其它组字幕保留。"
+                )
+                QTimer.singleShot(0, lambda paths=extract_paths: self._extract_timelines_for_paths(paths))
+            else:
+                self._append_run_log("已启用“合成并转文字”：现在开始对合成成品提取字幕。")
+                QTimer.singleShot(0, self.extract_all_timelines)
 
     def _on_task_queue_dropped(self, paths):
         videos = []
@@ -5490,7 +5602,11 @@ class DynamicCaptionPage(QWidget):
             self._load_current_free_text()
         else:
             self._timeline_selection_changed(caption_source)
+        # 立刻刷新时间轴（用缓存/探测时长，不依赖播放器是否已拿到 duration）
         self._refresh_canva_timeline(video_path)
+        # 播放器异步就绪后再补一次，确保时长与分段缩放精确
+        QTimer.singleShot(120, lambda p=video_path: self._refresh_canva_timeline_if_current(p))
+        QTimer.singleShot(450, lambda p=video_path: self._refresh_canva_timeline_if_current(p))
 
     def _on_debounce_load_audio(self):
         source = getattr(self, "_pending_audio_source", None)
@@ -5687,6 +5803,7 @@ class DynamicCaptionPage(QWidget):
         self._preview_external_audio = bool(external and Path(external).is_file())
         self._preview_audio_offset_ms = audio_offset_ms if self._preview_external_audio else 0
         abs_path = str(media.resolve())
+        self._preview_loaded_path = abs_path
         is_image = media.suffix.lower() in IMAGE_EXTENSIONS
         self._preview_is_image = is_image
         try:
@@ -7126,7 +7243,19 @@ class DynamicCaptionPage(QWidget):
     def _preview_duration_changed(self, value):
         self.seek.setRange(0,max(0,value)); self._preview_position_changed(self.player.position())
         if value > 0:
-            self._refresh_canva_timeline()
+            # 只刷新「当前预览路径」对应的时间轴，避免快速切换时旧视频 duration 串到新项目
+            path = getattr(self, "_preview_loaded_path", "") or ""
+            if not path:
+                item = self.videos.currentItem() if hasattr(self, "videos") else None
+                path = item.text() if item else ""
+            if path:
+                try:
+                    key = self._timeline_key(path)
+                    if key:
+                        self._media_duration_cache[key] = int(value)
+                except Exception:
+                    pass
+                self._refresh_canva_timeline(path)
 
     def _current_settings(self):
         preset = next((button.text() for button in self.preset_buttons if button.isChecked()), None)
@@ -7548,6 +7677,67 @@ class DynamicCaptionPage(QWidget):
             self.audio_mode.setCurrentText("使用配音/添加的音频（消除视频原音，可另混背景音乐）")
         self._append_run_log("视频原声轨道已开启。" if enabled else "视频原声轨道已静音；导出时不会保留原视频声音。")
 
+    def _refresh_canva_timeline_if_current(self, video_path: str):
+        """仅当仍选中该视频时刷新，避免快速切换时迟到的定时器写错轨。"""
+        if not video_path or not hasattr(self, "videos"):
+            return
+        item = self.videos.currentItem()
+        if not item:
+            return
+        try:
+            if self._timeline_key(item.text()) != self._timeline_key(video_path):
+                return
+        except Exception:
+            if item.text() != video_path:
+                return
+        self._refresh_canva_timeline(video_path)
+
+    def _resolve_timeline_duration_ms(self, video_path: str) -> int:
+        """优先播放器时长（且路径匹配），否则缓存 / ffprobe，保证分段轨不必等预览解码。"""
+        path = str(video_path or "")
+        if not path:
+            return 0
+        video_key = self._timeline_key(path)
+        player_ms = 0
+        if hasattr(self, "player"):
+            try:
+                player_ms = int(self.player.duration() or 0)
+            except Exception:
+                player_ms = 0
+        loaded = str(getattr(self, "_preview_loaded_path", "") or "")
+        player_matches = False
+        if player_ms > 0 and loaded:
+            try:
+                player_matches = self._timeline_key(loaded) == video_key
+            except Exception:
+                player_matches = Path(loaded).name == Path(path).name
+        if player_ms > 0 and (player_matches or not loaded):
+            self._media_duration_cache[video_key] = player_ms
+            return player_ms
+        cached = int(self._media_duration_cache.get(video_key) or 0)
+        if cached > 0:
+            return cached
+        # sidecar 总时长作备选（不依赖 ffprobe）
+        try:
+            data = load_group_segments_map(path)
+            if data:
+                total = sum(max(0, int(s.get("duration_ms") or 0)) for s in (data.get("segments") or []))
+                if total >= 200:
+                    self._media_duration_cache[video_key] = total
+                    return total
+        except Exception:
+            pass
+        try:
+            ff = self.find_ffmpeg()
+            sec = float(media_duration(ff, path, fallback=0.0) or 0.0)
+            if sec > 0.05:
+                ms = max(1000, int(round(sec * 1000)))
+                self._media_duration_cache[video_key] = ms
+                return ms
+        except Exception:
+            pass
+        return 0
+
     def _refresh_canva_timeline(self, video_path=""):
         if not hasattr(self, "canva_timeline") or not hasattr(self, "videos"):
             return
@@ -7556,31 +7746,108 @@ class DynamicCaptionPage(QWidget):
             video_path = item.text() if item else ""
         if not video_path:
             return
+        # 若调用方指定了路径，但用户已切到别的视频，则忽略（防过期回调）
+        current = self.videos.currentItem()
+        if current:
+            try:
+                if self._timeline_key(current.text()) != self._timeline_key(video_path):
+                    # 允许仅用当前项；过期的 path 直接丢弃
+                    return
+            except Exception:
+                pass
         source = self._caption_source_for_video(video_path)
         key = self._timeline_key(source)
         srt = self.override_text.toPlainText() if hasattr(self, "override_text") else ""
         if key:
             srt = self.timeline_overrides.get(key, srt)
-        duration = self.player.duration() if hasattr(self, "player") else 0
-        edit_state=self.timeline_edit_states.get(self._timeline_key(video_path),{})
-        is_group_output=any(
-            self._timeline_key(path)==self._timeline_key(video_path)
-            for path in getattr(self,"group_merge_outputs",[])
+        duration = self._resolve_timeline_duration_ms(video_path)
+        video_key = self._timeline_key(video_path)
+        edit_state = dict(self.timeline_edit_states.get(video_key, {}) or {})
+        is_group_output = any(
+            self._timeline_key(path) == video_key
+            for path in getattr(self, "group_merge_outputs", [])
+        ) or Path(video_path).name.endswith("去口气音合成.mp4") or Path(video_path).name.endswith("_去口气音合成.mp4")
+        # Prefer segmented bars (one bar per original clip) when sidecar exists.
+        # Do not overwrite if user already has multi-segment custom layout.
+        existing_video = list((edit_state.get("tracks") or {}).get("video") or [])
+        # 时长尚未就绪时也允许先拆段（用 sidecar 合计），避免必须来回切换
+        can_auto_segment = (
+            (not edit_state.get("segmented"))
+            and len(existing_video) <= 1
         )
-        if is_group_output and not edit_state and duration>0:
-            edit_state={
-                "duration_ms":duration,
-                "original_audio_enabled":False,
-                "tracks":{
-                    "video":[{"start":0,"end":duration,"source_start":0,"source_end":duration,
-                              "name":Path(video_path).name}],
-                    "original_audio":[{"start":0,"end":duration,"source_start":0,"source_end":duration,
-                                       "name":"视频原声"}],
-                    "bgm":[],"tts":[],
-                },
-            }
-            self.timeline_edit_states[self._timeline_key(video_path)]=edit_state
-        original_audio_enabled=bool(edit_state.get("original_audio_enabled",not is_group_output))
+        if can_auto_segment:
+            # 旧成品无 sidecar 时，尝试从 .group_merge_cache 恢复分段（有 json 则很快）
+            try:
+                try:
+                    ff = self.find_ffmpeg()
+                except Exception:
+                    ff = None
+                try_rebuild_segments_sidecar(video_path, ffmpeg=ff)
+            except Exception:
+                pass
+            if duration <= 0:
+                try:
+                    data = load_group_segments_map(video_path)
+                    if data:
+                        duration = max(
+                            1000,
+                            sum(max(80, int(s.get("duration_ms") or 0)) for s in (data.get("segments") or [])),
+                        )
+                except Exception:
+                    pass
+            segmented = build_segmented_edit_state(
+                video_path, max(duration, 1000), original_audio_enabled=True,
+            )
+            if segmented:
+                edit_state = segmented
+                self.timeline_edit_states[video_key] = dict(edit_state)
+                # 只在首次拆段时记日志，避免 duration 回调刷屏
+                if not getattr(self, "_segment_log_keys", None):
+                    self._segment_log_keys = set()
+                if video_key not in self._segment_log_keys:
+                    self._segment_log_keys.add(video_key)
+                    self._append_run_log(
+                        f"时间轴已按合成段落拆分：{len(segmented['tracks']['video'])} 段视频/音频，"
+                        "可单独拖动有问题的一段（两端恢复内容、中间改位置）。"
+                        "最终导出仍是一个完整视频，分段仅便于编辑定位。"
+                    )
+            elif is_group_output and not existing_video and duration > 0:
+                edit_state = {
+                    "duration_ms": duration,
+                    "original_audio_enabled": True,
+                    "tracks": {
+                        "video": [{"start": 0, "end": duration, "source_start": 0, "source_end": duration,
+                                   "source_duration": duration, "name": Path(video_path).name}],
+                        "original_audio": [{"start": 0, "end": duration, "source_start": 0, "source_end": duration,
+                                            "source_duration": duration, "name": "视频原声"}],
+                        "bgm": [], "tts": [],
+                    },
+                }
+                self.timeline_edit_states[video_key] = edit_state
+        elif edit_state.get("segmented") and duration > 0:
+            # 已有分段但时长更新：按真实时长重算条宽，避免第一次用了近似时长
+            prev = int(edit_state.get("duration_ms") or 0)
+            if prev > 0 and abs(prev - duration) > 80:
+                rebuilt = build_segmented_edit_state(
+                    video_path, duration, original_audio_enabled=True,
+                )
+                if rebuilt and len((rebuilt.get("tracks") or {}).get("video") or []) == len(existing_video):
+                    # 保留用户若只改了名字等；这里以重算为准（未手改 source 时最稳）
+                    # 若用户已微调过多段，不覆盖（条数相同且 segmented 但有手动痕迹较难判断：仅当尚未手改 source 偏移）
+                    user_tweaked = False
+                    for bar in existing_video:
+                        if int(bar.get("start", 0)) != int(bar.get("source_start", 0)):
+                            user_tweaked = True
+                            break
+                        if int(bar.get("end", 0)) - int(bar.get("start", 0)) != int(bar.get("source_end", 0)) - int(bar.get("source_start", 0)):
+                            user_tweaked = True
+                            break
+                    if not user_tweaked:
+                        edit_state = rebuilt
+                        self.timeline_edit_states[video_key] = dict(edit_state)
+        if duration <= 0:
+            duration = max(1000, int(edit_state.get("duration_ms") or 0), 1000)
+        original_audio_enabled = bool(edit_state.get("original_audio_enabled", not is_group_output))
         self.canva_timeline.set_project(
             video_path,
             duration,
@@ -7627,20 +7894,32 @@ class DynamicCaptionPage(QWidget):
 
     def extract_all_timelines(self):
         videos=[self.videos.item(i).text() for i in range(self.videos.count())]
-        audios=[self.audios.item(i).text() for i in range(self.audios.count())]
         if not videos:
             QMessageBox.information(self,"没有视频","请先添加需要批量处理的视频素材。")
             return
-        if self.timeline_thread and self.timeline_thread.isRunning(): return
-        settings=self._current_settings()
-        sources=[]
+        self._extract_timelines_for_paths(videos)
+
+    def _extract_timelines_for_paths(self, video_paths):
+        """仅为指定视频提取字幕，其它条目的 timeline_overrides 不动。"""
+        videos = [str(p) for p in (video_paths or []) if p and Path(p).is_file()]
+        if not videos:
+            return
+        if self.timeline_thread and self.timeline_thread.isRunning():
+            return
+        sources = []
         for video in videos:
-            value=self._caption_source_for_video(video)
-            if value not in sources: sources.append(value)
-        provider=self.provider.currentText(); callback=lambda path:self.transcribe_callable(path,provider)
-        self.extract_timeline_btn.setEnabled(False); self.extract_all_btn.setEnabled(False)
+            value = self._caption_source_for_video(video)
+            if value and value not in sources:
+                sources.append(value)
+        if not sources:
+            return
+        provider = self.provider.currentText()
+        callback = lambda path: self.transcribe_callable(path, provider)
+        self.extract_timeline_btn.setEnabled(False)
+        self.extract_all_btn.setEnabled(False)
         self.extract_all_btn.setText(f"排队提取 0/{len(sources)}")
-        self.timeline_thread=QThread(self); self.timeline_worker=BatchTimelineWorker(callback,sources,self.output.text())
+        self.timeline_thread = QThread(self)
+        self.timeline_worker = BatchTimelineWorker(callback, sources, self.output.text())
         self.timeline_worker.moveToThread(self.timeline_thread)
         self.timeline_thread.started.connect(self.timeline_worker.run)
         self.timeline_worker.item_started.connect(self._batch_timeline_item_started)
@@ -7650,7 +7929,9 @@ class DynamicCaptionPage(QWidget):
         self.timeline_worker.finished.connect(self.timeline_thread.quit)
         self.timeline_thread.finished.connect(self._timeline_ended)
         self.timeline_thread.finished.connect(self.timeline_thread.deleteLater)
-        self._append_run_log(f"已建立批量字幕队列：{len(sources)} 个素材，将按视频匹配关系逐个处理。")
+        self._append_run_log(
+            f"已建立字幕队列：{len(sources)} 个素材（仅本次列表，其它组字幕保留）。"
+        )
         self.timeline_thread.start()
 
     def _batch_timeline_item_started(self,source,index,total):

@@ -440,6 +440,356 @@ def _safe_name(value):
     return cleaned or "合成视频"
 
 
+def group_segments_sidecar_path(output_path) -> Path:
+    """Sidecar next to a group-merge product: stem.segments.json"""
+    path = Path(output_path)
+    return path.with_name(path.stem + ".segments.json")
+
+
+def write_group_segments_map(output_path, segments, transition_ms=0):
+    """Write per-segment timing so the timeline can show split video/audio bars.
+
+    segments: list of dicts with keys name, duration_ms, optional original/normalized paths.
+    """
+    output_path = Path(output_path)
+    rows = []
+    for index, item in enumerate(segments or [], 1):
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "index": index,
+            "name": str(item.get("name") or f"段{index:02d}"),
+            "duration_ms": max(80, int(item.get("duration_ms") or 0)),
+            "original": str(item.get("original") or ""),
+            "normalized": str(item.get("normalized") or ""),
+        })
+    if not rows:
+        return None
+    payload = {
+        "version": 1,
+        "output": output_path.name,
+        "transition_ms": max(0, int(transition_ms or 0)),
+        "segments": rows,
+    }
+    sidecar = group_segments_sidecar_path(output_path)
+    sidecar.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return sidecar
+
+
+def load_group_segments_map(output_path):
+    """Load segment map if present; return dict or None."""
+    sidecar = group_segments_sidecar_path(output_path)
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    segments = data.get("segments") or []
+    if len(segments) < 2:
+        return None
+    return data
+
+
+def _ffprobe_candidates(ffmpeg=None):
+    """Yield possible ffprobe executables (bundled + PATH)."""
+    seen = set()
+    candidates = []
+    if ffmpeg:
+        fp = Path(ffmpeg)
+        candidates.append(fp.with_name("ffprobe" + fp.suffix))
+        candidates.append(fp.with_name("ffprobe.exe"))
+    # Project-relative common locations (dev + packaged)
+    here = Path(__file__).resolve()
+    roots = [here.parents[1], Path.cwd()]
+    for root in roots:
+        candidates.extend([
+            root / ".build_media" / "ffprobe.exe",
+            root / "internal" / "ffprobe.exe",
+            root / "dist_folder" / "VideoToolkit" / "internal" / "ffprobe.exe",
+        ])
+    candidates.extend([Path("ffprobe"), Path("ffprobe.exe")])
+    for item in candidates:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        if item.name in {"ffprobe", "ffprobe.exe"} or item.is_file():
+            yield str(item)
+
+
+def _probe_media_duration_ms(path, ffmpeg=None) -> int:
+    """Best-effort duration in ms via ffprobe; 0 on failure."""
+    path = Path(path)
+    if not path.is_file():
+        return 0
+    creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    for tool in _ffprobe_candidates(ffmpeg):
+        try:
+            res = subprocess.run(
+                [tool, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=creation, timeout=30,
+            )
+            text = (res.stdout or b"").decode("utf-8", errors="replace").strip().splitlines()
+            text = (text[0] if text else "").strip()
+            if text and text.upper() != "N/A":
+                return max(0, int(round(float(text) * 1000)))
+        except Exception:
+            continue
+    # Fallback: ffmpeg -i header
+    ffmpeg_tools = []
+    if ffmpeg:
+        ffmpeg_tools.append(str(ffmpeg))
+    ffmpeg_tools.extend(["ffmpeg", "ffmpeg.exe"])
+    for tool in ffmpeg_tools:
+        try:
+            res = subprocess.run(
+                [tool, "-hide_banner", "-i", str(path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=creation, timeout=30,
+            )
+            text = (res.stdout or b"").decode("utf-8", errors="replace")
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+            if m:
+                h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                return max(0, int(round((h * 3600 + mi * 60 + s) * 1000)))
+        except Exception:
+            continue
+    return 0
+
+
+def _parse_concat_segment_paths(concat_file: Path):
+    """Parse FFmpeg concat demuxer list → absolute Paths that still exist."""
+    if not concat_file.is_file():
+        return []
+    rows = []
+    try:
+        text = concat_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.lower().startswith("file "):
+            continue
+        raw = line[5:].strip()
+        if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+            raw = raw[1:-1].replace("'\\''", "'")
+        elif raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            raw = raw[1:-1]
+        candidate = Path(raw)
+        if candidate.is_file():
+            rows.append(candidate)
+    return rows
+
+
+def _original_names_from_analysis(analysis_file: Path, count: int):
+    """Return up to count original clip basenames from analysis.json (insertion order)."""
+    if not analysis_file.is_file() or count <= 0:
+        return []
+    try:
+        data = json.loads(analysis_file.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    names = []
+    for key in data.keys():
+        name = Path(str(key)).name
+        if name:
+            names.append(name)
+        if len(names) >= count:
+            break
+    return names
+
+
+def try_rebuild_segments_sidecar(output_path, ffmpeg=None):
+    """Rebuild stem.segments.json from .group_merge_cache when missing.
+
+    Used for products merged before segmented timeline support. Returns sidecar
+    Path on success, else None.
+    """
+    output_path = Path(output_path)
+    if not output_path.is_file():
+        return None
+    existing = load_group_segments_map(output_path)
+    if existing:
+        return group_segments_sidecar_path(output_path)
+
+    cache_root = output_path.parent / ".group_merge_cache"
+    if not cache_root.is_dir():
+        return None
+
+    # Stem like "12_去口气音合成" → group token "12"
+    stem = output_path.stem
+    group_token = stem
+    for suffix in ("_去口气音合成", "去口气音合成", "_合成"):
+        if group_token.endswith(suffix):
+            group_token = group_token[: -len(suffix)]
+            break
+    group_token = group_token.strip("_- ")
+
+    out_dur = _probe_media_duration_ms(output_path, ffmpeg=ffmpeg)
+    best = None  # (score, rows, transition_ms)  lower score is better
+    for cache_dir in sorted(cache_root.iterdir()):
+        if not cache_dir.is_dir():
+            continue
+        final_file = cache_dir / "final.json"
+        final_data = {}
+        try:
+            if final_file.is_file():
+                final_data = json.loads(final_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            final_data = {}
+        # Prefer exact output name match written by newer merges
+        name_hit = (
+            str(final_data.get("output_name") or final_data.get("output") or "")
+            == output_path.name
+            or str(final_data.get("group_name") or "") == group_token
+        )
+        segment_paths = _parse_concat_segment_paths(cache_dir / "concat.txt")
+        if len(segment_paths) < 2:
+            # Fall back to newest segment_NNN_* files by index
+            by_index = {}
+            for child in cache_dir.glob("segment_*.mp4"):
+                m = re.match(r"segment_(\d+)_", child.name)
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                prev = by_index.get(idx)
+                if prev is None or child.stat().st_mtime >= prev.stat().st_mtime:
+                    by_index[idx] = child
+            segment_paths = [by_index[i] for i in sorted(by_index)]
+        if len(segment_paths) < 2:
+            continue
+
+        names = _original_names_from_analysis(cache_dir / "analysis.json", len(segment_paths))
+        # Strong match: originals look like 12-1.mp4 / 12_1.mp4 for product 12_去口气音合成
+        prefix_hit = False
+        if group_token and names:
+            hits = 0
+            for n in names:
+                stem_n = Path(n).stem
+                if (
+                    stem_n == group_token
+                    or stem_n.startswith(f"{group_token}-")
+                    or stem_n.startswith(f"{group_token}_")
+                ):
+                    hits += 1
+            prefix_hit = hits >= max(2, (len(names) + 1) // 2)
+
+        durs = [_probe_media_duration_ms(p, ffmpeg=ffmpeg) for p in segment_paths]
+        known = [d for d in durs if d > 0]
+        if len(known) < 2 and not (name_hit or prefix_hit):
+            continue
+        if known:
+            avg = int(round(sum(known) / len(known)))
+        elif out_dur > 0:
+            avg = max(80, int(round(out_dur / len(segment_paths))))
+        else:
+            avg = 2000
+        durs = [d if d > 0 else avg for d in durs]
+        total = sum(durs) or 1
+        rows = []
+        for i, (seg_path, dur) in enumerate(zip(segment_paths, durs)):
+            rows.append({
+                "name": names[i] if i < len(names) else seg_path.name,
+                "duration_ms": max(80, dur),
+                "original": "",
+                "normalized": str(seg_path.resolve()),
+            })
+        transition_ms = int(final_data.get("transition_ms") or 0)
+        if name_hit:
+            best = (0.0, rows, transition_ms)
+            break
+        if prefix_hit:
+            score = 0.01
+            if out_dur > 0:
+                score = min(0.05, abs(total - out_dur) / max(out_dur, 1))
+            if best is None or score < best[0]:
+                best = (score, rows, transition_ms)
+            continue
+        if out_dur > 0:
+            score = abs(total - out_dur) / max(out_dur, 1)
+            if best is None or score < best[0]:
+                best = (score, rows, transition_ms)
+
+    if not best:
+        return None
+    score, rows, transition_ms = best
+    # Reject very poor duration matches (likely wrong cache group)
+    if score > 0.22:
+        return None
+    return write_group_segments_map(output_path, rows, transition_ms=transition_ms)
+
+
+def build_segmented_edit_state(output_path, duration_ms, original_audio_enabled=True):
+    """Build timeline edit_state with one bar per merged segment (video + original_audio).
+
+    Source ranges map into the **concatenated output file** (not originals), so edge
+    drag adjusts which part of the finished file is used. Segment names help find
+    the bad take; re-merge with milder trim if content was permanently cut by 去口气.
+
+    Final export is still one continuous file; segments are timeline edit aids only.
+    """
+    data = load_group_segments_map(output_path)
+    if not data:
+        try:
+            try_rebuild_segments_sidecar(output_path)
+        except Exception:
+            pass
+        data = load_group_segments_map(output_path)
+    if not data:
+        return None
+    segments = data.get("segments") or []
+    if len(segments) < 2:
+        return None
+    duration_ms = max(1000, int(duration_ms or 0))
+    raw = [max(80, int(s.get("duration_ms") or 0)) for s in segments]
+    total_raw = sum(raw) or 1
+    # Fit to real file duration (hard-cut ≈ 1.0; xfade slightly shorter)
+    scale = duration_ms / total_raw
+    t = 0
+    video_tracks = []
+    audio_tracks = []
+    for i, seg in enumerate(segments):
+        if i < len(segments) - 1:
+            dur = max(80, int(round(raw[i] * scale)))
+        else:
+            dur = max(80, duration_ms - t)
+        name = str(seg.get("name") or f"段{i + 1:02d}")
+        label = f"{i + 1:02d}.{name}"
+        video_tracks.append({
+            "start": t,
+            "end": t + dur,
+            "source_start": t,
+            "source_end": t + dur,
+            "source_duration": duration_ms,
+            "name": label,
+        })
+        audio_tracks.append({
+            "start": t,
+            "end": t + dur,
+            "source_start": t,
+            "source_end": t + dur,
+            "source_duration": duration_ms,
+            "name": f"{label}·音",
+        })
+        t += dur
+    return {
+        "duration_ms": duration_ms,
+        "original_audio_enabled": bool(original_audio_enabled),
+        "segmented": True,
+        "tracks": {
+            "video": video_tracks,
+            "original_audio": audio_tracks,
+            "bgm": [],
+            "tts": [],
+        },
+    }
+
+
 class GroupMergeWorker(QObject):
     log = Signal(str)
     progress = Signal(int)
@@ -984,13 +1334,12 @@ class GroupMergeWorker(QObject):
                     state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
                 except Exception:
                     state = {}
+                transition_cfg = resolve_merge_transition(transition_name)
+                transition_key = (transition_cfg or {}).get("xfade") if transition_cfg else None
+                actual_transition_duration = 0.0
                 if not (self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024
                         and state.get("fingerprint") == final_fingerprint):
                     self.log.emit(f"正在合并文件夹“{folder.name}”的 {len(normalized)} 个片段，请等待…")
-                    
-                    # Use resolved transition_name
-                    transition_cfg = resolve_merge_transition(transition_name)
-                    transition_key = (transition_cfg or {}).get("xfade") if transition_cfg else None
                     
                     if transition_key and len(normalized) > 1:
                         # 优先用户在 UI 设置的时长；未设置时用该转场类型的推荐默认值
@@ -1099,9 +1448,64 @@ class GroupMergeWorker(QObject):
                         else:
                             err = (res.stdout or b"").decode("utf-8", errors="replace")
                             self.log.emit(f"群组切片失败：{err}，保留未切片版本。")
-                    state_file.write_text(json.dumps({"fingerprint": final_fingerprint}, indent=2), encoding="utf-8")
+                    used_transition_ms = 0
+                    if transition_key and len(normalized) > 1 and actual_transition_duration:
+                        used_transition_ms = int(round(float(actual_transition_duration) * 1000))
+                    state_file.write_text(json.dumps({
+                        "fingerprint": final_fingerprint,
+                        "output_name": destination.name,
+                        "group_name": folder.name,
+                        "transition_ms": used_transition_ms,
+                        "segment_count": len(normalized),
+                    }, ensure_ascii=False, indent=2), encoding="utf-8")
                 else:
                     self.log.emit(f"续接：复用已完成合成视频 {destination.name}")
+                    used_transition_ms = 0
+                    if transition_key and len(normalized) > 1 and actual_transition_duration:
+                        used_transition_ms = int(round(float(actual_transition_duration) * 1000))
+                # Sidecar: keep per-segment bars on the timeline for fine re-timing
+                try:
+                    seg_rows = []
+                    for orig, norm in zip(clips, normalized):
+                        try:
+                            dur_ms = int(round(float(self._probe(norm)["duration"]) * 1000))
+                        except Exception:
+                            dur_ms = 0
+                        seg_rows.append({
+                            "name": Path(orig).name,
+                            "duration_ms": max(80, dur_ms),
+                            "original": str(Path(orig).resolve()),
+                            "normalized": str(Path(norm).resolve()),
+                        })
+                    if not used_transition_ms:
+                        if transition_key and len(normalized) > 1 and actual_transition_duration:
+                            used_transition_ms = int(round(float(actual_transition_duration) * 1000))
+                    sidecar = write_group_segments_map(
+                        destination, seg_rows, transition_ms=used_transition_ms,
+                    )
+                    # Keep final.json aligned even on resume path
+                    try:
+                        prev = {}
+                        if state_file.is_file():
+                            prev = json.loads(state_file.read_text(encoding="utf-8")) or {}
+                        prev.update({
+                            "output_name": destination.name,
+                            "group_name": folder.name,
+                            "transition_ms": used_transition_ms,
+                            "segment_count": len(seg_rows),
+                        })
+                        if "fingerprint" not in prev:
+                            prev["fingerprint"] = final_fingerprint
+                        state_file.write_text(json.dumps(prev, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                    if sidecar:
+                        self.log.emit(
+                            f"已写入分段轨道元数据（{len(seg_rows)} 段）：{sidecar.name}，"
+                            "时间轴按段落显示便于微调；最终导出仍是一个完整视频。"
+                        )
+                except Exception as exc:
+                    self.log.emit(f"提醒：分段轨道元数据写入失败（不影响成品）：{exc}")
                 outputs.append(str(destination))
                 completed_steps += 1
                 self.progress.emit(round(completed_steps / total_steps * 100))

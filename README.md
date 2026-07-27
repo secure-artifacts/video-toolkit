@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.17**
+当前版本：**v1.7.18**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -46,11 +46,17 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.17.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.17/video-toolkit-windows-x64-v1.7.17.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.17/VideoToolkit_Setup_v1.7.17.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.14.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.14/video-toolkit-macos-arm64-v1.7.14.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.14.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.14/video-toolkit-macos-x64-v1.7.14.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.18.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.18/video-toolkit-windows-x64-v1.7.18.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.18/VideoToolkit_Setup_v1.7.18.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.17.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.17/video-toolkit-macos-arm64-v1.7.17.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.17.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.17/video-toolkit-macos-x64-v1.7.17.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.18 · 2026-07-27
+- 分组合成：成品写入分段元数据；时间轴按原始片段拆成多段视频/原声，便于修「话说一半」。
+- 旧成品可从 `.group_merge_cache` 自动恢复分段轨。
+- 「重新合成选中组」只更新该组，不清空其它已微调项目。
+- 时间轴：拉长右边缘涟漪后推后续轨；切换项目即可显示分段（无需来回点）。
 
 ### v1.7.17 · 2026-07-27
 - 顶栏导航恢复「批量重命名」「自动流水线」入口（页面本身一直在，仅导航漏写）。

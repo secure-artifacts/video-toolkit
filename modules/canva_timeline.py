@@ -60,6 +60,8 @@ class MediaClip:
     source_start: int
     source_end: int
     name: str = ""
+    # Full source media length in ms; allows edge-drag to restore trimmed content.
+    source_duration: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -68,7 +70,18 @@ class MediaClip:
             "source_start": self.source_start,
             "source_end": self.source_end,
             "name": self.name,
+            "source_duration": self.source_duration or max(self.source_end, 0),
         }
+
+    def resolved_source_duration(self, fallback: int = 0) -> int:
+        """Full source file length; never shrink just because the clip was trimmed."""
+        candidates = [
+            int(self.source_duration or 0),
+            int(fallback or 0),
+            int(self.source_end or 0),
+            int(self.source_start or 0) + max(80, int(self.end - self.start)),
+        ]
+        return max(candidates)
 
 
 class TransitionPresetButton(QPushButton):
@@ -142,6 +155,9 @@ class TimelineCanvas(QWidget):
         self.duration_ms = 10_000
         self.position_ms = 0
         self.pixels_per_second = ZOOM_DEFAULT_PPS
+        # Full length of the loaded media file (ms). Used so edge-drag can restore
+        # trimmed audio/video even if a clip forgot source_duration after edits.
+        self.media_source_duration_ms = 10_000
         self.clips: list[CaptionClip] = []
         self.video_waveform: list[float] = []
         self.bgm_waveform: list[float] = []
@@ -160,7 +176,8 @@ class TimelineCanvas(QWidget):
             "tts": [],
         }
         self.selected: tuple[str, int] | None = None
-        self._drag: tuple[str, int, str, int, int, int, int] | None = None
+        # Drag payload: kind, index, edge, originals..., linked, ripple snapshot, ...
+        self._drag: tuple | None = None
         self._scrubbing = False
         self._project_key = ""
         self._undo_stack: list[dict] = []
@@ -200,6 +217,44 @@ class TimelineCanvas(QWidget):
         self.zoomWheel.emit(delta, int(event.position().x()))
         event.accept()
 
+    def _apply_tracks_from_state(self, tracks_state: dict, full_ms: int):
+        """Restore media bars from edit_state tracks (always, not only on project change)."""
+        if not tracks_state:
+            return
+        full_ms = max(1000, int(full_ms or 0))
+        for kind in self.media_clips:
+            restored = []
+            for item in tracks_state.get(kind, []) or []:
+                try:
+                    src_end = int(item["source_end"])
+                    src_dur = max(
+                        int(item.get("source_duration") or 0),
+                        src_end,
+                        full_ms,
+                        self.media_source_duration_ms,
+                    )
+                    restored.append(
+                        MediaClip(
+                            int(item["start"]), int(item["end"]),
+                            int(item["source_start"]), src_end,
+                            str(item.get("name", "")),
+                            source_duration=src_dur,
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for clip in restored:
+                self.media_source_duration_ms = max(
+                    self.media_source_duration_ms,
+                    clip.resolved_source_duration(self.media_source_duration_ms),
+                )
+                clip.source_duration = max(
+                    clip.source_duration or 0, self.media_source_duration_ms
+                )
+            # Only replace when payload has bars for this kind (empty list clears intentionally)
+            if kind in tracks_state:
+                self.media_clips[kind] = restored
+
     def set_project(
         self,
         duration_ms: int,
@@ -211,6 +266,7 @@ class TimelineCanvas(QWidget):
         edit_state: dict | None = None,
     ):
         self.duration_ms = max(1000, int(duration_ms or 0))
+        self.media_source_duration_ms = max(self.duration_ms, int(duration_ms or 0), 1000)
         self.video_name = str(video_name or "")
         self.bgm_name = str(bgm_name or "")
         self.tts_name = str(tts_name or "")
@@ -218,44 +274,36 @@ class TimelineCanvas(QWidget):
         self.clips = parse_srt(srt)
         cue_end = max((clip.end for clip in self.clips), default=0)
         self.duration_ms = max(self.duration_ms, cue_end, 1000)
+        self.media_source_duration_ms = max(self.media_source_duration_ms, self.duration_ms)
         project_key = str(video_name or "")
-        if project_key != self._project_key:
+        tracks_state = (edit_state or {}).get("tracks") or {}
+        is_new_project = project_key != self._project_key
+        if is_new_project:
             self._project_key = project_key
             base_name = Path(project_key).name if project_key else "视频"
+            full = self.media_source_duration_ms
             self.media_clips["video"] = [
-                MediaClip(0, self.duration_ms, 0, self.duration_ms, base_name)
+                MediaClip(0, full, 0, full, base_name, source_duration=full)
             ]
             self.media_clips["original_audio"] = [
-                MediaClip(0, self.duration_ms, 0, self.duration_ms, "视频原声")
+                MediaClip(0, full, 0, full, "视频原声", source_duration=full)
             ]
             self.media_clips["bgm"] = (
-                [MediaClip(0, self.duration_ms, 0, self.duration_ms, Path(bgm_name).name)]
+                [MediaClip(0, full, 0, full, Path(bgm_name).name, source_duration=full)]
                 if bgm_name
                 else []
             )
             self.media_clips["tts"] = (
-                [MediaClip(0, self.duration_ms, 0, self.duration_ms, Path(tts_name).name)]
+                [MediaClip(0, full, 0, full, Path(tts_name).name, source_duration=full)]
                 if tts_name
                 else []
             )
             self.selected = None
             self.transitions = []
-            tracks_state = (edit_state or {}).get("tracks", {})
-            if tracks_state:
-                for kind in self.media_clips:
-                    restored = []
-                    for item in tracks_state.get(kind, []):
-                        try:
-                            restored.append(
-                                MediaClip(
-                                    int(item["start"]), int(item["end"]),
-                                    int(item["source_start"]), int(item["source_end"]),
-                                    str(item.get("name", "")),
-                                )
-                            )
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                    self.media_clips[kind] = restored
+        # 关键：同项目第二次刷新（播放器时长就绪 / 分段元数据就绪）也必须套用 tracks。
+        # 以前仅在 project_key 变化时应用，导致要来回切换几次才出现分段轨。
+        if tracks_state:
+            self._apply_tracks_from_state(tracks_state, self.media_source_duration_ms)
             self.transitions = [
                 {
                     "position": max(0, int(item.get("position", 0))),
@@ -265,15 +313,15 @@ class TimelineCanvas(QWidget):
                 for item in (edit_state or {}).get("transitions", [])
                 if item.get("name")
             ]
-        else:
-            saved_tracks=(edit_state or {}).get("tracks",{})
-            if "bgm" not in saved_tracks:
+        elif not is_new_project:
+            if "bgm" not in tracks_state:
                 self._ensure_optional_track("bgm", bgm_name)
-            if "tts" not in saved_tracks:
+            if "tts" not in tracks_state:
                 self._ensure_optional_track("tts", tts_name)
         self.position_ms = min(self.position_ms, self.duration_ms)
         self.clear_history()
         self._update_width()
+        self.update()
 
     def set_transition_catalog(self, names: list[str], duration_ms: int = 500):
         self.transition_names = [str(name) for name in names if str(name).strip()]
@@ -320,9 +368,10 @@ class TimelineCanvas(QWidget):
         if cut <= clip.start + 80 or cut >= clip.end - 80:
             return False
         source_cut = clip.source_start + (cut - clip.start)
+        src_dur = clip.resolved_source_duration()
         tracks[index:index + 1] = [
-            MediaClip(clip.start, cut, clip.source_start, source_cut, clip.name),
-            MediaClip(cut, clip.end, source_cut, clip.source_end, clip.name),
+            MediaClip(clip.start, cut, clip.source_start, source_cut, clip.name, src_dur),
+            MediaClip(cut, clip.end, source_cut, clip.source_end, clip.name, src_dur),
         ]
         if kind == "video":
             self._split_linked_original_audio(cut)
@@ -330,8 +379,9 @@ class TimelineCanvas(QWidget):
 
     def _ensure_optional_track(self, kind: str, name: str):
         if name and not self.media_clips[kind]:
+            full = self.duration_ms
             self.media_clips[kind] = [
-                MediaClip(0, self.duration_ms, 0, self.duration_ms, Path(name).name)
+                MediaClip(0, full, 0, full, Path(name).name, source_duration=full)
             ]
         elif not name:
             self.media_clips[kind] = []
@@ -481,19 +531,22 @@ class TimelineCanvas(QWidget):
         for index, clip in enumerate(self.clips):
             left, right = self._x(clip.start), self._x(clip.end)
             width = max(4.0, right - left)
-            painter.setPen(QPen(QColor("#b7a7ff"), 1))
+            selected = self.selected == ("caption", index)
+            painter.setPen(QPen(QColor("#e2dcff") if selected else QColor("#b7a7ff"), 2 if selected else 1))
             painter.setBrush(QColor("#765fd1"))
             painter.drawRoundedRect(int(left), caption_y, int(width), 40, 5, 5)
-            painter.fillRect(int(left), caption_y, 4, 40, QColor("#e2dcff"))
-            painter.fillRect(int(right - 4), caption_y, 4, 40, QColor("#e2dcff"))
+            # Edge handles for trim; middle drag moves the whole subtitle block
+            handle_w = max(5, min(10, int(width // 5)))
+            painter.fillRect(int(left), caption_y, handle_w, 40, QColor("#e2dcff"))
+            painter.fillRect(int(right - handle_w), caption_y, handle_w, 40, QColor("#e2dcff"))
             painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Microsoft YaHei UI", 8))
             text = " ".join(clip.text.splitlines())
             painter.drawText(
-                int(left + 8),
+                int(left + handle_w + 4),
                 caption_y + 25,
                 painter.fontMetrics().elidedText(
-                    text, Qt.TextElideMode.ElideRight, max(0, int(width - 16))
+                    text, Qt.TextElideMode.ElideRight, max(0, int(width - handle_w * 2 - 8))
                 ),
             )
 
@@ -533,6 +586,11 @@ class TimelineCanvas(QWidget):
                     clip.name or kind, Qt.TextElideMode.ElideRight, max(0, width - 16)
                 ),
             )
+            # Edge handles: drag left/right edges to trim or restore source content
+            if selected and width >= 16:
+                handle_w = max(4, min(8, width // 6))
+                painter.fillRect(int(left), y, handle_w, 36, QColor("#f8fafc"))
+                painter.fillRect(int(right - handle_w), y, handle_w, 36, QColor("#f8fafc"))
             if waveform:
                 self._draw_waveform_segment(
                     painter, waveform, clip, y + 25, waveform_color
@@ -571,94 +629,328 @@ class TimelineCanvas(QWidget):
         painter.setPen(QPen(color, 1))
         painter.drawPath(path)
 
+    def _edge_hit_px(self) -> float:
+        """Wider edge handles so trim is easy even when zoomed out."""
+        return float(max(12, min(22, int(self.pixels_per_second * 0.12))))
+
+    def _hit_media_edge(self, x: float, left: float, right: float) -> str:
+        edge = self._edge_hit_px()
+        width = right - left
+        # Tiny clips: prefer move unless very close to an edge.
+        if width <= edge * 2.5:
+            if abs(x - left) <= edge * 0.6:
+                return "start"
+            if abs(x - right) <= edge * 0.6:
+                return "end"
+            if left - 2 <= x <= right + 2:
+                return "move"
+            return ""
+        if abs(x - left) <= edge:
+            return "start"
+        if abs(x - right) <= edge:
+            return "end"
+        if left <= x <= right:
+            return "move"
+        return ""
+
+    def _grow_timeline_if_needed(self, end_ms: int):
+        end_ms = max(0, int(end_ms))
+        if end_ms > self.duration_ms:
+            self.duration_ms = end_ms + 200  # small tail room
+            self._update_width()
+
+    def _collect_ripple_after(
+        self,
+        after_ms: int,
+        exclude: set[tuple[str, int]] | None = None,
+    ) -> list[tuple[str, int, int, int]]:
+        """Snapshot clips whose timeline start is at/after after_ms (for ripple push).
+
+        Returns list of (kind, index, original_start, original_end).
+        kind is media track name or \"caption\".
+        """
+        exclude = exclude or set()
+        items: list[tuple[str, int, int, int]] = []
+        threshold = int(after_ms) - 2  # tiny tolerance for float/int rounding
+        for kind in ("video", "original_audio", "bgm", "tts"):
+            for index, clip in enumerate(self.media_clips.get(kind, [])):
+                if (kind, index) in exclude:
+                    continue
+                if int(clip.start) >= threshold:
+                    items.append((kind, index, int(clip.start), int(clip.end)))
+        for index, clip in enumerate(self.clips):
+            if ("caption", index) in exclude:
+                continue
+            if int(clip.start) >= threshold:
+                items.append(("caption", index, int(clip.start), int(clip.end)))
+        return items
+
+    def _apply_ripple_shift(
+        self,
+        ripple_items: list[tuple[str, int, int, int]],
+        delta_ms: int,
+    ):
+        """Shift snapshotted clips by delta_ms (timeline only; source in/out unchanged)."""
+        if not ripple_items or not delta_ms:
+            return
+        max_end = 0
+        for kind, index, o_start, o_end in ripple_items:
+            new_start = max(0, int(o_start) + int(delta_ms))
+            new_end = max(new_start + 80, int(o_end) + int(delta_ms))
+            if kind == "caption":
+                if 0 <= index < len(self.clips):
+                    self.clips[index].start = new_start
+                    self.clips[index].end = new_end
+                    max_end = max(max_end, new_end)
+            else:
+                tracks = self.media_clips.get(kind, [])
+                if 0 <= index < len(tracks):
+                    tracks[index].start = new_start
+                    tracks[index].end = new_end
+                    max_end = max(max_end, new_end)
+        if max_end:
+            self._grow_timeline_if_needed(max_end)
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         x, y = event.position().x(), event.position().y()
+        ms = self._ms(x)
         caption_top = self._caption_y()
         self._drag_snapshot_pushed = False
         if caption_top <= y <= caption_top + self.TRACK_HEIGHT:
             for index, clip in enumerate(self.clips):
                 left, right = self._x(clip.start), self._x(clip.end)
-                if abs(x - left) <= 8:
-                    self.push_undo()
-                    self._drag_snapshot_pushed = True
-                    self.selected = ("caption", index)
-                    self._drag = ("caption", index, "start", clip.start, clip.end, 0, 0)
-                    return
-                if abs(x - right) <= 8:
-                    self.push_undo()
-                    self._drag_snapshot_pushed = True
-                    self.selected = ("caption", index)
-                    self._drag = ("caption", index, "end", clip.start, clip.end, 0, 0)
-                    return
-                if left <= x <= right:
-                    self.selected = ("caption", index)
+                edge = self._hit_media_edge(x, left, right)
+                if not edge:
+                    continue
+                self.push_undo()
+                self._drag_snapshot_pushed = True
+                self.selected = ("caption", index)
+                grab = ms - clip.start
+                # Ripple later captions when changing end length
+                ripple = ()
+                if edge == "end":
+                    ripple = tuple(
+                        self._collect_ripple_after(clip.end, exclude={("caption", index)})
+                    )
+                self._drag = (
+                    "caption", index, edge, clip.start, clip.end, 0, 0, grab, 0,
+                    (), ripple,
+                )
+                if edge == "move":
                     self.seekRequested.emit(clip.start)
-                    self.update()
-                    return
+                self.update()
+                return
         for kind in ("video", "original_audio", "bgm", "tts"):
             top = self._track_y(kind)
             if not (top <= y <= top + self.TRACK_HEIGHT):
                 continue
             for index, clip in enumerate(self.media_clips.get(kind, [])):
                 left, right = self._x(clip.start), self._x(clip.end)
-                if left <= x <= right:
-                    edge = "start" if abs(x-left) <= 8 else "end" if abs(x-right) <= 8 else "move"
-                    self.push_undo()
-                    self._drag_snapshot_pushed = True
-                    self.selected = (kind, index)
-                    self._drag = (
-                        kind, index, edge, clip.start, clip.end,
-                        clip.source_start, clip.source_end,
-                    )
-                    self.seekRequested.emit(self._ms(x))
-                    self.update()
-                    return
+                edge = self._hit_media_edge(x, left, right)
+                if not edge:
+                    continue
+                self.push_undo()
+                self._drag_snapshot_pushed = True
+                self.selected = (kind, index)
+                grab = ms - clip.start
+                # Always use full media length so over-trimmed audio/video can be dragged back.
+                src_dur = max(
+                    clip.resolved_source_duration(self.media_source_duration_ms),
+                    self.media_source_duration_ms,
+                    clip.source_end,
+                )
+                clip.source_duration = src_dur
+                # Video edge drag also drives co-aligned original_audio (same start/end).
+                linked_audio = []
+                linked_video = []
+                if kind == "video":
+                    for ai, aclip in enumerate(self.media_clips.get("original_audio", [])):
+                        if aclip.start == clip.start and aclip.end == clip.end:
+                            aclip.source_duration = max(
+                                aclip.resolved_source_duration(src_dur), src_dur
+                            )
+                            linked_audio.append(ai)
+                elif kind == "original_audio":
+                    # Keep paired video bar in lockstep when present
+                    for vi, vclip in enumerate(self.media_clips.get("video", [])):
+                        if vclip.start == clip.start and vclip.end == clip.end:
+                            vclip.source_duration = max(
+                                vclip.resolved_source_duration(src_dur), src_dur
+                            )
+                            linked_video.append(vi)
+                exclude = {(kind, index)}
+                for ai in linked_audio:
+                    exclude.add(("original_audio", ai))
+                for vi in linked_video:
+                    exclude.add(("video", vi))
+                # 拉长/缩短右边缘时，后面所有轨整体后移/前移，避免重叠
+                ripple = ()
+                if edge == "end":
+                    ripple = tuple(self._collect_ripple_after(clip.end, exclude=exclude))
+                self._drag = (
+                    kind, index, edge, clip.start, clip.end,
+                    clip.source_start, clip.source_end, grab, src_dur,
+                    tuple(linked_audio), ripple, tuple(linked_video),
+                )
+                self.seekRequested.emit(ms)
+                self.update()
+                return
         if x >= 0:
             self._scrubbing = True
-            self.seekRequested.emit(self._ms(x))
+            self.seekRequested.emit(ms)
 
     def mouseMoveEvent(self, event):
+        x = event.position().x()
+        y = event.position().y()
         if self._scrubbing:
-            self.seekRequested.emit(self._ms(event.position().x()))
+            self.seekRequested.emit(self._ms(x))
             return
         if not self._drag:
+            # Hover cursor feedback
+            self._update_hover_cursor(x, y)
             return
-        (
-            kind, index, edge, original_start, original_end,
-            original_source_start, original_source_end,
-        ) = self._drag
-        value = self._ms(event.position().x())
+        # Support caption / media tuples with optional ripple snapshot
+        drag = self._drag
+        kind = drag[0]
+        index = drag[1]
+        edge = drag[2]
+        original_start = drag[3]
+        original_end = drag[4]
+        original_source_start = drag[5]
+        original_source_end = drag[6]
+        grab_ms = drag[7]
+        original_source_dur = drag[8]
+        linked_audio = drag[9] if len(drag) > 9 else ()
+        ripple_items = list(drag[10]) if len(drag) > 10 else []
+        linked_video = drag[11] if len(drag) > 11 else ()
+        value = self._ms(x)
+        min_len = 80
         if kind == "caption":
             if not (0 <= index < len(self.clips)):
                 return
             clip = self.clips[index]
             if edge == "start":
                 lower = self.clips[index - 1].end if index else 0
-                clip.start = max(lower, min(value, clip.end - 80))
-            else:
-                upper = self.clips[index + 1].start if index + 1 < len(self.clips) else self.duration_ms
-                clip.end = min(upper, max(value, clip.start + 80))
+                clip.start = max(lower, min(value, clip.end - min_len))
+            elif edge == "end":
+                # No hard clamp to next caption — ripple later captions instead
+                clip.end = max(value, clip.start + min_len)
+                ripple_delta = clip.end - original_end
+                self._apply_ripple_shift(ripple_items, ripple_delta)
+                self._grow_timeline_if_needed(clip.end)
+            else:  # move whole subtitle block
+                length = original_end - original_start
+                new_start = max(0, value - int(grab_ms))
+                # Soft neighbor clamps (allow slight overlap prevention)
+                if index > 0:
+                    new_start = max(new_start, self.clips[index - 1].end)
+                if index + 1 < len(self.clips):
+                    new_start = min(new_start, self.clips[index + 1].start - length)
+                clip.start = max(0, new_start)
+                clip.end = clip.start + length
+                self._grow_timeline_if_needed(clip.end)
         else:
             tracks = self.media_clips.get(kind, [])
             if not (0 <= index < len(tracks)):
                 return
             clip = tracks[index]
-            if edge == "start":
-                delta = max(-original_source_start, min(value - original_start, original_end - original_start - 80))
-                clip.start = original_start + delta
-                clip.source_start = original_source_start + delta
-            elif edge == "end":
-                delta = min(self.duration_ms-original_end, max(value-original_end, -(original_end-original_start-80)))
-                clip.end = original_end + delta
-                clip.source_end = original_source_end + delta
-            else:
-                length = original_end - original_start
-                new_start = max(0, min(value - length // 2, self.duration_ms - length))
-                clip.start, clip.end = new_start, new_start + length
+            src_dur = max(
+                int(original_source_dur or 0),
+                int(self.media_source_duration_ms or 0),
+                original_source_end,
+                80,
+            )
+            clip.source_duration = max(clip.source_duration or 0, src_dur)
+
+            def apply_edge(target: MediaClip, o_start, o_end, o_ss, o_se):
+                if edge == "start":
+                    # Pull left to restore (source_start ↓) or trim in (source_start ↑).
+                    delta = value - o_start
+                    min_delta = -o_ss
+                    max_delta = o_end - o_start - min_len
+                    if o_start + delta < 0:
+                        delta = -o_start
+                    delta = max(min_delta, min(delta, max_delta))
+                    target.start = o_start + delta
+                    target.source_start = o_ss + delta
+                elif edge == "end":
+                    # Pull right to restore up to full source file length.
+                    delta = value - o_end
+                    remaining = max(0, src_dur - o_se)
+                    min_delta = -(o_end - o_start - min_len)
+                    delta = max(min_delta, min(delta, remaining))
+                    target.end = o_end + delta
+                    target.source_end = o_se + delta
+                    target.source_duration = max(target.source_duration or 0, src_dur)
+                    self._grow_timeline_if_needed(target.end)
+                else:
+                    length = o_end - o_start
+                    new_start = max(0, value - int(grab_ms))
+                    target.start = new_start
+                    target.end = new_start + length
+                    self._grow_timeline_if_needed(target.end)
+                target.source_duration = max(target.source_duration or 0, src_dur)
+
+            apply_edge(
+                clip, original_start, original_end,
+                original_source_start, original_source_end,
+            )
+            # Keep video + 视频原声 locked together when they started aligned.
+            if kind == "video" and linked_audio:
+                audio_tracks = self.media_clips.get("original_audio", [])
+                for ai in linked_audio:
+                    if 0 <= ai < len(audio_tracks):
+                        aclip = audio_tracks[ai]
+                        apply_edge(
+                            aclip, original_start, original_end,
+                            original_source_start, original_source_end,
+                        )
+            elif kind == "original_audio" and linked_video:
+                video_tracks = self.media_clips.get("video", [])
+                for vi in linked_video:
+                    if 0 <= vi < len(video_tracks):
+                        vclip = video_tracks[vi]
+                        apply_edge(
+                            vclip, original_start, original_end,
+                            original_source_start, original_source_end,
+                        )
+            elif kind == "original_audio":
+                clip.source_duration = max(clip.source_duration or 0, src_dur)
+            # 拉长/缩短右边缘：后续音视频与字幕整体推移，不重叠
+            if edge == "end":
+                ripple_delta = int(clip.end) - int(original_end)
+                self._apply_ripple_shift(ripple_items, ripple_delta)
         self.update()
+
+    def _update_hover_cursor(self, x: float, y: float):
+        caption_top = self._caption_y()
+        if caption_top <= y <= caption_top + self.TRACK_HEIGHT:
+            for clip in self.clips:
+                left, right = self._x(clip.start), self._x(clip.end)
+                edge = self._hit_media_edge(x, left, right)
+                if edge in ("start", "end"):
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    return
+                if edge == "move":
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                    return
+        for kind in ("video", "original_audio", "bgm", "tts"):
+            top = self._track_y(kind)
+            if not (top <= y <= top + self.TRACK_HEIGHT):
+                continue
+            for clip in self.media_clips.get(kind, []):
+                left, right = self._x(clip.start), self._x(clip.end)
+                edge = self._hit_media_edge(x, left, right)
+                if edge in ("start", "end"):
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    return
+                if edge == "move":
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                    return
+        self.unsetCursor()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -671,6 +963,8 @@ class TimelineCanvas(QWidget):
                 self.srtChanged.emit(write_srt(self.clips))
             else:
                 self._emit_timeline_state()
+            self._update_width()
+            self.update()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat(TransitionPresetButton.MIME_TYPE):
@@ -756,9 +1050,10 @@ class TimelineCanvas(QWidget):
         for index, clip in enumerate(self.media_clips["original_audio"]):
             if clip.start < cut < clip.end:
                 source_cut = clip.source_start + (cut - clip.start)
+                src_dur = clip.resolved_source_duration()
                 self.media_clips["original_audio"][index:index+1] = [
-                    MediaClip(clip.start, cut, clip.source_start, source_cut, clip.name),
-                    MediaClip(cut, clip.end, source_cut, clip.source_end, clip.name),
+                    MediaClip(clip.start, cut, clip.source_start, source_cut, clip.name, src_dur),
+                    MediaClip(cut, clip.end, source_cut, clip.source_end, clip.name, src_dur),
                 ]
                 return
 
@@ -842,13 +1137,14 @@ class TimelineCanvas(QWidget):
     ) -> list[MediaClip]:
         result = []
         for clip in clips:
+            src_dur = clip.resolved_source_duration()
             if clip.end <= start:
                 result.append(clip)
             elif clip.start >= end:
                 result.append(
                     MediaClip(
                         clip.start-delta, clip.end-delta,
-                        clip.source_start, clip.source_end, clip.name,
+                        clip.source_start, clip.source_end, clip.name, src_dur,
                     )
                 )
             else:
@@ -856,7 +1152,8 @@ class TimelineCanvas(QWidget):
                     left_source_end = clip.source_start + (start - clip.start)
                     result.append(
                         MediaClip(
-                            clip.start, start, clip.source_start, left_source_end, clip.name
+                            clip.start, start, clip.source_start, left_source_end,
+                            clip.name, src_dur,
                         )
                     )
                 if clip.end > end:
@@ -864,7 +1161,7 @@ class TimelineCanvas(QWidget):
                     result.append(
                         MediaClip(
                             start, clip.end-delta,
-                            right_source_start, clip.source_end, clip.name,
+                            right_source_start, clip.source_end, clip.name, src_dur,
                         )
                     )
         return result
@@ -912,11 +1209,14 @@ class TimelineCanvas(QWidget):
                 restored = []
                 for item in tracks.get(kind, []):
                     try:
+                        src_end = int(item["source_end"])
+                        src_dur = int(item.get("source_duration") or 0) or src_end
                         restored.append(
                             MediaClip(
                                 int(item["start"]), int(item["end"]),
-                                int(item["source_start"]), int(item["source_end"]),
+                                int(item["source_start"]), src_end,
                                 str(item.get("name", "")),
+                                source_duration=src_dur,
                             )
                         )
                     except (KeyError, TypeError, ValueError):
@@ -1031,7 +1331,9 @@ class CanvaTimelinePanel(QWidget):
         toolbar = QHBoxLayout()
         title = QLabel("多轨时间轴")
         title.setStyleSheet("font-weight:800;color:#f4f4f5;font-size:13px;")
-        hint = QLabel("拖动字幕块左右边缘可校准时间 · 左侧轨道名固定 · 滚轮缩放内容")
+        hint = QLabel(
+            "字幕：拖中间改位置，拖两端改时长 · 音视频：拖右端拉长会把后面各轨整体后推（不重叠）；两端可裁切/恢复源内容 · 拖中间改位置 · 左侧名固定 · 滚轮缩放"
+        )
         hint.setStyleSheet("color:#8b93a5;font-size:11px;")
         toolbar.addWidget(title)
         toolbar.addWidget(hint)
