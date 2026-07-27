@@ -163,10 +163,15 @@ class TimelineCanvas(QWidget):
         self._drag: tuple[str, int, str, int, int, int, int] | None = None
         self._scrubbing = False
         self._project_key = ""
+        self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
+        self._max_history = 40
+        self._history_locked = False
+        self._drag_snapshot_pushed = False
         self.setMinimumHeight(self.RULER_HEIGHT + self.TRACK_HEIGHT * 5 + 8)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
-        self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._update_width()
 
     def _update_width(self):
@@ -267,6 +272,7 @@ class TimelineCanvas(QWidget):
             if "tts" not in saved_tracks:
                 self._ensure_optional_track("tts", tts_name)
         self.position_ms = min(self.position_ms, self.duration_ms)
+        self.clear_history()
         self._update_width()
 
     def set_transition_catalog(self, names: list[str], duration_ms: int = 500):
@@ -568,16 +574,22 @@ class TimelineCanvas(QWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         x, y = event.position().x(), event.position().y()
         caption_top = self._caption_y()
+        self._drag_snapshot_pushed = False
         if caption_top <= y <= caption_top + self.TRACK_HEIGHT:
             for index, clip in enumerate(self.clips):
                 left, right = self._x(clip.start), self._x(clip.end)
                 if abs(x - left) <= 8:
+                    self.push_undo()
+                    self._drag_snapshot_pushed = True
                     self.selected = ("caption", index)
                     self._drag = ("caption", index, "start", clip.start, clip.end, 0, 0)
                     return
                 if abs(x - right) <= 8:
+                    self.push_undo()
+                    self._drag_snapshot_pushed = True
                     self.selected = ("caption", index)
                     self._drag = ("caption", index, "end", clip.start, clip.end, 0, 0)
                     return
@@ -594,6 +606,8 @@ class TimelineCanvas(QWidget):
                 left, right = self._x(clip.start), self._x(clip.end)
                 if left <= x <= right:
                     edge = "start" if abs(x-left) <= 8 else "end" if abs(x-right) <= 8 else "move"
+                    self.push_undo()
+                    self._drag_snapshot_pushed = True
                     self.selected = (kind, index)
                     self._drag = (
                         kind, index, edge, clip.start, clip.end,
@@ -676,6 +690,7 @@ class TimelineCanvas(QWidget):
         name = bytes(event.mimeData().data(TransitionPresetButton.MIME_TYPE)).decode(
             "utf-8", "replace"
         )
+        self.push_undo()
         self.add_transition(name, self._ms(event.position().x()))
         event.acceptProposedAction()
 
@@ -688,7 +703,9 @@ class TimelineCanvas(QWidget):
         for name in self.transition_names:
             action = submenu.addAction(name)
             action.triggered.connect(
-                lambda checked=False, value=name, at=position: self.add_transition(value, at)
+                lambda checked=False, value=name, at=position: (
+                    self.push_undo(), self.add_transition(value, at)
+                )
             )
         nearby = next(
             (
@@ -705,6 +722,7 @@ class TimelineCanvas(QWidget):
 
     def _remove_transition(self, item: dict):
         if item in self.transitions:
+            self.push_undo()
             self.transitions.remove(item)
             self._emit_timeline_state()
             self.update()
@@ -724,7 +742,11 @@ class TimelineCanvas(QWidget):
         if not (0 <= index < len(tracks)):
             return
         cut = self.position_ms
+        self.push_undo()
         if not self._split_clip(kind, index, cut):
+            # no-op split: drop the empty undo snapshot
+            if self._undo_stack:
+                self._undo_stack.pop()
             return
         self.selected = (kind, index + 1)
         self._emit_timeline_state()
@@ -746,6 +768,7 @@ class TimelineCanvas(QWidget):
         kind, index = self.selected
         if kind == "caption":
             if 0 <= index < len(self.clips):
+                self.push_undo()
                 self.clips.pop(index)
                 self.srtChanged.emit(write_srt(self.clips))
         else:
@@ -753,12 +776,33 @@ class TimelineCanvas(QWidget):
             if 0 <= index < len(tracks):
                 if kind == "video" and len(tracks) == 1:
                     return
+                self.push_undo()
                 removed = tracks.pop(index)
                 if kind == "video":
                     self._ripple_delete_range(removed.start, removed.end)
         self.selected = None
         self._emit_timeline_state()
         self.update()
+
+    def keyPressEvent(self, event):
+        mods = event.modifiers()
+        key = event.key()
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            if key == Qt.Key.Key_Z and not (mods & Qt.KeyboardModifier.ShiftModifier):
+                if self.undo():
+                    event.accept()
+                    return
+            if key == Qt.Key.Key_Y or (
+                key == Qt.Key.Key_Z and (mods & Qt.KeyboardModifier.ShiftModifier)
+            ):
+                if self.redo():
+                    event.accept()
+                    return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.delete_selected()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _ripple_delete_range(self, start: int, end: int):
         delta = max(0, end - start)
@@ -838,6 +882,88 @@ class TimelineCanvas(QWidget):
             }
         )
 
+    def _history_snapshot(self) -> dict:
+        return {
+            "duration_ms": self.duration_ms,
+            "original_audio_enabled": self.original_audio_enabled,
+            "position_ms": self.position_ms,
+            "clips": [(c.start, c.end, c.text) for c in self.clips],
+            "transitions": [dict(item) for item in self.transitions],
+            "tracks": {
+                kind: [clip.as_dict() for clip in clips]
+                for kind, clips in self.media_clips.items()
+            },
+            "selected": self.selected,
+        }
+
+    def _restore_history_snapshot(self, snap: dict):
+        self._history_locked = True
+        try:
+            self.duration_ms = max(1000, int(snap.get("duration_ms") or 1000))
+            self.original_audio_enabled = bool(snap.get("original_audio_enabled", True))
+            self.position_ms = max(0, min(int(snap.get("position_ms") or 0), self.duration_ms))
+            self.clips = [
+                CaptionClip(int(s), int(e), str(t))
+                for s, e, t in (snap.get("clips") or [])
+            ]
+            self.transitions = [dict(item) for item in (snap.get("transitions") or [])]
+            tracks = snap.get("tracks") or {}
+            for kind in self.media_clips:
+                restored = []
+                for item in tracks.get(kind, []):
+                    try:
+                        restored.append(
+                            MediaClip(
+                                int(item["start"]), int(item["end"]),
+                                int(item["source_start"]), int(item["source_end"]),
+                                str(item.get("name", "")),
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                self.media_clips[kind] = restored
+            sel = snap.get("selected")
+            self.selected = tuple(sel) if isinstance(sel, (list, tuple)) and len(sel) == 2 else None
+            self._update_width()
+            self.srtChanged.emit(write_srt(self.clips))
+            self._emit_timeline_state()
+            self.update()
+        finally:
+            self._history_locked = False
+
+    def push_undo(self):
+        """Save current state so the next edit can be undone."""
+        if self._history_locked:
+            return
+        self._undo_stack.append(self._history_snapshot())
+        if len(self._undo_stack) > self._max_history:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def undo(self) -> bool:
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._history_snapshot())
+        self._restore_history_snapshot(self._undo_stack.pop())
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(self._history_snapshot())
+        self._restore_history_snapshot(self._redo_stack.pop())
+        return True
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    def clear_history(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
 
 class TrackLabelRail(QWidget):
     """Fixed left column for track names — does not scroll or zoom with the timeline."""
@@ -913,8 +1039,14 @@ class CanvaTimelinePanel(QWidget):
         cut.setToolTip("先选中轨道片段，再把播放头拖到切点")
         cut.clicked.connect(lambda: None)
         self.delete_button = QPushButton("删除选中片段")
+        self.undo_button = QPushButton("撤销")
+        self.undo_button.setToolTip("撤销上一步时间轴操作（Ctrl+Z）")
+        self.redo_button = QPushButton("重做")
+        self.redo_button.setToolTip("重做（Ctrl+Y / Ctrl+Shift+Z）")
         toolbar.addWidget(cut)
         toolbar.addWidget(self.delete_button)
+        toolbar.addWidget(self.undo_button)
+        toolbar.addWidget(self.redo_button)
         toolbar.addStretch()
         self.original_audio = QCheckBox("保留视频原声")
         self.original_audio.setChecked(True)
@@ -972,9 +1104,14 @@ class CanvaTimelinePanel(QWidget):
         self.canvas.srtChanged.connect(self.srtChanged)
         self.canvas.seekRequested.connect(self.seekRequested)
         self.canvas.timelineEdited.connect(self.timelineEdited)
+        self.canvas.timelineEdited.connect(lambda *_: self._refresh_undo_buttons())
+        self.canvas.srtChanged.connect(lambda *_: self._refresh_undo_buttons())
         cut.clicked.disconnect()
         cut.clicked.connect(self.canvas.split_at_playhead)
         self.delete_button.clicked.connect(self.canvas.delete_selected)
+        self.undo_button.clicked.connect(self._undo_clicked)
+        self.redo_button.clicked.connect(self._redo_clicked)
+        self._refresh_undo_buttons()
         self.original_audio.toggled.connect(self.canvas.set_original_audio_enabled)
         self.original_audio.toggled.connect(self.originalAudioChanged)
         self.setMinimumHeight(270)
@@ -999,6 +1136,37 @@ class CanvaTimelinePanel(QWidget):
         self.canvas.set_zoom(value)
         if hasattr(self, "zoom_value"):
             self.zoom_value.setText(str(int(value)))
+
+    def _refresh_undo_buttons(self):
+        if hasattr(self, "undo_button"):
+            self.undo_button.setEnabled(self.canvas.can_undo())
+        if hasattr(self, "redo_button"):
+            self.redo_button.setEnabled(self.canvas.can_redo())
+
+    def _undo_clicked(self):
+        if self.canvas.undo():
+            self._refresh_undo_buttons()
+
+    def _redo_clicked(self):
+        if self.canvas.redo():
+            self._refresh_undo_buttons()
+
+    def keyPressEvent(self, event):
+        # Allow undo/redo when focus is on panel chrome (not only canvas).
+        mods = event.modifiers()
+        key = event.key()
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            if key == Qt.Key.Key_Z and not (mods & Qt.KeyboardModifier.ShiftModifier):
+                self._undo_clicked()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Y or (
+                key == Qt.Key.Key_Z and (mods & Qt.KeyboardModifier.ShiftModifier)
+            ):
+                self._redo_clicked()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def _wheel_zoom(self, delta: int, canvas_x: int):
         """Zoom toward the cursor so frame-level edits stay under the pointer."""

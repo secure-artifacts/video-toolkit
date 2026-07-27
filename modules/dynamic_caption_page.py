@@ -2938,71 +2938,138 @@ class GroupMergeReportDialog(QDialog):
                 
         return list(unique_entries.values())
         
+    @staticmethod
+    def _fmt_duration(seconds):
+        try:
+            sec = max(0.0, float(seconds or 0))
+        except (TypeError, ValueError):
+            sec = 0.0
+        total = int(round(sec))
+        m, s = divmod(total, 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d} ({sec:.2f}s)"
+        return f"{m}:{s:02d} ({sec:.2f}s)"
+
     def update_report(self):
         entries = self._get_filtered_unique_entries()
         
         # Calculate summary
         total_videos = len(entries)
         total_clips = sum(int(e.get("clip_count", 0)) for e in entries)
+        total_output_sec = sum(float(e.get("output_duration_sec") or 0) for e in entries)
+        total_segments_sec = sum(float(e.get("segments_total_sec") or 0) for e in entries)
         
         # Build HTML for display
         html = f"<h3>每日合成报表 ({self.date_picker.date().toString('yyyy-MM-dd')})</h3>"
         html += "<h4>详细列表</h4>"
         html += "<table border='1' cellpadding='4' style='border-collapse: collapse; border: 1px solid #334155;'>"
-        html += "<tr style='background: #1e293b;'><th>合成时间</th><th>视频组 (文件夹)</th><th>已合成片段数</th><th>成品文件名</th></tr>"
+        html += (
+            "<tr style='background: #1e293b;'>"
+            "<th>合成时间</th><th>视频组</th><th>片段数</th>"
+            "<th>各分段时长</th><th>成品总时长</th><th>成品文件名</th></tr>"
+        )
         for e in entries:
-            html += f"<tr><td>{e.get('timestamp', '').split(' ')[1]}</td><td>{e.get('group_name')}</td><td align='center'>{e.get('clip_count')}</td><td>{e.get('output_name')}</td></tr>"
+            segs = e.get("segment_durations") or []
+            if segs:
+                seg_html = "<br/>".join(
+                    f"{i+1}. {s.get('name','')} — {self._fmt_duration(s.get('duration_sec'))}"
+                    for i, s in enumerate(segs)
+                )
+            else:
+                seg_html = "<span style='color:#a8a29e;'>—</span>"
+            out_dur = e.get("output_duration_sec")
+            out_html = self._fmt_duration(out_dur) if out_dur else "<span style='color:#a8a29e;'>—</span>"
+            ts = str(e.get("timestamp", "")).split(" ")
+            time_part = ts[1] if len(ts) > 1 else e.get("timestamp", "")
+            html += (
+                f"<tr><td>{time_part}</td><td>{e.get('group_name')}</td>"
+                f"<td align='center'>{e.get('clip_count')}</td>"
+                f"<td style='font-size:12px;'>{seg_html}</td>"
+                f"<td align='center'>{out_html}</td>"
+                f"<td>{e.get('output_name')}</td></tr>"
+            )
         if not entries:
-            html += "<tr><td colspan='4' align='center' style='color:#a8a29e;'>当天无合成成功的历史记录 (数据为 0)</td></tr>"
+            html += "<tr><td colspan='6' align='center' style='color:#a8a29e;'>当天无合成成功的历史记录 (数据为 0)</td></tr>"
         html += "</table>"
         
         html += "<h4>报表总结</h4>"
         html += "<table border='1' cellpadding='4' style='border-collapse: collapse; border: 1px solid #334155;'>"
         html += f"<tr><td style='background: #1e293b;'><b>实际合成视频组数 (去重)</b></td><td align='center'>{total_videos}</td></tr>"
         html += f"<tr><td style='background: #1e293b;'><b>实际合成总片段数 (去重)</b></td><td align='center'>{total_clips}</td></tr>"
+        html += f"<tr><td style='background: #1e293b;'><b>分段素材时长合计</b></td><td align='center'>{self._fmt_duration(total_segments_sec)}</td></tr>"
+        html += f"<tr><td style='background: #1e293b;'><b>成品总时长合计</b></td><td align='center'>{self._fmt_duration(total_output_sec)}</td></tr>"
         html += "</table>"
         
         self.report_text.setHtml(html)
         
     def copy_detailed_list(self):
         entries = self._get_filtered_unique_entries()
-        lines = ["合成时间\\t视频组(文件夹)\\t已合成片段数\\t成品文件名"]
+        lines = ["合成时间\t视频组(文件夹)\t已合成片段数\t各分段时长\t成品总时长(秒)\t成品文件名"]
         for e in entries:
-            time_part = e.get('timestamp', '').split(' ')[1]
-            lines.append(f"{time_part}\\t{e.get('group_name')}\\t{e.get('clip_count')}\\t{e.get('output_name')}")
-        QApplication.clipboard().setText("\\n".join(lines))
+            time_part = str(e.get("timestamp", "")).split(" ")
+            time_part = time_part[1] if len(time_part) > 1 else e.get("timestamp", "")
+            segs = e.get("segment_durations") or []
+            seg_text = "; ".join(
+                f"{s.get('name','')}={float(s.get('duration_sec') or 0):.2f}s" for s in segs
+            ) if segs else ""
+            out_dur = e.get("output_duration_sec")
+            out_text = f"{float(out_dur):.2f}" if out_dur not in (None, "") else ""
+            lines.append(
+                f"{time_part}\t{e.get('group_name')}\t{e.get('clip_count')}\t"
+                f"{seg_text}\t{out_text}\t{e.get('output_name')}"
+            )
+        QApplication.clipboard().setText("\n".join(lines))
         QMessageBox.information(self, "复制成功", "详细列表已以 TSV 格式复制到剪贴板，可直接粘贴到 Google Sheets 或 Excel。")
         
     def copy_summary(self):
         entries = self._get_filtered_unique_entries()
         total_videos = len(entries)
         total_clips = sum(int(e.get("clip_count", 0)) for e in entries)
+        total_output_sec = sum(float(e.get("output_duration_sec") or 0) for e in entries)
+        total_segments_sec = sum(float(e.get("segments_total_sec") or 0) for e in entries)
         
         lines = [
-            "指标\\t数值",
-            f"实际合成视频组数 (去重)\\t{total_videos}",
-            f"实际合成总片段数 (去重)\\t{total_clips}"
+            "指标\t数值",
+            f"实际合成视频组数 (去重)\t{total_videos}",
+            f"实际合成总片段数 (去重)\t{total_clips}",
+            f"分段素材时长合计(秒)\t{total_segments_sec:.2f}",
+            f"成品总时长合计(秒)\t{total_output_sec:.2f}",
         ]
-        QApplication.clipboard().setText("\\n".join(lines))
+        QApplication.clipboard().setText("\n".join(lines))
         QMessageBox.information(self, "复制成功", "总结已以 TSV 格式复制到剪贴板，可直接粘贴到 Google Sheets 或 Excel。")
         
     def copy_all(self):
         entries = self._get_filtered_unique_entries()
         total_videos = len(entries)
         total_clips = sum(int(e.get("clip_count", 0)) for e in entries)
+        total_output_sec = sum(float(e.get("output_duration_sec") or 0) for e in entries)
+        total_segments_sec = sum(float(e.get("segments_total_sec") or 0) for e in entries)
         
         selected_date = self.date_picker.date().toString("yyyy-MM-dd")
-        text = f"每日合成报表 ({selected_date})\\n\\n"
-        text += "详细列表\\n"
-        text += "合成时间\\t视频组(文件夹)\\t已合成片段数\\t成品文件名\\n"
+        text = f"每日合成报表 ({selected_date})\n\n"
+        text += "详细列表\n"
+        text += "合成时间\t视频组(文件夹)\t已合成片段数\t各分段时长\t成品总时长(秒)\t成品文件名\n"
         for e in entries:
-            time_part = e.get('timestamp', '').split(' ')[1]
-            text += f"{time_part}\\t{e.get('group_name')}\\t{e.get('clip_count')}\\t{e.get('output_name')}\\n"
+            time_part = str(e.get("timestamp", "")).split(" ")
+            time_part = time_part[1] if len(time_part) > 1 else e.get("timestamp", "")
+            segs = e.get("segment_durations") or []
+            seg_text = "; ".join(
+                f"{s.get('name','')}={float(s.get('duration_sec') or 0):.2f}s" for s in segs
+            ) if segs else ""
+            out_dur = e.get("output_duration_sec")
+            out_text = f"{float(out_dur):.2f}" if out_dur not in (None, "") else ""
+            text += (
+                f"{time_part}\t{e.get('group_name')}\t{e.get('clip_count')}\t"
+                f"{seg_text}\t{out_text}\t{e.get('output_name')}\n"
+            )
         if not entries:
-            text += "(无数据)\\n"
-        text += "\\n报表总结\\n"
-        text += f"实际合成视频组数 (去重)\\t{total_videos}\\n"
-        text += f"实际合成总片段数 (去重)\\t{total_clips}\\n"
+            text += "(无数据)\n"
+        text += "\n报表总结\n"
+        text += f"实际合成视频组数 (去重)\t{total_videos}\n"
+        text += f"实际合成总片段数 (去重)\t{total_clips}\n"
+        text += f"分段素材时长合计(秒)\t{total_segments_sec:.2f}\n"
+        text += f"成品总时长合计(秒)\t{total_output_sec:.2f}\n"
         
         QApplication.clipboard().setText(text)
         QMessageBox.information(self, "复制成功", "所有报表内容已复制到剪贴板。")
@@ -3173,7 +3240,9 @@ class DynamicCaptionPage(QWidget):
         audio_tab = QWidget(); audio_tab_layout = QVBoxLayout(audio_tab); audio_tab_layout.setContentsMargins(4,4,4,4)
         self.audios = DropListWidget(); self.audios.setMinimumHeight(95); self.audios.paths_dropped.connect(lambda p: self._add(self.audios, p, AUDIO_EXTENSIONS))
         self.audios.currentTextChanged.connect(self._audio_selection_changed)
-        arow = QHBoxLayout(); ab = QPushButton("添加音频"); ab.clicked.connect(self._choose_audio)
+        arow = QHBoxLayout()
+        ab = QPushButton("批量添加音频"); ab.clicked.connect(self._choose_audio)
+        ab.setToolTip("可一次多选音频文件加入队列（也可拖入列表或选文件夹）")
         af = QPushButton("添加文件夹"); af.clicked.connect(lambda: self._choose_folder(self.audios, AUDIO_EXTENSIONS))
         ac = QPushButton("清空"); ac.clicked.connect(lambda: self._clear_media_queue(self.audios))
         for button in (ab,af,ac): arow.addWidget(button)
@@ -3245,6 +3314,18 @@ class DynamicCaptionPage(QWidget):
         sort_row.addWidget(self.group_sort_mode,1); group_layout.addLayout(sort_row)
         trim_mode_row=QHBoxLayout(); trim_mode_row.addWidget(QLabel("裁剪")); trim_mode_row.addWidget(self.group_trim_mode,1)
         group_layout.addLayout(trim_mode_row)
+        # 不转文案：合成后不自动提取字幕（快速声音边界尤其常用；与左侧「合成并转文字」联动）
+        self.group_skip_transcript = QCheckBox("不转文案")
+        self.group_skip_transcript.setToolTip(
+            "勾选后：分组合成完成不自动提取字幕（不跑转文字）。\n"
+            "适合「快速声音边界」大批量去口气；需要字幕时可取消勾选或事后手动提取。\n"
+            "注意：若排序为「按分段文案自动匹配」，合成过程中仍会识别语音用于排序，与本选项无关。"
+        )
+        self.group_skip_transcript.setChecked(False)
+        skip_row = QHBoxLayout()
+        skip_row.addWidget(self.group_skip_transcript)
+        skip_row.addStretch(1)
+        group_layout.addLayout(skip_row)
         self.group_head_padding.setMinimumWidth(78); self.group_tail_padding.setMinimumWidth(78)
         self.group_head_padding.setToolTip("第一词前最多保留的保护时间，防止吞掉词首发音")
         self.group_tail_padding.setToolTip("最后一词后最多保留的保护时间，防止吞掉词尾发音")
@@ -3270,6 +3351,10 @@ class DynamicCaptionPage(QWidget):
         group_action_panel=QWidget(); self.group_action_panel=group_action_panel
         group_action_layout=QVBoxLayout(group_action_panel); group_action_layout.setContentsMargins(2,4,2,2); group_action_layout.setSpacing(5)
         self.group_auto_timeline = QCheckBox("合成并转文字"); self.group_auto_timeline.setChecked(True)
+        self.group_auto_timeline.setToolTip("与右侧「不转文案」相反：勾选则合成后自动批量提取字幕。")
+        self.group_auto_timeline.toggled.connect(self._sync_group_transcript_flags_from_auto)
+        self.group_skip_transcript.toggled.connect(self._sync_group_transcript_flags_from_skip)
+        self.group_trim_mode.currentTextChanged.connect(self._on_group_trim_mode_changed)
         self.group_merge_start = QPushButton("合成"); self.group_merge_start.setObjectName("primary"); self.group_merge_start.setFixedSize(100,42); self.group_merge_start.clicked.connect(self.start_group_merge)
         self.group_merge_stop = QPushButton("停止"); self.group_merge_stop.setFixedSize(100,42); self.group_merge_stop.setEnabled(False); self.group_merge_stop.clicked.connect(self.stop_group_merge)
         self.group_merge_selected = QPushButton("重新合成选中组"); self.group_merge_selected.setFixedSize(100,36); self.group_merge_selected.clicked.connect(self.start_group_merge_selected)
@@ -3284,7 +3369,7 @@ class DynamicCaptionPage(QWidget):
         self.group_bgm_button.setToolTip("选择当前合成项目使用的背景音乐，并显示到独立 BGM 轨道")
         self.group_bgm_button.clicked.connect(self._choose_bgm_file)
         group_action_layout.addWidget(self.group_bgm_button)
-        self.group_merge_report_btn.hide()
+        group_action_layout.addWidget(self.group_merge_report_btn)
         group_action_layout.addStretch()
         group_action_panel.setFixedWidth(126)
 
@@ -3383,11 +3468,18 @@ class DynamicCaptionPage(QWidget):
         del_proj_btn.clicked.connect(self._delete_selected_projects)
         paste_proj_btn = QPushButton("📋 从 Excel 粘贴")
         paste_proj_btn.clicked.connect(self._paste_projects_from_clipboard)
+        batch_audio_proj_btn = QPushButton("🎵 批量导入外部配音")
+        batch_audio_proj_btn.setToolTip(
+            "一次选择多个已转好的音频，按文件名排序后写入各行「语音文案」列；\n"
+            "该行将跳过 TTS，直接用外部音频合成。行数不足会自动补行。"
+        )
+        batch_audio_proj_btn.clicked.connect(self._batch_import_project_external_audio)
         clear_proj_btn = QPushButton("🧹 清空项目")
         clear_proj_btn.clicked.connect(self._clear_projects)
         proj_toolbar.addWidget(add_proj_btn)
         proj_toolbar.addWidget(del_proj_btn)
         proj_toolbar.addWidget(paste_proj_btn)
+        proj_toolbar.addWidget(batch_audio_proj_btn)
         proj_toolbar.addWidget(clear_proj_btn)
         proj_layout.insertLayout(0, proj_toolbar) # Put it at the top!
         
@@ -5028,7 +5120,7 @@ class DynamicCaptionPage(QWidget):
             )
             
         self._active_group_watermark_fingerprint = watermark_fingerprint if burn_watermark else ""
-        self._group_auto_extract_requested = bool(self.group_auto_timeline.isChecked())
+        self._group_auto_extract_requested = self._group_wants_auto_transcript()
         self._group_auto_extract_pending = False
         self.group_merge_outputs = []
         self.group_merge_thread = QThread(self)
@@ -5133,7 +5225,7 @@ class DynamicCaptionPage(QWidget):
         self._active_group_watermark_fingerprint=watermark_fingerprint if burn_watermark else ""
         # Lock the user's choice at task start.  Changing the checkbox while a long
         # merge is running must not unexpectedly start or suppress transcription.
-        self._group_auto_extract_requested=bool(self.group_auto_timeline.isChecked())
+        self._group_auto_extract_requested=self._group_wants_auto_transcript()
         self._group_auto_extract_pending=False
         self.group_merge_outputs = []
         self.group_merge_thread = QThread(self)
@@ -5206,6 +5298,44 @@ class DynamicCaptionPage(QWidget):
             self.run_status.setText("当前状态：正在停止分组合成…")
             self.log.appendPlainText("正在停止当前处理；已完成内容会保留，下次可直接断点续接。")
 
+    def _group_wants_auto_transcript(self):
+        """是否在合成后自动转文字。勾选「不转文案」时关闭。"""
+        if hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked():
+            return False
+        return bool(getattr(self, "group_auto_timeline", None) and self.group_auto_timeline.isChecked())
+
+    def _sync_group_transcript_flags_from_skip(self, checked: bool):
+        self._user_set_transcript_pref = True
+        if not hasattr(self, "group_auto_timeline"):
+            return
+        self.group_auto_timeline.blockSignals(True)
+        self.group_auto_timeline.setChecked(not bool(checked))
+        self.group_auto_timeline.blockSignals(False)
+
+    def _sync_group_transcript_flags_from_auto(self, checked: bool):
+        self._user_set_transcript_pref = True
+        if not hasattr(self, "group_skip_transcript"):
+            return
+        self.group_skip_transcript.blockSignals(True)
+        self.group_skip_transcript.setChecked(not bool(checked))
+        self.group_skip_transcript.blockSignals(False)
+
+    def _on_group_trim_mode_changed(self, text: str):
+        """切换到快速声音边界时，若用户未手动改过偏好，默认勾选「不转文案」。"""
+        if "快速" in str(text) and hasattr(self, "group_skip_transcript"):
+            if (
+                hasattr(self, "group_auto_timeline")
+                and self.group_auto_timeline.isChecked()
+                and not getattr(self, "_user_set_transcript_pref", False)
+            ):
+                # 程序自动勾选，不记为用户偏好
+                self.group_skip_transcript.blockSignals(True)
+                self.group_skip_transcript.setChecked(True)
+                self.group_skip_transcript.blockSignals(False)
+                self.group_auto_timeline.blockSignals(True)
+                self.group_auto_timeline.setChecked(False)
+                self.group_auto_timeline.blockSignals(False)
+
     def _group_merge_item_done(self, output, group_name, index, total):
         if output not in self.group_merge_outputs:
             self.group_merge_outputs.append(output)
@@ -5217,14 +5347,38 @@ class DynamicCaptionPage(QWidget):
                 "baked_watermarks",json.dumps(self._baked_watermarks,ensure_ascii=False))
         self.log.appendPlainText(f"[{index}/{total}] {group_name} 已加入合成结果队列。")
         
-        # Calculate clip count and record history
+        # Calculate clip count / durations and record history
         clip_count = 0
+        segment_durations = []
+        try:
+            ffmpeg = self.find_ffmpeg()
+        except Exception:
+            ffmpeg = "ffmpeg"
         if hasattr(self, "group_merge_groups"):
             for folder, clips in self.group_merge_groups:
                 if folder.name == group_name:
                     clip_count = len(clips)
+                    for clip in clips:
+                        try:
+                            dur = float(media_duration(ffmpeg, str(clip), fallback=0.0) or 0.0)
+                        except Exception:
+                            dur = 0.0
+                        segment_durations.append({
+                            "name": Path(clip).name,
+                            "duration_sec": round(dur, 3),
+                        })
                     break
-        self._record_group_merge_history(group_name, clip_count, Path(output).name)
+        output_duration = 0.0
+        if Path(output).is_file():
+            try:
+                output_duration = float(media_duration(ffmpeg, str(output), fallback=0.0) or 0.0)
+            except Exception:
+                output_duration = 0.0
+        self._record_group_merge_history(
+            group_name, clip_count, Path(output).name,
+            segment_durations=segment_durations,
+            output_duration_sec=round(output_duration, 3),
+        )
 
     def _load_group_merge_outputs(self, auto_extract=False):
         outputs = [
@@ -8077,6 +8231,38 @@ class DynamicCaptionPage(QWidget):
             self.project_table.setRowCount(0)
             self._add_project_row()
 
+    def _batch_import_project_external_audio(self):
+        """Assign multiple pre-made audio files to consecutive project rows as script=path."""
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "批量选择外部配音音频", "",
+            "音频文件 (*.mp3 *.wav *.aac *.ogg *.m4a *.flac *.opus)"
+        )
+        if not files:
+            return
+        files = sorted(files, key=lambda p: natural_key(Path(p).name))
+        while self.project_table.rowCount() < len(files):
+            self._add_project_row()
+        for i, path in enumerate(files):
+            # Column 1 = script / external audio path
+            item = self.project_table.item(i, 1)
+            if item is None:
+                item = QTableWidgetItem()
+                self.project_table.setItem(i, 1, item)
+            item.setText(path)
+            name_item = self.project_table.item(i, 0)
+            if name_item is None:
+                name_item = QTableWidgetItem()
+                self.project_table.setItem(i, 0, name_item)
+            cur_name = name_item.text().strip()
+            if not cur_name or cur_name.startswith("video_") or cur_name.startswith("项目"):
+                name_item.setText(Path(path).stem)
+        self._refresh_project_script_edit()
+        QMessageBox.information(
+            self, "批量导入完成",
+            f"已写入 {len(files)} 条外部配音路径到「语音文案」列。\n"
+            "合成时将跳过文字转语音，直接使用这些音频。",
+        )
+
     def _project_cell_double_clicked(self, row, col):
         if col == 2:  # Materials
             files, _ = QFileDialog.getOpenFileNames(
@@ -8358,7 +8544,10 @@ class DynamicCaptionPage(QWidget):
 
 
 
-    def _record_group_merge_history(self, group_name, clip_count, output_name):
+    def _record_group_merge_history(
+        self, group_name, clip_count, output_name,
+        segment_durations=None, output_duration_sec=0.0,
+    ):
         try:
             from modules.platform_utils import app_data_dir
             history_path = app_data_dir() / "group_merge_history.json"
@@ -8370,12 +8559,18 @@ class DynamicCaptionPage(QWidget):
                     history = []
             import datetime
             now = datetime.datetime.now()
+            segments = list(segment_durations or [])
             entry = {
                 "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "date": now.strftime("%Y-%m-%d"),
                 "group_name": group_name,
                 "clip_count": clip_count,
-                "output_name": output_name
+                "output_name": output_name,
+                "segment_durations": segments,
+                "output_duration_sec": float(output_duration_sec or 0.0),
+                "segments_total_sec": round(
+                    sum(float(s.get("duration_sec") or 0) for s in segments), 3
+                ),
             }
             history.append(entry)
             history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -9052,9 +9247,13 @@ class ProjectAddDialog(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
         
-        tip = QLabel("批量添加项目表格：您可以手动添加多行，输入项目名/文案并指定素材；也可以点击下方“📋 从 Excel 粘贴”快速批量导入。\n"
-                     "💡 提示：双击素材或背景音乐单元格内的按钮可以进行选取。背景音乐为空或写有随机时，默认使用全局随机分配。")
+        tip = QLabel(
+            "批量添加项目表格：可手动多行添加，或「从 Excel 粘贴」导入文案。\n"
+            "• 语音：每行写文案（走 TTS），或使用「批量导入外部配音」一次选中多个已转好的音频，按顺序填入各行。\n"
+            "• 素材/BGM：点单元格按钮选择；BGM 空或随机时用全局随机分配。"
+        )
         tip.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:8px;border-radius:5px;")
+        tip.setWordWrap(True)
         layout.addWidget(tip)
         
         # Table
@@ -9088,11 +9287,18 @@ class ProjectAddDialog(QDialog):
         add_row_btn.clicked.connect(self._add_empty_row_btn)
         paste_excel_btn = QPushButton("📋 从 Excel 粘贴")
         paste_excel_btn.clicked.connect(self._paste_from_excel)
+        batch_audio_btn = QPushButton("🎵 批量导入外部配音")
+        batch_audio_btn.setToolTip(
+            "一次选择多个已转好的音频（mp3/wav…），按文件名自然排序后依次填入各行「语音文案」列；\n"
+            "行数不足会自动补行。该行将跳过 TTS，直接用外部音频与素材合成。"
+        )
+        batch_audio_btn.clicked.connect(self._batch_import_external_audio)
         clear_all_btn = QPushButton("🧹 清空全部")
         clear_all_btn.clicked.connect(self._clear_all_rows)
         
         tool_bar.addWidget(add_row_btn)
         tool_bar.addWidget(paste_excel_btn)
+        tool_bar.addWidget(batch_audio_btn)
         tool_bar.addWidget(clear_all_btn)
         tool_bar.addStretch()
         
@@ -9224,6 +9430,38 @@ class ProjectAddDialog(QDialog):
             btn.setText("🎲 随机分配")
             btn.setToolTip("")
             
+    def _batch_import_external_audio(self):
+        """Multi-select audio files and assign one per project row (create rows if needed)."""
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "批量选择外部配音音频", "",
+            "音频文件 (*.mp3 *.wav *.aac *.ogg *.m4a *.flac *.opus)"
+        )
+        if not files:
+            return
+        files = sorted(files, key=lambda p: natural_key(Path(p).name))
+        # Ensure enough rows
+        while self.table.rowCount() < len(files):
+            self._add_empty_row()
+        assigned = 0
+        for i, path in enumerate(files):
+            widget = self.table.cellWidget(i, 1)
+            if widget is None:
+                continue
+            if hasattr(widget, "set_audio"):
+                widget.set_audio(path)
+                assigned += 1
+            # Name from audio stem if still default-like
+            name_edit = self.table.cellWidget(i, 0)
+            if isinstance(name_edit, QLineEdit):
+                cur = name_edit.text().strip()
+                if not cur or cur.startswith("项目 "):
+                    name_edit.setText(Path(path).stem)
+        QMessageBox.information(
+            self, "批量导入完成",
+            f"已将 {assigned} 个外部配音按顺序填入表格。\n"
+            f"这些行将跳过文字转语音，直接使用音频文件合成。",
+        )
+
     def _paste_from_excel(self):
         txt = QApplication.clipboard().text()
         if not txt.strip():
