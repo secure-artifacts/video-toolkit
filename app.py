@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.16").strip().lstrip("v") or "1.7.16"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.17").strip().lstrip("v") or "1.7.17"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -2424,9 +2424,19 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(brand)
         nav_layout.addSpacing(16)
         self.nav_buttons = []
-        nav_items = (("首页", 0), ("批量截图", 1), ("智能剪辑", 2), ("Reels 编辑器", 3),
-                     ("清除元数据", 10), ("字幕提取", 5),
-                     ("设置与组件", 7), ("帮助", 9))
+        # 索引与 self.pages 顺序一致：0 首页 … 4 批量重命名 … 8 流水线 … 10 元数据
+        nav_items = (
+            ("首页", 0),
+            ("批量截图", 1),
+            ("智能剪辑", 2),
+            ("Reels 编辑器", 3),
+            ("批量重命名", 4),
+            ("清除元数据", 10),
+            ("字幕提取", 5),
+            ("自动流水线", 8),
+            ("设置与组件", 7),
+            ("帮助", 9),
+        )
         for text, page_index in nav_items:
             btn = QPushButton(text)
             btn.setCheckable(True)
