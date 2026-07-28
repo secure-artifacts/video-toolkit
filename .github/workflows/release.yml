@@ -58,10 +58,24 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path 'dist_final' -Force | Out-Null
-          $archive = "dist_final\video-toolkit-windows-x64-${{ github.ref_name }}.zip"
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.Trim().TrimStart('v')
+          if ($version -notmatch '^[0-9A-Za-z._-]+$') { throw "Invalid version from tag: $tag" }
+          # Keep Inno Setup output name in sync with the git tag (avoids Setup_vX vs AppVersion mismatch).
+          $iss = Get-Content -LiteralPath 'VideoToolkit.iss' -Raw
+          $iss = [regex]::Replace($iss, '(?m)^AppVersion=.*$', "AppVersion=$version")
+          $iss = [regex]::Replace($iss, '(?m)^OutputBaseFilename=.*$', "OutputBaseFilename=VideoToolkit_Setup_v$version")
+          Set-Content -LiteralPath 'VideoToolkit.iss' -Value $iss -Encoding UTF8
+          $archive = "dist_final\video-toolkit-windows-x64-$tag.zip"
           Compress-Archive -Path 'dist_folder\VideoToolkit\*' -DestinationPath $archive -CompressionLevel Optimal
           iscc VideoToolkit.iss
-          Move-Item -Path "VideoToolkit_Setup_${{ github.ref_name }}.exe" -Destination "dist_final\" -Force
+          $setup = "VideoToolkit_Setup_v$version.exe"
+          if (-not (Test-Path -LiteralPath $setup)) {
+            $found = Get-ChildItem -Filter 'VideoToolkit_Setup_*.exe' | Select-Object -First 1
+            if (-not $found) { throw "Inno Setup did not produce $setup" }
+            $setup = $found.Name
+          }
+          Move-Item -LiteralPath $setup -Destination 'dist_final\' -Force
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2

@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.18").strip().lstrip("v") or "1.7.18"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.20").strip().lstrip("v") or "1.7.20"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -1400,7 +1400,7 @@ class PipelineWorker(QObject):
 
     def __init__(self, store, sources, output, threshold, provider, model, language,
                  ffmpeg, prefix, date_text, suffix, start_index, padding, cloud_config=None,
-                 resume_existing=True):
+                 resume_existing=True, extras=None):
         super().__init__()
         self.store = store; self.sources = sources; self.output = Path(output)
         self.threshold = threshold; self.provider = provider; self.model = model
@@ -1409,11 +1409,151 @@ class PipelineWorker(QObject):
         self.start_index = start_index; self.padding = padding; self.cancelled = False
         self.cloud_config = cloud_config or {}
         self.resume_existing = resume_existing
+        self.extras = extras or {}  # bgm_path, bgm_volume, watermark_path, wm_width, wm_opacity
         self.state = {}
         self.checkpoint_path = None
 
     def cancel(self):
         self.cancelled = True
+
+    def _polish_finals(self, final_dir: Path, final_records: list):
+        """后处理与 Reels 一致：9:16 全屏水印；声音=仅原声 或 原声+BGM（支持曲库随机截取）。"""
+        audio_mode = str(self.extras.get("audio_mode") or "仅视频原声")
+        bgm_root = Path(str(self.extras.get("bgm_path") or ""))
+        wm = Path(str(self.extras.get("watermark_path") or ""))
+        want_bgm = "背景" in audio_mode or "BGM" in audio_mode.upper()
+        use_wm = bool(self.extras.get("watermark_enabled")) and wm.is_file()
+        randomize_bgm = bool(self.extras.get("bgm_random", True))
+        # 解析曲库：单文件 / 文件夹
+        try:
+            from modules.dynamic_caption_page import find_bgm_file, random_bgm_start_ms, media_duration
+        except Exception:
+            find_bgm_file = None
+            random_bgm_start_ms = None
+            media_duration = None
+
+        def resolve_bgm(index, video_path):
+            if not want_bgm or not bgm_root:
+                return None, 0
+            if find_bgm_file is None:
+                return (bgm_root if bgm_root.is_file() else None), 0
+            picked = find_bgm_file(str(bgm_root), index - 1, video_path, randomize=randomize_bgm)
+            if not picked or not Path(picked).is_file():
+                return None, 0
+            offset_ms = 0
+            if randomize_bgm and random_bgm_start_ms is not None:
+                offset_ms = int(random_bgm_start_ms(
+                    self.ffmpeg, picked, video_path, index - 1, "pipeline_bgm"
+                ))
+            return Path(picked), offset_ms
+
+        sample_bgm, _ = resolve_bgm(1, final_records[0]["path"] if final_records else "")
+        use_bgm_any = want_bgm and (sample_bgm is not None or bgm_root.is_file() or bgm_root.is_dir())
+        if not use_bgm_any and not use_wm:
+            if want_bgm:
+                self.log.emit("提醒：已选「原声＋背景音乐」但未找到可用 BGM 文件/文件夹，按仅原声输出。")
+            return
+        if want_bgm and not sample_bgm and not bgm_root.is_file():
+            self.log.emit(f"提醒：BGM 路径无效：{bgm_root}，跳过混音（仍可烧水印）。")
+            use_bgm_any = False
+        if not use_bgm_any and not use_wm:
+            return
+
+        vol = max(0.01, min(1.0, float(self.extras.get("bgm_volume", 25)) / 100.0))
+        # 默认 100% 不透明全屏覆盖
+        wm_op = max(0.1, min(1.0, float(self.extras.get("wm_opacity", 100)) / 100.0))
+        creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        for index, rec in enumerate(final_records, 1):
+            if self.cancelled:
+                raise RuntimeError("任务已取消")
+            src = Path(rec["path"])
+            if not src.is_file():
+                continue
+            bgm_file, bgm_offset_ms = resolve_bgm(index, str(src))
+            use_bgm = bool(bgm_file and Path(bgm_file).is_file())
+            if want_bgm and not use_bgm:
+                self.log.emit(f"提醒：{src.name} 未匹配到 BGM，本条仅原声"
+                              + ("＋水印" if use_wm else "") + "。")
+            if not use_bgm and not use_wm:
+                continue
+            tmp = src.with_name(src.stem + "._polish_tmp.mp4")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+            filter_parts = []
+            next_in = 1
+            v_label = "0:v"
+            if use_wm:
+                cmd += ["-i", str(wm)]
+                # 固定 9:16 全屏覆盖：水印强制对齐主画面尺寸后 0,0 叠加
+                filter_parts.append(
+                    f"[0:v]setpts=PTS-STARTPTS[base];"
+                    f"[{next_in}:v]format=rgba,colorchannelmixer=aa={wm_op:.3f}[wmraw];"
+                    f"[wmraw][base]scale2ref=w=iw:h=ih[wm][base2];"
+                    f"[base2][wm]overlay=0:0[vout]"
+                )
+                v_label = "vout"
+                next_in += 1
+            if use_bgm:
+                # 随机起点截取后循环铺满视频时长（loop 在 -i 前；-ss 跟在 loop 后）
+                cmd += ["-stream_loop", "-1"]
+                if bgm_offset_ms > 0:
+                    cmd += ["-ss", f"{bgm_offset_ms / 1000:.3f}"]
+                cmd += ["-i", str(bgm_file)]
+                filter_parts.append(
+                    f"[0:a]aformat=channel_layouts=stereo,volume=1.0[a0];"
+                    f"[{next_in}:a]aformat=channel_layouts=stereo,volume={vol:.3f},"
+                    f"afade=t=in:st=0:d=0.3[a1];"
+                    f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2,"
+                    f"aformat=channel_layouts=stereo[aout]"
+                )
+                next_in += 1
+            if filter_parts:
+                cmd += ["-filter_complex", ";".join(filter_parts)]
+            if use_wm:
+                cmd += ["-map", f"[{v_label}]"]
+            else:
+                cmd += ["-map", "0:v:0"]
+            if use_bgm:
+                cmd += ["-map", "[aout]"]
+            else:
+                cmd += ["-map", "0:a?"]
+            cmd += [
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k", "-shortest",
+                "-movflags", "+faststart", str(tmp),
+            ]
+            bgm_note = ""
+            if use_bgm:
+                bgm_note = f"｜BGM={Path(bgm_file).name}"
+                if bgm_offset_ms > 0:
+                    bgm_note += f"@{bgm_offset_ms/1000:.1f}s"
+            self.log.emit(
+                f"成品润色 {index}/{len(final_records)}：{src.name}"
+                f"｜声音={audio_mode}"
+                + bgm_note
+                + (f"｜全屏水印{int(wm_op*100)}%" if use_wm else "")
+            )
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=creation, text=True, encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 1024:
+                try:
+                    src.unlink(missing_ok=True)
+                    tmp.replace(src)
+                except OSError as exc:
+                    self.log.emit(f"提醒：替换成品失败 {src.name}：{exc}")
+            else:
+                err = (result.stdout or "")[-500:]
+                self.log.emit(f"提醒：润色跳过 {src.name}：{err or '编码失败'}")
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _pipeline_key(self):
         return stable_key({
@@ -1593,6 +1733,12 @@ class PipelineWorker(QObject):
                 transcript = self.state["transcripts"].get(source.name, {})
                 final_records.append({"path": str(destination), "original": transcript.get("original", ""),
                                       "chinese": transcript.get("chinese", "")})
+            # 可选：成品叠加 BGM / 水印（不影响剪辑与字幕识别核心）
+            if self.extras.get("bgm_path") or self.extras.get("watermark_path"):
+                self.state["stage"] = "polish"
+                self._save_checkpoint()
+                self.progress.emit(88)
+                self._polish_finals(final_dir, final_records)
             self.state["stage"] = "cloud" if self.cloud_config.get("enabled") else "completed"
             self._save_checkpoint()
             self.titles_ready.emit(str(clips_dir), titles)
@@ -1803,26 +1949,33 @@ class FocusOnlyWheelFilter(QObject):
     """全局防误触：下拉框 / 数字框 / 滑条仅在点击获得焦点后才响应滚轮。
 
     与 Reels 编辑器一致；未聚焦时把滚轮交给外层滚动区域，避免滚动页面时改参数。
+
+    注意：不可对正在处理的同一 QWheelEvent 再 sendEvent 转发——Win11/Qt6 会报
+    CE_INVALIDATED，严重时卡死；应直接改 QScrollBar 数值。
     """
 
     _CONTROL_TYPES = (QComboBox, QAbstractSpinBox, QSlider)
 
     def eventFilter(self, obj, event):
-        if event.type() != QEvent.Type.Wheel:
-            return False
-        control = self._find_control(obj)
-        if control is None:
-            return False
-        if control.focusPolicy() != Qt.FocusPolicy.ClickFocus:
-            control.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        if control.hasFocus():
-            return False
-        scroll = self._enclosing_scroll(control)
-        if scroll is not None:
-            QApplication.sendEvent(scroll.viewport(), event)
+        try:
+            if event is None or event.type() != QEvent.Type.Wheel:
+                return False
+            control = self._find_control(obj)
+            if control is None:
+                return False
+            try:
+                if control.focusPolicy() != Qt.FocusPolicy.ClickFocus:
+                    control.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+            except Exception:
+                pass
+            if control.hasFocus():
+                return False  # 已聚焦：允许改值
+            # 未聚焦：拦截改值，并手动滚动外层区域
+            self._scroll_enclosing(control, event)
             return True
-        event.ignore()
-        return True
+        except Exception:
+            # eventFilter 里绝不能抛到 Qt（会刷 Error calling Python override）
+            return False
 
     @classmethod
     def _find_control(cls, obj):
@@ -1841,6 +1994,36 @@ class FocusOnlyWheelFilter(QObject):
                 return parent
             parent = parent.parentWidget()
         return None
+
+    @classmethod
+    def _scroll_enclosing(cls, widget, event):
+        """用滚轮 delta 直接驱动外层 QScrollArea，避免 sendEvent 重入。"""
+        scroll = cls._enclosing_scroll(widget)
+        if scroll is None:
+            return
+        try:
+            angle = event.angleDelta()
+            pixel = event.pixelDelta()
+        except Exception:
+            return
+        dy = int(angle.y()) if angle is not None else 0
+        dx = int(angle.x()) if angle is not None else 0
+        if dy == 0 and pixel is not None:
+            dy = int(pixel.y())
+        if dx == 0 and pixel is not None:
+            dx = int(pixel.x())
+        # 竖向优先；Shift+滚轮常见为横向
+        def _apply(bar, delta):
+            if bar is None or not bar.isEnabled() or not delta:
+                return
+            steps = max(1, int(bar.singleStep() or 1) * 3)
+            if abs(delta) >= 15:
+                bar.setValue(bar.value() - int(delta / 120.0 * steps))
+            else:
+                bar.setValue(bar.value() - (steps if delta > 0 else -steps))
+
+        _apply(scroll.verticalScrollBar(), dy)
+        _apply(scroll.horizontalScrollBar(), dx)
 
 
 def apply_click_focus_to_wheel_controls(root: QWidget) -> None:
@@ -2155,26 +2338,33 @@ class FullTextToolTipFilter(QObject):
     """Show unabridged text for compact combo boxes and item views across the app."""
 
     def eventFilter(self, watched, event):
-        if event.type() == QEvent.Type.ToolTip:
-            if isinstance(watched, QComboBox):
-                text = watched.currentText().strip()
-                if text:
-                    QToolTip.showText(event.globalPos(), text, watched)
-                    return True
-            view = watched if isinstance(watched, QAbstractItemView) else None
-            parent = watched.parentWidget() if hasattr(watched, "parentWidget") else None
-            while view is None and parent is not None:
-                if isinstance(parent, QAbstractItemView): view = parent; break
-                parent = parent.parentWidget()
-            if view is not None:
-                point = view.viewport().mapFromGlobal(event.globalPos())
-                index = view.indexAt(point)
-                if index.isValid():
-                    text = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+        try:
+            if event is None:
+                return False
+            if event.type() == QEvent.Type.ToolTip:
+                if isinstance(watched, QComboBox):
+                    text = watched.currentText().strip()
                     if text:
-                        QToolTip.showText(event.globalPos(), text, view)
+                        QToolTip.showText(event.globalPos(), text, watched)
                         return True
-        return super().eventFilter(watched, event)
+                view = watched if isinstance(watched, QAbstractItemView) else None
+                parent = watched.parentWidget() if hasattr(watched, "parentWidget") else None
+                while view is None and parent is not None:
+                    if isinstance(parent, QAbstractItemView):
+                        view = parent
+                        break
+                    parent = parent.parentWidget()
+                if view is not None:
+                    point = view.viewport().mapFromGlobal(event.globalPos())
+                    index = view.indexAt(point)
+                    if index.isValid():
+                        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+                        if text:
+                            QToolTip.showText(event.globalPos(), text, view)
+                            return True
+            return super().eventFilter(watched, event)
+        except Exception:
+            return False
 
 
 
@@ -3101,6 +3291,89 @@ class MainWindow(QMainWindow):
         number_line.addWidget(QLabel("起始编号")); number_line.addWidget(self.pipeline_start)
         number_line.addWidget(QLabel("位数")); number_line.addWidget(self.pipeline_padding); number_line.addStretch()
         number_widget = QWidget(); number_widget.setLayout(number_line); form.addRow("编号", number_widget)
+        # 声音 / 水印：与 Reels 编辑器一致
+        self.pipeline_audio_mode = QComboBox()
+        self.pipeline_audio_mode.addItems([
+            "仅视频原声",
+            "视频原声＋背景音乐",
+        ])
+        self.pipeline_audio_mode.setToolTip(
+            "与 Reels 一致：要么只保留原声，要么原声与 BGM 混合（不替换掉原声）。"
+        )
+        form.addRow("声音模式", self.pipeline_audio_mode)
+        self.pipeline_bgm_path = QLineEdit()
+        self.pipeline_bgm_path.setPlaceholderText("BGM 文件 或 文件夹（多曲库随机匹配）")
+        self.pipeline_bgm_path.setToolTip(
+            "可填单个音频文件，或填含多首 BGM 的文件夹。\n"
+            "勾选「随机选曲并随机截取」后，每个成品从库中稳定随机一首，并从随机起点截取匹配时长。"
+        )
+        bgm_file_btn = QPushButton("文件…")
+        bgm_folder_btn = QPushButton("文件夹…")
+        def _pick_bgm_file():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择背景音乐文件", "",
+                "音频 (*.mp3 *.wav *.m4a *.aac *.flac *.ogg);;所有文件 (*.*)",
+            )
+            if path:
+                self.pipeline_bgm_path.setText(path)
+                self.pipeline_audio_mode.setCurrentText("视频原声＋背景音乐")
+        def _pick_bgm_folder():
+            path = QFileDialog.getExistingDirectory(self, "选择背景音乐文件夹")
+            if path:
+                self.pipeline_bgm_path.setText(path)
+                self.pipeline_audio_mode.setCurrentText("视频原声＋背景音乐")
+                self.pipeline_bgm_random.setChecked(True)
+        bgm_file_btn.clicked.connect(_pick_bgm_file)
+        bgm_folder_btn.clicked.connect(_pick_bgm_folder)
+        bgm_row = QHBoxLayout()
+        bgm_row.addWidget(self.pipeline_bgm_path, 1)
+        bgm_row.addWidget(bgm_file_btn)
+        bgm_row.addWidget(bgm_folder_btn)
+        bgm_widget = QWidget(); bgm_widget.setLayout(bgm_row)
+        form.addRow("背景音乐", bgm_widget)
+        self.pipeline_bgm_random = QCheckBox("随机选曲并随机截取匹配（推荐文件夹曲库）")
+        self.pipeline_bgm_random.setChecked(True)
+        self.pipeline_bgm_random.setToolTip(
+            "开启：每个视频按路径哈希稳定随机一首 BGM，并从随机起点截取（同 Reels）。\n"
+            "关闭：固定使用选中文件，或文件夹内按队列顺序轮换，均从 0 秒起。"
+        )
+        form.addRow("", self.pipeline_bgm_random)
+        self.pipeline_bgm_volume = QSpinBox()
+        self.pipeline_bgm_volume.setRange(1, 100)
+        self.pipeline_bgm_volume.setValue(25)
+        self.pipeline_bgm_volume.setSuffix(" %")
+        self.pipeline_bgm_volume.setToolTip("BGM 相对音量（原声保持 100%）")
+        form.addRow("BGM 音量", self.pipeline_bgm_volume)
+        self.pipeline_wm_enable = QCheckBox("成品叠加水印（默认 9:16 全屏覆盖 · 不透明度 100%）")
+        self.pipeline_wm_enable.setToolTip(
+            "与 Reels 一致：水印图强制缩放到画面尺寸后全屏覆盖（9:16 竖屏同样铺满）。"
+        )
+        self.pipeline_wm_path = QLineEdit()
+        self.pipeline_wm_path.setPlaceholderText("水印图 PNG/JPG（9:16 全屏覆盖，铺满画面）")
+        wm_browse = QPushButton("浏览…")
+        def _pick_wm():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择水印图片", "", "图片 (*.png *.jpg *.jpeg *.webp);;所有文件 (*.*)"
+            )
+            if path:
+                self.pipeline_wm_path.setText(path)
+                self.pipeline_wm_enable.setChecked(True)
+        wm_browse.clicked.connect(_pick_wm)
+        wm_row = QHBoxLayout()
+        wm_row.addWidget(self.pipeline_wm_path, 1)
+        wm_row.addWidget(wm_browse)
+        wm_widget = QWidget(); wm_widget.setLayout(wm_row)
+        form.addRow(self.pipeline_wm_enable, wm_widget)
+        self.pipeline_wm_opacity = QSpinBox()
+        self.pipeline_wm_opacity.setRange(10, 100)
+        self.pipeline_wm_opacity.setValue(100)
+        self.pipeline_wm_opacity.setSuffix(" %")
+        self.pipeline_wm_opacity.setToolTip("默认 100% 不透明全屏覆盖；可按需调低")
+        form.addRow("水印不透明度", self.pipeline_wm_opacity)
+        wm_mode_hint = QLabel("水印模式：固定 9:16 全屏覆盖（scale2ref 铺满，非角落小标）")
+        wm_mode_hint.setStyleSheet("color:#7dd3fc;")
+        wm_mode_hint.setWordWrap(True)
+        form.addRow("", wm_mode_hint)
         left_layout.addWidget(settings)
         cloud_group = QGroupBox("3. Google 云端同步（只上传重命名成品）")
         cloud_layout = QVBoxLayout(cloud_group); cloud_layout.setContentsMargins(10, 9, 10, 9)
@@ -3782,12 +4055,30 @@ class MainWindow(QMainWindow):
         self.subtitle_results.clear(); self.result_combo.clear(); self.result_combo.addItem(ALL_RESULTS_LABEL)
         self.pipeline_titles.clear(); self.pipeline_log.clear(); self.pipeline_progress.setValue(0)
         self.thread = QThread(self)
+        audio_mode = (
+            self.pipeline_audio_mode.currentText()
+            if hasattr(self, "pipeline_audio_mode") else "仅视频原声"
+        )
+        extras = {
+            "audio_mode": audio_mode,
+            "bgm_path": self.pipeline_bgm_path.text().strip() if hasattr(self, "pipeline_bgm_path") else "",
+            "bgm_volume": int(self.pipeline_bgm_volume.value()) if hasattr(self, "pipeline_bgm_volume") else 25,
+            "bgm_random": bool(
+                hasattr(self, "pipeline_bgm_random") and self.pipeline_bgm_random.isChecked()
+            ),
+            "watermark_enabled": bool(
+                hasattr(self, "pipeline_wm_enable") and self.pipeline_wm_enable.isChecked()
+            ),
+            "watermark_path": self.pipeline_wm_path.text().strip() if hasattr(self, "pipeline_wm_path") else "",
+            "wm_opacity": int(self.pipeline_wm_opacity.value()) if hasattr(self, "pipeline_wm_opacity") else 100,
+            "wm_mode": "9:16 全屏覆盖",
+        }
         self.worker = PipelineWorker(
             self.store, sources, self.pipeline_output.text(), self.pipeline_threshold.value(),
             provider, model, self._pipeline_language_code(), ffmpeg,
             self.pipeline_prefix.text(), self.pipeline_date.text(), self.pipeline_suffix.text(),
             self.pipeline_start.value(), self.pipeline_padding.value(), cloud_config,
-            self.pipeline_resume_check.isChecked())
+            self.pipeline_resume_check.isChecked(), extras=extras)
         self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.pipeline_log.appendPlainText)
         self.worker.progress.connect(self.pipeline_progress.setValue)
@@ -4855,15 +5146,43 @@ QPushButton:disabled { color:#64748b; background:#172033; }
 #primary { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #0ea5e9,stop:1 #6366f1); border-color:#60a5fa; color:white; font-weight:700; padding:7px 15px; }
 #primary:hover { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #38bdf8,stop:1 #818cf8); }
 QLineEdit, QComboBox, QListWidget, QPlainTextEdit, QTextEdit, QTableWidget { background:#0c1424; border:1px solid #2b3d58; border-radius:5px; padding:4px; selection-background-color:#2563eb; }
-/* SpinBox 单独保证数字区宽度：窄屏/高 DPI 下被压扁时数字会显示成 x/I/O 残影 */
+/*
+ * SpinBox 数字区：Win11 + 样式表时若宽度不足或按钮 subcontrol 未固定，
+ * 数字与后缀会被按钮盖住/裁切，残成 I/O/x/± 等“乱码”。必须：
+ * 1) 足够 min-width 容纳值+后缀；2) 明确上下按钮占位，把文字挤在左侧。
+ */
 QSpinBox, QDoubleSpinBox {
   background:#0c1424; border:1px solid #2b3d58; border-radius:5px;
-  padding:2px 6px 2px 4px; min-height:26px; min-width:70px;
-  selection-background-color:#2563eb;
-  font-family:'Segoe UI','Microsoft YaHei UI','Microsoft YaHei',Arial,sans-serif;
+  padding: 3px 22px 3px 6px;
+  min-height: 28px;
+  min-width: 96px;
+  color: #f1f5f9;
+  selection-background-color: #2563eb;
+  font-family: 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', Arial, sans-serif;
+  font-size: 12px;
 }
-QSpinBox::up-button, QDoubleSpinBox::up-button,
-QSpinBox::down-button, QDoubleSpinBox::down-button { width:16px; }
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+  subcontrol-origin: border;
+  subcontrol-position: top right;
+  width: 18px;
+  border-left: 1px solid #2b3d58;
+  border-bottom: 1px solid #2b3d58;
+  border-top-right-radius: 4px;
+  background: #17243a;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+  subcontrol-origin: border;
+  subcontrol-position: bottom right;
+  width: 18px;
+  border-left: 1px solid #2b3d58;
+  border-bottom-right-radius: 4px;
+  background: #17243a;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+  background: #223654;
+}
+/* 不重绘箭头，保留系统/Qt 默认三角，避免 Win11 上箭头样式把文字区挤坏 */
 QGroupBox { background:#101a2b; border:1px solid #293d5c; border-radius:8px; margin-top:8px; padding-top:7px; font-weight:700; }
 QGroupBox::title { subcontrol-origin:margin; left:9px; padding:0 4px; color:#b8c8dc; }
 QHeaderView::section { background:#17243a; color:#cbd5e1; border:none; padding:6px; }

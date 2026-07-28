@@ -8,8 +8,9 @@ from .settings_page import hidden_kwargs
 
 ENCODER_LABELS = {
     "auto": "自动硬件加速（推荐）",
-    "qsv": "Intel Quick Sync",
     "nvenc": "NVIDIA NVENC",
+    "mf": "Windows 硬件编码 (MF)",
+    "qsv": "Intel Quick Sync",
     "amf": "AMD AMF",
     "cpu": "CPU 兼容模式",
 }
@@ -23,24 +24,114 @@ def encoder_key(label_or_key):
     return "auto"
 
 
-@lru_cache(maxsize=16)
-def encoder_available(ffmpeg, key):
-    """Test a real short encode, not just whether FFmpeg lists the encoder."""
-    codec = {"qsv": "h264_qsv", "nvenc": "h264_nvenc", "amf": "h264_amf"}.get(key)
-    if not codec:
-        return key == "cpu"
+def _run_probe(ffmpeg, args, timeout=12):
+    """Run a short encode probe; return (ok, stderr_tail)."""
     command = [
-        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-        "color=black:s=320x240:d=0.12", "-c:v", codec, "-frames:v", "1", "-f", "null", "-",
+        str(ffmpeg), "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=black:s=640x360:d=0.20",
+        *args,
     ]
     try:
         result = subprocess.run(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=5, **hidden_kwargs(),
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_kwargs(),
         )
-        return result.returncode == 0
-    except Exception:
-        return False
+        err = (result.stderr or "").strip()
+        return result.returncode == 0, err[-500:] if err else ""
+    except subprocess.TimeoutExpired:
+        return False, "probe_timeout"
+    except Exception as exc:
+        return False, str(exc)
+
+
+@lru_cache(maxsize=32)
+def encoder_available(ffmpeg, key):
+    """Test a real short encode, not just whether FFmpeg lists the encoder."""
+    ok, _reason = encoder_probe_detail(str(ffmpeg), key)
+    return ok
+
+
+@lru_cache(maxsize=32)
+def encoder_probe_detail(ffmpeg, key):
+    """Return (ok, reason). reason is empty when ok, else human-readable failure."""
+    key = str(key or "")
+    if key == "cpu":
+        return True, ""
+    if key == "nvenc":
+        # 多种参数：新驱动用 p-preset，旧构建用 ll/hq
+        for args in (
+            ["-pix_fmt", "yuv420p", "-c:v", "h264_nvenc", "-preset", "p4",
+             "-cq", "28", "-frames:v", "2", "-f", "null", "-"],
+            ["-pix_fmt", "yuv420p", "-c:v", "h264_nvenc", "-preset", "fast",
+             "-b:v", "2M", "-frames:v", "2", "-f", "null", "-"],
+            ["-pix_fmt", "yuv420p", "-c:v", "h264_nvenc", "-b:v", "2M",
+             "-frames:v", "2", "-f", "null", "-"],
+        ):
+            ok, err = _run_probe(ffmpeg, args, timeout=10)
+            if ok:
+                return True, ""
+            joined = (err or "").lower()
+            if any(
+                token in joined
+                for token in (
+                    "nvenc api",
+                    "driver does not support",
+                    "610.00",
+                    "required:",
+                    "function not implemented",
+                    "no nvenc",
+                    "cannot load nvcuda",
+                )
+            ):
+                return False, (
+                    "NVIDIA NVENC 不可用：驱动/API 与当前 FFmpeg 不匹配。"
+                    "本机探测到常见情况是驱动偏旧（如 560.x）而 FFmpeg 需要更新 NVENC。"
+                    "请升级 GeForce 驱动到 610+，或先用「Windows 硬件编码 (MF)」。"
+                )
+            last = err
+        return False, last or "h264_nvenc 打开失败"
+    if key == "mf":
+        # Windows Media Foundation：多数机器可走硬件（含独显/核显路径），不依赖 NVENC API 版本
+        for args in (
+            ["-pix_fmt", "yuv420p", "-c:v", "h264_mf", "-rate_control", "quality",
+             "-quality", "75", "-frames:v", "3", "-f", "null", "-"],
+            ["-pix_fmt", "yuv420p", "-c:v", "h264_mf", "-frames:v", "3", "-f", "null", "-"],
+        ):
+            ok, err = _run_probe(ffmpeg, args, timeout=12)
+            if ok:
+                return True, ""
+            last = err
+        return False, last or "h264_mf 不可用"
+    if key == "qsv":
+        # QSV 冷启动可能很慢，给更长超时；并强制 nv12
+        for args in (
+            ["-vf", "format=nv12", "-c:v", "h264_qsv", "-global_quality", "28",
+             "-look_ahead", "0", "-frames:v", "2", "-f", "null", "-"],
+            ["-pix_fmt", "nv12", "-c:v", "h264_qsv", "-global_quality", "28",
+             "-frames:v", "2", "-f", "null", "-"],
+        ):
+            ok, err = _run_probe(ffmpeg, args, timeout=25)
+            if ok:
+                return True, ""
+            last = err
+        return False, last or "h264_qsv 不可用或初始化过慢"
+    if key == "amf":
+        for args in (
+            ["-pix_fmt", "yuv420p", "-c:v", "h264_amf", "-quality", "speed",
+             "-rc", "cqp", "-qp_i", "28", "-frames:v", "2", "-f", "null", "-"],
+        ):
+            ok, err = _run_probe(ffmpeg, args, timeout=10)
+            if ok:
+                return True, ""
+            last = err
+        return False, last or "h264_amf 不可用"
+    return False, f"未知编码器 {key}"
 
 
 def resolve_encoder(ffmpeg, requested="auto"):
@@ -48,45 +139,79 @@ def resolve_encoder(ffmpeg, requested="auto"):
     if requested == "cpu":
         return "cpu"
     if requested != "auto":
-        return requested if encoder_available(str(ffmpeg), requested) else "cpu"
-    # Intel is checked first on this app's common Windows laptops. A listed but
-    # unusable NVIDIA/AMD encoder is rejected by the real encode probe above.
-    for key in ("qsv", "nvenc", "amf"):
-        if encoder_available(str(ffmpeg), key):
+        ok, _reason = encoder_probe_detail(str(ffmpeg), requested)
+        return requested if ok else "cpu"
+    # 优先顺序：NVENC（真独显）→ Windows MF（不挑 NVENC API）→ QSV → AMF
+    for key in ("nvenc", "mf", "qsv", "amf"):
+        ok, _reason = encoder_probe_detail(str(ffmpeg), key)
+        if ok:
             return key
     return "cpu"
 
 
-def encoder_args(key, cpu_preset="veryfast", preview=False):
-    """Return H.264 args with similar visual quality across hardware backends."""
+def diagnose_encoders(ffmpeg):
+    """Return list of (key, ok, reason) for UI/log diagnostics."""
+    rows = []
+    for key in ("nvenc", "mf", "qsv", "amf", "cpu"):
+        ok, reason = encoder_probe_detail(str(ffmpeg), key)
+        rows.append((key, ok, reason))
+    return rows
+
+
+def encoder_args(key, cpu_preset="veryfast", preview=False, intermediate=False):
+    """Return H.264 args. intermediate=True for temp segments (faster, slightly lower quality)."""
+    key = encoder_key(key)
+    # 中间分段/时间轴缓存：优先速度
+    if intermediate or preview:
+        if key == "qsv":
+            return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "28",
+                    "-look_ahead", "0", "-pix_fmt", "nv12"]
+        if key == "nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
+                    "-rc", "vbr", "-cq", "28", "-b:v", "0", "-pix_fmt", "yuv420p"]
+        if key == "mf":
+            return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "70",
+                    "-pix_fmt", "yuv420p"]
+        if key == "amf":
+            return ["-c:v", "h264_amf", "-quality", "speed",
+                    "-rc", "cqp", "-qp_i", "28", "-qp_p", "28", "-pix_fmt", "yuv420p"]
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-threads", "0"]
     if key == "qsv":
-        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "25" if preview else "21",
-                "-pix_fmt", "nv12"]
+        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "21",
+                "-look_ahead", "0", "-pix_fmt", "nv12"]
     if key == "nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p2" if preview else "p3", "-tune", "hq",
-                "-rc", "vbr", "-cq", "25" if preview else "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
-    if key == "amf":
-        return ["-c:v", "h264_amf", "-quality", "speed" if preview else "balanced",
-                "-rc", "cqp", "-qp_i", "25" if preview else "21", "-qp_p", "25" if preview else "21",
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+                "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if key == "mf":
+        return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "75",
                 "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "ultrafast" if preview else cpu_preset,
-            "-crf", "25" if preview else "20", "-pix_fmt", "yuv420p", "-threads", "0"]
+    if key == "amf":
+        return ["-c:v", "h264_amf", "-quality", "balanced",
+                "-rc", "cqp", "-qp_i", "21", "-qp_p", "21", "-pix_fmt", "yuv420p"]
+    preset = str(cpu_preset or "veryfast")
+    if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
+        preset = "veryfast"
+    if preset == "medium":
+        preset = "faster"
+    return ["-c:v", "libx264", "-preset", preset,
+            "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0"]
 
 
 def calculate_target_size(src_w, src_h, aspect_ratio_str, resolution_str):
     # Determine orientation
     is_portrait = src_h > src_w
-    
+
     # Determine aspect ratio
     if aspect_ratio_str == "16:9":
-        ratio = 9/16 if is_portrait else 16/9
+        ratio = 9 / 16 if is_portrait else 16 / 9
     elif aspect_ratio_str == "3:4":
-        ratio = 3/4 if is_portrait else 4/3
+        ratio = 3 / 4 if is_portrait else 4 / 3
     elif aspect_ratio_str == "1:1":
         ratio = 1.0
     else:
-        ratio = src_w / src_h
-        
+        ratio = src_w / src_h if src_h else 16 / 9
+
     # Determine target height based on resolution selection
     if resolution_str == "720p":
         h = 720
@@ -101,8 +226,8 @@ def calculate_target_size(src_w, src_h, aspect_ratio_str, resolution_str):
         if is_portrait:
             h = src_h
         else:
-            h = int(src_w / ratio)
-            
+            h = int(src_w / ratio) if ratio else src_h
+
     # Calculate target width
     if ratio == 1.0:
         if resolution_str == "720p":
@@ -118,7 +243,7 @@ def calculate_target_size(src_w, src_h, aspect_ratio_str, resolution_str):
             w, h = max_dim, max_dim
     else:
         w = int(h * ratio)
-            
+
     # Ensure w and h are even numbers (FFmpeg requires even dimensions for yuv420p)
     w = (w // 2) * 2
     h = (h // 2) * 2

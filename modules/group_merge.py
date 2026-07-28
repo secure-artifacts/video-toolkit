@@ -26,24 +26,25 @@ MERGE_TRANSITION_PRESETS = {
     "Crash Zoom": {"xfade": "zoomin", "duration": 0.42},
     "平滑剪接": {"xfade": "hblur", "duration": 0.28},
     # —— 常用 xfade ——
-    "淡入淡出": {"xfade": "fade", "duration": 0.50},
-    "溶解": {"xfade": "dissolve", "duration": 0.55},
-    "淡入黑场": {"xfade": "fadeblack", "duration": 0.55},
-    "淡入白场": {"xfade": "fadewhite", "duration": 0.55},
-    "向左滑动": {"xfade": "slideleft", "duration": 0.50},
-    "向右滑动": {"xfade": "slideright", "duration": 0.50},
-    "向上滑动": {"xfade": "slideup", "duration": 0.50},
-    "向下滑动": {"xfade": "slidedown", "duration": 0.50},
-    "直线向左擦除": {"xfade": "wipeleft", "duration": 0.45},
-    "直线向右擦除": {"xfade": "wiperight", "duration": 0.45},
-    "直线向上擦除": {"xfade": "wipeup", "duration": 0.45},
-    "直线向下擦除": {"xfade": "wipedown", "duration": 0.45},
-    "圆形打开": {"xfade": "circleopen", "duration": 0.50},
-    "圆形关闭": {"xfade": "circleclose", "duration": 0.50},
-    "水平打开": {"xfade": "horzopen", "duration": 0.45},
-    "垂直打开": {"xfade": "vertopen", "duration": 0.45},
-    "像素化": {"xfade": "pixelize", "duration": 0.50},
-    "径向模糊": {"xfade": "radial", "duration": 0.50},
+    # 口播成片默认偏短转场，避免长叠化像“卡一下再说话”
+    "淡入淡出": {"xfade": "fade", "duration": 0.22},
+    "溶解": {"xfade": "dissolve", "duration": 0.28},
+    "淡入黑场": {"xfade": "fadeblack", "duration": 0.28},
+    "淡入白场": {"xfade": "fadewhite", "duration": 0.28},
+    "向左滑动": {"xfade": "slideleft", "duration": 0.28},
+    "向右滑动": {"xfade": "slideright", "duration": 0.28},
+    "向上滑动": {"xfade": "slideup", "duration": 0.28},
+    "向下滑动": {"xfade": "slidedown", "duration": 0.28},
+    "直线向左擦除": {"xfade": "wipeleft", "duration": 0.25},
+    "直线向右擦除": {"xfade": "wiperight", "duration": 0.25},
+    "直线向上擦除": {"xfade": "wipeup", "duration": 0.25},
+    "直线向下擦除": {"xfade": "wipedown", "duration": 0.25},
+    "圆形打开": {"xfade": "circleopen", "duration": 0.28},
+    "圆形关闭": {"xfade": "circleclose", "duration": 0.28},
+    "水平打开": {"xfade": "horzopen", "duration": 0.25},
+    "垂直打开": {"xfade": "vertopen", "duration": 0.25},
+    "像素化": {"xfade": "pixelize", "duration": 0.28},
+    "径向模糊": {"xfade": "radial", "duration": 0.28},
 }
 
 
@@ -309,14 +310,85 @@ def _speech_spans(srt):
     return spans
 
 
-def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=120):
+def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=280,
+                       tail_safety_ms=280):
+    """ASR 词界：从首词前 padding 到末词后 padding。
+
+    尾部额外 +tail_safety_ms：ASR 词尾时间常偏早，防止吞掉尾音/气声。
+    若末词后剩余不足 ~0.8s，直接保留到片尾。
+    """
     spans = _speech_spans(srt)
     duration = max(0.05, float(duration or 0.05))
     if not spans:
         return 0.0, duration, False
     start = max(0.0, spans[0][0] - max(0, head_padding_ms) / 1000.0)
-    end = min(duration, spans[-1][1] + max(0, tail_padding_ms) / 1000.0)
+    # 用户尾保护至少 280ms；再加 safety（ASR 常切在音节中间）
+    tail = max(280, int(tail_padding_ms or 0)) + max(0, int(tail_safety_ms))
+    end = min(duration, spans[-1][1] + tail / 1000.0)
+    # 末词结束后不远：整段留到文件尾，宁可多留气口
+    if duration - spans[-1][1] <= 0.85:
+        end = duration
     return start, max(start + 0.05, end), True
+
+
+def _last_voice_in_probe(events, probe_len: float) -> float:
+    """在 [0, probe_len] 探针窗口内，估计最后仍有声音的相对时刻。"""
+    probe_len = max(0.05, float(probe_len))
+    if not events:
+        return probe_len  # 未检出静音 → 可能全程有声
+    voice_end = 0.0
+    if events[0][0] == "start" and events[0][1] > 0.05:
+        voice_end = float(events[0][1])
+    for i, (kind, value) in enumerate(events):
+        value = float(value)
+        if kind != "end":
+            continue
+        next_start = None
+        for j in range(i + 1, len(events)):
+            if events[j][0] == "start":
+                next_start = float(events[j][1])
+                break
+        if next_start is not None:
+            voice_end = max(voice_end, next_start)
+        else:
+            voice_end = probe_len
+    if events[-1][0] == "start":
+        voice_end = max(voice_end, float(events[-1][1]))
+    return min(probe_len, voice_end)
+
+
+def energy_extend_end(ffmpeg, clip_path, end, duration, max_extend=1.5, threshold_db=-40):
+    """ASR/静音给出 end 后，探测其后是否还有说话能量，只扩展不回缩。"""
+    duration = max(0.05, float(duration or 0.05))
+    end = max(0.0, min(duration, float(end)))
+    remain = duration - end
+    if remain < 0.10:
+        return duration
+    probe_len = min(max_extend, remain)
+    cmd = [
+        str(ffmpeg), "-hide_banner", "-nostats",
+        "-ss", f"{end:.3f}", "-t", f"{probe_len:.3f}",
+        "-i", str(clip_path),
+        "-map", "0:a:0",
+        "-af", f"silencedetect=noise={int(threshold_db)}dB:d=0.05",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", **hidden_kwargs(),
+        )
+        text = result.stdout or ""
+    except Exception:
+        return end
+    events = [
+        (kind, float(value))
+        for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", text)
+    ]
+    voice_rel = _last_voice_in_probe(events, probe_len)
+    if voice_rel < 0.07:
+        return end
+    return min(duration, end + voice_rel + 0.15)
 
 
 def parse_srt_with_text(srt):
@@ -342,78 +414,154 @@ def parse_srt_with_text(srt):
 
 
 def find_matching_srt_bounds(srt, clip_script, duration, head_padding_ms=80, tail_padding_ms=120):
+    """按分段文案在本片段 SRT 中找最相似连续句，返回该句时间窗。
+
+    匹配失败时回退到「整段 ASR 首尾词」，宁多留不漏字。
+    """
     entries = parse_srt_with_text(srt)
     duration = max(0.05, float(duration or 0.05))
     if not entries:
         return 0.0, duration, False
-    
+
     clean_target = _plain_text(clip_script)
     if not clean_target:
         return speech_trim_bounds(srt, duration, head_padding_ms, tail_padding_ms)
-        
+
     best_score = -1.0
     best_range = (0, len(entries) - 1)
-    
+
     for i in range(len(entries)):
         for j in range(i, len(entries)):
-            subset_text = "".join(entry[2] for entry in entries[i:j+1])
+            subset_text = "".join(entry[2] for entry in entries[i:j + 1])
             clean_subset = _plain_text(subset_text)
             score = SequenceMatcher(None, clean_subset, clean_target).ratio()
             if score > best_score:
                 best_score = score
                 best_range = (i, j)
-                
+
     if best_score > 0.3:
         i, j = best_range
+        tail = max(200, int(tail_padding_ms or 0)) + 220
         start = max(0.0, entries[i][0] - max(0, head_padding_ms) / 1000.0)
-        end = min(duration, entries[j][1] + max(0, tail_padding_ms) / 1000.0)
+        end = min(duration, entries[j][1] + tail / 1000.0)
+        if duration - entries[j][1] <= 0.55:
+            end = duration
         return start, max(start + 0.05, end), True
-        
+
     return speech_trim_bounds(srt, duration, head_padding_ms, tail_padding_ms)
 
 
-def hybrid_trim_bounds(srt, duration, audio_bounds, head_padding_ms=80, tail_padding_ms=120,
-                       word_guard_ms=40):
-    """Combine transcript and audio boundaries without ever cutting into a timed word.
+def pair_silence_events(events):
+    """silencedetect 事件 → [(start, end), ...]；无 end 的尾段用 None 表示。"""
+    intervals = []
+    open_start = None
+    for kind, value in events or []:
+        if kind == "start":
+            if open_start is not None:
+                intervals.append((open_start, None))
+            open_start = float(value)
+        elif kind == "end" and open_start is not None:
+            intervals.append((open_start, float(value)))
+            open_start = None
+    if open_start is not None:
+        intervals.append((open_start, None))
+    return intervals
 
-    Audio detection is only allowed to refine the leading/trailing edge.  Internal
-    pauses remain untouched, which avoids the unnatural jump cuts produced by a
-    global silence remover.
+
+def safe_silence_bounds(duration, events, head_padding_ms=80, tail_padding_ms=120):
+    """只裁「真·片头静音」和「真·片尾静音」。
+
+    核心原则（高于 v1.7.17 旧逻辑）：
+    - 中间停顿绝不当成片尾（旧逻辑会把 last silence_start 当 end，后半句全没）。
+    - 片头 silence_end 若过晚（轻声被当成静音），宁可不裁。
+    - 不确定 → (0, duration, False) 保留完整片段。
+    """
+    duration = max(0.05, float(duration or 0.05))
+    intervals = pair_silence_events(events)
+    start = 0.0
+    end = duration
+    detected = False
+
+    # —— 片头：第一条从 ~0 开始的静音，且结束点不能太靠后 ——
+    max_head = min(2.8, duration * 0.40)
+    for s0, s1 in intervals:
+        if s0 > 0.15:
+            break
+        if s1 is None:
+            break
+        if 0.02 < s1 <= max_head:
+            start = s1
+            detected = True
+        break
+
+    # —— 片尾：静音必须「贴片尾」：无 end 或 end 很接近 duration，且起点足够靠后 ——
+    min_tail_from = max(duration * 0.50, duration - 5.0)
+    for s0, s1 in reversed(intervals):
+        touches_end = s1 is None or s1 >= duration - 0.08
+        if not touches_end:
+            continue
+        if s0 < min_tail_from:
+            continue
+        if s0 >= duration - 0.05:
+            continue
+        end = s0
+        detected = True
+        break
+
+    if detected:
+        start = max(0.0, start - max(0, int(head_padding_ms)) / 1000.0)
+        # 片尾多留：静音起点后再加 tail padding，减轻尾音被切
+        end = min(duration, end + max(0, int(tail_padding_ms)) / 1000.0 + 0.12)
+    if end <= start + 0.08:
+        return 0.0, duration, False
+    # 裁掉大半 → 不可信（轻声/阈值不当）
+    if (end - start) < duration * 0.50:
+        return 0.0, duration, False
+    return start, end, True
+
+
+def hybrid_trim_bounds(srt, duration, audio_bounds, head_padding_ms=80, tail_padding_ms=280,
+                       word_guard_ms=120):
+    """智能混合：ASR 词界为硬护栏；静音只收片头，片尾不因静音提前结束（防吞尾音）。
+
+    绝不：用中间静音切掉后半句；绝不：静音越过首/末识别词。
     """
     duration = max(0.05, float(duration or 0.05))
     spans = _speech_spans(srt)
     text_start, text_end, text_detected = speech_trim_bounds(
         srt, duration, head_padding_ms, tail_padding_ms,
     )
-    if not text_detected:
+    if not text_detected or not spans:
         if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
             return float(audio_bounds[0]), float(audio_bounds[1]), True
         return 0.0, duration, False
     if not audio_bounds or len(audio_bounds) < 3 or not bool(audio_bounds[2]):
         return text_start, text_end, True
-    audio_start, audio_end, _detected = audio_bounds[0], audio_bounds[1], audio_bounds[2]
+
+    audio_start = float(audio_bounds[0])
     guard = max(0, int(word_guard_ms)) / 1000.0
-    # Never move the start past the first timed word (minus a small consonant guard),
-    # nor the end before the last timed word (plus the same guard).
-    latest_safe_start = max(0.0, spans[0][0] - guard)
-    earliest_safe_end = min(duration, spans[-1][1] + guard)
-    start = min(latest_safe_start, max(text_start, float(audio_start)))
-    end = max(earliest_safe_end, min(text_end, float(audio_end)))
-    if end <= start + 0.05:
+    hard_latest_start = max(0.0, spans[0][0] - guard)
+    # 片尾硬底：末词结束 + 护栏，且不低于文案窗 end（已含 tail padding + safety）
+    hard_earliest_end = min(duration, max(text_end, spans[-1][1] + guard + 0.15))
+
+    start = text_start
+    # 片头：静音可收，但不得越过首词护栏；过晚静音（轻声）忽略
+    if audio_start <= spans[0][0] + 0.35:
+        start = min(hard_latest_start, max(text_start, audio_start))
+        start = min(start, hard_latest_start)
+    # 片尾：不使用 audio_end 缩短！静音收尾极易吞掉尾音/气声
+    end = max(text_end, hard_earliest_end)
+    end = min(duration, end)
+
+    start = max(0.0, min(start, hard_latest_start))
+    if end <= start + 0.08:
         return text_start, text_end, True
-    return max(0.0, start), min(duration, end), True
+    return start, end, True
 
 
 def refine_text_window_with_audio(text_start, text_end, text_ok, audio_bounds, duration,
-                                  edge_slack_ms=100):
-    """Tighten an already-chosen text window with leading/trailing silence bounds.
-
-    Used when the text window comes from script-segment matching (not the full SRT span),
-    so hybrid_trim_bounds' full-timeline word guards would be wrong.
-
-    Audio may only nibble the outer padding (about edge_slack_ms); it must not carve
-    into the middle of the matched phrase.
-    """
+                                  edge_slack_ms=150):
+    """分段文案窗 + 静音：只允许收片头；片尾保持文案窗（防吞尾）。"""
     duration = max(0.05, float(duration or 0.05))
     if not text_ok:
         if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
@@ -423,16 +571,76 @@ def refine_text_window_with_audio(text_start, text_end, text_ok, audio_bounds, d
     text_end = max(text_start + 0.05, min(duration, float(text_end)))
     if not audio_bounds or len(audio_bounds) < 3 or not bool(audio_bounds[2]):
         return text_start, text_end, True
-    audio_start, audio_end = float(audio_bounds[0]), float(audio_bounds[1])
+    audio_start = float(audio_bounds[0])
     slack = max(0, int(edge_slack_ms)) / 1000.0
-    # Same structure as hybrid_trim_bounds: audio can pull edges inward, but only within slack.
     latest_safe_start = min(duration, text_start + slack)
-    earliest_safe_end = max(0.0, text_end - slack)
-    start = min(latest_safe_start, max(text_start, audio_start))
-    end = max(earliest_safe_end, min(text_end, audio_end))
-    if end <= start + 0.05:
+    start = text_start
+    if audio_start <= text_start + slack + 0.25:
+        start = min(latest_safe_start, max(text_start, audio_start))
+    # 尾部不收：保持 text_end（已含尾保护）
+    end = text_end
+    if end <= start + 0.08:
         return text_start, text_end, True
     return max(0.0, start), min(duration, end), True
+
+
+def resolve_trim_bounds(trim_mode, srt, clip_script, audio_bounds, hybrid_bounds,
+                        media_duration, head_ms, tail_ms):
+    """统一三种模式的最终起止点。返回 (start, end, detected, reason)。
+
+    优先级：宁多留气口，不丢字。
+    """
+    media_duration = max(0.05, float(media_duration or 0.05))
+    head_ms = int(head_ms or 0)
+    tail_ms = int(tail_ms or 0)
+    srt = str(srt or "")
+    clip_script = str(clip_script or "").strip()
+
+    if clip_script and srt:
+        text_start, text_end, text_ok = find_matching_srt_bounds(
+            srt, clip_script, media_duration, head_ms, tail_ms,
+        )
+    elif srt:
+        text_start, text_end, text_ok = speech_trim_bounds(
+            srt, media_duration, head_ms, tail_ms,
+        )
+    else:
+        text_start, text_end, text_ok = 0.0, media_duration, False
+
+    mode = str(trim_mode or "hybrid").lower()
+    if mode == "fast":
+        if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+            return float(audio_bounds[0]), float(audio_bounds[1]), True, "快速声音边界"
+        if text_ok:
+            return text_start, text_end, True, "快速模式无静音边界→文案时间轴"
+        return 0.0, media_duration, False, "快速模式无可用边界→完整片段"
+
+    if mode == "text":
+        if text_ok:
+            return text_start, text_end, True, "文案边界"
+        if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+            return float(audio_bounds[0]), float(audio_bounds[1]), True, "文案不可用→声音边界"
+        return 0.0, media_duration, False, "文案边界失败→完整片段"
+
+    # hybrid（默认）
+    if clip_script and text_ok:
+        s, e, ok = refine_text_window_with_audio(
+            text_start, text_end, text_ok, audio_bounds, media_duration,
+        )
+        return s, e, ok, "智能混合（分段文案+声音）"
+    if text_ok:
+        s, e, ok = hybrid_trim_bounds(
+            srt, media_duration, audio_bounds, head_ms, tail_ms,
+        )
+        return s, e, ok, "智能混合（ASR词界+声音）"
+    if hybrid_bounds and len(hybrid_bounds) >= 3 and bool(hybrid_bounds[2]):
+        return (
+            float(hybrid_bounds[0]), float(hybrid_bounds[1]), True,
+            "智能混合（缓存hybrid）",
+        )
+    if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
+        return float(audio_bounds[0]), float(audio_bounds[1]), True, "智能混合无ASR→声音边界"
+    return 0.0, media_duration, False, "智能混合无边界→完整片段"
 
 
 def _safe_name(value):
@@ -824,7 +1032,11 @@ class GroupMergeWorker(QObject):
         candidate = Path(self.ffmpeg).with_name("ffprobe" + Path(self.ffmpeg).suffix)
         return str(candidate if candidate.exists() else "ffprobe")
 
-    def _run(self, command):
+    def _run(self, command, timeout=None, heartbeat_label=None, heartbeat_sec=8.0):
+        """Run FFmpeg/ffprobe. timeout=None means no hard limit (still cancellable).
+        heartbeat_label: emit a log line every heartbeat_sec while still running
+        so the UI does not look frozen on long QSV/filter encodes.
+        """
         if self.cancelled:
             raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
         process = subprocess.Popen(
@@ -833,12 +1045,40 @@ class GroupMergeWorker(QObject):
         )
         with self._lock:
             self._active_processes.add(process)
+        started = time.monotonic()
+        last_beat = started
+        stdout = stderr = ""
         try:
             while True:
                 try:
                     stdout, stderr = process.communicate(timeout=0.15)
                     break
                 except subprocess.TimeoutExpired:
+                    now = time.monotonic()
+                    if timeout is not None and (now - started) >= float(timeout):
+                        try:
+                            process.kill()
+                            stdout, stderr = process.communicate(timeout=2.0)
+                        except Exception:
+                            try:
+                                process.kill()
+                            except Exception:
+                                pass
+                            stdout, stderr = "", ""
+                        raise RuntimeError(
+                            f"FFmpeg 超时（>{float(timeout):.0f}s）"
+                            + (f"：{heartbeat_label}" if heartbeat_label else "")
+                            + "。常见原因：Intel QSV 多路并行卡死，或滤镜图未结束。"
+                            "请停止后重试（已改为硬件编码串行）。"
+                        )
+                    if heartbeat_label and (now - last_beat) >= float(heartbeat_sec):
+                        last_beat = now
+                        try:
+                            self.log.emit(
+                                f"编码进行中：{heartbeat_label}（已 {now - started:.0f}s，请稍候…）"
+                            )
+                        except Exception:
+                            pass
                     if not self.cancelled:
                         continue
                     try:
@@ -854,7 +1094,7 @@ class GroupMergeWorker(QObject):
         if self.cancelled:
             raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
         if process.returncode:
-            raise RuntimeError(stderr[-1200:].strip() or "FFmpeg 处理失败")
+            raise RuntimeError((stderr or "")[-1200:].strip() or "FFmpeg 处理失败")
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     def _write_final_output(self, command, destination: Path):
@@ -949,7 +1189,7 @@ class GroupMergeWorker(QObject):
         return info
 
     def _fast_analysis(self, clip, cache):
-        """Find leading/trailing quiet sections locally, without ASR or subtitle matching."""
+        """本地片头/片尾静音（安全版）：中间停顿绝不裁切。"""
         signature = self._signature(clip)
         key = str(Path(clip).resolve())
         saved = cache.get(key, {})
@@ -958,19 +1198,20 @@ class GroupMergeWorker(QObject):
         params = {"threshold": threshold, "minimum": round(minimum, 3),
                   "head": int(self.settings.get("head_padding_ms", 80)),
                   "tail": int(self.settings.get("tail_padding_ms", 120))}
+        # v4 = safe_silence_bounds；旧 v2 缓存可能含中间静音误裁，禁止续接
         if (self.settings.get("resume", True) and saved.get("signature") == signature
-                and saved.get("fast_bounds_version") == 2 and saved.get("fast_params") == params
+                and saved.get("fast_bounds_version") == 4 and saved.get("fast_params") == params
                 and saved.get("bounds")):
             self.log.emit(f"续接：复用本地声音边界 {clip.name}")
             return saved
         probe = self._probe(clip)
         duration = max(0.05, probe["duration"])
         if not probe["audio"]:
-            info = {**saved, "signature": signature, "fast_bounds_version": 2,
+            info = {**saved, "signature": signature, "fast_bounds_version": 4,
                     "fast_params": params, "duration": duration, "bounds": [0.0, duration, False]}
             cache[key] = info
             return info
-        self.log.emit(f"快速检测首尾声音：{clip.name}（本地处理，不识别字幕）")
+        self.log.emit(f"快速检测首尾声音：{clip.name}（仅片头/片尾，保护说话内容）")
         result = self._run([
             self.ffmpeg, "-hide_banner", "-nostats", "-i", str(clip),
             "-map", "0:a:0", "-af",
@@ -979,27 +1220,12 @@ class GroupMergeWorker(QObject):
         events = []
         for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", result.stderr or ""):
             events.append((kind, float(value)))
-        start = 0.0
-        end = duration
-        detected = False
-        if events and events[0][0] == "start" and events[0][1] <= 0.08:
-            first_end = next((value for kind, value in events if kind == "end"), None)
-            if first_end is not None:
-                start = min(duration, first_end)
-                detected = True
-        trailing_start = None
-        for index, (kind, value) in enumerate(events):
-            if kind == "start" and not any(next_kind == "end" for next_kind, _ in events[index + 1:]):
-                trailing_start = value
-        if trailing_start is not None and trailing_start < duration:
-            end = trailing_start
-            detected = True
-        if detected:
-            start = max(0.0, start - max(0, self.settings.get("head_padding_ms", 80)) / 1000.0)
-            end = min(duration, end + max(0, self.settings.get("tail_padding_ms", 120)) / 1000.0)
-        if end <= start + 0.05:
-            start, end, detected = 0.0, duration, False
-        info = {**saved, "signature": signature, "fast_bounds_version": 2,
+        start, end, detected = safe_silence_bounds(
+            duration, events,
+            self.settings.get("head_padding_ms", 80),
+            self.settings.get("tail_padding_ms", 120),
+        )
+        info = {**saved, "signature": signature, "fast_bounds_version": 4,
                 "fast_params": params, "duration": duration, "bounds": [start, end, detected]}
         cache[key] = info
         return info
@@ -1023,138 +1249,279 @@ class GroupMergeWorker(QObject):
                 clip_script = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', clip_script).strip()
 
         trim_mode = self.settings.get("trim_mode", "hybrid")
-        head_ms = self.settings.get("head_padding_ms", 80)
-        tail_ms = self.settings.get("tail_padding_ms", 120)
+        head_ms = int(self.settings.get("head_padding_ms", 100) or 100)
+        tail_ms = int(self.settings.get("tail_padding_ms", 280) or 280)
         srt = str(analysis.get("srt") or "")
         media_duration = probe["duration"]
 
+        reason = ""
         if manual_bounds is not None:
             start = max(0.0, min(media_duration, manual_bounds[0]))
             end = max(start + 0.05, min(media_duration, manual_bounds[1]))
             detected = True
+            reason = "手动切片"
             self.log.emit(f"切片功能：{clip.name} 已应用手动切片区间 {start:.2f}s - {end:.2f}s")
         elif trim_mode == "none":
             start, end, detected = 0.0, media_duration, True
+            reason = "不裁剪"
             self.log.emit(f"不裁剪：{clip.name} 保留完整片段。")
         else:
-            # Text window: prefer user-segment match when a clip_script is available,
-            # otherwise first/last spoken word from the full transcript.
-            if clip_script and srt:
-                text_start, text_end, text_ok = find_matching_srt_bounds(
-                    srt, clip_script, media_duration, head_ms, tail_ms,
-                )
-            elif srt:
-                text_start, text_end, text_ok = speech_trim_bounds(
-                    srt, media_duration, head_ms, tail_ms,
-                )
-            else:
-                text_start, text_end, text_ok = 0.0, media_duration, False
-
-            audio_bounds = analysis.get("bounds")
-            hybrid_bounds = analysis.get("hybrid_bounds")
-
-            if trim_mode == "fast":
-                # 快速声音边界：以本地静音检测为准；没有 bounds 时再退回文案时间轴。
-                if audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
-                    start, end, detected = float(audio_bounds[0]), float(audio_bounds[1]), True
-                elif text_ok:
-                    start, end, detected = text_start, text_end, True
-                    self.log.emit(f"提醒：{clip.name} 未得到静音边界，已改用文案时间轴裁剪。")
-                else:
-                    start, end, detected = 0.0, media_duration, False
-            elif trim_mode == "text":
-                # 仅按文案边界：字幕/分段匹配时间轴；识别失败时再退回声音边界。
-                if text_ok:
-                    start, end, detected = text_start, text_end, True
-                elif audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
-                    start, end, detected = float(audio_bounds[0]), float(audio_bounds[1]), True
-                    self.log.emit(f"提醒：{clip.name} 文案边界不可用，已改用本地声音边界。")
-                else:
-                    start, end, detected = 0.0, media_duration, False
-            else:
-                # 智能混合边界：文案窗口 + 首尾声音修正。
-                # 有分段文案时，按该段匹配窗口再与声音混合，避免被“整段 ASR”hybrid 覆盖。
-                if clip_script and text_ok:
-                    start, end, detected = refine_text_window_with_audio(
-                        text_start, text_end, text_ok, audio_bounds, media_duration,
-                    )
-                elif hybrid_bounds and len(hybrid_bounds) >= 3:
-                    start, end, detected = (
-                        float(hybrid_bounds[0]), float(hybrid_bounds[1]), bool(hybrid_bounds[2]),
-                    )
-                elif text_ok:
-                    start, end, detected = refine_text_window_with_audio(
-                        text_start, text_end, text_ok, audio_bounds, media_duration,
-                    )
-                elif audio_bounds and len(audio_bounds) >= 3 and bool(audio_bounds[2]):
-                    start, end, detected = float(audio_bounds[0]), float(audio_bounds[1]), True
-                else:
-                    start, end, detected = 0.0, media_duration, False
+            start, end, detected, reason = resolve_trim_bounds(
+                trim_mode, srt, clip_script,
+                analysis.get("bounds"), analysis.get("hybrid_bounds"),
+                media_duration, head_ms, tail_ms,
+            )
         if not detected:
-            self.log.emit(f"提醒：{clip.name} 未识别到说话时间，保留完整片段。")
+            self.log.emit(f"提醒：{clip.name} {reason or '未识别边界'}，保留完整片段。")
+            start, end = 0.0, media_duration
         else:
-            self.log.emit(f"去口气音：{clip.name} 保留 {start:.2f}s - {end:.2f}s")
+            spans = _speech_spans(srt)
+            if spans and trim_mode != "none":
+                # 尾底线：末词 + max(尾保护, 450ms)
+                floor_end = min(media_duration, spans[-1][1] + max(0.45, tail_ms / 1000.0))
+                if end < floor_end:
+                    end = floor_end
+                    reason = f"{reason}+尾底线"
+                # 末词距片尾 ≤1.2s：直接用到文件尾（如 14-5 的 preocupa 贴尾）
+                if media_duration - spans[-1][1] <= 1.20:
+                    if end < media_duration - 0.02:
+                        end = media_duration
+                        reason = f"{reason}+贴尾整段"
+            # 能量续尾：ASR 结束后若仍有声，继续延长
+            if trim_mode != "none" and end < media_duration - 0.08:
+                try:
+                    extended = energy_extend_end(
+                        self.ffmpeg, clip, end, media_duration, max_extend=1.8,
+                    )
+                    if extended > end + 0.04:
+                        self.log.emit(
+                            f"能量续尾：{clip.name} {end:.2f}s → {extended:.2f}s"
+                            f"（+{extended - end:.2f}s 补 ASR 未标出的尾音）"
+                        )
+                        end = extended
+                        reason = f"{reason}+能量续尾"
+                except Exception as exc:
+                    self.log.emit(f"提醒：能量续尾跳过 {clip.name}：{exc}")
+            # 片头：start 不得晚于「首词前 120ms」，避免切掉词头辅音
+            if spans and trim_mode != "none":
+                first = spans[0][0]
+                start = min(start, max(0.0, first - 0.12))
+            self.log.emit(
+                f"去口气音：{clip.name} 保留 {start:.2f}s - {end:.2f}s"
+                f"（{reason}｜首保护{head_ms}ms 尾保护{tail_ms}ms）"
+            )
+
+        # 转场预留（v14 自然接缝）：
+        # 旧方案在片头/片尾「垫静音」再 acrossfade → 听感是「停一下再说话」。
+        # 新方案：只在源文件里还有真实余量时多取一点（多为句末静音/气口），
+        # 绝不人工垫静音；合并时用短音频交叉淡化，画面可稍长叠化。
+        transition_pad = 0.0
+        start_silence_pad = 0.0  # 保留字段兼容指纹/日志，v14 恒为 0
+        end_silence_pad = 0.0
+        if total_count > 1:
+            tname = str(self.settings.get("transition_name") or "无转场")
+            if tname and tname != "无转场":
+                try:
+                    td = float(self.settings.get("transition_duration") or 0.22)
+                except (TypeError, ValueError):
+                    td = 0.22
+                # 接缝缓冲不必等于转场全长；0.12~0.28 足够给画面叠化
+                transition_pad = max(0.12, min(0.35, td if td >= 0.10 else 0.22))
+                if index < total_count - 1:
+                    room = media_duration - end
+                    if room > 0.02:
+                        # 只吃真实片尾余量，不造静音
+                        end = min(media_duration, end + min(transition_pad, room))
+                if index > 0:
+                    room = start
+                    if room > 0.02:
+                        start = max(0.0, start - min(transition_pad, room))
+                if transition_pad > 0:
+                    self.log.emit(
+                        f"转场预留：{clip.name} 段{index + 1}/{total_count} "
+                        f"真实余量缓冲≤{transition_pad:.2f}s（不垫静音，避免接缝停顿）"
+                    )
+
         duration = max(0.05, end - start)
         removed = max(0.0, probe["duration"] - duration)
         ratio = (removed / probe["duration"] * 100.0) if probe["duration"] > 0 else 0.0
         self.log.emit(
-            f"时长：{clip.name} 原始 {probe['duration']:.2f}s → 保留 {duration:.2f}s，删减 {removed:.2f}s（{ratio:.1f}%）"
+            f"时长：{clip.name} 原始 {probe['duration']:.2f}s → 取源 {duration:.2f}s"
+            f"，删减 {removed:.2f}s（{ratio:.1f}%）"
         )
         if ratio > 40:
             self.log.emit(f"提醒：{clip.name} 删减超过 40%，请检查文案时间轴或适当调低静音阈值。")
         watermark = Path(watermark) if watermark and Path(watermark).is_file() else None
+        # version 11：片尾不够转场时垫静音/定格，避免 acrossfade 吃真词
         fingerprint = hashlib.sha256(json.dumps({
             "source": self._signature(clip), "start": round(start, 3), "end": round(end, 3),
             "width": target_w, "height": target_h,
             "watermark": self._signature(watermark) if watermark else None,
-            "clean_metadata": bool(self.settings.get("clean_metadata", True)), "version": 5,
+            "clean_metadata": bool(self.settings.get("clean_metadata", True)),
+            "trim_mode": str(trim_mode),
+            "tail_ms": int(tail_ms),
+            "tpad": round(transition_pad, 3),
+            "spad": round(start_silence_pad, 3),
+            "epad": round(end_silence_pad, 3),
+            "index": int(index),
+            "version": 14,  # no silence pad (natural join) + faster encode
         }, sort_keys=True).encode("utf-8")).hexdigest()[:14]
         destination = cache_dir / f"segment_{index + 1:03d}_{fingerprint}.mp4"
         if self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024:
             self.log.emit(f"续接：复用已处理片段 {clip.name}")
             return destination
-        self.log.emit(f"正在裁剪口气音并统一音视频参数：{clip.name}")
-        fade_out = max(0.0, duration - 0.018)
-        # Flow 等服务输出的竖屏素材宽高比常有少量偏差。缩小后 pad 会在
-        # 成品周围留下黑边；改为等比放大铺满并居中裁剪，不拉伸画面。
-        video_filter = (
-            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1,fps=30,format=yuv420p"
+        sp = float(start_silence_pad or 0.0)
+        ep = float(end_silence_pad or 0.0)
+        expect_out = duration + sp + ep
+        self.log.emit(
+            f"正在裁剪口气音并统一音视频参数：{clip.name}"
+            f"（约 {expect_out:.1f}s，编码器 {ENCODER_LABELS.get(self.encoder, self.encoder)}）"
         )
+        # 画面核心：分辨率已一致时跳过 scale/crop（省大量 CPU）；不强行 fps=30（重采样很贵）
+        same_geometry = (
+            int(probe.get("width") or 0) == int(target_w)
+            and int(probe.get("height") or 0) == int(target_h)
+        )
+        if same_geometry:
+            video_core = "setsar=1,format=yuv420p"
+        else:
+            video_core = (
+                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                f"crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1,format=yuv420p"
+            )
+        has_pad = sp > 0.01 or ep > 0.01
+        need_complex = bool(watermark) or has_pad
         command = [
             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(clip), "-ss", f"{start:.3f}",
+            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+            "-i", str(clip),
         ]
-        if watermark:
-            command += ["-loop", "1", "-i", str(watermark)]
-        command += ["-t", f"{duration:.3f}"]
-        if watermark:
+        # —— 快路径：无水印、无垫片 → 简单 -vf/-af，比 filter_complex 轻很多 ——
+        if not need_complex:
+            command += ["-vf", video_core, "-map", "0:v:0"]
+            if probe["audio"]:
+                command += [
+                    "-af",
+                    "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo",
+                    "-map", "0:a:0",
+                ]
+            else:
+                command += ["-an"]
+            if self.settings.get("clean_metadata", True):
+                command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                            "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                            "-map_chapters", "-1"]
+            command += ["-sn", "-dn"]
+            command += encoder_args(
+                self.encoder, self.settings.get("encode_preset", "veryfast"), intermediate=True,
+            )
+            if probe["audio"]:
+                command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000"]
             command += [
-                "-filter_complex",
-                f"[0:v]{video_filter}[base];[1:v]scale={target_w}:{target_h},format=rgba[wm];"
-                "[base][wm]overlay=0:0:eof_action=repeat,format=yuv420p[outv]",
-                "-map", "[outv]",
+                "-t", f"{expect_out:.3f}",
+                "-fps_mode", "cfr", "-movflags", "+faststart",
+                str(destination),
             ]
         else:
-            command += ["-map", "0:v:0", "-vf", video_filter]
-        if probe["audio"]:
+            # 滤镜图：源 → 水印 → 头/尾定格；输出强制 -t 防止 loop 水印挂死
+            wm_idx = None
+            if watermark:
+                command += [
+                    "-loop", "1", "-framerate", "30",
+                    "-t", f"{max(0.25, expect_out):.3f}",
+                    "-i", str(watermark),
+                ]
+                wm_idx = 1
+
+            fc_parts = []
+            if watermark and wm_idx is not None:
+                fc_parts.append(
+                    f"[0:v]{video_core}[base];[{wm_idx}:v]scale={target_w}:{target_h},format=rgba[wm];"
+                    f"[base][wm]overlay=0:0:shortest=1,format=yuv420p[vcore]"
+                )
+            else:
+                fc_parts.append(f"[0:v]{video_core}[vcore]")
+            v_label = "vcore"
+            if sp > 0.01:
+                fc_parts.append(f"[{v_label}]tpad=start_mode=clone:start_duration={sp:.3f}[v1]")
+                v_label = "v1"
+            if ep > 0.01:
+                fc_parts.append(f"[{v_label}]tpad=stop_mode=clone:stop_duration={ep:.3f}[v2]")
+                v_label = "v2"
+
+            a_label = None
+            if probe["audio"]:
+                fc_parts.append(
+                    f"[0:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS[acore]"
+                )
+                a_label = "acore"
+                if sp > 0.01:
+                    fc_parts.append(
+                        f"aevalsrc=0|0:d={sp:.3f}:s=48000,"
+                        f"aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[ah];"
+                        f"[ah][{a_label}]concat=n=2:v=0:a=1[a1]"
+                    )
+                    a_label = "a1"
+                if ep > 0.01:
+                    fc_parts.append(
+                        f"aevalsrc=0|0:d={ep:.3f}:s=48000,"
+                        f"aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[at];"
+                        f"[{a_label}][at]concat=n=2:v=0:a=1[a2]"
+                    )
+                    a_label = "a2"
+                fc_parts.append(
+                    f"[{a_label}]apad=whole_dur={expect_out:.3f},"
+                    f"atrim=0:{expect_out:.3f},asetpts=PTS-STARTPTS[aout]"
+                )
+                a_label = "aout"
+
+            fc = ";".join(fc_parts)
+            command += ["-filter_complex", fc, "-map", f"[{v_label}]"]
+            if a_label:
+                command += ["-map", f"[{a_label}]"]
+            else:
+                command += ["-an"]
+            if self.settings.get("clean_metadata", True):
+                command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
+                            "-map_metadata:p", "-1", "-map_metadata:c", "-1",
+                            "-map_chapters", "-1"]
+            command += ["-sn", "-dn"]
+            command += encoder_args(
+                self.encoder, self.settings.get("encode_preset", "veryfast"), intermediate=True,
+            )
+            if a_label:
+                command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000"]
             command += [
-                "-map", "0:a:0", "-af",
-                f"aresample=48000,aformat=channel_layouts=stereo,afade=t=in:st=0:d=0.018,afade=t=out:st={fade_out:.3f}:d=0.018",
+                "-t", f"{expect_out:.3f}",
+                "-fps_mode", "cfr", "-movflags", "+faststart",
+                str(destination),
             ]
-        if self.settings.get("clean_metadata", True):
-            command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
-                        "-map_metadata:p", "-1", "-map_metadata:c", "-1",
-                        "-map_chapters", "-1"]
-        command += ["-sn", "-dn"]
-        command += encoder_args(self.encoder, self.settings.get("encode_preset", "veryfast"))
-        if probe["audio"]:
-            command += ["-fps_mode", "cfr", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000"]
+        # 8s 片段正常应 <15s；给硬件/水印余量。超时即杀，避免「一直卡在这里」
+        encode_timeout = max(90.0, min(600.0, expect_out * 25.0 + 45.0))
+        t0 = time.monotonic()
+        self._run(
+            command,
+            timeout=encode_timeout,
+            heartbeat_label=clip.name,
+            heartbeat_sec=6.0,
+        )
+        elapsed = time.monotonic() - t0
+        # 校验垫片后时长
+        try:
+            out_dur = float(self._probe(destination)["duration"])
+            if abs(out_dur - expect_out) > 0.35:
+                self.log.emit(
+                    f"提醒：{clip.name} 输出时长 {out_dur:.2f}s 与预期 {expect_out:.2f}s 偏差较大，请检查垫片。"
+                )
+            else:
+                self.log.emit(
+                    f"片段校验：{clip.name} 输出 {out_dur:.2f}s（含垫片，预期≈{expect_out:.2f}s，耗时 {elapsed:.1f}s）"
+                )
+        except Exception:
+            self.log.emit(f"片段处理完成：{clip.name}（耗时 {elapsed:.1f}s）")
         else:
-            command += ["-an"]
-        command += ["-movflags", "+faststart", str(destination)]
-        self._run(command)
-        self.log.emit(f"片段处理完成：{clip.name}")
+            self.log.emit(f"片段处理完成：{clip.name}")
         return destination
 
     def run(self):
@@ -1221,7 +1588,12 @@ class GroupMergeWorker(QObject):
                                     self.settings.get("tail_padding_ms", 120),
                                 ))
                                 analysis_cache[str(clip.resolve())] = analysis
-                                self.log.emit(f"智能混合边界：文案时间轴 + 首尾声音检测已完成 {clip.name}")
+                                hb = analysis["hybrid_bounds"]
+                                self.log.emit(
+                                    f"智能混合边界：{clip.name} → "
+                                    f"{float(hb[0]):.2f}s–{float(hb[1]):.2f}s"
+                                    f"{'' if hb[2] else '（回退完整）'}"
+                                )
                             elif trim_mode == "fast":
                                 self.log.emit(f"快速声音边界：已完成本地首尾检测 {clip.name}")
                             elif trim_mode == "none" and script_mode:
@@ -1285,10 +1657,23 @@ class GroupMergeWorker(QObject):
                         self.log.emit("已启用合成时烧录水印：水印将在片段统一编码时一次完成，后续导出不重复烧录。")
                     else:
                         watermark = None
-                from concurrent.futures import ThreadPoolExecutor
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 import os
-                max_workers = min(4, os.cpu_count() or 4)
-                self.log.emit(f"正在启动多线程并行编码加速（最大并行线程数：{max_workers}）...")
+                # QSV 多开易死锁；NVENC/MF/AMF 可 2 路；CPU 可 4 路。
+                if self.encoder == "qsv":
+                    max_workers = 1
+                    self.log.emit(
+                        "编码策略：Intel Quick Sync 串行（避免多路会话互锁）。"
+                    )
+                elif self.encoder in ("nvenc", "mf", "amf"):
+                    max_workers = min(2, len(clips), os.cpu_count() or 2)
+                    self.log.emit(
+                        f"编码策略：硬件编码并行 {max_workers}"
+                        f"（{ENCODER_LABELS.get(self.encoder, self.encoder)}）。"
+                    )
+                else:
+                    max_workers = min(4, len(clips), os.cpu_count() or 4)
+                    self.log.emit(f"编码策略：CPU 并行 {max_workers} 路。")
                 def run_norm(args):
                     clip, clip_index, total_count = args
                     return self._normalize(
@@ -1299,17 +1684,39 @@ class GroupMergeWorker(QObject):
                 normalized = [None] * len(clips)
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {executor.submit(run_norm, task): i for i, task in enumerate(tasks)}
-                    for future in futures:
+                    for future in as_completed(futures):
                         i = futures[future]
-                        normalized[i] = future.result()
+                        try:
+                            normalized[i] = future.result()
+                        except Exception as exc:
+                            # 取消其余任务，避免超时后仍占 QSV
+                            for other in futures:
+                                other.cancel()
+                            raise RuntimeError(
+                                f"片段编码失败：{tasks[i][0].name} — {exc}"
+                            ) from exc
                         completed_steps += 1
                         self.progress.emit(round(completed_steps / total_steps * 100))
+                if any(path is None or not Path(path).is_file() for path in normalized):
+                    raise RuntimeError(f"{folder.name} 有片段编码失败，无法合成。")
                 if any(not self._probe(path)["audio"] for path in normalized):
                     raise RuntimeError(f"{folder.name} 中存在没有音轨的片段，无法保证无缝合并声音。")
+                # 明确记录拼接顺序：源文件名 → 缓存段文件（便于核对「名字对、内容错」）
+                order_lines = []
+                for i, (src, norm) in enumerate(zip(clips, normalized), 1):
+                    order_lines.append(f"{i:02d}. {Path(src).name} → {Path(norm).name}")
+                self.log.emit("拼接顺序（必须与听感一致）：\n  " + "\n  ".join(order_lines))
                 concat_file = cache_dir / "concat.txt"
                 concat_file.write_text("\n".join(
                     "file '" + path.resolve().as_posix().replace("'", "'\\''") + "'" for path in normalized
                 ), encoding="utf-8")
+                # 旁路清单，方便人工打开核对
+                try:
+                    (cache_dir / "concat_order.txt").write_text(
+                        "\n".join(order_lines) + "\n", encoding="utf-8"
+                    )
+                except Exception:
+                    pass
                 destination = self.output / f"{_safe_name(folder.name)}_去口气音合成.mp4"
                 # Resolve group-specific transition name
                 group_key = folder.resolve().as_posix().lower()
@@ -1348,16 +1755,20 @@ class GroupMergeWorker(QObject):
                             user_dur = float(user_dur) if user_dur is not None else 0.0
                         except (TypeError, ValueError):
                             user_dur = 0.0
-                        preset_dur = float((transition_cfg or {}).get("duration") or 0.5)
+                        preset_dur = float((transition_cfg or {}).get("duration") or 0.22)
                         transition_duration = user_dur if user_dur >= 0.10 else preset_dur
-                        transition_duration = max(0.10, min(2.50, transition_duration))
+                        # 口播默认偏短：画面最长 0.35s，避免长叠化造成「停一下」感
+                        transition_duration = max(0.10, min(0.35, transition_duration))
                         segment_infos = [self._probe(path) for path in normalized]
                         min_segment_dur = min(info["duration"] for info in segment_infos)
-                        # 转场不得超过最短片段的 45%，避免过短素材 xfade 失败
-                        actual_transition_duration = min(transition_duration, max(0.12, min_segment_dur * 0.45))
+                        actual_transition_duration = min(
+                            transition_duration, max(0.10, min_segment_dur * 0.35)
+                        )
+                        # 音画必须同长叠化，否则 A/V 漂移；但不垫静音，叠的是真实句末/句首
                         self.log.emit(
                             f"应用合并转场「{transition_name}」→ xfade={transition_key}，"
-                            f"时长 {actual_transition_duration:.2f}s（设定 {transition_duration:.2f}s），共 {len(normalized)} 段。"
+                            f"时长 {actual_transition_duration:.2f}s（设定 {transition_duration:.2f}s），"
+                            f"共 {len(normalized)} 段｜自然接缝（无静音垫）。"
                         )
                         
                         concat_command = [
@@ -1366,37 +1777,45 @@ class GroupMergeWorker(QObject):
                         for path in normalized:
                             concat_command += ["-i", str(path)]
                             
-                        # Build filter complex
+                        self.log.emit(
+                            f"合并转场画面/声音同步 {actual_transition_duration:.2f}s；"
+                            f"三角淡化，依赖尾保护气口而非垫静音。"
+                        )
                         v_in = "[0:v]"
                         a_in = "[0:a]"
                         current_offset = segment_infos[0]["duration"] - actual_transition_duration
-                        
                         filter_parts = []
                         for i in range(1, len(normalized)):
                             next_v = f"[{i}:v]"
                             next_a = f"[{i}:a]"
                             out_v = f"[v_out_{i}]"
                             out_a = f"[a_out_{i}]"
-                            
                             filter_parts.append(
-                                f"{v_in}{next_v}xfade=transition={transition_key}:duration={actual_transition_duration}:offset={current_offset:.3f}{out_v}"
+                                f"{v_in}{next_v}xfade=transition={transition_key}:"
+                                f"duration={actual_transition_duration:.3f}:offset={current_offset:.3f}{out_v}"
                             )
+                            # tri 比 exp 更干净；同长保证音画同步
                             filter_parts.append(
-                                f"{a_in}{next_a}acrossfade=d={actual_transition_duration}:c1=tri:c2=tri{out_a}"
+                                f"{a_in}{next_a}acrossfade=d={actual_transition_duration:.3f}:"
+                                f"c1=tri:c2=tri{out_a}"
                             )
-                            
                             v_in = out_v
                             a_in = out_a
-                            current_offset = current_offset + segment_infos[i]["duration"] - actual_transition_duration
-                            
+                            current_offset = (
+                                current_offset + segment_infos[i]["duration"]
+                                - actual_transition_duration
+                            )
                         filter_complex_str = ";".join(filter_parts)
                         concat_command += [
                             "-filter_complex", filter_complex_str,
                             "-map", v_in,
-                            "-map", a_in
+                            "-map", a_in,
                         ]
-                        concat_command += encoder_args(self.encoder, self.settings.get("encode_preset", "veryfast"))
-                        concat_command += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+                        concat_command += encoder_args(
+                            self.encoder, self.settings.get("encode_preset", "veryfast"),
+                            intermediate=True,
+                        )
+                        concat_command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
                         if self.settings.get("clean_metadata", True):
                             concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
                                                "-map_metadata:p", "-1", "-map_metadata:c", "-1",

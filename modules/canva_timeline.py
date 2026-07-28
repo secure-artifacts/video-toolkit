@@ -663,26 +663,32 @@ class TimelineCanvas(QWidget):
         self,
         after_ms: int,
         exclude: set[tuple[str, int]] | None = None,
+        scope: str = "media",
     ) -> list[tuple[str, int, int, int]]:
-        """Snapshot clips whose timeline start is at/after after_ms (for ripple push).
+        """Snapshot clips at/after after_ms for ripple push.
 
-        Returns list of (kind, index, original_start, original_end).
-        kind is media track name or \"caption\".
+        scope:
+          - \"media\": video / original_audio / bgm / tts only（不碰字幕）
+          - \"caption\": 字幕轨 internally only（不碰音视频）
+        专业剪辑里字幕与 A/V 默认解绑：改字幕时长不会推动配音，改画面也不会推字幕。
         """
         exclude = exclude or set()
         items: list[tuple[str, int, int, int]] = []
         threshold = int(after_ms) - 2  # tiny tolerance for float/int rounding
-        for kind in ("video", "original_audio", "bgm", "tts"):
-            for index, clip in enumerate(self.media_clips.get(kind, [])):
-                if (kind, index) in exclude:
+        scope = str(scope or "media").lower()
+        if scope == "media":
+            for kind in ("video", "original_audio", "bgm", "tts"):
+                for index, clip in enumerate(self.media_clips.get(kind, [])):
+                    if (kind, index) in exclude:
+                        continue
+                    if int(clip.start) >= threshold:
+                        items.append((kind, index, int(clip.start), int(clip.end)))
+        elif scope == "caption":
+            for index, clip in enumerate(self.clips):
+                if ("caption", index) in exclude:
                     continue
                 if int(clip.start) >= threshold:
-                    items.append((kind, index, int(clip.start), int(clip.end)))
-        for index, clip in enumerate(self.clips):
-            if ("caption", index) in exclude:
-                continue
-            if int(clip.start) >= threshold:
-                items.append(("caption", index, int(clip.start), int(clip.end)))
+                    items.append(("caption", index, int(clip.start), int(clip.end)))
         return items
 
     def _apply_ripple_shift(
@@ -729,11 +735,15 @@ class TimelineCanvas(QWidget):
                 self._drag_snapshot_pushed = True
                 self.selected = ("caption", index)
                 grab = ms - clip.start
-                # Ripple later captions when changing end length
+                # 仅涟漪后续字幕，绝不推动音视频（否则对白对不齐）
                 ripple = ()
                 if edge == "end":
                     ripple = tuple(
-                        self._collect_ripple_after(clip.end, exclude={("caption", index)})
+                        self._collect_ripple_after(
+                            clip.end,
+                            exclude={("caption", index)},
+                            scope="caption",
+                        )
                     )
                 self._drag = (
                     "caption", index, edge, clip.start, clip.end, 0, 0, grab, 0,
@@ -786,10 +796,14 @@ class TimelineCanvas(QWidget):
                     exclude.add(("original_audio", ai))
                 for vi in linked_video:
                     exclude.add(("video", vi))
-                # 拉长/缩短右边缘时，后面所有轨整体后移/前移，避免重叠
+                # 拉长/缩短右边缘：只推动后续音视频轨，字幕独立（方便单独对齐语音）
                 ripple = ()
                 if edge == "end":
-                    ripple = tuple(self._collect_ripple_after(clip.end, exclude=exclude))
+                    ripple = tuple(
+                        self._collect_ripple_after(
+                            clip.end, exclude=exclude, scope="media",
+                        )
+                    )
                 self._drag = (
                     kind, index, edge, clip.start, clip.end,
                     clip.source_start, clip.source_end, grab, src_dur,
@@ -1332,7 +1346,7 @@ class CanvaTimelinePanel(QWidget):
         title = QLabel("多轨时间轴")
         title.setStyleSheet("font-weight:800;color:#f4f4f5;font-size:13px;")
         hint = QLabel(
-            "字幕：拖中间改位置，拖两端改时长 · 音视频：拖右端拉长会把后面各轨整体后推（不重叠）；两端可裁切/恢复源内容 · 拖中间改位置 · 左侧名固定 · 滚轮缩放"
+            "字幕与音视频已解绑：改字幕不会推音频 · 字幕：拖中间改位置/两端改时长（仅推后续字幕）· 音视频：右端拉长只推后续画面/原声/BGM · 左侧名固定 · 滚轮缩放"
         )
         hint.setStyleSheet("color:#8b93a5;font-size:11px;")
         toolbar.addWidget(title)

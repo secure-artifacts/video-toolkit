@@ -32,7 +32,9 @@ python -m PyInstaller \
   --osx-bundle-identifier com.secureartifacts.videotoolkit \
   --icon "$ROOT_DIR/logo.icns" \
   --add-data "$ROOT_DIR/logo.ico:." \
+  --add-data "$ROOT_DIR/VERSION:." \
   --add-data "$ROOT_DIR/resources/fonts:resources/fonts" \
+  --add-data "$ROOT_DIR/resources/language_packs:resources/language_packs" \
   --add-binary "$MEDIA_BIN/ffmpeg:." \
   --add-binary "$MEDIA_BIN/ffprobe:." \
   --collect-data faster_whisper \

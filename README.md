@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.18**
+当前版本：**v1.7.20**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -46,11 +46,22 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.18.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.18/video-toolkit-windows-x64-v1.7.18.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.18/VideoToolkit_Setup_v1.7.18.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.17.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.17/video-toolkit-macos-arm64-v1.7.17.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.17.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.17/video-toolkit-macos-x64-v1.7.17.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.20.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/video-toolkit-windows-x64-v1.7.20.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/VideoToolkit_Setup_v1.7.20.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.20.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/video-toolkit-macos-arm64-v1.7.20.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.20.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/video-toolkit-macos-x64-v1.7.20.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.20 · 2026-07-27
+- 文案校对：字幕识别页弹窗对比原文案与提取字幕，红字标差异，提交只改文字、保留时间戳。
+- 发布修复：CI 按 tag 同步 Inno 版本号；Windows + macOS（arm64 / x64）同次发布。
+
+### v1.7.19 · 2026-07-27
+- 去口气接缝：取消静音垫，转场更短，减少「停一下再说话」。
+- 硬编：新增 Windows MF；自动 NVENC→MF→QSV；驱动过旧时明确提示。
+- 加速：轻量分段滤镜、MF 并行；批处理不再卡在慢速 QSV 探测。
+- 轨道渲染预览（替代 8 秒预览）；流水线 BGM 文件夹/随机截取；水印默认全屏 100%。
+- 稳定性：QSV 防卡死、编码心跳/超时、中间目录清理。
 
 ### v1.7.18 · 2026-07-27
 - 分组合成：成品写入分段元数据；时间轴按原始片段拆成多段视频/原声，便于修「话说一半」。
