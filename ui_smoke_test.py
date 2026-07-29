@@ -112,7 +112,7 @@ assert window.dynamic_caption_page.layer_text.isEnabled()
 window.dynamic_caption_page.layer_text.setText("测试文字图层")
 assert window.dynamic_caption_page.layers[text_row]["text"] == "测试文字图层"
 assert [button.text().replace("└ ", "") for button in window.dynamic_caption_page.left_setting_buttons] == [
-    "批量上传", "编码", "输出与运行",
+    "上传", "编码", "输出/日志",
 ]
 assert window.merge_report_nav_btn.text() == "合成报表"
 assert window.dynamic_caption_page.font.currentText() == "Arial"
@@ -402,8 +402,8 @@ assert window.rename_page.preview.rowCount() > 0 and window.rename_page.preview.
 assert hasattr(window.dynamic_caption_page, "output_to_rename")
 assert not hasattr(window.dynamic_caption_page, "group_resume")
 assert window.dynamic_caption_page.group_trim_mode.currentText() == "智能混合边界（推荐）"
-assert window.dynamic_caption_page.group_head_padding.value() == 80
-assert window.dynamic_caption_page.group_tail_padding.value() == 120
+assert window.dynamic_caption_page.group_head_padding.value() == 100
+assert window.dynamic_caption_page.group_tail_padding.value() == 280
 assert window.dynamic_caption_page.group_silence_threshold.value() == -35
 assert window.dynamic_caption_page.group_silence_min.value() == 180
 assert window.dynamic_caption_page.fix_overlap_btn.text() == "修正重叠"

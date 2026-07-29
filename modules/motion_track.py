@@ -244,6 +244,7 @@ def new_track_record(
     blur: int = 18,
     label: str = "",
     start_ms: int = 0,
+    shape: list[dict] | None = None,
 ) -> dict:
     return {
         "id": uuid.uuid4().hex[:10],
@@ -252,6 +253,17 @@ def new_track_record(
         "label": str(label or "").strip(),
         "start_ms": int(start_ms or 0),
         "points": list(points or []),
+        # Optional polygon vertices relative to the tracked bbox (0–100).
+        # Tracking remains robust because OpenCV follows the enclosing box,
+        # while rendering affects only this irregular polygon.
+        "shape": [
+            {
+                "x": max(0.0, min(100.0, float(point.get("x", 0)))),
+                "y": max(0.0, min(100.0, float(point.get("y", 0)))),
+            }
+            for point in (shape or [])
+            if isinstance(point, dict)
+        ],
     }
 
 
@@ -304,7 +316,8 @@ def apply_tracks_to_video(
     cache = Path(cache_dir) / ".motion_track_cache"
     cache.mkdir(parents=True, exist_ok=True)
     fingerprint = abs(hash(json.dumps(
-        [{"id": t.get("id"), "blur": t.get("blur"), "n": len(t.get("points") or []),
+        [{"id": t.get("id"), "blur": t.get("blur"), "shape": t.get("shape") or [],
+          "n": len(t.get("points") or []),
           "p0": (t.get("points") or [None])[0], "p1": (t.get("points") or [None])[-1]}
          for t in blur_tracks],
         sort_keys=True, ensure_ascii=False,
@@ -362,7 +375,29 @@ def apply_tracks_to_video(
                 if roi.size == 0:
                     continue
                 blurred = cv2.GaussianBlur(roi, (k, k), 0)
-                frame[y0:y1, x0:x1] = blurred
+                shape = [
+                    point for point in (track.get("shape") or [])
+                    if isinstance(point, dict)
+                ]
+                if len(shape) >= 3:
+                    polygon = np.array([
+                        [
+                            max(0, min(ww - 1, round(float(point.get("x", 0)) / 100 * ww))),
+                            max(0, min(hh - 1, round(float(point.get("y", 0)) / 100 * hh))),
+                        ]
+                        for point in shape
+                    ], dtype=np.int32)
+                    region_mask = np.zeros((hh, ww), dtype=np.uint8)
+                    cv2.fillPoly(region_mask, [polygon], 255)
+                    # A tiny feather removes stair-stepped polygon edges.
+                    region_mask = cv2.GaussianBlur(region_mask, (3, 3), 0)
+                    alpha = (region_mask.astype(np.float32) / 255.0)[..., None]
+                    frame[y0:y1, x0:x1] = (
+                        blurred.astype(np.float32) * alpha
+                        + roi.astype(np.float32) * (1.0 - alpha)
+                    ).astype(np.uint8)
+                else:
+                    frame[y0:y1, x0:x1] = blurred
                 label = str(track.get("label") or "").strip()
                 if label:
                     cv2.putText(
