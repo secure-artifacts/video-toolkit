@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.20**
+当前版本：**v1.7.21**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -42,15 +42,36 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 视频效果和图片效果页顶部均显示当前选中的默认效果，选中按钮同时使用蓝色
 高亮边框，避免点击后无法确认是否生效。
 
+界面会根据窗口宽度自动压缩按钮文字、收紧设置项并通过悬浮提示显示完整说明，
+小屏幕不再因固定宽高隐藏关键操作。字幕识别、合成等长任务使用精简状态提示，
+详细过程统一写入“输出与日志”。
+
+时间轴新增“覆盖编辑”和“插入编辑”：把图片拖到切点会替换同长度画面、保持原始
+音轨不动；把视频拖到切点会插入视频及其自带声音，并让后续视频和原声同步后移。
+声明叠加轨支持文字、规则蒙版与透明 PNG 模板，可设置开始/结束时间、淡入淡出，
+并在轨道上拖动位置或边缘调整时长。PNG 的预览坐标与最终 FFmpeg 渲染使用同一套
+中心点换算。隐私追踪支持矩形或自定义多边形区域，跟踪路径用于仅模糊选定区域。
+
 ## 下载
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.20.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/video-toolkit-windows-x64-v1.7.20.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/VideoToolkit_Setup_v1.7.20.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.20.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/video-toolkit-macos-arm64-v1.7.20.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.20.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.20/video-toolkit-macos-x64-v1.7.20.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.21.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/video-toolkit-windows-x64-v1.7.21.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/VideoToolkit_Setup_v1.7.21.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.21.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/video-toolkit-macos-arm64-v1.7.21.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.21.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/video-toolkit-macos-x64-v1.7.21.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.21 · 2026-07-29
+- 自适应界面：小屏幕自动收紧按钮与双列设置，长文字精简显示并保留完整悬浮提示。
+- 时间轴编辑：图片覆盖编辑不移动原声；视频插入编辑会锁定并同步移动视频与自带音轨。
+- 声明叠加：文字、蒙版和 PNG 模板可按时间加入独立轨道，支持拖动、边缘改时长和淡入淡出。
+- 隐私追踪：新增自定义多边形区域，最终渲染只模糊选区；矩形模式继续保留。
+- 渲染一致性：统一 PNG 预览与导出的中心点坐标，修复实际成品位置偏移；导出保留音频。
+- 字幕与效果：字幕时间戳恢复直接编辑；转场和图片效果明确显示当前选中项；新增网红色块跟读预设及颜色配置。
+- 性能与稳定性：时间轴、叠加层和追踪结果按参数指纹复用缓存，旧布局缓存自动失效。
+- 预设可靠性：字幕预设保存、导入、删除与排序后立即落盘，避免快速刷新时丢失刚修改的预设。
+- 成品清理：整批渲染全部成功后自动删除时间轴/蒙版/追踪缓存及输出目录根层 JSON、ASS、临时文件；失败或中止时保留断点文件。
 
 ### v1.7.20 · 2026-07-27
 - 文案校对：字幕识别页弹窗对比原文案与提取字幕，红字标差异，提交只改文字、保留时间戳。
@@ -289,7 +310,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.6.8"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.21"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -301,9 +322,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 2. 构建 macOS Apple Silicon 和 Intel 版本。
 3. 验证 FFmpeg、FFprobe 与 ONNX Runtime。
 4. 为安装包生成 Build Provenance Attestation。
-5. 创建 GitHub Release 并上传三个 ZIP。
+5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
 
 ```bash
-git tag -a v1.6.8 -m "Release version 1.6.8"
-git push origin v1.6.8
+git tag -a v1.7.21 -m "Release version 1.7.21"
+git push origin v1.7.21
 ```

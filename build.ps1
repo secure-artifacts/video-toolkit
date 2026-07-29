@@ -6,7 +6,11 @@ if ([string]::IsNullOrWhiteSpace($version)) { $version = $env:GITHUB_REF_NAME }
 if ([string]::IsNullOrWhiteSpace($version)) {
   try { $version = (& git -C $root describe --tags --abbrev=0 2>$null).Trim() } catch { $version = '' }
 }
-if ([string]::IsNullOrWhiteSpace($version)) { $version = '1.7.12' }
+if ([string]::IsNullOrWhiteSpace($version)) {
+  $versionFile = Join-Path $root 'VERSION'
+  if (Test-Path $versionFile) { $version = (Get-Content -Raw -LiteralPath $versionFile).Trim() }
+}
+if ([string]::IsNullOrWhiteSpace($version)) { $version = '1.7.21' }
 $version = $version.Trim().TrimStart('v')
 if ($version -notmatch '^[0-9A-Za-z._-]+$') { throw "Invalid application version: $version" }
 $versionHook = Join-Path $env:TEMP ("video_toolkit_version_" + [guid]::NewGuid().ToString('N') + '.py')

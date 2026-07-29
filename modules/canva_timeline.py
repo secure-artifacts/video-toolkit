@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import struct
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -62,6 +64,8 @@ class MediaClip:
     name: str = ""
     # Full source media length in ms; allows edge-drag to restore trimmed content.
     source_duration: int = 0
+    media_type: str = "video"
+    path: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -71,6 +75,8 @@ class MediaClip:
             "source_end": self.source_end,
             "name": self.name,
             "source_duration": self.source_duration or max(self.source_end, 0),
+            "media_type": self.media_type,
+            "path": self.path,
         }
 
     def resolved_source_duration(self, fallback: int = 0) -> int:
@@ -147,8 +153,8 @@ class TimelineCanvas(QWidget):
     zoomWheel = Signal(int, int)
 
     LABEL_WIDTH = 112
-    RULER_HEIGHT = 30
-    TRACK_HEIGHT = 44
+    RULER_HEIGHT = 26
+    TRACK_HEIGHT = 38
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -167,8 +173,12 @@ class TimelineCanvas(QWidget):
         self.tts_name = ""
         self.original_audio_enabled = True
         self.transitions: list[dict] = []
+        # Timed declaration layers. Each entry contains start/end and a
+        # serializable text or mask layer payload used by the final ASS render.
+        self.overlays: list[dict] = []
         self.transition_names: list[str] = []
         self.transition_duration_ms = 500
+        self.image_overwrite_duration_ms = 1000
         self.media_clips: dict[str, list[MediaClip]] = {
             "video": [],
             "original_audio": [],
@@ -185,7 +195,7 @@ class TimelineCanvas(QWidget):
         self._max_history = 40
         self._history_locked = False
         self._drag_snapshot_pushed = False
-        self.setMinimumHeight(self.RULER_HEIGHT + self.TRACK_HEIGHT * 5 + 8)
+        self.setMinimumHeight(self.RULER_HEIGHT + self.TRACK_HEIGHT * 6 + 8)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -227,30 +237,39 @@ class TimelineCanvas(QWidget):
             for item in tracks_state.get(kind, []) or []:
                 try:
                     src_end = int(item["source_end"])
-                    src_dur = max(
-                        int(item.get("source_duration") or 0),
-                        src_end,
-                        full_ms,
-                        self.media_source_duration_ms,
-                    )
+                    item_path=str(item.get("path", "") or "")
+                    if item_path:
+                        src_dur=max(int(item.get("source_duration") or 0),src_end)
+                    else:
+                        src_dur = max(
+                            int(item.get("source_duration") or 0),
+                            src_end,
+                            full_ms,
+                            self.media_source_duration_ms,
+                        )
                     restored.append(
                         MediaClip(
                             int(item["start"]), int(item["end"]),
                             int(item["source_start"]), src_end,
                             str(item.get("name", "")),
                             source_duration=src_dur,
+                            media_type=str(item.get("media_type", "video") or "video"),
+                            path=item_path,
                         )
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
             for clip in restored:
-                self.media_source_duration_ms = max(
-                    self.media_source_duration_ms,
-                    clip.resolved_source_duration(self.media_source_duration_ms),
-                )
-                clip.source_duration = max(
-                    clip.source_duration or 0, self.media_source_duration_ms
-                )
+                if clip.path:
+                    clip.source_duration=max(clip.source_duration or 0,clip.source_end)
+                else:
+                    self.media_source_duration_ms = max(
+                        self.media_source_duration_ms,
+                        clip.resolved_source_duration(self.media_source_duration_ms),
+                    )
+                    clip.source_duration = max(
+                        clip.source_duration or 0, self.media_source_duration_ms
+                    )
             # Only replace when payload has bars for this kind (empty list clears intentionally)
             if kind in tracks_state:
                 self.media_clips[kind] = restored
@@ -300,6 +319,7 @@ class TimelineCanvas(QWidget):
             )
             self.selected = None
             self.transitions = []
+            self.overlays = []
         # 关键：同项目第二次刷新（播放器时长就绪 / 分段元数据就绪）也必须套用 tracks。
         # 以前仅在 project_key 变化时应用，导致要来回切换几次才出现分段轨。
         if tracks_state:
@@ -312,6 +332,16 @@ class TimelineCanvas(QWidget):
                 }
                 for item in (edit_state or {}).get("transitions", [])
                 if item.get("name")
+            ]
+            self.overlays = [
+                {
+                    "start": max(0, int(item.get("start", 0))),
+                    "end": max(80, int(item.get("end", 3000))),
+                    "name": str(item.get("name", "声明叠加")),
+                    "layer": dict(item.get("layer") or {}),
+                }
+                for item in (edit_state or {}).get("overlays", [])
+                if isinstance(item, dict) and isinstance(item.get("layer"), dict)
             ]
         elif not is_new_project:
             if "bgm" not in tracks_state:
@@ -329,6 +359,235 @@ class TimelineCanvas(QWidget):
 
     def set_transition_duration(self, duration_ms: int):
         self.transition_duration_ms = max(100, int(duration_ms))
+
+    def set_image_overwrite_duration(self, duration_ms: int):
+        self.image_overwrite_duration_ms = max(100, int(duration_ms))
+
+    def add_overlay(self, layer: dict, start_ms: int, end_ms: int):
+        """Add a time-limited declaration overlay without touching A/V tracks."""
+        if not isinstance(layer, dict) or layer.get("type") not in ("text", "mask", "image"):
+            return False
+        start = max(0, min(int(start_ms), self.duration_ms - 80))
+        end = max(start + 80, min(int(end_ms), self.duration_ms))
+        self.push_undo()
+        payload = dict(layer)
+        payload["enabled"] = True
+        self.overlays.append(
+            {
+                "start": start,
+                "end": end,
+                "name": str(payload.get("name") or {
+                    "text": "声明文字",
+                    "mask": "声明蒙版",
+                    "image": "PNG 声明图",
+                }.get(payload.get("type"), "声明叠加")),
+                "layer": payload,
+            }
+        )
+        self.overlays.sort(key=lambda item: (int(item["start"]), int(item["end"])))
+        self.selected = ("overlay", self.overlays.index(next(
+            item for item in self.overlays
+            if item["start"] == start and item["end"] == end and item["layer"] is payload
+        )))
+        self._emit_timeline_state()
+        self.update()
+        return True
+
+    def update_overlay_template(self, layer: dict) -> int:
+        """Synchronize geometry/style edits to clips created from this template."""
+        if not isinstance(layer,dict):
+            return 0
+        template_id=str(layer.get("template_id",""))
+        changed=0
+        for item in self.overlays:
+            current=dict(item.get("layer") or {})
+            same_id=bool(template_id and current.get("template_id")==template_id)
+            same_legacy=(
+                not template_id
+                and current.get("type")==layer.get("type")
+                and current.get("name")==layer.get("name")
+            )
+            if not (same_id or same_legacy):
+                continue
+            # Clip timing/fades stay clip-specific; visual template fields update.
+            preserved={
+                key:current[key] for key in ("fade_in_ms","fade_out_ms")
+                if key in current
+            }
+            updated={
+                key:value for key,value in layer.items()
+                if key!="timeline_template_only"
+            }
+            updated.update(preserved)
+            updated["enabled"]=True
+            item["layer"]=updated
+            item["name"]=str(updated.get("name") or item.get("name") or "声明叠加")
+            changed+=1
+        if changed:
+            self._emit_timeline_state()
+            self.update()
+        return changed
+
+    @staticmethod
+    def _is_image_path(path: str) -> bool:
+        return Path(path).suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff",
+        }
+
+    @staticmethod
+    def _is_video_path(path: str) -> bool:
+        return Path(path).suffix.lower() in {
+            ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mts", ".m2ts",
+        }
+
+    def _probe_media(self, path: str) -> tuple[int, bool]:
+        """Return (duration_ms, has_audio) using the configured FFmpeg bundle."""
+        source=Path(path)
+        ffmpeg=Path(str(getattr(self,"ffmpeg_path","ffmpeg") or "ffmpeg"))
+        ffprobe=ffmpeg.with_name("ffprobe"+ffmpeg.suffix)
+        probe_cmd=str(ffprobe) if ffprobe.is_file() else "ffprobe"
+        try:
+            result=subprocess.run(
+                [probe_cmd,"-v","error","-show_entries","format=duration",
+                 "-show_entries","stream=codec_type","-of","json",str(source)],
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                encoding="utf-8",errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess,"CREATE_NO_WINDOW") else 0,
+            )
+            if result.returncode==0:
+                import json
+                data=json.loads(result.stdout or "{}")
+                duration=max(80,round(float((data.get("format") or {}).get("duration") or 0)*1000))
+                has_audio=any(item.get("codec_type")=="audio" for item in data.get("streams",[]))
+                return duration,has_audio
+        except Exception:
+            pass
+        try:
+            result=subprocess.run(
+                [str(ffmpeg),"-hide_banner","-i",str(source)],
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                encoding="utf-8",errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess,"CREATE_NO_WINDOW") else 0,
+            )
+            text=result.stderr or ""
+            match=re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",text)
+            if match:
+                seconds=int(match.group(1))*3600+int(match.group(2))*60+float(match.group(3))
+                return max(80,round(seconds*1000)),bool(re.search(r"Stream\s+#.*Audio:",text))
+        except Exception:
+            pass
+        return 0,False
+
+    def insert_video_clip(self, video_path: str, position: int):
+        """Insert external video and its own audio as a locked A/V pair."""
+        source=Path(str(video_path or ""))
+        if not source.is_file() or not self._is_video_path(str(source)):
+            return False
+        source_duration,has_audio=self._probe_media(str(source))
+        if source_duration<80:
+            return False
+        position=max(0,min(int(position),self.duration_ms))
+        self.push_undo()
+        # Split the main picture and its linked original audio at the insertion point.
+        for index,clip in enumerate(list(self.media_clips.get("video",[]))):
+            if clip.start+80<position<clip.end-80:
+                self._split_clip("video",index,position)
+                break
+        # Ripple only the video and original-audio pair. Captions/BGM/TTS remain
+        # independently editable, matching the existing track-lock semantics.
+        for kind in ("video","original_audio"):
+            for clip in self.media_clips.get(kind,[]):
+                if clip.start>=position-2:
+                    clip.start+=source_duration
+                    clip.end+=source_duration
+        inserted=MediaClip(
+            position,position+source_duration,0,source_duration,source.name,
+            source_duration,"external_video",str(source.resolve()),
+        )
+        self.media_clips["video"].append(inserted)
+        self.media_clips["video"].sort(key=lambda clip:(clip.start,clip.end))
+        if has_audio:
+            self.media_clips["original_audio"].append(
+                MediaClip(
+                    position,position+source_duration,0,source_duration,
+                    f"{source.name} · 音频",source_duration,
+                    "external_audio",str(source.resolve()),
+                )
+            )
+            self.media_clips["original_audio"].sort(key=lambda clip:(clip.start,clip.end))
+        self.duration_ms+=source_duration
+        self.selected=("video",self.media_clips["video"].index(inserted))
+        self._emit_timeline_state()
+        self._update_width()
+        self.update()
+        return True
+
+    def overwrite_cut_with_image(self, image_path: str, position: int):
+        """Overwrite existing picture time around an edit point without growing the timeline."""
+        image = Path(str(image_path or ""))
+        if not image.is_file() or not self._is_image_path(str(image)):
+            return False
+        video_clips = self.media_clips.get("video", [])
+        if not video_clips:
+            return False
+        boundaries = sorted(
+            {int(clip.end) for clip in video_clips[:-1]}
+            | {int(clip.start) for clip in video_clips[1:]}
+        )
+        position = max(0, min(int(position), self.duration_ms))
+        if boundaries:
+            position = min(boundaries, key=lambda value: abs(value - position))
+        duration = min(
+            max(100, int(self.image_overwrite_duration_ms)),
+            max(100, self.duration_ms),
+        )
+        start = max(0, position - duration // 2)
+        end = min(self.duration_ms, start + duration)
+        start = max(0, end - duration)
+        if end - start < 80:
+            return False
+
+        self.push_undo()
+        kept: list[MediaClip] = []
+        for clip in video_clips:
+            src_dur = clip.resolved_source_duration()
+            if clip.end <= start or clip.start >= end:
+                kept.append(clip)
+                continue
+            if clip.start < start:
+                left_source_end = clip.source_start + (start - clip.start)
+                kept.append(
+                    MediaClip(
+                        clip.start, start, clip.source_start, left_source_end,
+                        clip.name, src_dur, clip.media_type, clip.path,
+                    )
+                )
+            if clip.end > end:
+                right_source_start = clip.source_start + (end - clip.start)
+                kept.append(
+                    MediaClip(
+                        end, clip.end, right_source_start, clip.source_end,
+                        clip.name, src_dur, clip.media_type, clip.path,
+                    )
+                )
+        kept.append(
+            MediaClip(
+                start, end, 0, end - start, image.name, end - start,
+                "image", str(image.resolve()),
+            )
+        )
+        kept.sort(key=lambda clip: (clip.start, clip.end))
+        self.media_clips["video"] = kept
+        # 覆盖编辑只替换画面。视频原声音轨保持原始起止和连续声音，
+        # 不切开、不静音，也不随着图片片段向后移动。
+        self.selected = (
+            "video",
+            next(index for index, clip in enumerate(kept) if clip.media_type == "image"
+                 and clip.start == start and clip.end == end),
+        )
+        self._emit_timeline_state()
+        self.update()
+        return True
 
     def add_transition(self, name: str, position: int):
         name = str(name or "").strip()
@@ -370,8 +629,14 @@ class TimelineCanvas(QWidget):
         source_cut = clip.source_start + (cut - clip.start)
         src_dur = clip.resolved_source_duration()
         tracks[index:index + 1] = [
-            MediaClip(clip.start, cut, clip.source_start, source_cut, clip.name, src_dur),
-            MediaClip(cut, clip.end, source_cut, clip.source_end, clip.name, src_dur),
+            MediaClip(
+                clip.start, cut, clip.source_start, source_cut, clip.name, src_dur,
+                clip.media_type, clip.path,
+            ),
+            MediaClip(
+                cut, clip.end, source_cut, clip.source_end, clip.name, src_dur,
+                clip.media_type, clip.path,
+            ),
         ]
         if kind == "video":
             self._split_linked_original_audio(cut)
@@ -435,6 +700,7 @@ class TimelineCanvas(QWidget):
             ("视频轨道", self.video_name),
             ("视频声音", "已静音" if not self.original_audio_enabled else "视频原声"),
             ("字幕时间块", ""),
+            ("声明叠加", "文字 / 蒙版 / PNG"),
             ("BGM 伴奏", self.bgm_name),
             ("文字配音", self.tts_name),
         )
@@ -444,7 +710,10 @@ class TimelineCanvas(QWidget):
 
     @staticmethod
     def _track_index(kind: str) -> int:
-        return {"video": 0, "original_audio": 1, "caption": 2, "bgm": 3, "tts": 4}[kind]
+        return {
+            "video": 0, "original_audio": 1, "caption": 2,
+            "overlay": 3, "bgm": 4, "tts": 5,
+        }[kind]
 
     def _track_y(self, kind: str) -> int:
         return self.RULER_HEIGHT + self._track_index(kind) * self.TRACK_HEIGHT
@@ -455,7 +724,7 @@ class TimelineCanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#111318"))
 
         # Track row backgrounds (full content width; names are on the fixed left rail).
-        for index in range(5):
+        for index in range(6):
             y = self.RULER_HEIGHT + index * self.TRACK_HEIGHT
             painter.fillRect(
                 0,
@@ -527,27 +796,57 @@ class TimelineCanvas(QWidget):
             self.video_waveform if self.original_audio_enabled else [],
         )
 
-        caption_y = self._caption_y() + 7
+        caption_y = self._caption_y() + 4
+        caption_height = self.TRACK_HEIGHT - 8
         for index, clip in enumerate(self.clips):
             left, right = self._x(clip.start), self._x(clip.end)
             width = max(4.0, right - left)
             selected = self.selected == ("caption", index)
             painter.setPen(QPen(QColor("#e2dcff") if selected else QColor("#b7a7ff"), 2 if selected else 1))
             painter.setBrush(QColor("#765fd1"))
-            painter.drawRoundedRect(int(left), caption_y, int(width), 40, 5, 5)
+            painter.drawRoundedRect(int(left), caption_y, int(width), caption_height, 5, 5)
             # Edge handles for trim; middle drag moves the whole subtitle block
             handle_w = max(5, min(10, int(width // 5)))
-            painter.fillRect(int(left), caption_y, handle_w, 40, QColor("#e2dcff"))
-            painter.fillRect(int(right - handle_w), caption_y, handle_w, 40, QColor("#e2dcff"))
+            painter.fillRect(int(left), caption_y, handle_w, caption_height, QColor("#e2dcff"))
+            painter.fillRect(int(right - handle_w), caption_y, handle_w, caption_height, QColor("#e2dcff"))
             painter.setPen(QColor("#ffffff"))
             painter.setFont(QFont("Microsoft YaHei UI", 8))
             text = " ".join(clip.text.splitlines())
             painter.drawText(
                 int(left + handle_w + 4),
-                caption_y + 25,
+                caption_y + 22,
                 painter.fontMetrics().elidedText(
                     text, Qt.TextElideMode.ElideRight, max(0, int(width - handle_w * 2 - 8))
                 ),
+            )
+
+        overlay_y = self._track_y("overlay") + 4
+        for index, item in enumerate(self.overlays):
+            left, right = self._x(int(item.get("start", 0))), self._x(int(item.get("end", 0)))
+            width = max(4, int(right - left))
+            selected = self.selected == ("overlay", index)
+            layer_type = str((item.get("layer") or {}).get("type", "text"))
+            fill = QColor({
+                "text": "#0f766e",
+                "mask": "#7c2d92",
+                "image": "#b45309",
+            }.get(layer_type, "#475569"))
+            painter.setPen(QPen(QColor("#f8fafc") if selected else fill.lighter(145), 2 if selected else 1))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(int(left), overlay_y, width, self.TRACK_HEIGHT - 8, 5, 5)
+            if selected and width >= 16:
+                handle_w = max(5, min(9, width // 6))
+                painter.fillRect(int(left), overlay_y, handle_w, self.TRACK_HEIGHT - 8, QColor("#f8fafc"))
+                painter.fillRect(int(right - handle_w), overlay_y, handle_w, self.TRACK_HEIGHT - 8, QColor("#f8fafc"))
+            painter.setPen(QColor("#ffffff"))
+            title = str(item.get("name") or {
+                "text": "声明文字",
+                "mask": "声明蒙版",
+                "image": "PNG 声明图",
+            }.get(layer_type, "声明叠加"))
+            painter.drawText(
+                int(left + 8), overlay_y + 23,
+                painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, max(0, width - 16)),
             )
 
         self._draw_media_track(painter, "bgm", QColor("#275f50"), QColor("#6ee7b7"), self.bgm_waveform)
@@ -575,22 +874,33 @@ class TimelineCanvas(QWidget):
             left, right = self._x(clip.start), self._x(clip.end)
             width = max(4, int(right - left))
             selected = self.selected == (kind, index)
-            painter.setPen(QPen(QColor("#f8fafc") if selected else fill.lighter(135), 2 if selected else 1))
-            painter.setBrush(fill)
-            painter.drawRoundedRect(int(left), y, width, 36, 5, 5)
+            clip_fill = (
+                QColor("#7c3aed") if kind == "video" and clip.media_type == "image"
+                else QColor("#0369a1") if clip.media_type in ("external_video","external_audio")
+                else fill
+            )
+            painter.setPen(QPen(QColor("#f8fafc") if selected else clip_fill.lighter(135), 2 if selected else 1))
+            painter.setBrush(clip_fill)
+            painter.drawRoundedRect(int(left), y, width, self.TRACK_HEIGHT - 8, 5, 5)
             painter.setPen(QColor("#eef2ff"))
             painter.drawText(
                 int(left + 8),
                 y + 14,
                 painter.fontMetrics().elidedText(
-                    clip.name or kind, Qt.TextElideMode.ElideRight, max(0, width - 16)
+                    (
+                        f"图片覆盖 · {clip.name}" if clip.media_type == "image"
+                        else f"插入视频 · {clip.name}" if clip.media_type == "external_video"
+                        else f"视频音频 · {clip.name}" if clip.media_type == "external_audio"
+                        else (clip.name or kind)
+                    ),
+                    Qt.TextElideMode.ElideRight, max(0, width - 16)
                 ),
             )
             # Edge handles: drag left/right edges to trim or restore source content
             if selected and width >= 16:
                 handle_w = max(4, min(8, width // 6))
-                painter.fillRect(int(left), y, handle_w, 36, QColor("#f8fafc"))
-                painter.fillRect(int(right - handle_w), y, handle_w, 36, QColor("#f8fafc"))
+                painter.fillRect(int(left), y, handle_w, self.TRACK_HEIGHT - 8, QColor("#f8fafc"))
+                painter.fillRect(int(right - handle_w), y, handle_w, self.TRACK_HEIGHT - 8, QColor("#f8fafc"))
             if waveform:
                 self._draw_waveform_segment(
                     painter, waveform, clip, y + 25, waveform_color
@@ -753,6 +1063,24 @@ class TimelineCanvas(QWidget):
                     self.seekRequested.emit(clip.start)
                 self.update()
                 return
+        overlay_top = self._track_y("overlay")
+        if overlay_top <= y <= overlay_top + self.TRACK_HEIGHT:
+            for index, item in enumerate(self.overlays):
+                left = self._x(int(item.get("start", 0)))
+                right = self._x(int(item.get("end", 0)))
+                edge = self._hit_media_edge(x, left, right)
+                if not edge:
+                    continue
+                self.push_undo()
+                self._drag_snapshot_pushed = True
+                self.selected = ("overlay", index)
+                start = int(item.get("start", 0)); end = int(item.get("end", start + 80))
+                self._drag = (
+                    "overlay", index, edge, start, end, 0, 0, ms - start, 0, (), (),
+                )
+                self.seekRequested.emit(ms)
+                self.update()
+                return
         for kind in ("video", "original_audio", "bgm", "tts"):
             top = self._track_y(kind)
             if not (top <= y <= top + self.TRACK_HEIGHT):
@@ -767,11 +1095,14 @@ class TimelineCanvas(QWidget):
                 self.selected = (kind, index)
                 grab = ms - clip.start
                 # Always use full media length so over-trimmed audio/video can be dragged back.
-                src_dur = max(
-                    clip.resolved_source_duration(self.media_source_duration_ms),
-                    self.media_source_duration_ms,
-                    clip.source_end,
-                )
+                if clip.path:
+                    src_dur=max(clip.resolved_source_duration(),clip.source_end)
+                else:
+                    src_dur = max(
+                        clip.resolved_source_duration(self.media_source_duration_ms),
+                        self.media_source_duration_ms,
+                        clip.source_end,
+                    )
                 clip.source_duration = src_dur
                 # Video edge drag also drives co-aligned original_audio (same start/end).
                 linked_audio = []
@@ -842,30 +1173,46 @@ class TimelineCanvas(QWidget):
         linked_video = drag[11] if len(drag) > 11 else ()
         value = self._ms(x)
         min_len = 80
-        if kind == "caption":
-            if not (0 <= index < len(self.clips)):
+        if kind in ("caption", "overlay"):
+            target_items = self.clips if kind == "caption" else self.overlays
+            if not (0 <= index < len(target_items)):
                 return
-            clip = self.clips[index]
+            clip = target_items[index]
+            clip_start = int(clip.start if kind == "caption" else clip.get("start", 0))
+            clip_end = int(clip.end if kind == "caption" else clip.get("end", clip_start + min_len))
             if edge == "start":
-                lower = self.clips[index - 1].end if index else 0
-                clip.start = max(lower, min(value, clip.end - min_len))
+                lower = 0
+                new_start = max(lower, min(value, clip_end - min_len))
+                if kind == "caption":
+                    clip.start = new_start
+                else:
+                    clip["start"] = new_start
             elif edge == "end":
-                # No hard clamp to next caption — ripple later captions instead
-                clip.end = max(value, clip.start + min_len)
-                ripple_delta = clip.end - original_end
-                self._apply_ripple_shift(ripple_items, ripple_delta)
-                self._grow_timeline_if_needed(clip.end)
-            else:  # move whole subtitle block
+                new_end = max(value, clip_start + min_len)
+                if kind == "caption":
+                    clip.end = new_end
+                    ripple_delta = clip.end - original_end
+                    self._apply_ripple_shift(ripple_items, ripple_delta)
+                else:
+                    clip["end"] = new_end
+                self._grow_timeline_if_needed(new_end)
+            else:  # move whole subtitle / declaration block
                 length = original_end - original_start
                 new_start = max(0, value - int(grab_ms))
-                # Soft neighbor clamps (allow slight overlap prevention)
-                if index > 0:
-                    new_start = max(new_start, self.clips[index - 1].end)
-                if index + 1 < len(self.clips):
-                    new_start = min(new_start, self.clips[index + 1].start - length)
-                clip.start = max(0, new_start)
-                clip.end = clip.start + length
-                self._grow_timeline_if_needed(clip.end)
+                if kind == "caption":
+                    # Soft neighbor clamps (allow slight overlap prevention)
+                    if index > 0:
+                        new_start = max(new_start, self.clips[index - 1].end)
+                    if index + 1 < len(self.clips):
+                        new_start = min(new_start, self.clips[index + 1].start - length)
+                    clip.start = max(0, new_start)
+                    clip.end = clip.start + length
+                    new_end = clip.end
+                else:
+                    clip["start"] = max(0, new_start)
+                    clip["end"] = clip["start"] + length
+                    new_end = clip["end"]
+                self._grow_timeline_if_needed(new_end)
         else:
             tracks = self.media_clips.get(kind, [])
             if not (0 <= index < len(tracks)):
@@ -951,6 +1298,18 @@ class TimelineCanvas(QWidget):
                 if edge == "move":
                     self.setCursor(Qt.CursorShape.SizeAllCursor)
                     return
+        overlay_top = self._track_y("overlay")
+        if overlay_top <= y <= overlay_top + self.TRACK_HEIGHT:
+            for item in self.overlays:
+                edge = self._hit_media_edge(
+                    x, self._x(int(item.get("start", 0))), self._x(int(item.get("end", 0)))
+                )
+                if edge in ("start", "end"):
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    return
+                if edge == "move":
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                    return
         for kind in ("video", "original_audio", "bgm", "tts"):
             top = self._track_y(kind)
             if not (top <= y <= top + self.TRACK_HEIGHT):
@@ -981,18 +1340,60 @@ class TimelineCanvas(QWidget):
             self.update()
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasFormat(TransitionPresetButton.MIME_TYPE):
+        has_image = any(
+            url.isLocalFile() and self._is_image_path(url.toLocalFile())
+            for url in event.mimeData().urls()
+        )
+        has_video = any(
+            url.isLocalFile() and self._is_video_path(url.toLocalFile())
+            for url in event.mimeData().urls()
+        )
+        if event.mimeData().hasFormat(TransitionPresetButton.MIME_TYPE) or has_image or has_video:
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasFormat(TransitionPresetButton.MIME_TYPE):
+        has_image = any(
+            url.isLocalFile() and self._is_image_path(url.toLocalFile())
+            for url in event.mimeData().urls()
+        )
+        has_video = any(
+            url.isLocalFile() and self._is_video_path(url.toLocalFile())
+            for url in event.mimeData().urls()
+        )
+        if event.mimeData().hasFormat(TransitionPresetButton.MIME_TYPE) or has_image or has_video:
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
+        video_path = next(
+            (
+                url.toLocalFile() for url in event.mimeData().urls()
+                if url.isLocalFile() and self._is_video_path(url.toLocalFile())
+            ),
+            "",
+        )
+        if video_path:
+            if self.insert_video_clip(video_path,self._ms(event.position().x())):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return
+        image_path = next(
+            (
+                url.toLocalFile() for url in event.mimeData().urls()
+                if url.isLocalFile() and self._is_image_path(url.toLocalFile())
+            ),
+            "",
+        )
+        if image_path:
+            if self.overwrite_cut_with_image(image_path, self._ms(event.position().x())):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return
         if not event.mimeData().hasFormat(TransitionPresetButton.MIME_TYPE):
             return event.ignore()
         name = bytes(event.mimeData().data(TransitionPresetButton.MIME_TYPE)).decode(
@@ -1080,6 +1481,10 @@ class TimelineCanvas(QWidget):
                 self.push_undo()
                 self.clips.pop(index)
                 self.srtChanged.emit(write_srt(self.clips))
+        elif kind == "overlay":
+            if 0 <= index < len(self.overlays):
+                self.push_undo()
+                self.overlays.pop(index)
         else:
             tracks = self.media_clips.get(kind, [])
             if 0 <= index < len(tracks):
@@ -1159,6 +1564,7 @@ class TimelineCanvas(QWidget):
                     MediaClip(
                         clip.start-delta, clip.end-delta,
                         clip.source_start, clip.source_end, clip.name, src_dur,
+                        clip.media_type, clip.path,
                     )
                 )
             else:
@@ -1167,7 +1573,7 @@ class TimelineCanvas(QWidget):
                     result.append(
                         MediaClip(
                             clip.start, start, clip.source_start, left_source_end,
-                            clip.name, src_dur,
+                            clip.name, src_dur, clip.media_type, clip.path,
                         )
                     )
                 if clip.end > end:
@@ -1176,22 +1582,34 @@ class TimelineCanvas(QWidget):
                         MediaClip(
                             start, clip.end-delta,
                             right_source_start, clip.source_end, clip.name, src_dur,
+                            clip.media_type, clip.path,
                         )
                     )
         return result
 
+    def current_state(self) -> dict:
+        """Return a detached snapshot so callers can persist edits immediately."""
+        return {
+            "duration_ms": self.duration_ms,
+            "original_audio_enabled": self.original_audio_enabled,
+            "transitions": [dict(item) for item in self.transitions],
+            "overlays": [
+                {
+                    "start": int(item.get("start", 0)),
+                    "end": int(item.get("end", 0)),
+                    "name": str(item.get("name", "")),
+                    "layer": dict(item.get("layer") or {}),
+                }
+                for item in self.overlays
+            ],
+            "tracks": {
+                kind: [clip.as_dict() for clip in clips]
+                for kind, clips in self.media_clips.items()
+            },
+        }
+
     def _emit_timeline_state(self):
-        self.timelineEdited.emit(
-            {
-                "duration_ms": self.duration_ms,
-                "original_audio_enabled": self.original_audio_enabled,
-                "transitions": [dict(item) for item in self.transitions],
-                "tracks": {
-                    kind: [clip.as_dict() for clip in clips]
-                    for kind, clips in self.media_clips.items()
-                },
-            }
-        )
+        self.timelineEdited.emit(self.current_state())
 
     def _history_snapshot(self) -> dict:
         return {
@@ -1200,6 +1618,15 @@ class TimelineCanvas(QWidget):
             "position_ms": self.position_ms,
             "clips": [(c.start, c.end, c.text) for c in self.clips],
             "transitions": [dict(item) for item in self.transitions],
+            "overlays": [
+                {
+                    "start": int(item.get("start", 0)),
+                    "end": int(item.get("end", 0)),
+                    "name": str(item.get("name", "")),
+                    "layer": dict(item.get("layer") or {}),
+                }
+                for item in self.overlays
+            ],
             "tracks": {
                 kind: [clip.as_dict() for clip in clips]
                 for kind, clips in self.media_clips.items()
@@ -1218,6 +1645,15 @@ class TimelineCanvas(QWidget):
                 for s, e, t in (snap.get("clips") or [])
             ]
             self.transitions = [dict(item) for item in (snap.get("transitions") or [])]
+            self.overlays = [
+                {
+                    "start": int(item.get("start", 0)),
+                    "end": int(item.get("end", 0)),
+                    "name": str(item.get("name", "")),
+                    "layer": dict(item.get("layer") or {}),
+                }
+                for item in (snap.get("overlays") or [])
+            ]
             tracks = snap.get("tracks") or {}
             for kind in self.media_clips:
                 restored = []
@@ -1231,6 +1667,8 @@ class TimelineCanvas(QWidget):
                                 int(item["source_start"]), src_end,
                                 str(item.get("name", "")),
                                 source_duration=src_dur,
+                                media_type=str(item.get("media_type", "video") or "video"),
+                                path=str(item.get("path", "") or ""),
                             )
                         )
                     except (KeyError, TypeError, ValueError):
@@ -1287,7 +1725,7 @@ class TrackLabelRail(QWidget):
         self.canvas = canvas
         self.setFixedWidth(TimelineCanvas.LABEL_WIDTH)
         self.setMinimumHeight(
-            TimelineCanvas.RULER_HEIGHT + TimelineCanvas.TRACK_HEIGHT * 5 + 8
+            TimelineCanvas.RULER_HEIGHT + TimelineCanvas.TRACK_HEIGHT * 6 + 8
         )
         self.setStyleSheet("background:#181b22;border-right:1px solid #2a2f3a;")
 
@@ -1342,59 +1780,80 @@ class CanvaTimelinePanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 6)
         root.setSpacing(5)
-        toolbar = QHBoxLayout()
+        toolbar = QVBoxLayout()
+        toolbar.setSpacing(4)
+        title_row = QHBoxLayout()
         title = QLabel("多轨时间轴")
         title.setStyleSheet("font-weight:800;color:#f4f4f5;font-size:13px;")
-        hint = QLabel(
-            "字幕与音视频已解绑：改字幕不会推音频 · 字幕：拖中间改位置/两端改时长（仅推后续字幕）· 音视频：右端拉长只推后续画面/原声/BGM · 左侧名固定 · 滚轮缩放"
+        hint = QLabel("图片＝覆盖画面；视频＝插入编辑并锁定自带音频")
+        hint.setToolTip(
+            "图片占用原时间且不改原声；视频会插入到放置点、推后后续原画面与原声音频，"
+            "插入视频自己的画面和声音保持成对移动。"
         )
+        hint.setWordWrap(False)
         hint.setStyleSheet("color:#8b93a5;font-size:11px;")
-        toolbar.addWidget(title)
-        toolbar.addWidget(hint)
-        cut = QPushButton("✂ 在播放头切片")
+        title_row.addWidget(title)
+        title_row.addWidget(hint, 1)
+        toolbar.addLayout(title_row)
+        edit_row = QHBoxLayout()
+        cut = QPushButton("✂ 切片")
         cut.setToolTip("先选中轨道片段，再把播放头拖到切点")
         cut.clicked.connect(lambda: None)
-        self.delete_button = QPushButton("删除选中片段")
+        self.delete_button = QPushButton("删除")
+        self.delete_button.setToolTip("删除当前选中的时间轴片段")
         self.undo_button = QPushButton("撤销")
         self.undo_button.setToolTip("撤销上一步时间轴操作（Ctrl+Z）")
         self.redo_button = QPushButton("重做")
         self.redo_button.setToolTip("重做（Ctrl+Y / Ctrl+Shift+Z）")
-        toolbar.addWidget(cut)
-        toolbar.addWidget(self.delete_button)
-        toolbar.addWidget(self.undo_button)
-        toolbar.addWidget(self.redo_button)
-        toolbar.addStretch()
+        edit_row.addWidget(cut)
+        edit_row.addWidget(self.delete_button)
+        edit_row.addWidget(self.undo_button)
+        edit_row.addWidget(self.redo_button)
+        edit_row.addStretch()
+        edit_row.addWidget(QLabel("图片时长"))
+        self.image_overwrite_duration = QSpinBox()
+        self.image_overwrite_duration.setRange(100, 10_000)
+        self.image_overwrite_duration.setValue(1000)
+        self.image_overwrite_duration.setSingleStep(100)
+        self.image_overwrite_duration.setSuffix(" ms")
+        self.image_overwrite_duration.setToolTip("图片覆盖画面的时长；不会增加总时长，也不会移动视频原声音轨")
+        edit_row.addWidget(self.image_overwrite_duration)
+        toolbar.addLayout(edit_row)
+        view_row = QHBoxLayout()
         self.original_audio = QCheckBox("保留视频原声")
         self.original_audio.setChecked(True)
-        toolbar.addWidget(self.original_audio)
-        toolbar.addWidget(QLabel("BGM 音量"))
+        view_row.addWidget(self.original_audio)
+        view_row.addWidget(QLabel("BGM 音量"))
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 200)
         self.volume.setValue(25)
-        self.volume.setFixedWidth(110)
+        self.volume.setMinimumWidth(72)
+        self.volume.setMaximumWidth(150)
         self.volume.valueChanged.connect(self.bgmVolumeChanged)
-        toolbar.addWidget(self.volume)
-        toolbar.addWidget(QLabel("缩放"))
+        view_row.addWidget(self.volume, 1)
+        view_row.addWidget(QLabel("缩放"))
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(ZOOM_MIN_PPS, ZOOM_MAX_PPS)
         self.zoom.setValue(ZOOM_DEFAULT_PPS)
         self.zoom.setSingleStep(8)
         self.zoom.setPageStep(80)
-        self.zoom.setFixedWidth(130)
+        self.zoom.setMinimumWidth(90)
+        self.zoom.setMaximumWidth(180)
         self.zoom.setToolTip(
             "时间轴缩放（也可在轨道上滚轮缩放）\n"
             f"最小 {ZOOM_MIN_PPS}px/s · 最大 {ZOOM_MAX_PPS}px/s（可到帧级）\n"
             "左侧轨道名称固定不动"
         )
-        toolbar.addWidget(self.zoom)
+        view_row.addWidget(self.zoom, 1)
         self.zoom_value = QLabel(f"{ZOOM_DEFAULT_PPS}")
         self.zoom_value.setFixedWidth(36)
         self.zoom_value.setStyleSheet("color:#94a3b8;font-size:11px;")
         self.zoom_value.setToolTip("当前像素/秒")
-        toolbar.addWidget(self.zoom_value)
+        view_row.addWidget(self.zoom_value)
         fit = QPushButton("适合窗口")
         fit.clicked.connect(self._fit)
-        toolbar.addWidget(fit)
+        view_row.addWidget(fit)
+        toolbar.addLayout(view_row)
         root.addLayout(toolbar)
 
         # Fixed track-name rail + scrollable timeline content
@@ -1402,6 +1861,7 @@ class CanvaTimelinePanel(QWidget):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         self.canvas = TimelineCanvas()
+        self.canvas.ffmpeg_path = self.ffmpeg
         self.label_rail = TrackLabelRail(self.canvas)
         self.canvas.label_rail = self.label_rail
         body.addWidget(self.label_rail, 0)
@@ -1416,6 +1876,9 @@ class CanvaTimelinePanel(QWidget):
         root.addLayout(body, 1)
 
         self.zoom.valueChanged.connect(self._on_zoom_slider)
+        self.image_overwrite_duration.valueChanged.connect(
+            self.canvas.set_image_overwrite_duration
+        )
         self.canvas.zoomWheel.connect(self._wheel_zoom)
         self.canvas.srtChanged.connect(self.srtChanged)
         self.canvas.seekRequested.connect(self.seekRequested)
@@ -1430,7 +1893,7 @@ class CanvaTimelinePanel(QWidget):
         self._refresh_undo_buttons()
         self.original_audio.toggled.connect(self.canvas.set_original_audio_enabled)
         self.original_audio.toggled.connect(self.originalAudioChanged)
-        self.setMinimumHeight(270)
+        self.setMinimumHeight(262)
         self.setStyleSheet(
             "CanvaTimelinePanel{background:#101218;border:1px solid #30343f;border-radius:8px;}"
         )
@@ -1523,6 +1986,25 @@ class CanvaTimelinePanel(QWidget):
 
     def set_srt(self, srt: str):
         self.canvas.set_srt(srt)
+
+    def add_overlay(self, layer: dict, start_ms: int, end_ms: int):
+        return self.canvas.add_overlay(layer, start_ms, end_ms)
+
+    def update_overlay_template(self, layer: dict) -> int:
+        return self.canvas.update_overlay_template(layer)
+
+    def current_state(self) -> dict:
+        return self.canvas.current_state()
+
+    def ensure_time_visible(self, milliseconds: int):
+        """Scroll a newly inserted overlay into view without moving the playhead."""
+        target_x = int(self.canvas._x(max(0, int(milliseconds))))
+        bar = self.scroll.horizontalScrollBar()
+        viewport_width = max(1, self.scroll.viewport().width())
+        if target_x < bar.value() + 24 or target_x > bar.value() + viewport_width - 90:
+            bar.setValue(max(0, target_x - viewport_width // 3))
+        self.canvas.update()
+        self.label_rail.update()
 
     def set_project(
         self,
