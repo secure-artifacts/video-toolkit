@@ -1314,6 +1314,61 @@ def _write_reels_checkpoint(output,state):
     temporary=path.with_suffix(".tmp"); temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); temporary.replace(path)
 
 
+RENDER_CACHE_DIR_NAMES = (
+    ".timeline_edit_cache",
+    ".timeline_overlay_cache",
+    ".motion_track_cache",
+    ".watermark_cache",
+    ".reels_timeline_cache",
+)
+
+
+def cleanup_successful_render_artifacts(output, final_products):
+    """Remove generated render caches/JSON only after final products are valid.
+
+    The caller owns the all-items-success decision.  Fixed cache directory
+    names and root-level generated sidecars keep this cleanup away from source
+    folders or user-created nested project data.
+    """
+    root = Path(output).expanduser()
+    products = [Path(path) for path in (final_products or [])]
+    if not root.is_dir() or not products:
+        return {"files": 0, "directories": 0, "errors": []}
+    if any(not path.is_file() or path.stat().st_size <= 1024 for path in products):
+        return {"files": 0, "directories": 0, "errors": ["成品校验未通过，缓存已保留"]}
+
+    removed_files = 0
+    removed_directories = 0
+    errors = []
+    root_resolved = root.resolve()
+    for name in RENDER_CACHE_DIR_NAMES:
+        cache = root / name
+        try:
+            if cache.resolve().parent != root_resolved:
+                continue
+            if cache.is_dir():
+                shutil.rmtree(cache)
+                removed_directories += 1
+        except OSError as exc:
+            errors.append(f"{name}：{exc}")
+
+    # These sidecars are generated beside final products.  Do not recurse into
+    # arbitrary user folders; 00_分组合成 has its own guarded cleanup routine.
+    for pattern in ("*.json", "*.tmp", "*.ass"):
+        for path in root.glob(pattern):
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed_files += 1
+            except OSError as exc:
+                errors.append(f"{path.name}：{exc}")
+    return {
+        "files": removed_files,
+        "directories": removed_directories,
+        "errors": errors,
+    }
+
+
 def free_caption_srt(text, duration, settings):
     """把不需要对口型的自由文案按两行一屏生成时间轴。"""
     lang = settings.get("caption_language") or settings.get("language")
@@ -10168,6 +10223,34 @@ class DynamicCaptionPage(QWidget):
                     QMessageBox.warning(self,"自动上传未启动",f"本地视频已经生成完成。\n\n上传/填表未启动：{exc}")
             elif not files:
                 self._append_run_log("未找到本次生成的成品，已跳过自动上传。")
+        completed_products = [
+            Path(item.get("path", "")) for item in self.generated_records
+        ]
+        all_products_ready = (
+            ok
+            and self._batch_expected_count > 0
+            and len(completed_products) == self._batch_expected_count
+            and all(path.is_file() and path.stat().st_size > 1024 for path in completed_products)
+        )
+        if all_products_ready:
+            cleanup = cleanup_successful_render_artifacts(
+                self.output.text(), completed_products
+            )
+            if cleanup["errors"]:
+                self._append_run_log(
+                    "成品已全部生成；部分缓存暂时被占用，可稍后重试清理："
+                    + "｜".join(cleanup["errors"][:5])
+                )
+            else:
+                self._append_run_log(
+                    "成品已全部生成；已清理 "
+                    f"{cleanup['directories']} 个缓存目录和 {cleanup['files']} 个 JSON/临时文件，"
+                    "输出目录仅保留最终成品及用户原有文件。"
+                )
+        elif ok:
+            self._append_run_log(
+                "本批存在失败或缺失成品，已保留缓存与 JSON 供断点续接。"
+            )
         (QMessageBox.information if ok else QMessageBox.critical)(self, "动态文案" if ok else "生成失败", message)
 
     def _cleanup_completed_group_intermediates(self, ok):
