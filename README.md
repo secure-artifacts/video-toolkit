@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.21**
+当前版本：**v1.7.22**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,18 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.21.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/video-toolkit-windows-x64-v1.7.21.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/VideoToolkit_Setup_v1.7.21.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.21.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/video-toolkit-macos-arm64-v1.7.21.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.21.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.21/video-toolkit-macos-x64-v1.7.21.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.22.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/video-toolkit-windows-x64-v1.7.22.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/VideoToolkit_Setup_v1.7.22.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.22.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/video-toolkit-macos-arm64-v1.7.22.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.22.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/video-toolkit-macos-x64-v1.7.22.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.22 · 2026-07-30
+- 预览：修复黑屏与首帧黑底；固定 9:16 画布叠字幕，避免横向拉长。
+- 水印导出：修复全屏黑底水印把成片盖成纯黑；自动抠黑/白底，预合成透明叠加。
+- 实时字幕：无词级时间轴时仍显示整句；与时间轴字幕条对齐更稳。
+- 性能：预览约 8fps 低分辨率；OpenCV 时关闭双路解码；进度/样式写入防抖，降低 CPU。
+- 图文成片：重新合成与预览加载更稳，避免弹窗内同步解码卡死。
 
 ### v1.7.21 · 2026-07-29
 - 自适应界面：小屏幕自动收紧按钮与双列设置，长文字精简显示并保留完整悬浮提示。
@@ -310,7 +317,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.7.21"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.22"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -325,6 +332,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
 
 ```bash
-git tag -a v1.7.21 -m "Release version 1.7.21"
-git push origin v1.7.21
+git tag -a v1.7.22 -m "Release version 1.7.22"
+git push origin v1.7.22
 ```
