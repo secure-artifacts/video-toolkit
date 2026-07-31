@@ -148,6 +148,8 @@ def write_srt(clips: list[CaptionClip]) -> str:
 class TimelineCanvas(QWidget):
     srtChanged = Signal(str)
     seekRequested = Signal(int)
+    # 涟漪删除区间（毫秒）：上层用于同步词级 SRT
+    rangeRippled = Signal(int, int)
     timelineEdited = Signal(dict)
     # deltaY from wheel, x on canvas (for zoom-to-cursor)
     zoomWheel = Signal(int, int)
@@ -1536,6 +1538,29 @@ class TimelineCanvas(QWidget):
             elif cue.start < start:
                 kept.append(CaptionClip(cue.start, max(cue.start+80, start), cue.text))
         self.clips = kept
+        # 声明叠加层与媒体同步涟漪，避免删段后文字/蒙版/PNG 仍停在旧时间
+        if hasattr(self, "overlays") and self.overlays:
+            kept_overlays = []
+            for item in self.overlays:
+                try:
+                    o_start = int(item.get("start", 0) or 0)
+                    o_end = int(item.get("end", o_start + 1000) or (o_start + 1000))
+                except Exception:
+                    kept_overlays.append(item)
+                    continue
+                if o_end <= start:
+                    kept_overlays.append(item)
+                elif o_start >= end:
+                    copy = dict(item)
+                    copy["start"] = o_start - delta
+                    copy["end"] = o_end - delta
+                    kept_overlays.append(copy)
+                elif o_start < start < o_end:
+                    copy = dict(item)
+                    copy["end"] = max(copy.get("start", start) + 80, start)
+                    kept_overlays.append(copy)
+                # 完全落在删除区间内的叠加层丢弃
+            self.overlays = kept_overlays
         adjusted_transitions = []
         for item in self.transitions:
             position = int(item.get("position", 0))
@@ -1548,7 +1573,14 @@ class TimelineCanvas(QWidget):
         self.transitions = adjusted_transitions
         self.duration_ms = max(1000, self.duration_ms - delta)
         self.srtChanged.emit(write_srt(self.clips))
+        # 通知上层同步词级时间轴（毫秒）
+        if hasattr(self, "rangeRippled"):
+            try:
+                self.rangeRippled.emit(int(start), int(end))
+            except Exception:
+                pass
         self._update_width()
+        self._emit_timeline_state()
 
     @staticmethod
     def _delete_range_from_track(
@@ -1767,6 +1799,7 @@ class TrackLabelRail(QWidget):
 class CanvaTimelinePanel(QWidget):
     srtChanged = Signal(str)
     seekRequested = Signal(int)
+    rangeRippled = Signal(int, int)
     bgmVolumeChanged = Signal(int)
     timelineEdited = Signal(dict)
     originalAudioChanged = Signal(bool)
@@ -1882,6 +1915,7 @@ class CanvaTimelinePanel(QWidget):
         self.canvas.zoomWheel.connect(self._wheel_zoom)
         self.canvas.srtChanged.connect(self.srtChanged)
         self.canvas.seekRequested.connect(self.seekRequested)
+        self.canvas.rangeRippled.connect(self.rangeRippled)
         self.canvas.timelineEdited.connect(self.timelineEdited)
         self.canvas.timelineEdited.connect(lambda *_: self._refresh_undo_buttons())
         self.canvas.srtChanged.connect(lambda *_: self._refresh_undo_buttons())

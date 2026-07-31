@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.22**
+当前版本：**v1.7.23**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,18 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.22.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/video-toolkit-windows-x64-v1.7.22.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/VideoToolkit_Setup_v1.7.22.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.22.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/video-toolkit-macos-arm64-v1.7.22.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.22.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.22/video-toolkit-macos-x64-v1.7.22.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.23.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.23/video-toolkit-windows-x64-v1.7.23.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.23/VideoToolkit_Setup_v1.7.23.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.23.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.23/video-toolkit-macos-arm64-v1.7.23.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.23.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.23/video-toolkit-macos-x64-v1.7.23.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.23 · 2026-07-31
+- 实时字幕效果：仅有句级字幕时按句时长合成跟读进度；Descript 经典黄等 `word_color` 可逐词变色。
+- 底色框预设：黑底白字/黄底框/深蓝/紫底 改回真正的 `dual_box`（普通底 + 跟读高亮），名称与画面一致。
+- 分组合成加速：边界分析多路并行；静音只扫片头/片尾；ASR 串行保护本地 Whisper。
+- 字幕识别：API/本地模型与优先级可配置（Gemini→Gladia→Local→Groq）；本地支持 small/medium/large-v3。
+- 预览跟读缓存按词进度刷新，避免高亮卡住；启动日志在 UI 未就绪时不再崩溃。
 
 ### v1.7.22 · 2026-07-30
 - 预览：修复黑屏与首帧黑底；固定 9:16 画布叠字幕，避免横向拉长。
@@ -317,7 +324,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.7.22"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.23"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -332,6 +339,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
 
 ```bash
-git tag -a v1.7.22 -m "Release version 1.7.22"
-git push origin v1.7.22
+git tag -a v1.7.23 -m "Release version 1.7.23"
+git push origin v1.7.23
 ```

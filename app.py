@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.22").strip().lstrip("v") or "1.7.22"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.23").strip().lstrip("v") or "1.7.23"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -74,13 +74,38 @@ LOCAL_PROVIDER = "本地 Whisper（无需密钥）"
 AUTO_PROVIDER = "自动选择（按优先级）"
 TRANSCRIPTION_PROVIDERS = [AUTO_PROVIDER, LOCAL_PROVIDER] + ASR_PROVIDERS
 DEFAULT_MODELS = {
-    LOCAL_PROVIDER: "small",
-    "Groq": "whisper-large-v3-turbo",
-    "Gemini": "gemini-3.5-flash",
+    # 本地默认 medium：比 small 更懂语境/词形，比 large-v3 更快
+    LOCAL_PROVIDER: "medium",
+    # turbo 在部分希腊语/宗教口播上会幻觉成「Υπότιτλοι AUTHORWAVE」；large-v3 更稳
+    "Groq": "whisper-large-v3",
+    "Gemini": "gemini-2.0-flash",
     "ElevenLabs": "scribe_v2",
     "Gladia": "default",
     "Luma": "default",
     "Kling": "default",
+}
+# 本地 Whisper 可选体积（faster-whisper 模型名）
+LOCAL_WHISPER_MODEL_OPTIONS = [
+    ("small", "small · 快 / 准确度中上"),
+    ("medium", "medium · 推荐（语义更稳）"),
+    ("large-v3", "large-v3 · 最准 / 更慢更吃显存"),
+]
+# 自动模式下的服务优先级：按用户要求与实测（Gemini 有额度时优先云端高质量）
+DEFAULT_PROVIDER_PRIORITY = [
+    "Gemini", "Gladia", LOCAL_PROVIDER, "Groq", "ElevenLabs", "Luma", "Kling",
+]
+# 已安装用户配置里若仍是旧默认模型，启动时迁移到可用值
+_MODEL_MIGRATIONS = {
+    "Groq": {
+        "whisper-large-v3-turbo": "whisper-large-v3",
+        "whisper-large-v3-turbo-latest": "whisper-large-v3",
+    },
+    "Gemini": {
+        "gemini-1.5-flash": "gemini-2.0-flash",
+        "gemini-1.5-flash-latest": "gemini-2.0-flash",
+        "gemini-1.5-pro": "gemini-2.0-flash",
+        # 3.5 在部分账号可用，但免费额度更易 429；保留用户自选不强制改 3.5
+    },
 }
 DEFAULT_SHEET_MAPPINGS = [
     {"field": "日期", "column": "A", "source": "date", "value": ""},
@@ -160,7 +185,7 @@ class ConfigStore:
             "providers": {p: [] for p in PROVIDERS},
             "round_robin": {p: 0 for p in PROVIDERS},
             "models": dict(DEFAULT_MODELS),
-            "provider_priority": PROVIDERS + [LOCAL_PROVIDER],
+            "provider_priority": list(DEFAULT_PROVIDER_PRIORITY),
             "google_sync": {
                 "enabled": False, "json_path": "", "parent_folder": "",
                 "folder_mode": "视频名称", "custom_folder_name": "", "public_link": False,
@@ -190,6 +215,34 @@ class ConfigStore:
                 loaded["round_robin"].setdefault(provider, 0)
                 loaded["models"].setdefault(provider, DEFAULT_MODELS[provider])
             loaded["models"].setdefault(LOCAL_PROVIDER, DEFAULT_MODELS[LOCAL_PROVIDER])
+            # 迁移已知会出错/幻觉的旧模型名
+            for provider, mapping in _MODEL_MIGRATIONS.items():
+                current = str(loaded["models"].get(provider, "") or "")
+                if current in mapping:
+                    loaded["models"][provider] = mapping[current]
+            # 识别优先级：Gemini → Gladia → 本地 → Groq（可在「调整顺序」里改）
+            preferred = list(DEFAULT_PROVIDER_PRIORITY)
+            old_pri = [p for p in (loaded.get("provider_priority") or []) if p in preferred]
+            # 旧默认（本地第一 或 Groq 第一）统一迁移到新推荐序
+            legacy_heads = {LOCAL_PROVIDER, "Groq"}
+            if (
+                not old_pri
+                or old_pri[:4] == [LOCAL_PROVIDER, "Gladia", "Groq", "ElevenLabs"]
+                or (old_pri and old_pri[0] in legacy_heads and "Gemini" in old_pri and old_pri.index("Gemini") > 2)
+            ):
+                loaded["provider_priority"] = list(preferred)
+            else:
+                pri = list(old_pri)
+                for p in preferred:
+                    if p not in pri:
+                        pri.append(p)
+                loaded["provider_priority"] = pri
+            # 本地模型若还是默认 small，升到 medium（用户已选手动 medium/large 则保留）
+            if str(loaded["models"].get(LOCAL_PROVIDER, "")).strip() in ("", "small"):
+                # 仅当从未显式改过：若用户故意 small，可在界面再改回
+                # 用配置标记避免反复强制
+                if not loaded.get("_local_model_user_set"):
+                    loaded["models"][LOCAL_PROVIDER] = DEFAULT_MODELS[LOCAL_PROVIDER]
             old_google = loaded.get("google_sync", {})
             had_mappings = bool(old_google.get("sheet_mappings"))
             old_mapping_version = int(old_google.get("mapping_ui_version", 1))
@@ -660,6 +713,11 @@ class TranscribeWorker(QObject):
                       else self.store.candidates(self.provider))
         if not candidates:
             raise RuntimeError(f"{self.provider} 没有可用密钥，请先到“密钥管理”添加并检测。")
+        # 非断点模式：清掉该素材工作目录，避免复用 Groq 错误分段缓存
+        if not self.resume_existing:
+            work = self.output_dir / ".work" / self._source_work_key(source_value)
+            if work.exists():
+                shutil.rmtree(work, ignore_errors=True)
         temp = self._source_work_dir(source_value)
         if is_supported_video_url(source_value):
             metadata_path = temp / "online_source.json"
@@ -809,22 +867,42 @@ class TranscribeWorker(QObject):
             import ctranslate2
         except ImportError as exc:
             raise RuntimeError("缺少本地字幕组件，请运行：pip install faster-whisper") from exc
-        self.log.emit(f"正在加载本地 Whisper 模型：{self.model}（首次使用会下载模型）…")
-        if self._local_model is None:
+        model_name = str(self.model or DEFAULT_MODELS[LOCAL_PROVIDER]).strip() or "medium"
+        # 兼容界面展示名
+        for code, label in LOCAL_WHISPER_MODEL_OPTIONS:
+            if model_name == label or model_name.startswith(code):
+                model_name = code
+                break
+        if model_name not in {code for code, _ in LOCAL_WHISPER_MODEL_OPTIONS}:
+            self.log.emit(f"未知本地模型「{model_name}」，回退 medium")
+            model_name = "medium"
+        self.log.emit(
+            f"正在加载本地 Whisper 模型：{model_name}"
+            f"（首次使用会下载；medium/large 更吃显存，语义更稳）…"
+        )
+        # 模型名变化时重新加载
+        if self._local_model is None or getattr(self, "_local_model_name", None) != model_name:
+            self._local_model = None
             has_cuda = ctranslate2.get_cuda_device_count() > 0
             try:
-                self._local_model = WhisperModel(self.model or "small",
-                                                 device="cuda" if has_cuda else "cpu",
-                                                 compute_type="auto" if has_cuda else "int8",
-                                                 cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+                self._local_model = WhisperModel(
+                    model_name,
+                    device="cuda" if has_cuda else "cpu",
+                    compute_type="auto" if has_cuda else "int8",
+                    cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+                )
                 self._local_device = "cuda" if has_cuda else "cpu"
+                self._local_model_name = model_name
             except (ValueError, RuntimeError) as exc:
                 if not has_cuda:
                     raise
                 self.log.emit(f"当前 GPU 模式不可用，自动切换 CPU INT8：{exc}")
-                self._local_model = WhisperModel(self.model or "small", device="cpu", compute_type="int8",
-                                                 cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+                self._local_model = WhisperModel(
+                    model_name, device="cpu", compute_type="int8",
+                    cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+                )
                 self._local_device = "cpu"
+                self._local_model_name = model_name
         language = None if not self.language or self.language == "auto" else self.language
         def collect_segments(stream, info):
             segments = []
@@ -862,9 +940,12 @@ class TranscribeWorker(QObject):
             if self._local_device != "cuda" or self.cancelled:
                 raise
             self.log.emit(f"GPU 长视频识别中断，自动改用 CPU INT8 从当前视频重试：{exc}")
-            self._local_model = WhisperModel(self.model or "small", device="cpu", compute_type="int8",
-                                             cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+            self._local_model = WhisperModel(
+                model_name, device="cpu", compute_type="int8",
+                cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+            )
             self._local_device = "cpu"
+            self._local_model_name = model_name
             segments, info = transcribe_with(self._local_model)
         detected = getattr(info, "language", None) or language
         plain = "\n".join(
@@ -874,46 +955,124 @@ class TranscribeWorker(QObject):
                "words": [word for segment in segments for word in segment.get("words", [])]}
         return segments_to_srt(segments, language=detected), plain, raw
 
+    def _groq_payload_is_suspicious(self, payload: dict, duration: float) -> str:
+        """识别 turbo 等模型在希腊语等语种上的典型幻觉（极短文本 + 水印词）。"""
+        text = str(payload.get("text") or "").strip()
+        words = payload.get("words") or []
+        segments = payload.get("segments") or []
+        lower = text.casefold()
+        # 已知幻觉：把整段口播压成水印/「字幕」二字
+        if "authorwave" in lower or "υπότιτλοι" in lower or "υποτιτλοι" in lower:
+            if len(text) < 80:
+                return f"疑似幻觉文本：{text[:60]}"
+        # 时长 > 12s 却文本/词数明显过少（turbo 幻觉或 large-v3 偶发截断）
+        if duration >= 12:
+            min_chars = max(60, int(duration * 2.5))
+            min_words = max(8, int(duration * 0.6))
+            if len(text) < min_chars or (words and len(words) < min_words and len(segments) <= 2):
+                return f"结果过稀（{len(text)} 字/{len(words)} 词/{duration:.0f}s）：{text[:60]}"
+        return ""
+
+    def _groq_transcribe_file(self, chunk: Path, key: str, model: str) -> dict:
+        data = {
+            "model": model,
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": ["word", "segment"],
+            "temperature": "0",
+        }
+        if self.language and self.language != "auto":
+            data["language"] = self.language
+        with chunk.open("rb") as handle:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {key}"},
+                data=data,
+                files={"file": (chunk.name, handle, "audio/wav")},
+                timeout=900,
+            )
+        if resp.status_code >= 300:
+            raise ApiFailure(response_error(resp), resp.status_code)
+        return resp.json()
+
     def _groq(self, audio: Path, key: str, temp: Path):
         chunks_dir = temp / "chunks"
         chunks_dir.mkdir(parents=True, exist_ok=True)
         pattern = chunks_dir / "chunk_%03d.wav"
         creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         segment_seconds = 90
+        # 统一抽 mono 16k 再分段，体积更小、Groq 更稳
+        prepared = temp / "groq_source.wav"
+        if not prepared.exists() or prepared.stat().st_size < 1000:
+            prep = subprocess.run(
+                [self.ffmpeg_path, "-y", "-i", str(audio), "-map", "0:a:0?", "-vn",
+                 "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(prepared)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                creationflags=creation, text=True, encoding="utf-8", errors="replace",
+            )
+            if prep.returncode != 0 or not prepared.exists():
+                # 回退：直接对源文件分段
+                prepared = audio
         chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda path: rename_natural_key(path.name))
         if not chunks:
             self.log.emit("正在把长音频切成 90 秒无损识别分段 …")
-            cmd = [self.ffmpeg_path, "-y", "-i", str(audio), "-map", "0:a:0", "-vn", "-f", "segment",
+            cmd = [self.ffmpeg_path, "-y", "-i", str(prepared), "-map", "0:a:0?", "-vn", "-f", "segment",
                    "-segment_time", str(segment_seconds), "-reset_timestamps", "1",
-                   "-c:a", "pcm_s16le", str(pattern)]
+                   "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(pattern)]
             result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                     creationflags=creation, text=True, encoding="utf-8", errors="replace")
             chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda path: rename_natural_key(path.name))
             if result.returncode != 0 or not chunks:
-                raise RuntimeError("Groq 长音频分段失败。\n" + result.stderr[-800:])
+                raise RuntimeError("Groq 长音频分段失败。\n" + (result.stderr or "")[-800:])
         else:
             self.log.emit(f"断点续接：复用 {len(chunks)} 个长音频分段。")
         cache_path = temp / "groq_chunk_results.json"
+        # 模型名变了就丢弃旧缓存（避免 turbo 幻觉结果永久复用）
         cache = read_json_file(cache_path, {})
+        if cache.get("_model") != self.model:
+            cache = {"_model": self.model}
+            atomic_write_json(cache_path, cache)
         all_segments, all_words, texts, raw_items, offset = [], [], [], [], 0.0
+        primary_model = self.model or DEFAULT_MODELS["Groq"]
+        fallback_models = []
+        if "turbo" in primary_model.casefold():
+            fallback_models.append("whisper-large-v3")
+        elif primary_model != "whisper-large-v3":
+            fallback_models.append("whisper-large-v3")
         for number, chunk in enumerate(chunks, 1):
             payload = cache.get(chunk.name)
-            if payload:
+            try:
+                chunk_dur = float(video_duration(self.ffmpeg_path, str(chunk)))
+            except Exception:
+                chunk_dur = float(segment_seconds)
+            if payload and not self._groq_payload_is_suspicious(payload, chunk_dur):
                 self.log.emit(f"Groq 断点续接：跳过已完成分段 {number}/{len(chunks)}")
             else:
-                self.log.emit(f"Groq 转写分段 {number}/{len(chunks)} …")
-                data = {"model": self.model, "response_format": "verbose_json",
-                        "timestamp_granularities[]": ["word", "segment"], "temperature": "0"}
-                if self.language and self.language != "auto":
-                    data["language"] = self.language
-                with chunk.open("rb") as handle:
-                    resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
-                                         headers={"Authorization": f"Bearer {key}"}, data=data,
-                                         files={"file": (chunk.name, handle, "audio/wav")}, timeout=900)
-                if resp.status_code >= 300:
-                    raise ApiFailure(response_error(resp), resp.status_code)
-                payload = resp.json()
+                if payload:
+                    self.log.emit(f"Groq 分段 {number} 缓存结果异常，重新请求 …")
+                used_model = primary_model
+                self.log.emit(f"Groq 转写分段 {number}/{len(chunks)}（模型 {used_model}）…")
+                payload = self._groq_transcribe_file(chunk, key, used_model)
+                reason = self._groq_payload_is_suspicious(payload, chunk_dur)
+                if reason:
+                    for alt in fallback_models:
+                        if alt == used_model:
+                            continue
+                        self.log.emit(f"Groq {used_model} 结果异常（{reason}），改用 {alt} 重试 …")
+                        try:
+                            payload = self._groq_transcribe_file(chunk, key, alt)
+                            used_model = alt
+                            if not self._groq_payload_is_suspicious(payload, chunk_dur):
+                                break
+                        except Exception as exc:
+                            self.log.emit(f"Groq 备用模型 {alt} 失败：{exc}")
+                    still_bad = self._groq_payload_is_suspicious(payload, chunk_dur)
+                    if still_bad:
+                        raise RuntimeError(
+                            f"Groq 识别结果异常（{still_bad}）。"
+                            "建议：设置里把 Groq 模型改为 whisper-large-v3，或改用本地 Whisper。"
+                        )
                 cache[chunk.name] = payload
+                cache["_model"] = used_model
                 atomic_write_json(cache_path, cache)
             raw_items.append(payload)
             text = payload.get("text", "").strip()
@@ -928,10 +1087,7 @@ class TranscribeWorker(QObject):
                 if word_text:
                     all_words.append({"start": float(word.get("start", 0)) + offset,
                                       "end": float(word.get("end", 0)) + offset, "text": word_text})
-            try:
-                offset += video_duration(self.ffmpeg_path, str(chunk))
-            except Exception:
-                offset += segment_seconds
+            offset += chunk_dur
         if not all_segments:
             all_segments = [{"start": 0, "end": max(2, offset), "text": "\n".join(texts)}]
         lang = None if not self.language or self.language == "auto" else self.language
@@ -953,7 +1109,10 @@ class TranscribeWorker(QObject):
         start = requests.post("https://generativelanguage.googleapis.com/upload/v1beta/files",
                               headers=headers, json={"file": {"display_name": audio.name}}, timeout=60)
         if start.status_code >= 300:
-            raise ApiFailure(response_error(start), start.status_code)
+            msg = response_error(start)
+            if start.status_code == 429:
+                msg = "Gemini 配额已用尽（429）。请到 Google AI Studio 检查额度/账单，或改用 Groq / 本地 Whisper。\n" + msg
+            raise ApiFailure(msg, start.status_code)
         upload_url = start.headers.get("x-goog-upload-url")
         if not upload_url:
             raise ApiFailure("Gemini 未返回上传地址")
@@ -964,12 +1123,41 @@ class TranscribeWorker(QObject):
                 "X-Goog-Upload-Command": "upload, finalize",
             }, data=handle, timeout=900)
         if uploaded.status_code >= 300:
-            raise ApiFailure(response_error(uploaded), uploaded.status_code)
+            msg = response_error(uploaded)
+            if uploaded.status_code == 429:
+                msg = "Gemini 上传配额已用尽（429）。请检查额度或改用其它识别服务。\n" + msg
+            raise ApiFailure(msg, uploaded.status_code)
         file_info = uploaded.json().get("file", {})
         file_uri = file_info.get("uri")
         file_name = file_info.get("name")
         if not file_uri:
             raise ApiFailure("Gemini 文件上传响应缺少 URI")
+        # 等待文件进入 ACTIVE，避免刚上传就 generate 失败
+        for _ in range(30):
+            if self.cancelled:
+                raise RuntimeError("任务已取消")
+            state = str(file_info.get("state") or "").upper()
+            if state in ("ACTIVE", "STATE_ACTIVE", ""):
+                if state.startswith("ACTIVE") or state == "STATE_ACTIVE":
+                    break
+                # 部分响应无 state 字段，直接继续
+                if not state:
+                    break
+            if state in ("FAILED", "STATE_FAILED"):
+                raise ApiFailure(f"Gemini 文件处理失败：{file_info}")
+            time.sleep(1)
+            try:
+                meta = requests.get(
+                    f"https://generativelanguage.googleapis.com/v1beta/{file_name}",
+                    headers={"x-goog-api-key": key}, timeout=30,
+                )
+                if meta.status_code < 300:
+                    file_info = meta.json()
+                    file_uri = file_info.get("uri") or file_uri
+                    if str(file_info.get("state") or "").upper() in ("ACTIVE", "STATE_ACTIVE"):
+                        break
+            except Exception:
+                break
         prompt = (
             "请准确转写这段音频，并只输出标准 SRT 字幕。要求：保留原语言；每条字幕包含序号、"
             "HH:MM:SS,mmm 时间码和正文；合理断句；不要 Markdown 代码框，不要解释。"
@@ -980,12 +1168,19 @@ class TranscribeWorker(QObject):
             "mime_type": mime, "file_uri": file_uri}}]}],
                 "generationConfig": {"temperature": 0.1}}
         try:
-            self.log.emit("Gemini 正在生成带时间码字幕 …")
+            model_name = self.model or DEFAULT_MODELS["Gemini"]
+            self.log.emit(f"Gemini 正在生成带时间码字幕（{model_name}）…")
             resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
                 headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body, timeout=1200)
             if resp.status_code >= 300:
-                raise ApiFailure(response_error(resp), resp.status_code)
+                msg = response_error(resp)
+                if resp.status_code == 429:
+                    msg = (
+                        "Gemini 配额已用尽（429）。免费额度用完后需开通计费，"
+                        "或暂时改用「本地 Whisper」/「Groq」。\n" + msg
+                    )
+                raise ApiFailure(msg, resp.status_code)
             payload = resp.json()
             text = "\n".join(part.get("text", "") for cand in payload.get("candidates", [])
                               for part in cand.get("content", {}).get("parts", []))
@@ -3182,7 +3377,15 @@ class MainWindow(QMainWindow):
         self.provider_combo = QComboBox(); self.provider_combo.addItems(TRANSCRIPTION_PROVIDERS)
         self.provider_combo.currentTextChanged.connect(self._provider_changed)
         form.addRow("识别服务", self.provider_combo)
-        self.model_edit = QLineEdit("按优先级自动匹配")
+        # 可编辑下拉：本地模型三选一；云端可填自定义模型名
+        self.model_edit = QComboBox()
+        self.model_edit.setEditable(True)
+        self.model_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.model_edit.setToolTip(
+            "本地 Whisper：small 快 / medium 推荐（语义更稳）/ large-v3 最准。\n"
+            "Groq 建议 whisper-large-v3；Gemini 建议 gemini-2.0-flash。\n"
+            "自动模式显示「按优先级自动匹配」，本地体积在选中「本地 Whisper」时设置。"
+        )
         form.addRow("模型", self.model_edit)
         self.language_edit = QComboBox()
         self.language_edit.setEditable(True)
@@ -4316,13 +4519,57 @@ class MainWindow(QMainWindow):
 
     def _provider_changed(self, provider):
         automatic = provider == AUTO_PROVIDER
-        self.model_edit.setReadOnly(automatic)
+        self.model_edit.blockSignals(True)
+        self.model_edit.clear()
         if automatic:
-            self.model_edit.setText("按优先级自动匹配")
+            self.model_edit.setEditable(False)
+            self.model_edit.addItem("按优先级自动匹配")
+            self.model_edit.setCurrentIndex(0)
             self.diarize_check.setEnabled(True)
+        elif provider == LOCAL_PROVIDER:
+            self.model_edit.setEditable(False)
+            current = str(self.store.data["models"].get(provider, DEFAULT_MODELS[provider]) or "medium")
+            select = 1  # medium
+            for index, (code, label) in enumerate(LOCAL_WHISPER_MODEL_OPTIONS):
+                self.model_edit.addItem(label, code)
+                if current == code or current.startswith(code) or current == label:
+                    select = index
+            self.model_edit.setCurrentIndex(select)
+            self.diarize_check.setEnabled(False)
         else:
-            self.model_edit.setText(self.store.data["models"].get(provider, DEFAULT_MODELS[provider]))
+            self.model_edit.setEditable(True)
+            current = str(self.store.data["models"].get(provider, DEFAULT_MODELS[provider]) or "")
+            presets = {
+                "Groq": ["whisper-large-v3", "whisper-large-v3-turbo"],
+                "Gemini": ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-3.5-flash"],
+                "ElevenLabs": ["scribe_v2"],
+                "Gladia": ["default"],
+            }.get(provider, [current or "default"])
+            for item in presets:
+                self.model_edit.addItem(item)
+            if current and self.model_edit.findText(current) < 0:
+                self.model_edit.addItem(current)
+            self.model_edit.setCurrentText(current or presets[0])
             self.diarize_check.setEnabled(provider in ("ElevenLabs", "Gladia"))
+        self.model_edit.blockSignals(False)
+
+    def _current_model_for_provider(self, provider: str) -> str:
+        """从模型下拉/配置解析实际模型名。"""
+        if provider == AUTO_PROVIDER:
+            return ""
+        if provider == LOCAL_PROVIDER:
+            data = self.model_edit.currentData()
+            if data:
+                return str(data)
+            text = self.model_edit.currentText().strip()
+            for code, label in LOCAL_WHISPER_MODEL_OPTIONS:
+                if text == code or text == label or text.startswith(code):
+                    return code
+            return str(self.store.data["models"].get(provider, DEFAULT_MODELS[provider]) or "medium")
+        text = self.model_edit.currentText().strip()
+        if text and text != "按优先级自动匹配":
+            return text
+        return str(self.store.data["models"].get(provider, DEFAULT_MODELS[provider]) or "")
 
     def _refresh_priority_label(self):
         if hasattr(self, "priority_label"):
@@ -4363,6 +4610,25 @@ class MainWindow(QMainWindow):
                 return provider
         return LOCAL_PROVIDER
 
+    def _caption_asr_language(self) -> str:
+        """Reels 文案语言 → Whisper/云识别 language 码；自动则 auto。"""
+        try:
+            page = getattr(self, "dynamic_caption_page", None)
+            if page is not None and hasattr(page, "writing_language"):
+                code = writing_language_from_ui(page.writing_language.currentText())
+                if code:
+                    return code
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "language_edit"):
+                code = writing_language_from_ui(self.language_edit.currentText())
+                if code:
+                    return code
+        except Exception:
+            pass
+        return "auto"
+
     def _caption_transcribe(self, media_path, selected_provider):
         """在动态文案工作线程中复用同一套识别、翻译和密钥轮询逻辑。"""
         priority = list(self.store.data.get("provider_priority") or PROVIDERS + [LOCAL_PROVIDER])
@@ -4372,6 +4638,7 @@ class MainWindow(QMainWindow):
             if provider in TRANSCRIPTION_PROVIDERS and provider != AUTO_PROVIDER and provider not in ordered:
                 ordered.append(provider)
         errors = []
+        asr_language = self._caption_asr_language()
         for provider in ordered:
             if provider != LOCAL_PROVIDER and not self.store.has_candidates(provider):
                 message = f"{provider} 没有可用密钥，自动尝试下一种识别服务"
@@ -4379,8 +4646,15 @@ class MainWindow(QMainWindow):
                 continue
             model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
             try:
-                worker = TranscribeWorker(self.store, provider, model, [media_path], "", "auto", False,
-                                          self._find_ffmpeg(), True)
+                # resume_existing=False：避免误复用 subtitle_tasks 断点里的坏结果
+                worker = TranscribeWorker(
+                    self.store, provider, model, [media_path], "", asr_language, False,
+                    self._find_ffmpeg(), False,
+                )
+                write_app_log(
+                    f"字幕识别：{Path(media_path).name}｜服务={provider}｜模型={model}｜语言={asr_language or 'auto'}",
+                    "INFO", "字幕识别",
+                )
                 result = worker._process_one(media_path)
                 raw = result.get("raw") or {}
                 words = raw.get("words") or (raw.get("response") or {}).get("words") or []
@@ -4391,8 +4665,24 @@ class MainWindow(QMainWindow):
                         timed_words.append({"start": float(word.get("start", 0)),
                                             "end": float(word.get("end", word.get("start", 0) + .25)), "text": text})
                 precise_srt = segments_to_srt(timed_words) if timed_words else result["srt"]
+                # 质量护栏：词级结果若明显少于句级，优先句级（防坏 words 列表）
+                phrase_count = max(0, str(result.get("srt") or "").count("-->"))
+                word_count = max(0, precise_srt.count("-->"))
+                if phrase_count >= 3 and word_count > 0 and word_count < max(2, phrase_count // 3):
+                    write_app_log(
+                        f"词级时间轴异常稀疏（词段 {word_count} / 句段 {phrase_count}），改用句级 SRT",
+                        "WARNING", "字幕识别",
+                    )
+                    precise_srt = result["srt"]
                 if errors:
                     write_app_log(f"已自动切换到 {provider} 并继续：{Path(media_path).name}", "INFO", "字幕识别")
+                # 供 Reels 界面日志显示「真正用了谁」
+                self._last_caption_asr = {
+                    "provider": provider,
+                    "model": model,
+                    "language": asr_language or "auto",
+                    "cues": max(0, precise_srt.count("-->")),
+                }
                 return result["original"], result["chinese"], precise_srt
             except Exception as exc:
                 message = f"{provider} 调用失败（可能是配额、密钥或网络问题）：{exc}；自动切换下一方案"
@@ -4646,13 +4936,19 @@ class MainWindow(QMainWindow):
             ffmpeg = self._find_ffmpeg()
         except Exception as exc:
             QMessageBox.critical(self, "缺少组件", str(exc)); return
-        model = (self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
-                 if selected_provider == AUTO_PROVIDER
-                 else self.model_edit.text().strip() or DEFAULT_MODELS[provider])
-        self.store.data["models"][provider] = model; self.store.save()
+        if selected_provider == AUTO_PROVIDER:
+            model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
+        else:
+            model = self._current_model_for_provider(selected_provider) or DEFAULT_MODELS[provider]
+            self.store.data["models"][provider] = model
+            if provider == LOCAL_PROVIDER:
+                self.store.data["_local_model_user_set"] = True
+            self.store.save()
         self.log_box.clear(); self.transcribe_progress.setValue(0)
         if selected_provider == AUTO_PROVIDER:
             self._append_log(f"自动选择：{provider}（模型：{model}）")
+        else:
+            self._append_log(f"使用 {provider}（模型：{model}）")
         self.subtitle_results.clear(); self.result_combo.clear(); self.result_combo.addItem(ALL_RESULTS_LABEL)
         self.original_result.clear(); self.chinese_result.clear()
         self.thread = QThread(self)

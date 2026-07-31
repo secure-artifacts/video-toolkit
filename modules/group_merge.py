@@ -1015,6 +1015,10 @@ class GroupMergeWorker(QObject):
         import threading
         self._active_processes = set()
         self._lock = threading.Lock()
+        # 本地 Whisper 模型非线程安全；API 也可串行化避免打爆限流。
+        # 分析阶段并行时：多路静音检测可重叠，ASR 经此锁排队。
+        self._asr_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
         self.encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
 
     def cancel(self):
@@ -1174,61 +1178,178 @@ class GroupMergeWorker(QObject):
     def _analysis(self, clip, cache):
         signature = self._signature(clip)
         key = str(Path(clip).resolve())
-        saved = cache.get(key, {})
+        with self._cache_lock:
+            saved = dict(cache.get(key, {}) or {})
         if (self.settings.get("resume", True) and saved.get("signature") == signature
                 and str(saved.get("srt") or "").strip()):
             self.log.emit(f"续接：复用语音边界 {clip.name}")
             return saved
         self.log.emit(f"正在识别说话边界：{clip.name}（此阶段可能需要一些时间）")
-        original, _translated, srt = self.transcribe(str(clip))
+        # ASR 串行：本地 Whisper 同模型不可并发；API 亦避免瞬间打满配额
+        with self._asr_lock:
+            if self.cancelled:
+                raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+            original, _translated, srt = self.transcribe(str(clip))
         if not str(srt or "").strip():
             raise RuntimeError("没有识别到带时间轴的有效文案")
-        info = {**saved, "signature": signature, "original": str(original or ""), "srt": str(srt or "")}
-        cache[key] = info
+        with self._cache_lock:
+            saved = dict(cache.get(key, {}) or {})
+            info = {**saved, "signature": signature, "original": str(original or ""), "srt": str(srt or "")}
+            cache[key] = info
         self.log.emit(f"说话边界识别完成：{clip.name}")
         return info
+
+    def _silence_events_head_tail(self, clip, duration, threshold, minimum):
+        """只解码片头/片尾做 silencedetect，避免整段 8s×N 全文件扫（智能混合时显著加速）。"""
+        duration = max(0.05, float(duration or 0.05))
+        threshold = int(threshold)
+        minimum = max(0.06, float(minimum))
+        af = f"silencedetect=noise={threshold}dB:d={minimum:.3f}"
+        events = []
+
+        def collect(stderr, offset=0.0):
+            for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", stderr or ""):
+                events.append((kind, float(value) + float(offset)))
+
+        # 短片：一次全扫更省事
+        if duration <= 6.5:
+            result = self._run([
+                self.ffmpeg, "-hide_banner", "-nostats", "-i", str(clip),
+                "-map", "0:a:0", "-af", af, "-f", "null", "-",
+            ])
+            collect(result.stderr, 0.0)
+            return events
+
+        head_win = min(3.2, max(1.2, duration * 0.42))
+        tail_win = min(5.5, max(1.5, duration * 0.55))
+        # 片头窗口
+        result = self._run([
+            self.ffmpeg, "-hide_banner", "-nostats",
+            "-t", f"{head_win:.3f}", "-i", str(clip),
+            "-map", "0:a:0", "-af", af, "-f", "null", "-",
+        ])
+        collect(result.stderr, 0.0)
+        # 片尾窗口（-ss 在 -i 前：时间戳从 0 起，需加 offset）
+        tail_ss = max(0.0, duration - tail_win)
+        if tail_ss > head_win * 0.85:
+            result = self._run([
+                self.ffmpeg, "-hide_banner", "-nostats",
+                "-ss", f"{tail_ss:.3f}", "-i", str(clip),
+                "-map", "0:a:0", "-af", af, "-f", "null", "-",
+            ])
+            collect(result.stderr, tail_ss)
+        return events
 
     def _fast_analysis(self, clip, cache):
         """本地片头/片尾静音（安全版）：中间停顿绝不裁切。"""
         signature = self._signature(clip)
         key = str(Path(clip).resolve())
-        saved = cache.get(key, {})
         threshold = int(self.settings.get("silence_threshold_db", -35))
         minimum = max(0.06, float(self.settings.get("silence_min_ms", 180)) / 1000.0)
         params = {"threshold": threshold, "minimum": round(minimum, 3),
                   "head": int(self.settings.get("head_padding_ms", 80)),
-                  "tail": int(self.settings.get("tail_padding_ms", 120))}
-        # v4 = safe_silence_bounds；旧 v2 缓存可能含中间静音误裁，禁止续接
+                  "tail": int(self.settings.get("tail_padding_ms", 120)),
+                  "scan": "head_tail_v5"}
+        with self._cache_lock:
+            saved = dict(cache.get(key, {}) or {})
+        # v5 = 首尾窗口 silencedetect + safe_silence_bounds；旧 v4 全片扫仍可续接
         if (self.settings.get("resume", True) and saved.get("signature") == signature
-                and saved.get("fast_bounds_version") == 4 and saved.get("fast_params") == params
+                and saved.get("fast_bounds_version") in (4, 5)
+                and saved.get("fast_params") == params
                 and saved.get("bounds")):
+            self.log.emit(f"续接：复用本地声音边界 {clip.name}")
+            return saved
+        # 兼容旧缓存：同签名且已有 bounds，参数仅 scan 字段不同时仍可复用
+        if (self.settings.get("resume", True) and saved.get("signature") == signature
+                and saved.get("fast_bounds_version") in (4, 5) and saved.get("bounds")
+                and isinstance(saved.get("fast_params"), dict)
+                and saved["fast_params"].get("threshold") == params["threshold"]
+                and saved["fast_params"].get("minimum") == params["minimum"]
+                and saved["fast_params"].get("head") == params["head"]
+                and saved["fast_params"].get("tail") == params["tail"]):
             self.log.emit(f"续接：复用本地声音边界 {clip.name}")
             return saved
         probe = self._probe(clip)
         duration = max(0.05, probe["duration"])
         if not probe["audio"]:
-            info = {**saved, "signature": signature, "fast_bounds_version": 4,
+            info = {**saved, "signature": signature, "fast_bounds_version": 5,
                     "fast_params": params, "duration": duration, "bounds": [0.0, duration, False]}
-            cache[key] = info
+            with self._cache_lock:
+                prev = dict(cache.get(key, {}) or {})
+                info = {**prev, **info}
+                cache[key] = info
             return info
         self.log.emit(f"快速检测首尾声音：{clip.name}（仅片头/片尾，保护说话内容）")
-        result = self._run([
-            self.ffmpeg, "-hide_banner", "-nostats", "-i", str(clip),
-            "-map", "0:a:0", "-af",
-            f"silencedetect=noise={threshold}dB:d={minimum:.3f}", "-f", "null", "-",
-        ])
-        events = []
-        for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", result.stderr or ""):
-            events.append((kind, float(value)))
+        events = self._silence_events_head_tail(clip, duration, threshold, minimum)
         start, end, detected = safe_silence_bounds(
             duration, events,
             self.settings.get("head_padding_ms", 80),
             self.settings.get("tail_padding_ms", 120),
         )
-        info = {**saved, "signature": signature, "fast_bounds_version": 4,
-                "fast_params": params, "duration": duration, "bounds": [start, end, detected]}
-        cache[key] = info
+        with self._cache_lock:
+            prev = dict(cache.get(key, {}) or {})
+            info = {**prev, "signature": signature, "fast_bounds_version": 5,
+                    "fast_params": params, "duration": duration, "bounds": [start, end, detected]}
+            cache[key] = info
         return info
+
+    def _persist_analysis_cache(self, cache_file, analysis_cache):
+        try:
+            with self._cache_lock:
+                payload = json.dumps(analysis_cache, ensure_ascii=False, indent=2)
+            cache_file.write_text(payload, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _analyze_clip(self, clip, analysis_cache, *, need_asr, need_fast, trim_mode, script_mode):
+        """单片段分析（可并行）：先静音后 ASR，便于多路静音与一路 ASR 重叠。"""
+        if self.cancelled:
+            raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+        key = str(clip.resolve())
+        if trim_mode == "none" and not script_mode:
+            return key, {}
+        if not need_asr and not need_fast:
+            return key, {}
+        analysis = {}
+        try:
+            # 静音检测无 GPU/模型，优先跑完，再进 ASR 锁 —— 并行收益最大
+            if need_fast:
+                analysis = self._fast_analysis(clip, analysis_cache)
+            if need_asr:
+                analysis = self._analysis(clip, analysis_cache)
+            if trim_mode == "hybrid":
+                media_duration = float(analysis.get("duration") or self._probe(clip)["duration"])
+                analysis["hybrid_bounds"] = list(hybrid_trim_bounds(
+                    analysis.get("srt", ""), media_duration, analysis.get("bounds"),
+                    self.settings.get("head_padding_ms", 80),
+                    self.settings.get("tail_padding_ms", 120),
+                ))
+                with self._cache_lock:
+                    prev = dict(analysis_cache.get(key, {}) or {})
+                    analysis = {**prev, **analysis}
+                    analysis_cache[key] = analysis
+                hb = analysis["hybrid_bounds"]
+                self.log.emit(
+                    f"智能混合边界：{clip.name} → "
+                    f"{float(hb[0]):.2f}s–{float(hb[1]):.2f}s"
+                    f"{'' if hb[2] else '（回退完整）'}"
+                )
+            elif trim_mode == "fast":
+                self.log.emit(f"快速声音边界：已完成本地首尾检测 {clip.name}")
+            elif trim_mode == "none" and script_mode:
+                self.log.emit(f"文案识别完成（不裁剪，仅用于按分段文案排序）：{clip.name}")
+            elif need_asr:
+                self.log.emit(f"智能文案边界：已按首词/末词时间定位 {clip.name}")
+            return key, analysis
+        except Exception as exc:
+            if script_mode and need_asr:
+                raise
+            if need_asr:
+                self.log.emit(
+                    f"智能文案边界识别失败，自动改用本地声音边界继续处理：{clip.name}（{exc}）"
+                )
+                return key, self._fast_analysis(clip, analysis_cache)
+            raise
 
     def _normalize(self, clip, index, total_count, cache_dir, analysis, target_w, target_h, watermark=None, group_script=""):
         probe = self._probe(clip)
@@ -1563,57 +1684,60 @@ class GroupMergeWorker(QObject):
                         first_probe = self._probe(clips[0])
                         if val2 > first_probe["duration"]:
                             group_manual_bounds = (val1, val2)
-                for clip in clips:
-                    if self.cancelled:
-                        raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
-                    # 裁剪模式需要的分析数据：
-                    # - none: 不需要（但文案排序仍要 ASR）
-                    # - text/hybrid: 需要 ASR 时间轴
-                    # - fast: 需要本地静音边界
-                    # - 文案排序: 无论裁剪模式都要 ASR（用于 match_clips_to_script）
-                    need_asr = script_mode or trim_mode in ("hybrid", "text")
-                    need_fast = trim_mode in ("hybrid", "fast")
-                    if trim_mode == "none" and not script_mode:
+                # 裁剪模式需要的分析数据：
+                # - none: 不需要（但文案排序仍要 ASR）
+                # - text/hybrid: 需要 ASR 时间轴
+                # - fast: 需要本地静音边界
+                # - 文案排序: 无论裁剪模式都要 ASR（用于 match_clips_to_script）
+                need_asr = script_mode or trim_mode in ("hybrid", "text")
+                need_fast = trim_mode in ("hybrid", "fast")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                # 静音检测可多路并行；ASR 在内部加锁串行 → 工人数略大于 1 即可重叠「静音||ASR」
+                if need_fast and not need_asr:
+                    analysis_workers = min(4, max(1, len(clips)))
+                elif need_asr and need_fast:
+                    analysis_workers = min(3, max(1, len(clips)))
+                elif need_asr:
+                    analysis_workers = min(2, max(1, len(clips)))
+                else:
+                    analysis_workers = 1
+                if len(clips) > 1 and (need_asr or need_fast):
+                    self.log.emit(
+                        f"边界分析并行：{analysis_workers} 路"
+                        f"（{'静音可重叠 + ASR 排队' if need_asr and need_fast else '静音并行' if need_fast else 'ASR'}）"
+                        f" · 本组 {len(clips)} 段"
+                    )
+                if trim_mode == "none" and not script_mode:
+                    for clip in clips:
                         analyses[str(clip.resolve())] = {}
-                    elif need_asr:
-                        try:
-                            analysis = self._analysis(clip, analysis_cache)
-                            if need_fast:
-                                analysis = self._fast_analysis(clip, analysis_cache)
-                            if trim_mode == "hybrid":
-                                media_duration = float(analysis.get("duration") or self._probe(clip)["duration"])
-                                analysis["hybrid_bounds"] = list(hybrid_trim_bounds(
-                                    analysis.get("srt", ""), media_duration, analysis.get("bounds"),
-                                    self.settings.get("head_padding_ms", 80),
-                                    self.settings.get("tail_padding_ms", 120),
-                                ))
-                                analysis_cache[str(clip.resolve())] = analysis
-                                hb = analysis["hybrid_bounds"]
-                                self.log.emit(
-                                    f"智能混合边界：{clip.name} → "
-                                    f"{float(hb[0]):.2f}s–{float(hb[1]):.2f}s"
-                                    f"{'' if hb[2] else '（回退完整）'}"
-                                )
-                            elif trim_mode == "fast":
-                                self.log.emit(f"快速声音边界：已完成本地首尾检测 {clip.name}")
-                            elif trim_mode == "none" and script_mode:
-                                self.log.emit(f"文案识别完成（不裁剪，仅用于按分段文案排序）：{clip.name}")
-                            else:
-                                self.log.emit(f"智能文案边界：已按首词/末词时间定位 {clip.name}")
-                            analyses[str(clip.resolve())] = analysis
-                        except Exception as exc:
-                            if script_mode:
-                                raise
-                            self.log.emit(
-                                f"智能文案边界识别失败，自动改用本地声音边界继续处理：{clip.name}（{exc}）"
-                            )
-                            analyses[str(clip.resolve())] = self._fast_analysis(clip, analysis_cache)
-                    else:
-                        # 纯快速声音边界（文件名排序）：不调用 ASR
-                        analyses[str(clip.resolve())] = self._fast_analysis(clip, analysis_cache)
-                    cache_file.write_text(json.dumps(analysis_cache, ensure_ascii=False, indent=2), encoding="utf-8")
-                    completed_steps += 1
-                    self.progress.emit(round(completed_steps / total_steps * 100))
+                        completed_steps += 1
+                        self.progress.emit(round(completed_steps / total_steps * 100))
+                else:
+                    def _job(c):
+                        return self._analyze_clip(
+                            c, analysis_cache,
+                            need_asr=need_asr, need_fast=need_fast,
+                            trim_mode=trim_mode, script_mode=script_mode,
+                        )
+                    with ThreadPoolExecutor(max_workers=analysis_workers) as executor:
+                        futures = {executor.submit(_job, clip): clip for clip in clips}
+                        for future in as_completed(futures):
+                            if self.cancelled:
+                                for other in futures:
+                                    other.cancel()
+                                raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+                            clip = futures[future]
+                            try:
+                                key, analysis = future.result()
+                            except Exception as exc:
+                                for other in futures:
+                                    other.cancel()
+                                raise RuntimeError(f"边界分析失败：{clip.name} — {exc}") from exc
+                            analyses[key] = analysis
+                            self._persist_analysis_cache(cache_file, analysis_cache)
+                            completed_steps += 1
+                            self.progress.emit(round(completed_steps / total_steps * 100))
+                self._persist_analysis_cache(cache_file, analysis_cache)
                 if self.settings.get("sort_mode") == "script":
                     if not str(group_script or "").strip():
                         self.log.emit("提醒：本组未找到分段文案，自动回退为文件名自然排序。")
