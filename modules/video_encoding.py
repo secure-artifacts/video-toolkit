@@ -159,43 +159,169 @@ def diagnose_encoders(ffmpeg):
 
 
 def encoder_args(key, cpu_preset="veryfast", preview=False, intermediate=False):
-    """Return H.264 args. intermediate=True for temp segments (faster, slightly lower quality)."""
+    """Return H.264 args. intermediate=True for temp segments (faster, slightly lower quality).
+
+    成品编码默认关闭 B 帧（-bf 0）：B 帧重排会让 stream start_time≈1 帧（如 0.033s），
+    达芬奇时间线从 0 起播会出现片头黑帧。
+    """
     key = encoder_key(key)
-    # 中间分段/时间轴缓存：优先速度
+    # 中间分段/时间轴缓存：优先速度（仍关 B 帧，避免拼接后残留 start delay）
     if intermediate or preview:
         if key == "qsv":
             return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "28",
-                    "-look_ahead", "0", "-pix_fmt", "nv12"]
+                    "-look_ahead", "0", "-bf", "0", "-pix_fmt", "nv12"]
         if key == "nvenc":
             return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
-                    "-rc", "vbr", "-cq", "28", "-b:v", "0", "-pix_fmt", "yuv420p"]
+                    "-rc", "vbr", "-cq", "28", "-b:v", "0", "-bf", "0", "-pix_fmt", "yuv420p"]
         if key == "mf":
+            # MF 无标准 -bf；靠滤镜 setpts + mux 参数压掉 start delay
             return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "70",
                     "-pix_fmt", "yuv420p"]
         if key == "amf":
             return ["-c:v", "h264_amf", "-quality", "speed",
-                    "-rc", "cqp", "-qp_i", "28", "-qp_p", "28", "-pix_fmt", "yuv420p"]
+                    "-rc", "cqp", "-qp_i", "28", "-qp_p", "28", "-bf_delta_qp", "0",
+                    "-pix_fmt", "yuv420p"]
         return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-threads", "0"]
+                "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0"]
     if key == "qsv":
         return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "21",
-                "-look_ahead", "0", "-pix_fmt", "nv12"]
+                "-look_ahead", "0", "-bf", "0", "-pix_fmt", "nv12"]
     if key == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
-                "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
+                "-rc", "vbr", "-cq", "21", "-b:v", "0", "-bf", "0", "-pix_fmt", "yuv420p"]
     if key == "mf":
         return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "75",
                 "-pix_fmt", "yuv420p"]
     if key == "amf":
         return ["-c:v", "h264_amf", "-quality", "balanced",
-                "-rc", "cqp", "-qp_i", "21", "-qp_p", "21", "-pix_fmt", "yuv420p"]
+                "-rc", "cqp", "-qp_i", "21", "-qp_p", "21", "-bf_delta_qp", "0",
+                "-pix_fmt", "yuv420p"]
     preset = str(cpu_preset or "veryfast")
     if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
         preset = "veryfast"
     if preset == "medium":
         preset = "faster"
     return ["-c:v", "libx264", "-preset", preset,
-            "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0"]
+            "-crf", "20", "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0"]
+
+
+def davinci_safe_mux_args(fps=30):
+    """Mux flags so Resolve/达芬奇 sees video+audio both starting at t=0, true CFR."""
+    rate = str(int(fps) if float(fps).is_integer() else fps)
+    timescale = str(int(float(rate) * 1000))
+    return [
+        "-r", rate,
+        "-fps_mode", "cfr",
+        "-video_track_timescale", timescale,
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
+    ]
+
+
+def _probe_video_fps(ffmpeg, path, default=30.0):
+    """Best-effort average frame rate from ffprobe; falls back to default."""
+    from pathlib import Path
+    import json
+    path = Path(path)
+    ffprobe = Path(str(ffmpeg)).with_name("ffprobe" + Path(str(ffmpeg)).suffix)
+    if not ffprobe.exists():
+        ffprobe = "ffprobe"
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe), "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "json", str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_kwargs(),
+        )
+        data = json.loads(result.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        for key in ("avg_frame_rate", "r_frame_rate"):
+            raw = str(stream.get(key) or "")
+            if "/" in raw:
+                num, den = raw.split("/", 1)
+                try:
+                    value = float(num) / float(den)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+                if 1.0 <= value <= 120.0:
+                    return value
+            else:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if 1.0 <= value <= 120.0:
+                    return value
+    except Exception:
+        pass
+    return float(default or 30.0)
+
+
+def remux_zero_start(ffmpeg, path, fps=None):
+    """重封装：去掉 AAC 编码延迟导致的 video start_time≈1 帧，防止达芬奇片头黑帧。
+
+    仅 copy + 视频 bitstream 时间戳重写，不二次损画质。失败时保留原文件。
+    使用 setts=ts=N/<fps>/TB（部分 FFmpeg 无 FR 常量，故写死帧率数）。
+    """
+    from pathlib import Path
+    import os
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size < 1024:
+        return False
+    temporary = path.with_name(f"{path.stem}.zts_{os.getpid()}{path.suffix}")
+    rate = float(fps) if fps and float(fps) > 1 else _probe_video_fps(ffmpeg, path, 30.0)
+    # 保留合理小数；常见 24/25/30/29.97
+    if abs(rate - round(rate)) < 0.02:
+        rate_expr = str(int(round(rate)))
+    else:
+        rate_expr = f"{rate:.3f}".rstrip("0").rstrip(".")
+    command = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(path),
+        "-map", "0:v:0?", "-map", "0:a:0?",
+        "-c", "copy",
+        "-bsf:v", f"setts=ts=N/{rate_expr}/TB",
+        "-muxdelay", "0", "-muxpreload", "0",
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
+        str(temporary),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=max(60, min(600, path.stat().st_size // (2 * 1024 * 1024) + 30)),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_kwargs(),
+        )
+        if result.returncode != 0 or not temporary.is_file() or temporary.stat().st_size < 1024:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        os.replace(str(temporary), str(path))
+        return True
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def calculate_target_size(src_w, src_h, aspect_ratio_str, resolution_str):

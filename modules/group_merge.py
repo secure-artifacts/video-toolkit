@@ -13,7 +13,10 @@ from PySide6.QtCore import QObject, Signal
 
 from .path_picker import VIDEO_EXTENSIONS, collect_files, natural_key
 from .settings_page import hidden_kwargs
-from .video_encoding import ENCODER_LABELS, encoder_args, resolve_encoder, calculate_target_size
+from .video_encoding import (
+    ENCODER_LABELS, encoder_args, resolve_encoder, calculate_target_size,
+    davinci_safe_mux_args, remux_zero_start,
+)
 
 
 # 合并转场预设：UI 显示名 → FFmpeg xfade 参数。
@@ -1019,6 +1022,8 @@ class GroupMergeWorker(QObject):
         # 分析阶段并行时：多路静音检测可重叠，ASR 经此锁排队。
         self._asr_lock = threading.Lock()
         self._cache_lock = threading.Lock()
+        # Windows MF 编码器多路并行易 “Could not open encoder before EOF”
+        self._mf_encode_lock = threading.Lock()
         self.encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
 
     def cancel(self):
@@ -1498,17 +1503,20 @@ class GroupMergeWorker(QObject):
             f"正在裁剪口气音并统一音视频参数：{clip.name}"
             f"（约 {expect_out:.1f}s，编码器 {ENCODER_LABELS.get(self.encoder, self.encoder)}）"
         )
-        # 画面核心：分辨率已一致时跳过 scale/crop（省大量 CPU）；不强行 fps=30（重采样很贵）
+        # 画面核心：分辨率已一致时跳过 scale/crop。
+        # 时间戳归零 + 关 B 帧：避免达芬奇看到 video start_time≈1 帧的片头黑帧。
+        # 中间段不强行 fps=30（源多为 24/25/30，重采样贵）；最终成片字幕烧录再统一 30fps。
         same_geometry = (
             int(probe.get("width") or 0) == int(target_w)
             and int(probe.get("height") or 0) == int(target_h)
         )
         if same_geometry:
-            video_core = "setsar=1,format=yuv420p"
+            video_core = "setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
         else:
             video_core = (
                 f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1,format=yuv420p"
+                f"crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,"
+                f"setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
             )
         has_pad = sp > 0.01 or ep > 0.01
         need_complex = bool(watermark) or has_pad
@@ -1523,7 +1531,8 @@ class GroupMergeWorker(QObject):
             if probe["audio"]:
                 command += [
                     "-af",
-                    "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo",
+                    "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    "asetpts=PTS-STARTPTS",
                     "-map", "0:a:0",
                 ]
             else:
@@ -1540,7 +1549,10 @@ class GroupMergeWorker(QObject):
                 command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000"]
             command += [
                 "-t", f"{expect_out:.3f}",
-                "-fps_mode", "cfr", "-movflags", "+faststart",
+                "-fps_mode", "cfr",
+                "-muxdelay", "0", "-muxpreload", "0",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
                 str(destination),
             ]
         else:
@@ -1558,7 +1570,7 @@ class GroupMergeWorker(QObject):
             if watermark and wm_idx is not None:
                 fc_parts.append(
                     f"[0:v]{video_core}[base];[{wm_idx}:v]scale={target_w}:{target_h},format=rgba[wm];"
-                    f"[base][wm]overlay=0:0:shortest=1,format=yuv420p[vcore]"
+                    f"[base][wm]overlay=0:0:shortest=1,format=yuv420p,setpts=PTS-STARTPTS[vcore]"
                 )
             else:
                 fc_parts.append(f"[0:v]{video_core}[vcore]")
@@ -1569,6 +1581,9 @@ class GroupMergeWorker(QObject):
             if ep > 0.01:
                 fc_parts.append(f"[{v_label}]tpad=stop_mode=clone:stop_duration={ep:.3f}[v2]")
                 v_label = "v2"
+            # 垫片后再次归零，保证输出从 t=0 起
+            fc_parts.append(f"[{v_label}]setpts=PTS-STARTPTS[vout]")
+            v_label = "vout"
 
             a_label = None
             if probe["audio"]:
@@ -1615,18 +1630,95 @@ class GroupMergeWorker(QObject):
                 command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000"]
             command += [
                 "-t", f"{expect_out:.3f}",
-                "-fps_mode", "cfr", "-movflags", "+faststart",
+                "-fps_mode", "cfr",
+                "-muxdelay", "0", "-muxpreload", "0",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
                 str(destination),
             ]
         # 8s 片段正常应 <15s；给硬件/水印余量。超时即杀，避免「一直卡在这里」
         encode_timeout = max(90.0, min(600.0, expect_out * 25.0 + 45.0))
         t0 = time.monotonic()
-        self._run(
-            command,
-            timeout=encode_timeout,
-            heartbeat_label=clip.name,
-            heartbeat_sec=6.0,
-        )
+        try:
+            # Windows MF 多路并行时常见 “Could not open encoder before EOF / -22”
+            if self.encoder == "mf" and hasattr(self, "_mf_encode_lock"):
+                with self._mf_encode_lock:
+                    self._run(
+                        command,
+                        timeout=encode_timeout,
+                        heartbeat_label=clip.name,
+                        heartbeat_sec=6.0,
+                    )
+            else:
+                self._run(
+                    command,
+                    timeout=encode_timeout,
+                    heartbeat_label=clip.name,
+                    heartbeat_sec=6.0,
+                )
+        except Exception as exc:
+            err = str(exc)
+            # 硬件编码偶发失败：自动用 libx264 重试本段，不拖垮整组
+            hw_fail = self.encoder in ("mf", "nvenc", "qsv", "amf") and any(
+                token in err.lower()
+                for token in (
+                    "h264_mf", "h264_nvenc", "h264_qsv", "h264_amf",
+                    "could not open encoder", "invalid argument",
+                    "error code: -22", "nothing was written",
+                    "encoder", "not open",
+                )
+            )
+            if not hw_fail:
+                raise
+            self.log.emit(
+                f"提醒：{clip.name} 硬件编码失败（{self.encoder}），自动改用 CPU 重试本段…"
+            )
+            try:
+                if destination.exists():
+                    destination.unlink()
+            except OSError:
+                pass
+            # 把命令里的硬件编码器参数替换为 libx264
+            retry = list(command)
+            try:
+                # 找到 -c:v 后的编码器名
+                for i, tok in enumerate(retry):
+                    if tok == "-c:v" and i + 1 < len(retry):
+                        # 删掉后续硬件专用参数直到下一个 flag 或输出路径
+                        retry[i + 1] = "libx264"
+                        break
+                # 去掉 MF/NVENC/QSV 特有选项
+                drop_keys = {
+                    "-rate_control", "-quality", "-cq", "-b:v", "-rc",
+                    "-look_ahead", "-tune", "-qp_i", "-qp_p", "-bf_delta_qp",
+                    "-global_quality", "-preset",
+                }
+                cleaned = []
+                skip_next = False
+                for i, tok in enumerate(retry):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if tok in drop_keys:
+                        skip_next = True
+                        continue
+                    # 保留 -c:v libx264 之后插入兼容参数
+                    cleaned.append(tok)
+                    if tok == "libx264" and i > 0 and retry[i - 1] == "-c:v":
+                        cleaned.extend(["-preset", "veryfast", "-crf", "23", "-bf", "0"])
+                # 确保 pix_fmt
+                if "-pix_fmt" not in cleaned:
+                    # 插在输出文件前
+                    cleaned = cleaned[:-1] + ["-pix_fmt", "yuv420p"] + cleaned[-1:]
+                retry = cleaned
+            except Exception:
+                retry = command
+            self._run(
+                retry,
+                timeout=encode_timeout,
+                heartbeat_label=f"{clip.name}·CPU",
+                heartbeat_sec=6.0,
+            )
         elapsed = time.monotonic() - t0
         # 校验垫片后时长
         try:
@@ -1783,13 +1875,14 @@ class GroupMergeWorker(QObject):
                         watermark = None
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 import os
-                # QSV 多开易死锁；NVENC/MF/AMF 可 2 路；CPU 可 4 路。
-                if self.encoder == "qsv":
+                # QSV/MF 多开易互锁或 “Could not open encoder before EOF”；NVENC/AMF 可 2 路。
+                if self.encoder in ("qsv", "mf"):
                     max_workers = 1
                     self.log.emit(
-                        "编码策略：Intel Quick Sync 串行（避免多路会话互锁）。"
+                        f"编码策略：{ENCODER_LABELS.get(self.encoder, self.encoder)} 串行"
+                        f"（避免多路会话互锁/打不开编码器）。"
                     )
-                elif self.encoder in ("nvenc", "mf", "amf"):
+                elif self.encoder in ("nvenc", "amf"):
                     max_workers = min(2, len(clips), os.cpu_count() or 2)
                     self.log.emit(
                         f"编码策略：硬件编码并行 {max_workers}"
@@ -1929,28 +2022,40 @@ class GroupMergeWorker(QObject):
                                 current_offset + segment_infos[i]["duration"]
                                 - actual_transition_duration
                             )
+                        # 最终再归零时间戳，避免 xfade 链残留 start delay
+                        filter_parts.append(f"{v_in}setpts=PTS-STARTPTS[vfinal]")
+                        filter_parts.append(f"{a_in}asetpts=PTS-STARTPTS[afinal]")
                         filter_complex_str = ";".join(filter_parts)
                         concat_command += [
                             "-filter_complex", filter_complex_str,
-                            "-map", v_in,
-                            "-map", a_in,
+                            "-map", "[vfinal]",
+                            "-map", "[afinal]",
                         ]
                         concat_command += encoder_args(
                             self.encoder, self.settings.get("encode_preset", "veryfast"),
                             intermediate=True,
                         )
-                        concat_command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
+                        concat_command += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000"]
                         if self.settings.get("clean_metadata", True):
                             concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
                                                "-map_metadata:p", "-1", "-map_metadata:c", "-1",
                                                "-map_chapters", "-1"]
-                        concat_command += ["-movflags", "+faststart", str(destination)]
+                        concat_command += [
+                            "-fps_mode", "cfr",
+                            "-muxdelay", "0", "-muxpreload", "0",
+                            "-avoid_negative_ts", "make_zero",
+                            "-movflags", "+faststart",
+                            str(destination),
+                        ]
                     else:
                         if transition_name and transition_name != "无转场" and len(normalized) <= 1:
                             self.log.emit(f"本组仅 1 个片段，跳过转场「{transition_name}」。")
+                        # 轻量重封装（不重编码）归零时间戳，避免 stream copy 保留负 DTS/start delay
                         concat_command = [
                             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
                             "-i", str(concat_file), "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+                            "-muxdelay", "0", "-muxpreload", "0",
+                            "-avoid_negative_ts", "make_zero",
                         ]
                         if self.settings.get("clean_metadata", True):
                             concat_command += ["-map_metadata", "-1", "-map_metadata:s", "-1",
@@ -1959,6 +2064,8 @@ class GroupMergeWorker(QObject):
                         concat_command += ["-movflags", "+faststart", str(destination)]
                         
                     destination = self._write_final_output(concat_command, destination)
+                    if remux_zero_start(self.ffmpeg, destination):
+                        self.log.emit("已归零成品时间戳（避免达芬奇/Resolve 片头黑帧）。")
                     if group_manual_bounds:
                         self.log.emit(f"群组切片功能：正在对合并后的成品视频应用手动切片 {group_manual_bounds[0]:.2f}s - {group_manual_bounds[1]:.2f}s...")
                         trimmed_dest = destination.with_name(destination.stem + "_trimmed.mp4")

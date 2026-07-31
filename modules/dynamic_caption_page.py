@@ -115,7 +115,8 @@ from .language_style import (
 )
 from .video_encoding import (
     ENCODER_LABELS, encoder_args, resolve_encoder, calculate_target_size,
-    diagnose_encoders, encoder_probe_detail,
+    diagnose_encoders, encoder_probe_detail, davinci_safe_mux_args,
+    remux_zero_start,
 )
 from .app_logging import write_app_log
 from .canva_timeline import CanvaTimelinePanel, TransitionPresetButton
@@ -833,6 +834,51 @@ def media_duration(ffmpeg, path, fallback=8.0):
     return fallback
 
 
+def media_stream_durations(ffmpeg, path):
+    """返回 (video_sec, audio_sec)。缺失的轨为 0；优先 stream duration，否则回退 format。"""
+    ffmpeg_path = Path(ffmpeg)
+    ffprobe = ffmpeg_path.with_name("ffprobe" + ffmpeg_path.suffix)
+    video_sec = audio_sec = 0.0
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe), "-v", "error",
+                "-show_entries", "stream=codec_type,duration:format=duration",
+                "-of", "json", str(path),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", **hidden_kwargs(),
+        )
+        data = json.loads(result.stdout or "{}")
+        for stream in data.get("streams") or []:
+            try:
+                dur = float(stream.get("duration") or 0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            if dur <= 0.05:
+                continue
+            kind = str(stream.get("codec_type") or "")
+            if kind == "video" and video_sec <= 0:
+                video_sec = dur
+            elif kind == "audio" and audio_sec <= 0:
+                audio_sec = dur
+        if video_sec <= 0.05 or audio_sec <= 0.05:
+            try:
+                fmt = float((data.get("format") or {}).get("duration") or 0)
+            except (TypeError, ValueError):
+                fmt = 0.0
+            if fmt > 0.05:
+                if video_sec <= 0.05:
+                    video_sec = fmt
+                if audio_sec <= 0.05 and media_has_audio(ffmpeg, path):
+                    audio_sec = fmt
+    except Exception:
+        pass
+    if video_sec <= 0.05:
+        video_sec = media_duration(ffmpeg, path, 0.0)
+    return max(0.0, video_sec), max(0.0, audio_sec)
+
+
 def media_has_audio(ffmpeg, path):
     """Return whether the first audio stream exists without decoding the media."""
     ffmpeg_path = Path(ffmpeg)
@@ -1124,7 +1170,7 @@ def mixed_audio_filter(original_volume=100, background_volume=25,
         f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={original:.3f}[original_audio];"
         f"[1:a:0]{','.join(background_filters)}[background_audio];"
         "[original_audio][background_audio]amix=inputs=2:duration=longest:"
-        "dropout_transition=2:normalize=0[aout]"
+        "dropout_transition=2:normalize=0,asetpts=PTS-STARTPTS[aout]"
     )
 
 
@@ -1136,6 +1182,7 @@ def replacement_audio_filter(fade_mode="直接加入（无淡入淡出）", fade
         filters.append(f"adelay={int(delay_ms)}|{int(delay_ms)}")
     filters.extend(added_audio_fade_filters(fade_mode,fade_in_ms,fade_out_ms,duration))
     filters.append("apad=pad_dur=86400")
+    filters.append("asetpts=PTS-STARTPTS")
     return f"[1:a:0]{','.join(filters)}[aout]"
 
 
@@ -1154,7 +1201,8 @@ def bgm_mix_audio_filter(dialogue_input, bgm_input, original_volume=100, backgro
     return (
         f"{dialogue_input}{','.join(dialogue_filters)}[dialogue_audio];"
         f"{bgm_input}{','.join(bgm_filters)}[bgm_audio];"
-        "[dialogue_audio][bgm_audio]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[aout]"
+        "[dialogue_audio][bgm_audio]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0,"
+        "asetpts=PTS-STARTPTS[aout]"
     )
 
 
@@ -1174,6 +1222,7 @@ def bgm_only_audio_filter(bgm_input, background_volume=25,
     filters.extend(added_audio_fade_filters(
         fade_mode, fade_in_ms, fade_out_ms, duration))
     filters.append("apad=pad_dur=86400")
+    filters.append("asetpts=PTS-STARTPTS")
     return f"{bgm_input}{','.join(filters)}[aout]"
 
 
@@ -2196,7 +2245,8 @@ def watermark_filter_graph(ass_filter, settings, watermark_input_index, v_filter
         return (
             video_prefix +
             f"[{watermark_input_index}:v]format=rgba[wm];"
-            "[captioned][wm]overlay=0:0:format=auto:eof_action=repeat[outv]"
+            "[captioned][wm]overlay=0:0:format=auto:eof_action=repeat,"
+            "setpts=PTS-STARTPTS[outv]"
         )
     prefix = (
         video_prefix +
@@ -2205,7 +2255,8 @@ def watermark_filter_graph(ass_filter, settings, watermark_input_index, v_filter
     if mode == "9:16 全屏覆盖" or "全屏" in mode:
         return (
             prefix + "[wm_alpha][captioned]scale2ref=w=main_w:h=main_h[wm][base];"
-            "[base][wm]overlay=0:0:format=auto:eof_action=repeat[outv]"
+            "[base][wm]overlay=0:0:format=auto:eof_action=repeat,"
+            "setpts=PTS-STARTPTS[outv]"
         )
     width = max(3, min(60, int(settings.get("watermark_width", 18)))) / 100
     margin = max(0, min(300, int(settings.get("watermark_margin", 28))))
@@ -2221,7 +2272,8 @@ def watermark_filter_graph(ass_filter, settings, watermark_input_index, v_filter
     return (
         prefix +
         f"[wm_alpha][captioned]scale2ref=w=main_w*{width:.4f}:h=ow/mdar[wm][base];"
-        f"[base][wm]overlay={x}:{y}:format=auto:eof_action=repeat[outv]"
+        f"[base][wm]overlay={x}:{y}:format=auto:eof_action=repeat,"
+        f"setpts=PTS-STARTPTS[outv]"
     )
 
 
@@ -3228,25 +3280,59 @@ class CaptionWorker(QObject):
                         v_end = max(v_start + 0.05, min(video_duration, v_end))
                         video_duration = v_end - v_start
                 
-                # Check video extension
+                # 同文件原声：音轨常比画面长几十~几百 ms。FFmpeg 默认会用「最后一帧静帧」
+                # 填满多出的音频 → 片尾像卡住。默认裁齐到画面时长，不要静帧。
+                if not is_image and not external and source_has_audio:
+                    v_stream, a_stream = media_stream_durations(self.ffmpeg, render_video)
+                    if v_stream > 0.05:
+                        video_duration = min(video_duration, v_stream) if video_duration > 0.05 else v_stream
+                    if a_stream > video_duration + 0.04:
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 原声音轨比画面长 "
+                            f"{a_stream - video_duration:.2f}s，已裁音频对齐画面（避免片尾静帧）。"
+                        )
+
+                # 配音/外挂音频比画面长时的延长策略
                 extend_mode = self.settings.get("video_extend_mode", "不处理")
                 loop_video = False
                 extend_filters = []
+                freeze_tail = False
                 
-                if not is_image and audio_duration > video_duration:
-                    if extend_mode == "不处理":
-                        extend_mode = "循环播放视频"
-                        self.log.emit(f"[{index + 1}/{len(self.videos)}] 提示：视频时长（{video_duration:.2f}秒）较短，已自动启用“循环播放视频”以匹配配音时长（{audio_duration:.2f}秒）。")
-                    
+                if not is_image and audio_duration > video_duration + 0.04:
                     diff = audio_duration - video_duration
-                    if extend_mode == "循环播放视频":
-                        loop_video = True
-                    elif extend_mode == "最后一帧延长/冻结":
-                        extend_filters.append(f"tpad=stop_duration={diff:.3f}:stop_mode=clone")
-                    elif extend_mode == "速度拉伸（减速延长）":
-                        speed_ratio = video_duration / audio_duration
-                        extend_filters.append(f"setpts=PTS/{speed_ratio:.4f}")
-                    video_duration = audio_duration
+                    # 小于约 2 帧的误差：裁音频即可，不要循环/静帧
+                    if diff <= 0.08:
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 音频仅比画面长 {diff:.2f}s，"
+                            f"按画面时长裁齐（忽略微小误差，避免片尾静帧）。"
+                        )
+                    else:
+                        if extend_mode == "不处理":
+                            extend_mode = "循环播放视频"
+                            self.log.emit(
+                                f"[{index + 1}/{len(self.videos)}] 提示：视频时长（{video_duration:.2f}秒）"
+                                f"短于配音（{audio_duration:.2f}秒），已自动启用“循环播放视频”对齐。"
+                            )
+                        if extend_mode == "循环播放视频":
+                            loop_video = True
+                            video_duration = audio_duration
+                        elif extend_mode == "最后一帧延长/冻结":
+                            # 故意静帧：仅在用户明确选择时
+                            freeze_tail = True
+                            extend_filters.append(f"tpad=stop_duration={diff:.3f}:stop_mode=clone")
+                            video_duration = audio_duration
+                            self.log.emit(
+                                f"[{index + 1}/{len(self.videos)}] 视频延长：末帧静帧 "
+                                f"{diff:.2f}s（当前设置为「最后一帧延长/冻结」）。"
+                            )
+                        elif extend_mode == "速度拉伸（减速延长）":
+                            speed_ratio = video_duration / audio_duration
+                            extend_filters.append(f"setpts=PTS/{speed_ratio:.4f}")
+                            video_duration = audio_duration
+                            self.log.emit(
+                                f"[{index + 1}/{len(self.videos)}] 视频延长：速度拉伸 "
+                                f"×{speed_ratio:.3f} 以匹配配音。"
+                            )
 
                 # 视频比音频长：裁剪视频以对齐音频时长
                 trim_video_to_audio = False
@@ -3257,6 +3343,9 @@ class CaptionWorker(QObject):
                         f"已自动裁剪视频以对齐音频时长。"
                     )
                     video_duration = audio_duration
+
+                # 成片目标时长：后续一律 -t 锁定，防止音画差把末帧拖成静帧
+                output_duration = max(0.05, float(video_duration))
 
                 v_filters = []
                 # MOV (ProRes/HEVC) 等格式可能使用 yuv422p10le / yuva444p10le 等
@@ -3270,7 +3359,12 @@ class CaptionWorker(QObject):
                 v_filters.append("fps=30")
                 if extend_filters:
                     v_filters.extend(extend_filters)
-                v_filter_str = ",".join(v_filters) if v_filters else ""
+                # 时间戳归零：避免成品 video start_time≈0.033（B帧/CTS）→ 达芬奇片头黑帧
+                # 非静帧延长时：用 trim 硬切到目标时长，杜绝编码器用末帧填空
+                if not freeze_tail:
+                    v_filters.append(f"trim=duration={output_duration:.3f}")
+                v_filters.append("setpts=PTS-STARTPTS")
+                v_filter_str = ",".join(v_filters) if v_filters else "setpts=PTS-STARTPTS"
 
                 
                 command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
@@ -3391,9 +3485,8 @@ class CaptionWorker(QObject):
                 if external: watermark_input += 1
                 if bgm_file: watermark_input += 1
                 
-                # Output limits
-                if loop_video or trim_video_to_audio:
-                    command += ["-t", f"{video_duration:.3f}"]
+                # 输出硬限：始终锁到目标时长，避免音轨略长时用末帧静帧填空
+                command += ["-t", f"{output_duration:.3f}"]
 
                 if bgm_file:
                     dialogue_input = "[1:a:0]" if replace_audio else "[0:a:0]"
@@ -3456,6 +3549,7 @@ class CaptionWorker(QObject):
                     command += ["-vf", vf_expr, "-map", "0:v:0"]
                     if audio_graph: command += ["-filter_complex", audio_graph]
                 if audio_graph:
+                    # shortest + 上方 -t：防止混音轨比画面长时拖成静帧
                     command += ["-map", "[aout]", "-shortest"]
                     if bgm_file:
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在混音：添加配音音量 {self.settings.get('original_volume',100)}%，"
@@ -3471,11 +3565,19 @@ class CaptionWorker(QObject):
                 elif mix_audio and not source_has_audio:
                     command += ["-map", "1:a:0", "-shortest"]
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 当前视频没有原声音轨，已自动仅使用背景音。")
+                elif source_has_audio or (external and not replace_audio):
+                    # 直通原声：归零时间戳 + 硬裁到画面时长，杜绝片尾静帧
+                    command += [
+                        "-af",
+                        "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"atrim=0:{output_duration:.3f},asetpts=PTS-STARTPTS",
+                        "-map", "0:a:0",
+                    ]
                 else:
-                    command += ["-map", "0:a?"]
+                    command += ["-an"]
                 # 不指定 -ac，保留源音频声道；字幕烧录只重编码画面。
                 command += encoder_args(encoder, self.settings["encode_preset"])
-                command += ["-fps_mode", "cfr", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+                command += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
                 if (external or bgm_file) and audio_mode in ("替换为添加的音频", "原声＋背景音混合"):
                     command += ["-ac", "2"]
                 if self.settings.get("clean_metadata", True):
@@ -3483,11 +3585,18 @@ class CaptionWorker(QObject):
                                 "-map_metadata:p", "-1", "-map_metadata:c", "-1",
                                 "-map_chapters", "-1"]
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 将在成品输出时直接清除元数据（不生成副本）。")
-                command += ["-movflags", "+faststart", str(destination)]
+                # 达芬奇：强制 CFR、音画从 t=0 起、去掉 B 帧造成的 start delay
+                command += davinci_safe_mux_args(30)
+                command += [str(destination)]
                 returncode, render_log = self._run_render(command, video_duration, index, len(self.videos))
                 try: ass.unlink()
                 except OSError: pass
                 if returncode: raise RuntimeError(render_log.strip() or "动态文案渲染失败")
+                # AAC 编码器仍可能写入 ~21ms 的 video start_time；轻量重封装归零
+                if remux_zero_start(self.ffmpeg, destination, fps=30):
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 已归零成品时间戳（避免达芬奇片头黑帧）。"
+                    )
                 completed[str(video.resolve())]={"fingerprint":fingerprint,"destination":str(destination),
                     "original":original,"chinese":chinese,"word_srt":word_srt,"phrase_srt":phrase_srt}
                 checkpoint["status"]="rendering"; _write_reels_checkpoint(self.output,checkpoint)
@@ -5076,7 +5185,8 @@ class DynamicCaptionPage(QWidget):
         self.render_preview_btn.setObjectName("primary")
         self.render_preview_btn.setToolTip(
             "把时间轴上的视频切片/挪动/转场 + 字幕/水印/BGM 渲染成可播放片段。\n"
-            "比「重新合成」快，专门用来核对轨道调整，不等于整组重跑。"
+            "普通切片后预览会实时映射源画面；删除/转场/插图会自动触发本预览。\n"
+            "比「重新合成」快，不等于整组重跑。"
         )
         self.render_preview_btn.clicked.connect(self.render_effect_preview)
         self.render_preview_btn.setMaximumWidth(230)
@@ -5624,8 +5734,12 @@ class DynamicCaptionPage(QWidget):
         self.aspect_ratio.setToolTip("分组合成与批量导出都会统一到此画面比例。")
         self.resolution.setToolTip("分组合成与批量导出都会统一到此分辨率。")
         self.video_extend_mode.setToolTip(
-            "仅「开始批量导出」生效：当替换/混合音频比画面更长时，如何把视频拉长对齐音频。"
-            "左侧「合成」多片段合并不使用此项。"
+            "仅「开始批量导出」生效：当配音/替换音频比画面明显更长时，如何把视频拉长对齐。\n"
+            "· 不处理：自动改为循环播放（微小误差会直接裁齐，不会静帧）\n"
+            "· 循环播放视频：从头循环画面（推荐，保持动态）\n"
+            "· 最后一帧延长/冻结：片尾定格补时长（会看到静帧）\n"
+            "· 速度拉伸：整段减速拉长\n"
+            "左侧「合成」多片段合并不使用此项。同文件原声比画面略长时会裁音频，避免静帧。"
         )
         self.transition_name.setToolTip(
             "仅左侧「合成」且组内 ≥2 个片段时生效。\n"
@@ -7835,15 +7949,35 @@ class DynamicCaptionPage(QWidget):
         v_start = self._current_video_v_start()
         is_from_timeline = (self.sender() == self.canva_timeline) if hasattr(self, "canva_timeline") else False
         
-        target_ms = int(milliseconds)
+        timeline_ms = max(0, int(milliseconds))
+        edits_live = (
+            is_from_timeline
+            and not getattr(self, "_precise_preview_active", False)
+            and self._timeline_edits_active()
+        )
+        if edits_live:
+            # 时间轴时刻 → 源文件时刻；画面按切片映射，播放器跳到对应源点
+            source_ms, _path = self._map_timeline_ms_to_source(timeline_ms)
+            target_ms = int(source_ms) + int(v_start * 1000)
+            self.player.setPosition(target_ms)
+            if self._preview_external_audio:
+                self.audio_player.setPosition(timeline_ms + self._preview_audio_offset_ms)
+            if getattr(self, "_preview_bgm_active", False) and hasattr(self, "bgm_player"):
+                self.bgm_player.setPosition(timeline_ms + self._preview_bgm_offset_ms)
+            if getattr(self, "preview_capture", None) is not None:
+                # target_override 传时间轴 ms，_render_preview_frame 内再映射
+                self._render_preview_frame(force=True, target_override=timeline_ms)
+            return
+
+        target_ms = timeline_ms
         if is_from_timeline and not getattr(self, "_precise_preview_active", False):
             target_ms += int(v_start * 1000)
             
         self.player.setPosition(target_ms)
         if self._preview_external_audio:
-            self.audio_player.setPosition(int(milliseconds)+self._preview_audio_offset_ms)
+            self.audio_player.setPosition(timeline_ms + self._preview_audio_offset_ms)
         if getattr(self, "_preview_bgm_active", False) and hasattr(self, "bgm_player"):
-            self.bgm_player.setPosition(int(milliseconds) + self._preview_bgm_offset_ms)
+            self.bgm_player.setPosition(timeline_ms + self._preview_bgm_offset_ms)
         # OpenCV 路径：立即跳到对应画面
         if getattr(self, "preview_capture", None) is not None:
             self._render_preview_frame(force=True, target_override=target_ms)
@@ -8281,8 +8415,43 @@ class DynamicCaptionPage(QWidget):
                 return
         except Exception:
             return
-        target = int(target_override) if target_override is not None else int(self.player.position() or 0)
-        target = max(0, target)
+        # 播放器时钟 = 时间轴时间（轨道预览成品）或源片时间
+        timeline_ms = int(target_override) if target_override is not None else int(self.player.position() or 0)
+        timeline_ms = max(0, timeline_ms)
+        # 有切片/删除时：把时间轴时刻映射到源文件读点，实时看到剪辑结果
+        read_ms = timeline_ms
+        mapped_path = ""
+        use_map = (
+            not getattr(self, "_precise_preview_active", False)
+            and self._timeline_edits_active()
+        )
+        if use_map:
+            try:
+                # target_override 来自时间轴 seek 时已是轨上时间；否则用 Canva 播放头
+                if target_override is not None:
+                    map_ms = max(0, int(target_override))
+                elif hasattr(self, "canva_timeline"):
+                    try:
+                        map_ms = int(self.canva_timeline.canvas.position_ms)
+                    except Exception:
+                        map_ms = timeline_ms
+                else:
+                    map_ms = timeline_ms
+                read_ms, mapped_path = self._map_timeline_ms_to_source(map_ms)
+                timeline_ms = map_ms  # 字幕跟读也跟轨上时间
+            except Exception:
+                read_ms, mapped_path = timeline_ms, ""
+            # 外插视频/图片无法用当前 capture：保持上一帧，等待自动轨道预览
+            if mapped_path:
+                try:
+                    main = getattr(self, "_preview_loaded_path", "") or ""
+                    if main and Path(mapped_path).resolve() != Path(main).resolve():
+                        if force and not self.preview_base_image.isNull():
+                            self._present_preview_image(self.preview_base_image, timeline_ms / 1000.0)
+                        return
+                except Exception:
+                    pass
+        target = max(0, int(read_ms))
         # 自维护读头：顺序读；略落后时丢 1～3 帧追上；大跳跃才 seek
         current = float(getattr(self, "_preview_capture_pos_ms", -1.0))
         if current < 0:
@@ -8290,7 +8459,7 @@ class DynamicCaptionPage(QWidget):
             gap = 0
         else:
             gap = target - current
-            need_seek = force or gap < -150 or gap > 1200
+            need_seek = force or gap < -150 or gap > 1200 or use_map and abs(gap) > 80
         if need_seek:
             try:
                 capture.set(cv2.CAP_PROP_POS_MSEC, float(target))
@@ -8326,7 +8495,7 @@ class DynamicCaptionPage(QWidget):
                 ok, frame = False, None
         if not ok or frame is None:
             if force and not self.preview_base_image.isNull():
-                self._present_preview_image(self.preview_base_image, target / 1000.0)
+                self._present_preview_image(self.preview_base_image, timeline_ms / 1000.0)
             return
         try:
             fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0) or 30.0
@@ -8343,11 +8512,17 @@ class DynamicCaptionPage(QWidget):
             if hasattr(self, "log") and self.log is not None:
                 self.log.appendPlainText("预览画面已就绪（实时字幕按播放时钟同步）")
         self._store_preview_base(image)
-        # 字幕时间用播放器时钟，保证跟读/高亮与声音同拍
+        # 字幕时间：有切片时用时间轴时刻，否则播放器时钟
         try:
-            clock_sec = (self.player.position() or target) / 1000.0
+            if use_map and hasattr(self, "canva_timeline"):
+                try:
+                    clock_sec = int(self.canva_timeline.canvas.position_ms) / 1000.0
+                except Exception:
+                    clock_sec = timeline_ms / 1000.0
+            else:
+                clock_sec = (self.player.position() or timeline_ms) / 1000.0
         except Exception:
-            clock_sec = target / 1000.0
+            clock_sec = timeline_ms / 1000.0
         self._present_preview_image(self.preview_base_image, clock_sec)
 
     def _connect_live_preview_signals(self):
@@ -10647,14 +10822,177 @@ class DynamicCaptionPage(QWidget):
             return source
         return ""
 
+    def _current_timeline_edit_state(self):
+        key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+        if not key:
+            return {}
+        return dict(self.timeline_edit_states.get(key, {}) or {})
+
+    def _timeline_video_segments(self, state=None):
+        state = state if state is not None else self._current_timeline_edit_state()
+        segs = list((state.get("tracks") or {}).get("video") or [])
+        segs = sorted(segs, key=lambda item: (int(item.get("start", 0)), int(item.get("end", 0))))
+        return segs
+
+    def _timeline_edits_active(self, state=None):
+        """是否存在需要按时间轴映射/烘焙的视频剪辑（相对完整源片）。"""
+        state = state if state is not None else self._current_timeline_edit_state()
+        segs = self._timeline_video_segments(state)
+        if not segs:
+            return False
+        if state.get("transitions"):
+            return True
+        if any(str(s.get("media_type", "video")) in ("image", "external_video") for s in segs):
+            return True
+        if len(segs) > 1:
+            return True
+        # 单段但裁过片头/片尾
+        try:
+            item = self.videos.currentItem() if hasattr(self, "videos") else None
+            path = item.text() if item else ""
+            full_ms = self._resolve_timeline_duration_ms(path) if path else 0
+        except Exception:
+            full_ms = 0
+        s0 = segs[0]
+        src0 = int(s0.get("source_start", 0) or 0)
+        src1 = int(s0.get("source_end", 0) or 0)
+        if src0 > 40:
+            return True
+        if full_ms > 0 and src1 > 0 and abs(src1 - full_ms) > 80:
+            return True
+        if not bool(state.get("original_audio_enabled", True)):
+            return True
+        return False
+
+    def _timeline_edits_need_bake(self, state=None):
+        """需要 FFmpeg 烘焙预览（转场/插图/外插视频/删除造成源音画不一致）。"""
+        state = state if state is not None else self._current_timeline_edit_state()
+        segs = self._timeline_video_segments(state)
+        if not segs:
+            return False
+        if state.get("transitions"):
+            return True
+        if any(str(s.get("media_type", "video")) in ("image", "external_video") for s in segs):
+            return True
+        if not bool(state.get("original_audio_enabled", True)):
+            return True
+        # 多段且源时间轴有缺口/重排 → 实时画面可映射，但原声轨需烘焙才听得对
+        if len(segs) >= 2:
+            ordered = sorted(segs, key=lambda item: int(item.get("start", 0)))
+            for prev, cur in zip(ordered, ordered[1:]):
+                # 时间线应无接
+                if int(cur.get("start", 0)) > int(prev.get("end", 0)) + 40:
+                    return True
+                # 源 in/out 不连续 = 删过中间或挪过
+                if abs(int(cur.get("source_start", 0)) - int(prev.get("source_end", 0))) > 40:
+                    return True
+        return False
+
+    def _map_timeline_ms_to_source(self, timeline_ms: int, state=None):
+        """时间轴播放头 → (source_ms, media_path|"" )。path 空表示当前主视频源。
+
+        用于切片/删除后 OpenCV 实时预览，无需点「轨道预览」。
+        """
+        state = state if state is not None else self._current_timeline_edit_state()
+        segs = self._timeline_video_segments(state)
+        t = max(0, int(timeline_ms))
+        if not segs:
+            return t, ""
+        last_i = len(segs) - 1
+        for i, item in enumerate(segs):
+            start = int(item.get("start", 0) or 0)
+            end = int(item.get("end", 0) or 0)
+            if end <= start:
+                continue
+            # 半开区间 [start, end)；最后一段包含终点，避免贴边空白
+            in_seg = (start <= t < end) or (i == last_i and t == end)
+            if not in_seg:
+                continue
+            offset = max(0, min(t, end - 1) - start)
+            src0 = int(item.get("source_start", 0) or 0)
+            src1 = int(item.get("source_end", src0 + (end - start)) or 0)
+            source_ms = src0 + offset
+            source_ms = max(src0, min(source_ms, max(src0, src1 - 1)))
+            media_type = str(item.get("media_type", "video") or "video")
+            path = str(item.get("path", "") or "")
+            if media_type in ("image", "external_video") and path:
+                return source_ms, path
+            return source_ms, ""
+        # 超出范围：钉在最后一帧源点
+        last = segs[-1]
+        src1 = int(last.get("source_end", 0) or 0)
+        path = str(last.get("path", "") or "")
+        media_type = str(last.get("media_type", "video") or "video")
+        if media_type in ("image", "external_video") and path:
+            return max(0, src1 - 1), path
+        return max(0, src1 - 1), ""
+
+    def _schedule_auto_track_preview(self):
+        """时间轴结构变化后自动轨道预览（防抖，避免连点切片时反复编码）。"""
+        if not hasattr(self, "_auto_track_preview_timer"):
+            self._auto_track_preview_timer = QTimer(self)
+            self._auto_track_preview_timer.setSingleShot(True)
+            self._auto_track_preview_timer.setInterval(700)
+            self._auto_track_preview_timer.timeout.connect(self._run_auto_track_preview)
+        # 已在渲染中则等结束后由用户再点；此处仅排队
+        if getattr(self, "preview_thread", None) and self.preview_thread.isRunning():
+            self._auto_track_preview_timer.start()
+            return
+        self._auto_track_preview_timer.start()
+
+    def _run_auto_track_preview(self):
+        if getattr(self, "preview_thread", None) and self.preview_thread.isRunning():
+            return
+        if not self._timeline_edits_need_bake():
+            return
+        # 无视频选中时跳过
+        if not hasattr(self, "videos") or not self.videos.currentItem():
+            return
+        self._append_run_log("时间轴已变更，正在自动轨道预览…")
+        try:
+            self.render_effect_preview()
+        except Exception as exc:
+            self._append_run_log(f"自动轨道预览跳过：{exc}")
+
     def _timeline_edit_changed(self, state):
-        key=self._current_video_key()
+        key = self._current_video_key()
+        state = dict(state or {})
         if key:
-            self.timeline_edit_states[key]=dict(state or {})
+            self.timeline_edit_states[key] = state
+        # 旧的「轨道预览」成品已过时
+        if getattr(self, "_precise_preview_active", False):
+            self._precise_preview_active = False
+            item = self.videos.currentItem() if hasattr(self, "videos") else None
+            if item:
+                source = self._matched_source_for_video(item.text())
+                mode = self._get_audio_mode_internal() if hasattr(self, "_get_audio_mode_internal") else ""
+                external = (
+                    source if source and Path(source).is_file()
+                    and Path(source).resolve() != Path(item.text()).resolve()
+                    and mode in ("替换为添加的音频", "原声＋背景音混合")
+                    else ""
+                )
+                offset = self.audio_offsets.get(self._timeline_key(external), 0) if external else 0
+                self.load_video_preview(
+                    item.text(), external, precise=False,
+                    mix_audio=mode == "原声＋背景音混合", audio_offset_ms=offset,
+                )
+        # 实时画面：强制按新时间轴映射刷新当前帧
+        self._preview_capture_pos_ms = -1.0
+        self._invalidate_preview_caption_overlay()
+        QTimer.singleShot(40, lambda: self._render_preview_frame(force=True))
+        if self._timeline_edits_need_bake(state):
             self._append_run_log(
-                "时间轴已更新。点「轨道渲染预览」可听看调整结果；"
-                "「重新合成选中组」才会整组重跑去口气合成。"
+                "时间轴已更新（含删除/转场/插图等）。画面将实时映射；"
+                "约 0.7s 后自动轨道预览以对齐声音，也可立即点「轨道预览」。"
             )
+            self._schedule_auto_track_preview()
+        elif self._timeline_edits_active(state):
+            self._append_run_log(
+                "时间轴已更新。预览已按切片实时映射源画面（拖动播放头即可查看，无需点轨道预览）。"
+            )
+        else:
+            self._append_run_log("时间轴已更新。")
 
     def _timeline_original_audio_changed(self, enabled):
         key=self._current_video_key()

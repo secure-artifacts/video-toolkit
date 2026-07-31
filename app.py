@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.23").strip().lstrip("v") or "1.7.23"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.24").strip().lstrip("v") or "1.7.24"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -90,9 +90,9 @@ LOCAL_WHISPER_MODEL_OPTIONS = [
     ("medium", "medium · 推荐（语义更稳）"),
     ("large-v3", "large-v3 · 最准 / 更慢更吃显存"),
 ]
-# 自动模式下的服务优先级：按用户要求与实测（Gemini 有额度时优先云端高质量）
+# 自动模式下的服务优先级：Groq 快 → Gemini → Gladia → 本地 → 其它
 DEFAULT_PROVIDER_PRIORITY = [
-    "Gemini", "Gladia", LOCAL_PROVIDER, "Groq", "ElevenLabs", "Luma", "Kling",
+    "Groq", "Gemini", "Gladia", LOCAL_PROVIDER, "ElevenLabs", "Luma", "Kling",
 ]
 # 已安装用户配置里若仍是旧默认模型，启动时迁移到可用值
 _MODEL_MIGRATIONS = {
@@ -220,16 +220,25 @@ class ConfigStore:
                 current = str(loaded["models"].get(provider, "") or "")
                 if current in mapping:
                     loaded["models"][provider] = mapping[current]
-            # 识别优先级：Gemini → Gladia → 本地 → Groq（可在「调整顺序」里改）
+            # 识别优先级：Groq → Gemini → Gladia → 本地 → 其它（可在「调整顺序」里改）
             preferred = list(DEFAULT_PROVIDER_PRIORITY)
             old_pri = [p for p in (loaded.get("provider_priority") or []) if p in preferred]
-            # 旧默认（本地第一 或 Groq 第一）统一迁移到新推荐序
-            legacy_heads = {LOCAL_PROVIDER, "Groq"}
-            if (
+            # 旧默认序统一迁到新推荐序（保留用户在「调整顺序」里手动改过的非旧默认）
+            legacy_prefixes = {
+                tuple([LOCAL_PROVIDER, "Gladia", "Groq", "ElevenLabs"]),
+                tuple(["Gemini", "Gladia", LOCAL_PROVIDER, "Groq"]),
+                tuple(["Gemini", "Gladia", "Groq", LOCAL_PROVIDER]),
+                tuple(["Gladia", "Gemini", LOCAL_PROVIDER, "Groq"]),
+            }
+            old_head4 = tuple(old_pri[:4]) if len(old_pri) >= 4 else tuple(old_pri)
+            force_new = (
                 not old_pri
-                or old_pri[:4] == [LOCAL_PROVIDER, "Gladia", "Groq", "ElevenLabs"]
-                or (old_pri and old_pri[0] in legacy_heads and "Gemini" in old_pri and old_pri.index("Gemini") > 2)
-            ):
+                or old_head4 in legacy_prefixes
+                or (old_pri and old_pri[0] == LOCAL_PROVIDER)
+                or (old_pri and old_pri[0] == "Gemini" and "Groq" in old_pri
+                    and old_pri.index("Groq") >= 2)
+            )
+            if force_new:
                 loaded["provider_priority"] = list(preferred)
             else:
                 pri = list(old_pri)
