@@ -1468,9 +1468,27 @@ class GroupMergeWorker(QObject):
                         f"真实余量缓冲≤{transition_pad:.2f}s（不垫静音，避免接缝停顿）"
                     )
 
-        duration = max(0.05, end - start)
-        removed = max(0.0, probe["duration"] - duration)
-        ratio = (removed / probe["duration"] * 100.0) if probe["duration"] > 0 else 0.0
+        # 硬性校验：无效裁切会导致 0 帧 → “Could not open encoder before EOF / nothing written”
+        media_duration = max(0.08, float(media_duration or probe.get("duration") or 0.08))
+        if start >= media_duration - 0.04 or end <= start + 0.04:
+            self.log.emit(
+                f"提醒：{clip.name} 裁切区间无效（{float(start):.2f}–{float(end):.2f}s / 片长 {media_duration:.2f}s），"
+                f"改用整段，避免空帧编码失败。"
+            )
+            start, end = 0.0, media_duration
+            reason = f"{reason or '边界'}→整段回退"
+        start = max(0.0, min(float(start), media_duration - 0.08))
+        end = max(start + 0.08, min(float(end), media_duration))
+        duration = max(0.08, end - start)
+        # H.264/yuv420p 要求偶数分辨率
+        target_w = max(2, int(target_w) // 2 * 2)
+        target_h = max(2, int(target_h) // 2 * 2)
+        if int(probe.get("width") or 0) < 2 or int(probe.get("height") or 0) < 2:
+            raise RuntimeError(
+                f"{clip.name} 没有有效视频流（{probe.get('width')}×{probe.get('height')}），无法编码。"
+            )
+        removed = max(0.0, float(probe.get("duration") or 0) - duration)
+        ratio = (removed / probe["duration"] * 100.0) if probe.get("duration") else 0.0
         self.log.emit(
             f"时长：{clip.name} 原始 {probe['duration']:.2f}s → 取源 {duration:.2f}s"
             f"，删减 {removed:.2f}s（{ratio:.1f}%）"
@@ -1490,7 +1508,7 @@ class GroupMergeWorker(QObject):
             "spad": round(start_silence_pad, 3),
             "epad": round(end_silence_pad, 3),
             "index": int(index),
-            "version": 14,  # no silence pad (natural join) + faster encode
+            "version": 15,  # clamp empty trim + accurate -ss after -i
         }, sort_keys=True).encode("utf-8")).hexdigest()[:14]
         destination = cache_dir / f"segment_{index + 1:03d}_{fingerprint}.mp4"
         if self.settings.get("resume", True) and destination.exists() and destination.stat().st_size > 1024:
@@ -1520,11 +1538,12 @@ class GroupMergeWorker(QObject):
             )
         has_pad = sp > 0.01 or ep > 0.01
         need_complex = bool(watermark) or has_pad
-        command = [
-            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
-            "-i", str(clip),
-        ]
+        # 默认 -ss 在 -i 前（关键帧快进，快很多）。start≈0 时省略 -ss。
+        # 若出现 0 帧再回退到 -ss 在 -i 后 / 整段（见下方重试逻辑）。
+        command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        if start > 0.02:
+            command += ["-ss", f"{start:.3f}"]
+        command += ["-t", f"{duration:.3f}", "-i", str(clip)]
         # —— 快路径：无水印、无垫片 → 简单 -vf/-af，比 filter_complex 轻很多 ——
         if not need_complex:
             command += ["-vf", video_core, "-map", "0:v:0"]
@@ -1639,86 +1658,145 @@ class GroupMergeWorker(QObject):
         # 8s 片段正常应 <15s；给硬件/水印余量。超时即杀，避免「一直卡在这里」
         encode_timeout = max(90.0, min(600.0, expect_out * 25.0 + 45.0))
         t0 = time.monotonic()
-        try:
-            # Windows MF 多路并行时常见 “Could not open encoder before EOF / -22”
-            if self.encoder == "mf" and hasattr(self, "_mf_encode_lock"):
-                with self._mf_encode_lock:
-                    self._run(
-                        command,
-                        timeout=encode_timeout,
-                        heartbeat_label=clip.name,
-                        heartbeat_sec=6.0,
-                    )
-            else:
-                self._run(
-                    command,
-                    timeout=encode_timeout,
-                    heartbeat_label=clip.name,
-                    heartbeat_sec=6.0,
+
+        def _to_cpu_command(cmd):
+            """Replace hardware encoder flags with libx264."""
+            retry = list(cmd)
+            for i, tok in enumerate(retry):
+                if tok == "-c:v" and i + 1 < len(retry):
+                    retry[i + 1] = "libx264"
+                    break
+            drop_keys = {
+                "-rate_control", "-quality", "-cq", "-b:v", "-rc",
+                "-look_ahead", "-tune", "-qp_i", "-qp_p", "-bf_delta_qp",
+                "-global_quality", "-preset", "-crf", "-bf",
+            }
+            cleaned = []
+            skip_next = False
+            for i, tok in enumerate(retry):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok in drop_keys:
+                    skip_next = True
+                    continue
+                cleaned.append(tok)
+                if tok == "libx264" and i > 0 and retry[i - 1] == "-c:v":
+                    cleaned.extend(["-preset", "veryfast", "-crf", "23", "-bf", "0"])
+            if "-pix_fmt" not in cleaned:
+                cleaned = cleaned[:-1] + ["-pix_fmt", "yuv420p"] + cleaned[-1:]
+            return cleaned
+
+        def _full_clip_command(cmd):
+            """去掉裁切，整段编码（空帧/越界 seek 的最后手段）。"""
+            out = list(cmd)
+            # 删除 -ss / -t 参数对（紧跟在 -i 后或前）
+            cleaned = []
+            i = 0
+            while i < len(out):
+                if out[i] in ("-ss", "-t") and i + 1 < len(out):
+                    i += 2
+                    continue
+                cleaned.append(out[i])
+                i += 1
+            return cleaned
+
+        def _run_encode(cmd, label):
+            self._run(cmd, timeout=encode_timeout, heartbeat_label=label, heartbeat_sec=6.0)
+
+        def _accurate_ss_command(cmd):
+            """把 -ss 移到 -i 之后（精确裁切，略慢；仅作空帧失败后的回退）。"""
+            out = list(cmd)
+            ss_val = None
+            cleaned = []
+            i = 0
+            while i < len(out):
+                if out[i] == "-ss" and i + 1 < len(out):
+                    ss_val = out[i + 1]
+                    i += 2
+                    continue
+                cleaned.append(out[i])
+                i += 1
+            if not ss_val:
+                return cleaned
+            # 在 -i <path> 之后插入 -ss
+            result = []
+            i = 0
+            while i < len(cleaned):
+                result.append(cleaned[i])
+                if cleaned[i] == "-i" and i + 1 < len(cleaned):
+                    result.append(cleaned[i + 1])
+                    result.extend(["-ss", ss_val])
+                    i += 2
+                    continue
+                i += 1
+            return result
+
+        def _empty_output_error(err: str) -> bool:
+            low = err.lower()
+            return any(
+                token in low
+                for token in (
+                    "could not open encoder",
+                    "nothing was written",
+                    "received no packets",
+                    "error code: -22",
+                    "invalid argument",
                 )
+            )
+
+        try:
+            _run_encode(command, clip.name)
         except Exception as exc:
             err = str(exc)
-            # 硬件编码偶发失败：自动用 libx264 重试本段，不拖垮整组
-            hw_fail = self.encoder in ("mf", "nvenc", "qsv", "amf") and any(
-                token in err.lower()
-                for token in (
-                    "h264_mf", "h264_nvenc", "h264_qsv", "h264_amf",
-                    "could not open encoder", "invalid argument",
-                    "error code: -22", "nothing was written",
-                    "encoder", "not open",
-                )
-            )
-            if not hw_fail:
-                raise
-            self.log.emit(
-                f"提醒：{clip.name} 硬件编码失败（{self.encoder}），自动改用 CPU 重试本段…"
-            )
+            empty = _empty_output_error(err)
+            hw = self.encoder in ("mf", "nvenc", "qsv", "amf")
             try:
                 if destination.exists():
                     destination.unlink()
             except OSError:
                 pass
-            # 把命令里的硬件编码器参数替换为 libx264
-            retry = list(command)
+            # 1) 空帧：先试精确 -ss（-i 后），仍失败再整段
+            # 2) 硬件失败：改 CPU
+            if not (hw or empty):
+                raise
+            retry_cmd = command
+            if empty and start > 0.02:
+                self.log.emit(
+                    f"提醒：{clip.name} 可能关键帧 seek 空帧，改用精确裁切重试…"
+                )
+                retry_cmd = _accurate_ss_command(command)
+            if hw:
+                self.log.emit(
+                    f"提醒：{clip.name} 编码失败（{self.encoder}），"
+                    f"{'空帧/无效参数，' if empty else ''}"
+                    f"自动改用 CPU 重试本段…"
+                )
+                retry_cmd = _to_cpu_command(retry_cmd)
             try:
-                # 找到 -c:v 后的编码器名
-                for i, tok in enumerate(retry):
-                    if tok == "-c:v" and i + 1 < len(retry):
-                        # 删掉后续硬件专用参数直到下一个 flag 或输出路径
-                        retry[i + 1] = "libx264"
-                        break
-                # 去掉 MF/NVENC/QSV 特有选项
-                drop_keys = {
-                    "-rate_control", "-quality", "-cq", "-b:v", "-rc",
-                    "-look_ahead", "-tune", "-qp_i", "-qp_p", "-bf_delta_qp",
-                    "-global_quality", "-preset",
-                }
-                cleaned = []
-                skip_next = False
-                for i, tok in enumerate(retry):
-                    if skip_next:
-                        skip_next = False
-                        continue
-                    if tok in drop_keys:
-                        skip_next = True
-                        continue
-                    # 保留 -c:v libx264 之后插入兼容参数
-                    cleaned.append(tok)
-                    if tok == "libx264" and i > 0 and retry[i - 1] == "-c:v":
-                        cleaned.extend(["-preset", "veryfast", "-crf", "23", "-bf", "0"])
-                # 确保 pix_fmt
-                if "-pix_fmt" not in cleaned:
-                    # 插在输出文件前
-                    cleaned = cleaned[:-1] + ["-pix_fmt", "yuv420p"] + cleaned[-1:]
-                retry = cleaned
-            except Exception:
-                retry = command
-            self._run(
-                retry,
-                timeout=encode_timeout,
-                heartbeat_label=f"{clip.name}·CPU",
-                heartbeat_sec=6.0,
-            )
+                _run_encode(retry_cmd, f"{clip.name}·重试")
+            except Exception as exc2:
+                err2 = str(exc2)
+                if _empty_output_error(err2) or empty:
+                    self.log.emit(
+                        f"提醒：{clip.name} 裁切后仍无帧，改用整段 0–{media_duration:.2f}s 再试…"
+                    )
+                    try:
+                        if destination.exists():
+                            destination.unlink()
+                    except OSError:
+                        pass
+                    full_cmd = _full_clip_command(_to_cpu_command(command))
+                    full_cmd = full_cmd[:-1] + [
+                        "-t", f"{media_duration:.3f}",
+                        full_cmd[-1],
+                    ]
+                    _run_encode(full_cmd, f"{clip.name}·整段")
+                    expect_out = media_duration
+                else:
+                    raise RuntimeError(
+                        f"片段编码失败：{clip.name} — {err2}"
+                    ) from exc2
         elapsed = time.monotonic() - t0
         # 校验垫片后时长
         try:
@@ -1875,22 +1953,25 @@ class GroupMergeWorker(QObject):
                         watermark = None
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 import os
-                # QSV/MF 多开易互锁或 “Could not open encoder before EOF”；NVENC/AMF 可 2 路。
-                if self.encoder in ("qsv", "mf"):
+                # QSV 多开易死锁；MF/NVENC/AMF 双路（失败单段会 CPU 回退）；CPU 最多 4 路。
+                if self.encoder == "qsv":
                     max_workers = 1
                     self.log.emit(
-                        f"编码策略：{ENCODER_LABELS.get(self.encoder, self.encoder)} 串行"
-                        f"（避免多路会话互锁/打不开编码器）。"
+                        "编码策略：Intel Quick Sync 串行（避免多路会话互锁）。"
                     )
-                elif self.encoder in ("nvenc", "amf"):
+                elif self.encoder in ("nvenc", "mf", "amf"):
                     max_workers = min(2, len(clips), os.cpu_count() or 2)
                     self.log.emit(
                         f"编码策略：硬件编码并行 {max_workers}"
-                        f"（{ENCODER_LABELS.get(self.encoder, self.encoder)}）。"
+                        f"（{ENCODER_LABELS.get(self.encoder, self.encoder)}；"
+                        f"单段失败自动 CPU 重试）。"
                     )
                 else:
                     max_workers = min(4, len(clips), os.cpu_count() or 4)
-                    self.log.emit(f"编码策略：CPU 并行 {max_workers} 路。")
+                    self.log.emit(
+                        f"编码策略：CPU 并行 {max_workers} 路。"
+                        f" 提示：片段多时建议改「自动硬件加速」可明显提速。"
+                    )
                 def run_norm(args):
                     clip, clip_index, total_count = args
                     return self._normalize(
@@ -2066,6 +2147,7 @@ class GroupMergeWorker(QObject):
                     destination = self._write_final_output(concat_command, destination)
                     if remux_zero_start(self.ffmpeg, destination):
                         self.log.emit("已归零成品时间戳（避免达芬奇/Resolve 片头黑帧）。")
+                    # 已对齐则静默跳过，不刷日志（避免误以为又慢了一遍）
                     if group_manual_bounds:
                         self.log.emit(f"群组切片功能：正在对合并后的成品视频应用手动切片 {group_manual_bounds[0]:.2f}s - {group_manual_bounds[1]:.2f}s...")
                         trimmed_dest = destination.with_name(destination.stem + "_trimmed.mp4")

@@ -268,17 +268,64 @@ def _probe_video_fps(ffmpeg, path, default=30.0):
     return float(default or 30.0)
 
 
+def _probe_stream_start_times(ffmpeg, path):
+    """Return (video_start, audio_start); missing stream → 0.0."""
+    from pathlib import Path
+    import json
+    path = Path(path)
+    ffprobe = Path(str(ffmpeg)).with_name("ffprobe" + Path(str(ffmpeg)).suffix)
+    if not ffprobe.exists():
+        ffprobe = "ffprobe"
+    v_start = a_start = 0.0
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe), "-v", "error",
+                "-show_entries", "stream=codec_type,start_time",
+                "-of", "json", str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_kwargs(),
+        )
+        data = json.loads(result.stdout or "{}")
+        for stream in data.get("streams") or []:
+            try:
+                st = float(stream.get("start_time") or 0)
+            except (TypeError, ValueError):
+                st = 0.0
+            kind = str(stream.get("codec_type") or "")
+            if kind == "video" and v_start == 0.0:
+                v_start = st
+            elif kind == "audio" and a_start == 0.0:
+                a_start = st
+    except Exception:
+        pass
+    return v_start, a_start
+
+
 def remux_zero_start(ffmpeg, path, fps=None):
     """重封装：去掉 AAC 编码延迟导致的 video start_time≈1 帧，防止达芬奇片头黑帧。
 
     仅 copy + 视频 bitstream 时间戳重写，不二次损画质。失败时保留原文件。
-    使用 setts=ts=N/<fps>/TB（部分 FFmpeg 无 FR 常量，故写死帧率数）。
+    若音画已从 ~0 起则跳过（避免每次合成多扫一遍大文件）。
     """
     from pathlib import Path
     import os
     path = Path(path)
     if not path.is_file() or path.stat().st_size < 1024:
         return False
+    # 已对齐则跳过：省掉大文件二次 remux（分组合成尾声明显变快）
+    try:
+        v0, a0 = _probe_stream_start_times(ffmpeg, path)
+        if v0 <= 0.002 and a0 <= 0.002:
+            return False
+    except Exception:
+        pass
     temporary = path.with_name(f"{path.stem}.zts_{os.getpid()}{path.suffix}")
     rate = float(fps) if fps and float(fps) > 1 else _probe_video_fps(ffmpeg, path, 30.0)
     # 保留合理小数；常见 24/25/30/29.97

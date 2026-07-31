@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.24**
+当前版本：**v1.7.25**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,17 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.24.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.24/video-toolkit-windows-x64-v1.7.24.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.24/VideoToolkit_Setup_v1.7.24.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.24.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.24/video-toolkit-macos-arm64-v1.7.24.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.24.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.24/video-toolkit-macos-x64-v1.7.24.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.25.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/video-toolkit-windows-x64-v1.7.25.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/VideoToolkit_Setup_v1.7.25.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.25.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/video-toolkit-macos-arm64-v1.7.25.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.25.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/video-toolkit-macos-x64-v1.7.25.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.25 · 2026-07-31
+- 分组合成加速：恢复快速关键帧裁切；无效区间/空帧时再精确重试或整段回退。
+- 硬件编码：MF/NVENC 恢复双路并行，单段失败自动 CPU 重试。
+- 成品时间戳已对齐时跳过二次 remux，缩短收尾时间。
+- 裁切校验更稳，减少 `Could not open encoder before EOF / no packets`。
 
 ### v1.7.24 · 2026-07-31
 - 达芬奇：成品片头黑帧修复（关 B 帧、时间戳归零、轻量重封装）。
@@ -331,7 +337,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.7.24"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.25"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -346,6 +352,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
 
 ```bash
-git tag -a v1.7.24 -m "Release version 1.7.24"
-git push origin v1.7.24
+git tag -a v1.7.25 -m "Release version 1.7.25"
+git push origin v1.7.25
 ```
