@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.25**
+当前版本：**v1.7.26**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,21 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.25.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/video-toolkit-windows-x64-v1.7.25.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/VideoToolkit_Setup_v1.7.25.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.25.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/video-toolkit-macos-arm64-v1.7.25.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.25.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.25/video-toolkit-macos-x64-v1.7.25.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.26.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.26/video-toolkit-windows-x64-v1.7.26.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.26/VideoToolkit_Setup_v1.7.26.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.26.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.26/video-toolkit-macos-arm64-v1.7.26.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.26.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.26/video-toolkit-macos-x64-v1.7.26.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.26 · 2026-08-02
+- 组件：设置页一键更新 yt-dlp / 检查全部更新 / 更新全部 Python 依赖；pip 与 FFmpeg 下载实时进度日志。
+- 密钥：Gemini 支持 `AQ.` 新版 Key；自动识别增强；密钥页左右分栏（添加 | 申请链接），列表完整可见。
+- 字幕：对照复制改为 CSV 两列（可贴 Google 表格）+「已复制」提示。
+- 智能剪辑：静默无黑窗；场景/切片明细日志。批量截图：yt-dlp 版本与截图过程明细。
+- 分组合成：结束后可按批量导出规则自动重命名，导出跳过二次命名。
+- 图文成片：文件夹按编号/文件名自动匹配；9:16 缩略图与悬停大图；可按顺序粘贴文案。
+- 预览默认静音，点播放或声音开关开声；环境音独立轨道与音量；马达加斯加语语言包。
+- 多语言 edge-tts 音色扩展；密钥管理内嵌 ASR/TTS 注册入口。
 
 ### v1.7.25 · 2026-07-31
 - 分组合成加速：恢复快速关键帧裁切；无效区间/空帧时再精确重试或整段回退。
@@ -337,7 +347,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.7.25"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.26"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -352,6 +362,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
 
 ```bash
-git tag -a v1.7.25 -m "Release version 1.7.25"
-git push origin v1.7.25
+git tag -a v1.7.26 -m "Release version 1.7.26"
+git push origin v1.7.26
 ```

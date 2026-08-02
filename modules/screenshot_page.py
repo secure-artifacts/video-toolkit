@@ -73,88 +73,162 @@ class ProcessThread(QThread):
     def run(self):
         proxy = urllib.request.getproxies().get('https')
         history = self.load_history()
-        logging.info(f"=== 啟動任務: 處理 {len(self.urls)} 個鏈接 ===")
+        total_tasks = len([u for u in self.urls if str(u).strip()])
+        logging.info(f"=== 启动任务: 处理 {total_tasks} 个来源 ===")
+        self.log_signal.emit("════════ 批量截图开始 ════════")
+        self.log_signal.emit(
+            f"任务数：{total_tasks}  |  每条截图 {self.count} 张  |  间隔 {self.interval}s"
+        )
+        self.log_signal.emit(f"输出目录：{self.folder}  |  前缀：{self.prefix}")
+        if proxy:
+            self.log_signal.emit(f"系统代理：{proxy}")
 
         YoutubeDL = None
-        if any(not os.path.isfile(item.strip()) for item in self.urls if item.strip()):
+        need_ytdlp = any(not os.path.isfile(item.strip()) for item in self.urls if item.strip())
+        if need_ytdlp:
             try:
                 from yt_dlp import YoutubeDL
+                try:
+                    import importlib.metadata as _md
+                    ytdlp_ver = _md.version("yt-dlp")
+                except Exception:
+                    ytdlp_ver = "未知"
+                self.log_signal.emit(f"yt-dlp 版本：{ytdlp_ver}（网络链接解析依赖此版本）")
             except ImportError:
-                msg = "環境錯誤：未安裝 yt-dlp 庫，網絡鏈接無法解析"
+                msg = "环境错误：未安装 yt-dlp，网络链接无法解析。请到「设置与组件」一键更新 yt-dlp。"
                 self.log_signal.emit(f"❌ {msg}")
                 logging.error(msg)
+                self.finished_signal.emit()
                 return
 
+        ok_n, skip_n, fail_n = 0, 0, 0
         for index, url in enumerate(self.urls):
             url = url.strip()
-            if not url: continue
+            if not url:
+                continue
             is_local = os.path.isfile(url)
-            
-            # 查重跳過記錄
+            task_no = index + 1
+            label = os.path.basename(url) if is_local else (url[:80] + ("…" if len(url) > 80 else ""))
+
+            # 查重跳过
             if not is_local and url in history:
-                self.log_signal.emit(f"⚠️ 跳過已存在鏈接")
-                logging.info(f"跳過已處理 URL: {url}")
+                skip_n += 1
+                self.log_signal.emit(f"⚠️ [{task_no}/{total_tasks}] 跳过已处理链接：{label}")
+                logging.info(f"跳过已处理 URL: {url}")
+                self.progress_signal.emit(int(task_no / max(1, total_tasks) * 100))
                 continue
 
             temp_video = None
             try:
-                self.log_signal.emit(f"🎬 [任務 {index+1}] {'正在读取本地视频' if is_local else '正在获取网络视频'}...")
-                logging.info(f"開始處理: {url}")
+                self.log_signal.emit(
+                    f"▶ [{task_no}/{total_tasks}] "
+                    f"{'本地视频' if is_local else '网络视频'}：{label}"
+                )
+                logging.info(f"开始处理: {url}")
                 if is_local:
                     temp_video = url
+                    self.log_signal.emit(f"  路径：{url}")
                 else:
+                    self.log_signal.emit("  正在用 yt-dlp 解析并下载…")
                     ydl_opts = {
-                        'outtmpl': f'temp_{int(time.time())}.%(ext)s',
+                        'outtmpl': f'temp_{int(time.time())}_{task_no}.%(ext)s',
                         'format': 'mp4/best',
                         'quiet': True,
+                        'no_warnings': True,
                         'proxy': proxy,
                         'nocheckcertificate': True,
                     }
                     with YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                         temp_video = ydl.prepare_filename(info)
+                        title = (info or {}).get("title") or ""
+                        duration = (info or {}).get("duration")
+                        if title:
+                            self.log_signal.emit(f"  标题：{title}")
+                        if duration:
+                            self.log_signal.emit(f"  时长：{float(duration):.1f}s")
+                        self.log_signal.emit(f"  已下载临时文件：{os.path.basename(temp_video)}")
 
-                # 截圖邏輯
+                # 截图目录
                 f_idx = 1
                 while True:
                     out_path = os.path.join(self.folder, f"{self.prefix}_{f_idx:03d}")
-                    if not os.path.exists(out_path): break
+                    if not os.path.exists(out_path):
+                        break
                     f_idx += 1
 
                 os.makedirs(out_path, exist_ok=True)
                 cap = cv2.VideoCapture(temp_video)
-                
+                if not cap.isOpened():
+                    raise Exception("无法打开视频（解码失败或路径无效）")
+
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                vid_dur = (frame_count / fps) if fps > 1 else 0
+                self.log_signal.emit(
+                    f"  画面：{width}×{height}"
+                    + (f"  |  时长约 {vid_dur:.1f}s" if vid_dur else "")
+                    + (f"  |  {fps:.1f}fps" if fps else "")
+                )
+                self.log_signal.emit(
+                    f"  开始截图：共 {self.count} 张，间隔 {self.interval}s → {out_path}"
+                )
+
                 sc = 0
                 for i in range(self.count):
-                    cap.set(cv2.CAP_PROP_POS_MSEC, i * self.interval * 1000)
+                    pos_ms = i * self.interval * 1000
+                    cap.set(cv2.CAP_PROP_POS_MSEC, pos_ms)
                     ret, frame = cap.read()
                     if ret:
-                        cv2.imwrite(os.path.join(out_path, f"shot_{i+1:03d}.jpg"), frame)
+                        shot_name = f"shot_{i+1:03d}.jpg"
+                        cv2.imwrite(os.path.join(out_path, shot_name), frame)
                         sc += 1
+                        # 每张或每 5 张汇报一次，避免刷屏又不太干
+                        if self.count <= 8 or (i + 1) % max(1, self.count // 5) == 0 or i == 0 or i + 1 == self.count:
+                            self.log_signal.emit(
+                                f"    ✓ {shot_name} @ {pos_ms/1000:.1f}s"
+                            )
+                    else:
+                        self.log_signal.emit(
+                            f"    ✗ 第 {i+1} 张失败（时间点 {pos_ms/1000:.1f}s 无画面）"
+                        )
                 cap.release()
 
                 if sc > 0:
                     if not is_local:
                         self.save_history(url)
-                    self.log_signal.emit(f"✅ 成功完成: {os.path.basename(out_path)}")
-                    logging.info(f"成功截取 {sc} 張圖。鏈接: {url}")
+                    ok_n += 1
+                    self.log_signal.emit(
+                        f"✅ [{task_no}/{total_tasks}] 完成：{sc}/{self.count} 张 → {out_path}"
+                    )
+                    logging.info(f"成功截取 {sc} 张。链接: {url} → {out_path}")
                     self.folder_ready_signal.emit(out_path)
                 else:
-                    raise Exception("視頻下載成功但無法解析畫面內容")
-                
+                    raise Exception("视频已就绪但未能截取任何画面（时间点可能超出片长）")
+
             except Exception as e:
-                # 這裡記錄所有執行錯誤和沒成功的記錄
-                error_log = f"任務 {index+1} 失敗: {str(e)} | URL: {url}"
-                self.log_signal.emit(f"❌ 執行出錯，請查看日誌")
+                fail_n += 1
+                error_log = f"任务 {task_no} 失败: {str(e)} | URL: {url}"
+                self.log_signal.emit(f"❌ [{task_no}/{total_tasks}] 失败：{e}")
+                self.log_signal.emit(f"   来源：{label}")
                 logging.error(error_log)
-                
+
             finally:
                 if temp_video and not is_local and os.path.exists(temp_video):
-                    try: os.remove(temp_video)
-                    except: pass
-                self.progress_signal.emit(int((index + 1) / len(self.urls) * 100))
+                    try:
+                        os.remove(temp_video)
+                        self.log_signal.emit("  已清理临时下载文件")
+                    except Exception:
+                        pass
+                self.progress_signal.emit(int(task_no / max(1, total_tasks) * 100))
 
-        logging.info("=== 所有任務執行完畢 ===")
+        self.log_signal.emit("════════ 批量截图结束 ════════")
+        self.log_signal.emit(
+            f"成功 {ok_n}  |  跳过 {skip_n}  |  失败 {fail_n}  |  输出根目录：{self.folder}"
+        )
+        logging.info("=== 所有任务执行完毕 ===")
         self.finished_signal.emit()
 
 # --- 主界面 ---
@@ -234,16 +308,15 @@ class VideoTool(QMainWindow):
         tools_layout = QVBoxLayout(tools)
         tools_layout.setContentsMargins(10, 10, 10, 10)
         tools_layout.setSpacing(6)
+        tool_tip = QLabel("FFmpeg / yt-dlp 请到顶部「设置与组件」统一检测与一键更新。")
+        tool_tip.setStyleSheet("color:#94a3b8;font-size:11px;")
+        tool_tip.setWordWrap(True)
+        tools_layout.addWidget(tool_tip)
         tool_row = QHBoxLayout()
-        self.btn_upd = QPushButton("更新 yt-dlp")
-        self.btn_upd.clicked.connect(self.update_ytdlp)
-        self.btn_chk = QPushButton("检查 FFmpeg")
-        self.btn_chk.clicked.connect(self.check_ffmpeg)
         self.btn_log = QPushButton("完整执行日志")
         self.btn_log.clicked.connect(self.view_log)
-        tool_row.addWidget(self.btn_upd)
-        tool_row.addWidget(self.btn_chk)
         tool_row.addWidget(self.btn_log)
+        tool_row.addStretch()
         tools_layout.addLayout(tool_row)
         out_row = QHBoxLayout()
         self.btn_open = QPushButton("打开完成文件夹")
@@ -291,32 +364,6 @@ class VideoTool(QMainWindow):
         split.setStretchFactor(1, 3)
         root.addWidget(split, 1)
 
-    # --- 功能邏輯 ---
-    def update_ytdlp(self):
-        """核心功能：更新解析組件"""
-        self.log_view.append("🔄 正在啟動 Yt-DLP 強制更新程序...")
-        logging.info("用戶觸發更新組件")
-        try:
-            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            subprocess.Popen([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp", "--no-cache-dir"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
-        except Exception as e:
-            self.log_view.append(f"❌ 無法啟動更新: {e}")
-
-    def check_ffmpeg(self):
-        """核心功能：檢測解碼器"""
-        try:
-            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            res = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
-                                 shell=False, creationflags=flags)
-            if res.returncode == 0:
-                msg = "✅ FFmpeg 解碼器檢測正常！"
-                QMessageBox.information(self, "檢測成功", msg + "\n" + res.stdout.split('\n')[0])
-                logging.info(msg)
-            else: raise Exception()
-        except:
-            QMessageBox.critical(self, "錯誤", "❌ 未檢測到 FFmpeg！這會導致高畫質視頻截取失敗。")
-            logging.error("檢測不到 FFmpeg")
 
     def view_log(self):
         """核心功能：打開後台日誌文件"""

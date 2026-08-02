@@ -169,9 +169,11 @@ class TimelineCanvas(QWidget):
         self.clips: list[CaptionClip] = []
         self.video_waveform: list[float] = []
         self.bgm_waveform: list[float] = []
+        self.ambient_waveform: list[float] = []
         self.tts_waveform: list[float] = []
         self.video_name = ""
         self.bgm_name = ""
+        self.ambient_name = ""
         self.tts_name = ""
         self.original_audio_enabled = True
         self.transitions: list[dict] = []
@@ -185,6 +187,7 @@ class TimelineCanvas(QWidget):
             "video": [],
             "original_audio": [],
             "bgm": [],
+            "ambient": [],
             "tts": [],
         }
         self.selected: tuple[str, int] | None = None
@@ -197,7 +200,7 @@ class TimelineCanvas(QWidget):
         self._max_history = 40
         self._history_locked = False
         self._drag_snapshot_pushed = False
-        self.setMinimumHeight(self.RULER_HEIGHT + self.TRACK_HEIGHT * 6 + 8)
+        self.setMinimumHeight(self.RULER_HEIGHT + self.TRACK_HEIGHT * 7 + 8)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -285,11 +288,13 @@ class TimelineCanvas(QWidget):
         tts_name: str = "",
         original_audio_enabled: bool = True,
         edit_state: dict | None = None,
+        ambient_name: str = "",
     ):
         self.duration_ms = max(1000, int(duration_ms or 0))
         self.media_source_duration_ms = max(self.duration_ms, int(duration_ms or 0), 1000)
         self.video_name = str(video_name or "")
         self.bgm_name = str(bgm_name or "")
+        self.ambient_name = str(ambient_name or "")
         self.tts_name = str(tts_name or "")
         self.original_audio_enabled = bool(original_audio_enabled)
         self.clips = parse_srt(srt)
@@ -310,8 +315,15 @@ class TimelineCanvas(QWidget):
                 MediaClip(0, full, 0, full, "视频原声", source_duration=full)
             ]
             self.media_clips["bgm"] = (
-                [MediaClip(0, full, 0, full, Path(bgm_name).name, source_duration=full)]
+                [MediaClip(0, full, 0, full, Path(bgm_name).name, source_duration=full,
+                           media_type="bgm", path=str(bgm_name or ""))]
                 if bgm_name
+                else []
+            )
+            self.media_clips["ambient"] = (
+                [MediaClip(0, full, 0, full, Path(ambient_name).name, source_duration=full,
+                           media_type="ambient", path=str(ambient_name or ""))]
+                if ambient_name
                 else []
             )
             self.media_clips["tts"] = (
@@ -345,13 +357,24 @@ class TimelineCanvas(QWidget):
                 for item in (edit_state or {}).get("overlays", [])
                 if isinstance(item, dict) and isinstance(item.get("layer"), dict)
             ]
-        elif not is_new_project:
+            # 轨道状态里没有环境音时，用当前选择补一条
+            if "ambient" not in tracks_state:
+                self._ensure_optional_track("ambient", ambient_name)
             if "bgm" not in tracks_state:
                 self._ensure_optional_track("bgm", bgm_name)
             if "tts" not in tracks_state:
                 self._ensure_optional_track("tts", tts_name)
+        elif not is_new_project:
+            if "bgm" not in tracks_state:
+                self._ensure_optional_track("bgm", bgm_name)
+            if "ambient" not in tracks_state:
+                self._ensure_optional_track("ambient", ambient_name)
+            if "tts" not in tracks_state:
+                self._ensure_optional_track("tts", tts_name)
         self.position_ms = min(self.position_ms, self.duration_ms)
-        self.clear_history()
+        # 仅换片时清撤销栈；同项目刷新保留撤销（避免一切片就被 duration 回调冲掉）
+        if is_new_project:
+            self.clear_history()
         self._update_width()
         self.update()
 
@@ -626,7 +649,9 @@ class TimelineCanvas(QWidget):
         if not (0 <= index < len(tracks)):
             return False
         clip = tracks[index]
-        if cut <= clip.start + 80 or cut >= clip.end - 80:
+        # 允许更靠近两端（约 1 帧～50ms），旧版 80ms 在短段上几乎切不动
+        edge = 50
+        if cut <= clip.start + edge or cut >= clip.end - edge:
             return False
         source_cut = clip.source_start + (cut - clip.start)
         src_dur = clip.resolved_source_duration()
@@ -669,6 +694,8 @@ class TimelineCanvas(QWidget):
     def set_waveform(self, kind: str, values: list[float]):
         if kind == "bgm":
             self.bgm_waveform = values
+        elif kind == "ambient":
+            self.ambient_waveform = values
         elif kind == "tts":
             self.tts_waveform = values
         else:
@@ -700,10 +727,11 @@ class TimelineCanvas(QWidget):
         """Rows for the fixed left name rail: (title, detail)."""
         return (
             ("视频轨道", self.video_name),
-            ("视频声音", "已静音" if not self.original_audio_enabled else "视频原声"),
+            ("视频原声", "已静音（独立）" if not self.original_audio_enabled else "原片声音·独立"),
             ("字幕时间块", ""),
             ("声明叠加", "文字 / 蒙版 / PNG"),
-            ("BGM 伴奏", self.bgm_name),
+            ("BGM 伴奏", self.bgm_name or "背景音乐"),
+            ("环境音", self.ambient_name or "氛围音·独立于原声"),
             ("文字配音", self.tts_name),
         )
 
@@ -714,7 +742,7 @@ class TimelineCanvas(QWidget):
     def _track_index(kind: str) -> int:
         return {
             "video": 0, "original_audio": 1, "caption": 2,
-            "overlay": 3, "bgm": 4, "tts": 5,
+            "overlay": 3, "bgm": 4, "ambient": 5, "tts": 6,
         }[kind]
 
     def _track_y(self, kind: str) -> int:
@@ -726,7 +754,7 @@ class TimelineCanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#111318"))
 
         # Track row backgrounds (full content width; names are on the fixed left rail).
-        for index in range(6):
+        for index in range(7):
             y = self.RULER_HEIGHT + index * self.TRACK_HEIGHT
             painter.fillRect(
                 0,
@@ -852,6 +880,7 @@ class TimelineCanvas(QWidget):
             )
 
         self._draw_media_track(painter, "bgm", QColor("#275f50"), QColor("#6ee7b7"), self.bgm_waveform)
+        self._draw_media_track(painter, "ambient", QColor("#1e3a5f"), QColor("#7dd3fc"), self.ambient_waveform)
         self._draw_media_track(painter, "tts", QColor("#68461f"), QColor("#f6b95f"), self.tts_waveform)
 
         playhead_x = self._x(self.position_ms)
@@ -989,7 +1018,7 @@ class TimelineCanvas(QWidget):
         threshold = int(after_ms) - 2  # tiny tolerance for float/int rounding
         scope = str(scope or "media").lower()
         if scope == "media":
-            for kind in ("video", "original_audio", "bgm", "tts"):
+            for kind in ("video", "original_audio", "bgm", "ambient", "tts"):
                 for index, clip in enumerate(self.media_clips.get(kind, [])):
                     if (kind, index) in exclude:
                         continue
@@ -1083,7 +1112,7 @@ class TimelineCanvas(QWidget):
                 self.seekRequested.emit(ms)
                 self.update()
                 return
-        for kind in ("video", "original_audio", "bgm", "tts"):
+        for kind in ("video", "original_audio", "bgm", "ambient", "tts"):
             top = self._track_y(kind)
             if not (top <= y <= top + self.TRACK_HEIGHT):
                 continue
@@ -1312,7 +1341,7 @@ class TimelineCanvas(QWidget):
                 if edge == "move":
                     self.setCursor(Qt.CursorShape.SizeAllCursor)
                     return
-        for kind in ("video", "original_audio", "bgm", "tts"):
+        for kind in ("video", "original_audio", "bgm", "ambient", "tts"):
             top = self._track_y(kind)
             if not (top <= y <= top + self.TRACK_HEIGHT):
                 continue
@@ -1438,30 +1467,58 @@ class TimelineCanvas(QWidget):
             self._emit_timeline_state()
             self.update()
 
-    def split_at_playhead(self):
+    def split_at_playhead(self) -> bool:
+        """Split the clip under the playhead. Returns True if a cut was made."""
+        cut = int(self.position_ms)
         selected = self.selected
-        if not selected or selected[0] == "caption":
+        # 优先：当前选中的可切轨；否则找播放头所在的视频段；再否则原声/BGM/TTS
+        if selected and selected[0] in ("video", "original_audio", "bgm", "ambient", "tts"):
+            kind, index = selected
+            tracks = self.media_clips.get(kind, [])
+            if not (0 <= index < len(tracks)):
+                selected = None
+            else:
+                clip = tracks[index]
+                # 选中段不包含播放头时，改找播放头下的视频
+                if not (clip.start <= cut <= clip.end):
+                    selected = None
+        if not selected or selected[0] == "caption" or selected[0] == "overlay":
             selected = next(
-                (("video", i) for i, clip in enumerate(self.media_clips["video"])
-                 if clip.start < self.position_ms < clip.end),
+                (
+                    ("video", i)
+                    for i, clip in enumerate(self.media_clips.get("video") or [])
+                    if clip.start <= cut <= clip.end
+                ),
                 None,
             )
         if not selected:
-            return
+            # 再试其它轨（用户点在原声/BGM 上时）
+            for kind in ("original_audio", "bgm", "ambient", "tts"):
+                selected = next(
+                    (
+                        (kind, i)
+                        for i, clip in enumerate(self.media_clips.get(kind) or [])
+                        if clip.start <= cut <= clip.end
+                    ),
+                    None,
+                )
+                if selected:
+                    break
+        if not selected:
+            return False
         kind, index = selected
         tracks = self.media_clips.get(kind, [])
         if not (0 <= index < len(tracks)):
-            return
-        cut = self.position_ms
+            return False
         self.push_undo()
         if not self._split_clip(kind, index, cut):
-            # no-op split: drop the empty undo snapshot
             if self._undo_stack:
                 self._undo_stack.pop()
-            return
+            return False
         self.selected = (kind, index + 1)
         self._emit_timeline_state()
         self.update()
+        return True
 
     def _split_linked_original_audio(self, cut: int):
         for index, clip in enumerate(self.media_clips["original_audio"]):
@@ -1525,7 +1582,7 @@ class TimelineCanvas(QWidget):
         self.media_clips["video"] = self._delete_range_from_track(
             self.media_clips["video"], start, end, delta
         )
-        for kind in ("original_audio", "bgm", "tts"):
+        for kind in ("original_audio", "bgm", "ambient", "tts"):
             self.media_clips[kind] = self._delete_range_from_track(
                 self.media_clips[kind], start, end, delta
             )
@@ -1624,6 +1681,8 @@ class TimelineCanvas(QWidget):
         return {
             "duration_ms": self.duration_ms,
             "original_audio_enabled": self.original_audio_enabled,
+            # 用户切片/拖动后禁止被「按时长重算分段」覆盖
+            "user_edited": True,
             "transitions": [dict(item) for item in self.transitions],
             "overlays": [
                 {
@@ -1757,7 +1816,7 @@ class TrackLabelRail(QWidget):
         self.canvas = canvas
         self.setFixedWidth(TimelineCanvas.LABEL_WIDTH)
         self.setMinimumHeight(
-            TimelineCanvas.RULER_HEIGHT + TimelineCanvas.TRACK_HEIGHT * 6 + 8
+            TimelineCanvas.RULER_HEIGHT + TimelineCanvas.TRACK_HEIGHT * 7 + 8
         )
         self.setStyleSheet("background:#181b22;border-right:1px solid #2a2f3a;")
 
@@ -1801,6 +1860,7 @@ class CanvaTimelinePanel(QWidget):
     seekRequested = Signal(int)
     rangeRippled = Signal(int, int)
     bgmVolumeChanged = Signal(int)
+    ambientVolumeChanged = Signal(int)
     timelineEdited = Signal(dict)
     originalAudioChanged = Signal(bool)
 
@@ -1829,16 +1889,19 @@ class CanvaTimelinePanel(QWidget):
         title_row.addWidget(hint, 1)
         toolbar.addLayout(title_row)
         edit_row = QHBoxLayout()
-        cut = QPushButton("✂ 切片")
-        cut.setToolTip("先选中轨道片段，再把播放头拖到切点")
-        cut.clicked.connect(lambda: None)
+        self.cut_button = QPushButton("✂ 切片")
+        self.cut_button.setToolTip(
+            "把播放头拖到要切开的位置，点此切片。\n"
+            "优先切中视频轨；也可先点选某段再切。\n"
+            "切点需距片段两端至少约 0.05 秒。"
+        )
         self.delete_button = QPushButton("删除")
         self.delete_button.setToolTip("删除当前选中的时间轴片段")
         self.undo_button = QPushButton("撤销")
         self.undo_button.setToolTip("撤销上一步时间轴操作（Ctrl+Z）")
         self.redo_button = QPushButton("重做")
         self.redo_button.setToolTip("重做（Ctrl+Y / Ctrl+Shift+Z）")
-        edit_row.addWidget(cut)
+        edit_row.addWidget(self.cut_button)
         edit_row.addWidget(self.delete_button)
         edit_row.addWidget(self.undo_button)
         edit_row.addWidget(self.redo_button)
@@ -1855,15 +1918,32 @@ class CanvaTimelinePanel(QWidget):
         view_row = QHBoxLayout()
         self.original_audio = QCheckBox("保留视频原声")
         self.original_audio.setChecked(True)
+        self.original_audio.setToolTip(
+            "只控制「视频原声」轨道（原片自带声音）。\n"
+            "关闭后导出/预览不含原片声音，但环境音、BGM、配音仍独立存在。"
+        )
         view_row.addWidget(self.original_audio)
-        view_row.addWidget(QLabel("BGM 音量"))
+        view_row.addWidget(QLabel("BGM"))
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 200)
         self.volume.setValue(25)
-        self.volume.setMinimumWidth(72)
-        self.volume.setMaximumWidth(150)
+        self.volume.setMinimumWidth(56)
+        self.volume.setMaximumWidth(110)
+        self.volume.setToolTip("背景音乐音量（不影响环境音与视频原声）")
         self.volume.valueChanged.connect(self.bgmVolumeChanged)
         view_row.addWidget(self.volume, 1)
+        view_row.addWidget(QLabel("环境音"))
+        self.ambient_volume = QSlider(Qt.Orientation.Horizontal)
+        self.ambient_volume.setRange(0, 200)
+        self.ambient_volume.setValue(20)
+        self.ambient_volume.setMinimumWidth(56)
+        self.ambient_volume.setMaximumWidth(110)
+        self.ambient_volume.setToolTip(
+            "环境音音量（青色轨道，与视频原声完全独立）。\n"
+            "在「背景音乐」页添加环境音文件后，会出现在此轨道上可单独裁剪。"
+        )
+        self.ambient_volume.valueChanged.connect(self.ambientVolumeChanged)
+        view_row.addWidget(self.ambient_volume, 1)
         view_row.addWidget(QLabel("缩放"))
         self.zoom = QSlider(Qt.Orientation.Horizontal)
         self.zoom.setRange(ZOOM_MIN_PPS, ZOOM_MAX_PPS)
@@ -1919,8 +1999,8 @@ class CanvaTimelinePanel(QWidget):
         self.canvas.timelineEdited.connect(self.timelineEdited)
         self.canvas.timelineEdited.connect(lambda *_: self._refresh_undo_buttons())
         self.canvas.srtChanged.connect(lambda *_: self._refresh_undo_buttons())
-        cut.clicked.disconnect()
-        cut.clicked.connect(self.canvas.split_at_playhead)
+        # 直接连接切片（勿再用 connect(lambda:None)+disconnect 占位，部分环境下会丢信号）
+        self.cut_button.clicked.connect(self._on_cut_clicked)
         self.delete_button.clicked.connect(self.canvas.delete_selected)
         self.undo_button.clicked.connect(self._undo_clicked)
         self.redo_button.clicked.connect(self._redo_clicked)
@@ -2009,6 +2089,28 @@ class CanvaTimelinePanel(QWidget):
         seconds = max(1.0, self.canvas.duration_ms / 1000)
         self.zoom.setValue(max(self.zoom.minimum(), min(self.zoom.maximum(), int(available / seconds))))
 
+    def _on_cut_clicked(self):
+        """Toolbar cut: split at playhead and surface why it no-ops."""
+        ok = self.canvas.split_at_playhead()
+        if not ok:
+            # 轻量状态：不弹窗打断，用 tooltip 闪一下说明
+            tip = (
+                "无法切片：请把播放头移到某段视频中间（距两端至少约 0.05 秒），"
+                "或先点选要切开的片段。"
+            )
+            self.cut_button.setToolTip(tip)
+            # 恢复默认说明
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(
+                4000,
+                lambda: self.cut_button.setToolTip(
+                    "把播放头拖到要切开的位置，点此切片。\n"
+                    "优先切中视频轨；也可先点选某段再切。\n"
+                    "切点需距片段两端至少约 0.05 秒。"
+                ),
+            )
+        self._refresh_undo_buttons()
+
     def set_position(self, milliseconds: int):
         self.canvas.set_position(milliseconds)
 
@@ -2049,19 +2151,24 @@ class CanvaTimelinePanel(QWidget):
         tts_path: str = "",
         original_audio_enabled: bool = True,
         edit_state: dict | None = None,
+        ambient_path: str = "",
     ):
         self.original_audio.blockSignals(True)
         self.original_audio.setChecked(bool(original_audio_enabled))
         self.original_audio.blockSignals(False)
         self.canvas.set_project(
-            duration_ms, video_path, srt, bgm_path, tts_path, original_audio_enabled, edit_state
+            duration_ms, video_path, srt, bgm_path, tts_path, original_audio_enabled, edit_state,
+            ambient_name=ambient_path,
         )
         self.canvas.set_waveform("video", [])
         self.canvas.set_waveform("bgm", [])
+        self.canvas.set_waveform("ambient", [])
         self.canvas.set_waveform("tts", [])
         self._load_waveform("video", video_path)
         if bgm_path and Path(bgm_path).is_file():
             self._load_waveform("bgm", bgm_path)
+        if ambient_path and Path(ambient_path).is_file():
+            self._load_waveform("ambient", ambient_path)
         if tts_path and Path(tts_path).is_file():
             self._load_waveform("tts", tts_path)
         if hasattr(self, "label_rail"):

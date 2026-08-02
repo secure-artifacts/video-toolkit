@@ -27,6 +27,7 @@ WRITING_LANGUAGE_OPTIONS: list[tuple[str, str]] = [
     ("Ελληνικά 希腊语", "el"),
     ("Русский 俄语", "ru"),
     ("Türkçe 土耳其语", "tr"),
+    ("Malagasy 马达加斯加语", "mg"),
     ("中文", "zh"),
     ("العربية 阿拉伯语", "ar"),
     ("עברית 希伯来语", "he"),
@@ -164,6 +165,18 @@ BUILTIN_PACKS: dict[str, dict] = {
         "disable_word_highlight": True,
         "font_hints": ["Segoe UI", "Tahoma", "Arial", "Noto Sans Hebrew", "David"],
     },
+    "mg": {
+        "name": "Malagasy",
+        "rtl": False,
+        "quote_open": "\u201c",
+        "quote_close": "\u201d",
+        "single_open": "\u2018",
+        "single_close": "\u2019",
+        "normalize_ascii_quotes": True,
+        # 马达加斯加语为拉丁字母；自动检测易误判为英语/法语，请手动选「Malagasy」
+        "font_hints": ["Arial", "Segoe UI", "Calibri", "Noto Sans"],
+        "whisper_code": "mg",
+    },
 }
 
 _LANG_ALIASES = {
@@ -179,6 +192,9 @@ _LANG_ALIASES = {
     "cmn": "zh", "zho": "zh", "zh-cn": "zh", "zh-tw": "zh", "chi": "zh",
     "ara": "ar", "arabic": "ar",
     "heb": "he", "iw": "he", "hebrew": "he",
+    # 马达加斯加语（Malagasy）— Whisper / ISO 639-1: mg
+    "mg": "mg", "mlg": "mg", "malagasy": "mg", "madagascar": "mg",
+    "马达加斯加": "mg", "马达加斯加语": "mg", "马拉加斯语": "mg",
 }
 
 _RLE = "\u202b"

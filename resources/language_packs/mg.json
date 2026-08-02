@@ -1,0 +1,18 @@
+{
+  "code": "mg",
+  "name": "Malagasy",
+  "rtl": false,
+  "quote_open": "“",
+  "quote_close": "”",
+  "single_open": "‘",
+  "single_close": "’",
+  "normalize_ascii_quotes": true,
+  "font_hints": [
+    "Arial",
+    "Segoe UI",
+    "Calibri",
+    "Noto Sans"
+  ],
+  "whisper_code": "mg",
+  "notes": "马达加斯加语；识别时请在语言下拉选 Malagasy，避免自动检测误判为英语/法语"
+}

@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.25").strip().lstrip("v") or "1.7.25"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.26").strip().lstrip("v") or "1.7.26"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -293,7 +293,7 @@ class ConfigStore:
             temp.replace(self.path)
 
     def add_key(self, provider: str, key: str):
-        key = key.strip()
+        key = normalize_api_key(key)
         if not key:
             raise ValueError("密钥不能为空")
         with self.lock:
@@ -380,56 +380,145 @@ def probe_audio_layout(ffmpeg_path: str, media_path: str):
     return (int(match.group(1)), match.group(2).strip()) if match else None
 
 
+def normalize_api_key(key: str) -> str:
+    """清洗粘贴噪声：BOM、零宽字符、首尾引号/空白、行内空白。"""
+    value = str(key or "")
+    # 去掉常见不可见字符
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060", "\xa0"):
+        value = value.replace(ch, "")
+    value = value.strip().strip("\"'“”‘’`").strip()
+    # 密钥不应含空白；若用户从表格粘出带空格，去掉所有空白
+    if any(c.isspace() for c in value):
+        compact = "".join(value.split())
+        # 仅当去掉空白后仍像密钥（无中文）时采用
+        if compact and all(ord(c) < 128 for c in compact):
+            value = compact
+    return value
+
+
 def detect_api_provider(key: str) -> str | None:
-    """根据密钥前缀/形态猜测所属服务；无法判断时返回 None。"""
-    value = (key or "").strip()
+    """根据密钥前缀/形态猜测所属服务；无法判断时返回 None。
+
+    规则按「强特征优先」，避免把 OpenAI 的 sk- 误判成 ElevenLabs 的 sk_。
+    """
+    value = normalize_api_key(key)
     if not value:
         return None
     lower = value.casefold()
+
+    # —— 强前缀（几乎可确定）——
     if value.startswith("gsk_") or lower.startswith("gsk-"):
         return "Groq"
-    if value.startswith("AIza"):
+    # Google AI Studio / Gemini API Key（https://aistudio.google.com/api-keys）
+    # 1) 旧版常见：AIzaSy...（约 39 字符）
+    # 2) 新版常见：AQ.xxxxxxxx...（点号后跟一串 urlsafe 字符）
+    # 界面脱敏只显示前几位时，可能看到 “AI…” / “AQ…” —— 都归 Gemini。
+    if lower.startswith("aiza") or value.startswith(("AIza", "AIZa", "aiza", "AIZA")):
         return "Gemini"
-    # ElevenLabs 常见 sk_ 前缀（较长）
-    if value.startswith("sk_") and len(value) >= 24:
+    if lower.startswith("aq.") and len(value) >= 20:
+        return "Gemini"
+    if re.match(r"^aq\.[A-Za-z0-9_\-]{16,}$", value, flags=re.IGNORECASE):
+        return "Gemini"
+    # 少数导出/复制时只剩 AI 开头的 Google 密钥（长度足够时才认，避免误伤）
+    if lower.startswith("ai") and 35 <= len(value) <= 64 and re.fullmatch(r"[A-Za-z0-9_\-]+", value):
+        # 排除明显不是 Google 的
+        if not lower.startswith(("airtable", "aidrive")):
+            return "Gemini"
+    # ElevenLabs：下划线 sk_（注意不是 OpenAI 的 sk-）
+    if value.startswith("sk_") and len(value) >= 20:
         return "ElevenLabs"
+    # ElevenLabs 偶尔下发 xi- 风格 / 长 hex
+    if value.startswith("xi_") and len(value) >= 16:
+        return "ElevenLabs"
+
+    # 名称写在密钥里（自建备注或部分面板导出）
     if "gladia" in lower:
         return "Gladia"
-    # Gladia 部分密钥为 UUID 形态
+    if "groq" in lower and ("gsk" in lower or len(value) > 20):
+        return "Groq"
+    if "gemini" in lower or "generativelanguage" in lower or "googleapis" in lower:
+        return "Gemini"
+    if "eleven" in lower or "11labs" in lower:
+        return "ElevenLabs"
+    if "luma" in lower:
+        return "Luma"
+    if "kling" in lower:
+        return "Kling"
+
+    # Gladia：标准 UUID
     if re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
         value,
     ):
         return "Gladia"
-    if "luma" in lower:
-        return "Luma"
-    if "kling" in lower:
-        return "Kling"
+    # Gladia：无连字符 32 位 hex（部分后台导出）
+    if re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        return "Gladia"
+    # Gladia：较长随机 token（40–80 的 urlsafe 字符），且不像其它家前缀
+    if (
+        40 <= len(value) <= 96
+        and re.fullmatch(r"[A-Za-z0-9_\-]+", value)
+        and not lower.startswith(("sk-", "sk_", "gsk_", "aiza", "pk_", "rk_"))
+    ):
+        # 更像 Gladia/通用 token；优先 Gladia（本软件常用）
+        return "Gladia"
+
+    # OpenAI 风格 sk- / sk-proj- 明确不是本软件 ASR 服务
+    if value.startswith("sk-"):
+        return None
+
     return None
 
 
-def check_api_key(provider: str, key: str) -> tuple[bool, str]:
+def detect_api_provider_with_probe(key: str, timeout: float = 8.0) -> tuple[str | None, str]:
+    """先规则识别；失败则对常见 ASR 服务做短超时探测，返回 (provider, 说明)。"""
+    value = normalize_api_key(key)
+    if not value:
+        return None, "空密钥"
+    guessed = detect_api_provider(value)
+    if guessed:
+        return guessed, f"按格式识别为 {guessed}"
+
+    # 探测顺序：特征冲突少、响应快的优先
+    probe_order = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
+    errors = []
+    for provider in probe_order:
+        ok, message = check_api_key(provider, value, timeout=timeout)
+        if ok:
+            return provider, f"联网探测确认为 {provider}"
+        # 401/403 说明服务认得出这是「密钥形态」但无效；401 可作弱线索
+        if "HTTP 401" in message or "HTTP 403" in message:
+            errors.append(f"{provider}:密钥形态匹配但未通过({message[:80]})")
+        else:
+            errors.append(f"{provider}:{message[:60]}")
+    detail = "；".join(errors[:4])
+    return None, f"无法识别（{detail}）"
+
+
+def check_api_key(provider: str, key: str, timeout: float = 20.0) -> tuple[bool, str]:
     # HTTP headers must be ASCII/Latin-1 encodable; APP_NAME contains Chinese.
     headers = {"User-Agent": "VideoToolkit/1.0"}
+    key = normalize_api_key(key)
     try:
         if not key or any(ord(char) < 33 or ord(char) > 126 for char in key):
             return False, "密钥格式异常：含有空格、中文、全角字符或其他非法字符"
         if provider == "Groq":
             resp = requests.get("https://api.groq.com/openai/v1/models",
-                                headers={**headers, "Authorization": f"Bearer {key}"}, timeout=20)
+                                headers={**headers, "Authorization": f"Bearer {key}"}, timeout=timeout)
         elif provider == "Gemini":
             resp = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                                headers={**headers, "x-goog-api-key": key}, timeout=20)
+                                headers={**headers, "x-goog-api-key": key}, timeout=timeout)
         elif provider == "ElevenLabs":
             resp = requests.get("https://api.elevenlabs.io/v1/user",
-                                headers={**headers, "xi-api-key": key}, timeout=20)
+                                headers={**headers, "xi-api-key": key}, timeout=timeout)
         elif provider == "Luma":
             return True, "密钥格式有效，免联机检测"
         elif provider == "Kling":
             return True, "密钥格式有效，免联机检测"
         else:
+            # Gladia
             resp = requests.get("https://api.gladia.io/v2/pre-recorded?limit=1",
-                                headers={**headers, "x-gladia-key": key}, timeout=20)
+                                headers={**headers, "x-gladia-key": key}, timeout=timeout)
         if resp.status_code < 300:
             return True, "验证通过"
         return False, f"HTTP {resp.status_code}: {response_error(resp)}"
@@ -3401,8 +3490,11 @@ class MainWindow(QMainWindow):
         fill_writing_language_combo(self.language_edit, "")
         # 第一项「自动检测」对识别也表示 auto
         self.language_edit.setToolTip(
-            "识别语言提示（whisper 等）与书写规范共用。"
-            "选「自动检测」时由模型/文本判断；也可选希腊、阿拉伯、西语等，或直接输入 el/ar/pt。")
+            "识别语言提示（Whisper/云服务）与书写规范共用。\n"
+            "选「自动检测」时由模型判断；马达加斯加语请选「Malagasy 马达加斯加语」（码 mg），"
+            "勿用自动——拉丁字母易被误判为英语/法语。\n"
+            "也可选希腊/阿拉伯/西语等，或直接输入 el/ar/pt/mg。"
+        )
         form.addRow("语言 / 书写规范", self.language_edit)
         self.diarize_check = QCheckBox("区分说话人（服务支持时启用）")
         form.addRow("说话人", self.diarize_check)
@@ -3437,13 +3529,26 @@ class MainWindow(QMainWindow):
         result_bar = QHBoxLayout(); result_bar.addWidget(QLabel("查看结果"))
         self.result_combo = QComboBox(); self.result_combo.addItem(ALL_RESULTS_LABEL)
         self.result_combo.currentTextChanged.connect(self._show_subtitle_result)
-        copy_original = QPushButton("复制当前原文"); copy_original.clicked.connect(lambda: QApplication.clipboard().setText(self.original_result.toPlainText()))
-        copy_bilingual = QPushButton("复制当前对照"); copy_bilingual.clicked.connect(self._copy_bilingual)
+        copy_original = QPushButton("复制当前原文"); copy_original.clicked.connect(self._copy_current_original)
+        copy_bilingual = QPushButton("复制当前对照"); copy_bilingual.setToolTip(
+            "复制为 CSV 两列（原文\\t中文），可直接粘贴到 Google 表格左右并排"
+        )
+        copy_bilingual.clicked.connect(self._copy_bilingual)
         copy_all_original = QPushButton("复制全部原文"); copy_all_original.clicked.connect(self._copy_all_original)
-        copy_all_bilingual = QPushButton("复制全部对照"); copy_all_bilingual.clicked.connect(self._copy_all_bilingual)
+        copy_all_bilingual = QPushButton("复制全部对照"); copy_all_bilingual.setToolTip(
+            "复制全部结果为 CSV 两列（原文\\t中文），可直接粘贴到 Google 表格"
+        )
+        copy_all_bilingual.clicked.connect(self._copy_all_bilingual)
         export_all = QPushButton("批量导出字幕"); export_all.setObjectName("primary"); export_all.clicked.connect(self._export_all_subtitles)
         result_bar.addWidget(self.result_combo, 1); result_bar.addWidget(copy_original); result_bar.addWidget(copy_bilingual)
         result_bar.addWidget(copy_all_original); result_bar.addWidget(copy_all_bilingual); result_bar.addWidget(export_all)
+        self.copy_status = QLabel("")
+        self.copy_status.setStyleSheet(
+            "color:#4ade80;font-size:12px;font-weight:700;padding:2px 8px;"
+            "background:#052e16;border-radius:4px;"
+        )
+        self.copy_status.setVisible(False)
+        result_bar.addWidget(self.copy_status)
         result_layout.addLayout(result_bar)
         result_split = QSplitter(Qt.Orientation.Vertical); result_split.setChildrenCollapsible(False)
         original_group = QGroupBox("识别原文"); original_layout = QVBoxLayout(original_group)
@@ -3490,7 +3595,10 @@ class MainWindow(QMainWindow):
         form.addRow("字幕服务", self.pipeline_provider)
         self.pipeline_language = QComboBox(); self.pipeline_language.setEditable(True)
         fill_writing_language_combo(self.pipeline_language, "")
-        self.pipeline_language.setToolTip("识别语言与书写规范；自动检测或手动选择/输入语言码")
+        self.pipeline_language.setToolTip(
+            "识别语言与书写规范。马达加斯加语请选 Malagasy（mg）；"
+            "自动检测易把马拉加斯语判成英语/法语。"
+        )
         form.addRow("语言 / 书写规范", self.pipeline_language)
         rename_line = QHBoxLayout()
         self.pipeline_prefix = QLineEdit(); self.pipeline_prefix.setPlaceholderText("前缀")
@@ -3689,85 +3797,165 @@ class MainWindow(QMainWindow):
     def _keys_page(self):
         page, layout = self._page_shell(
             "🔑 API 密钥管理",
-            "粘贴密钥即可自动识别服务（Groq / Gemini / ElevenLabs / Gladia）；也可手动指定。调用时轮询，失效会自动切换。",
+            "粘贴即可自动识别（Gemini：AIza / AQ.）；也可强制指定。调用时轮询，失效自动切换。",
         )
+        # 上方：左添加密钥 | 右申请入口（不抢下方列表高度）
+        top_split = QSplitter(Qt.Orientation.Horizontal)
+        top_split.setChildrenCollapsible(False)
+        top_split.setHandleWidth(6)
+
+        # —— 左侧：添加密钥（较窄即可）——
         add_group = QGroupBox("添加密钥")
         add_layout = QVBoxLayout(add_group)
-        add_layout.setContentsMargins(12, 12, 12, 12)
-        add_layout.setSpacing(8)
+        add_layout.setContentsMargins(10, 10, 10, 10)
+        add_layout.setSpacing(6)
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("归类方式"))
+        mode_row.addWidget(QLabel("归类"))
         self.key_assign_mode = QComboBox()
-        self.key_assign_mode.addItem("自动识别服务（推荐）", "auto")
+        self.key_assign_mode.addItem("自动识别（推荐）", "auto")
         for provider in PROVIDERS:
-            self.key_assign_mode.addItem(f"强制归入 {provider}", provider)
-        self.key_assign_mode.setMinimumWidth(220)
+            self.key_assign_mode.addItem(f"强制 {provider}", provider)
         self.key_assign_mode.setToolTip(
-            "自动：按密钥前缀归类（gsk_→Groq，AIza→Gemini，sk_→ElevenLabs，UUID→Gladia）。\n"
-            "识别不出时请在下拉框手动指定服务再添加。"
+            "自动：gsk_→Groq，AIza/AQ.→Gemini，sk_→ElevenLabs，UUID→Gladia。\n"
+            "认不出会短时联网探测；仍失败请强制指定。"
         )
         mode_row.addWidget(self.key_assign_mode, 1)
         add_layout.addLayout(mode_row)
         self.key_bulk_input = QPlainTextEdit()
         self.key_bulk_input.setPlaceholderText(
-            "在此粘贴密钥，每行一枚；可混合多个服务。\n"
-            "示例：\n"
-            "gsk_xxxx…          → 自动归入 Groq\n"
-            "AIzaxxxx…          → 自动归入 Gemini\n"
-            "sk_xxxx…           → 自动归入 ElevenLabs"
+            "每行一枚密钥，可混合服务：\n"
+            "gsk_… → Groq\n"
+            "AIza… / AQ.… → Gemini\n"
+            "sk_… → ElevenLabs\n"
+            "UUID → Gladia"
         )
-        self.key_bulk_input.setMinimumHeight(100)
-        self.key_bulk_input.setMaximumHeight(140)
-        add_layout.addWidget(self.key_bulk_input)
-        
-        # Quick key application links
+        self.key_bulk_input.setMinimumHeight(120)
+        add_layout.addWidget(self.key_bulk_input, 1)
+        add_btn = QPushButton("添加密钥（自动检测）")
+        add_btn.setObjectName("primary")
+        add_btn.setMinimumHeight(34)
+        add_btn.clicked.connect(self._add_keys_unified)
+        add_layout.addWidget(add_btn)
+        hint = QLabel("gsk_→Groq · AIza/AQ.→Gemini · sk_→ElevenLabs · UUID→Gladia")
+        hint.setStyleSheet("color:#7dd3fc;font-size:11px;")
+        hint.setWordWrap(True)
+        add_layout.addWidget(hint)
+        self.provider_inputs = {p: self.key_bulk_input for p in PROVIDERS}
+        top_split.addWidget(add_group)
+
+        # —— 右侧：申请入口与说明（可滚动）——
+        links_group = QGroupBox("申请入口与说明")
+        links_outer = QVBoxLayout(links_group)
+        links_outer.setContentsMargins(8, 8, 8, 8)
+        links_scroll = QScrollArea()
+        links_scroll.setWidgetResizable(True)
+        links_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        links_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        links_body = QWidget()
+        links_body_layout = QVBoxLayout(links_body)
+        links_body_layout.setContentsMargins(4, 2, 4, 4)
         links_label = QLabel(
-            "<b>🔑 快捷申请密钥链接：</b><br/>"
-            "• <b>Groq</b>: <a href='https://console.groq.com/keys' style='color:#60a5fa;'>console.groq.com</a>&nbsp;&nbsp;&nbsp;&nbsp;"
-            "• <b>Gemini</b>: <a href='https://aistudio.google.com/' style='color:#60a5fa;'>aistudio.google.com</a>&nbsp;&nbsp;&nbsp;&nbsp;"
-            "• <b>ElevenLabs</b>: <a href='https://elevenlabs.io/' style='color:#60a5fa;'>elevenlabs.io</a>&nbsp;&nbsp;&nbsp;&nbsp;"
-            "• <b>Gladia</b>: <a href='https://app.gladia.io/' style='color:#60a5fa;'>app.gladia.io</a>"
+            "<div style='line-height:1.5;font-size:12px'>"
+            "<b>一、语音识别 ASR（密钥加在左侧）</b><br/>"
+            "• <b>Groq</b> "
+            "<a href='https://console.groq.com/keys' style='color:#60a5fa;'>申请密钥</a> · "
+            "<a href='https://console.groq.com' style='color:#93c5fd;'>控制台</a><br/>"
+            "• <b>Gemini</b>（识别+配音同一 Key）"
+            "<a href='https://aistudio.google.com/api-keys' style='color:#60a5fa;'>API Keys</a> · "
+            "<a href='https://aistudio.google.com/' style='color:#93c5fd;'>AI Studio</a><br/>"
+            "• <b>ElevenLabs</b>（识别+多语 TTS）"
+            "<a href='https://elevenlabs.io/app/settings/api-keys' style='color:#60a5fa;'>API Keys</a> · "
+            "<a href='https://elevenlabs.io/app/voice-library' style='color:#93c5fd;'>音色库</a> · "
+            "<a href='https://elevenlabs.io/' style='color:#93c5fd;'>官网</a><br/>"
+            "• <b>Gladia</b> "
+            "<a href='https://app.gladia.io/account' style='color:#60a5fa;'>账户/API</a> · "
+            "<a href='https://docs.gladia.io/' style='color:#93c5fd;'>文档</a><br/><br/>"
+            "<b>二、文字转语音 TTS</b><br/>"
+            "• <b>微软 edge-tts</b>（免费、无需密钥；Reels 选「微软文字转语音」）"
+            "<a href='https://speech.microsoft.com/portal' style='color:#60a5fa;'>试听</a> · "
+            "<a href='https://learn.microsoft.com/azure/ai-services/speech-service/language-support' style='color:#93c5fd;'>语言列表</a><br/>"
+            "• <b>Gemini 自然语音</b> "
+            "<a href='https://ai.google.dev/gemini-api/docs/speech-generation' style='color:#60a5fa;'>文档</a><br/>"
+            "• <b>ElevenLabs TTS</b> "
+            "<a href='https://elevenlabs.io/docs/api-reference/text-to-speech' style='color:#60a5fa;'>TTS API</a><br/>"
+            "• <b>Azure Speech</b>（商用可选）"
+            "<a href='https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeechServices' style='color:#60a5fa;'>创建资源</a> · "
+            "<a href='https://speech.microsoft.com/' style='color:#93c5fd;'>官网</a><br/><br/>"
+            "<b>三、本地识别</b>：设置与组件安装 Whisper，无需密钥。"
+            "</div>"
         )
         links_label.setOpenExternalLinks(True)
-        links_label.setStyleSheet("QLabel { line-height: 1.6; margin-top: 4px; margin-bottom: 4px; }")
-        add_layout.addWidget(links_label)
-        
-        action_row = QHBoxLayout()
-        add_btn = QPushButton("添加密钥")
-        add_btn.setObjectName("primary")
-        add_btn.clicked.connect(self._add_keys_unified)
-        hint = QLabel("规则：gsk_ → Groq · AIza → Gemini · sk_ → ElevenLabs · UUID → Gladia")
-        hint.setStyleSheet("color:#7dd3fc;font-size:12px;")
-        action_row.addWidget(add_btn)
-        action_row.addWidget(hint, 1)
-        add_layout.addLayout(action_row)
-        # 兼容旧代码引用（单输入框映射）
-        self.provider_inputs = {p: self.key_bulk_input for p in PROVIDERS}
-        layout.addWidget(add_group)
+        links_label.setWordWrap(True)
+        links_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        links_label.setStyleSheet(
+            "QLabel { background:#0b1830; color:#e2e8f0; padding:8px 10px; border-radius:6px; }"
+        )
+        links_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        links_body_layout.addWidget(links_label)
+        links_body_layout.addStretch(1)
+        links_scroll.setWidget(links_body)
+        links_outer.addWidget(links_scroll)
+        top_split.addWidget(links_group)
 
-        panel = QFrame(); panel.setObjectName("panel")
-        panel_layout = QVBoxLayout(panel); panel_layout.setContentsMargins(10, 10, 10, 10)
+        # 左约 38% 添加区，右约 62% 说明
+        top_split.setStretchFactor(0, 2)
+        top_split.setStretchFactor(1, 3)
+        top_split.setSizes([360, 560])
+        # 限制上半区高度，把空间留给密钥列表
+        top_wrap = QWidget()
+        top_wrap_layout = QVBoxLayout(top_wrap)
+        top_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        top_wrap_layout.addWidget(top_split)
+        top_wrap.setMaximumHeight(260)
+        top_wrap.setMinimumHeight(200)
+        layout.addWidget(top_wrap, 0)
+
+        # —— 下方：密钥列表（主要区域）——
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_layout.setSpacing(6)
+        list_title = QLabel("已添加密钥列表")
+        list_title.setStyleSheet("font-weight:700;color:#f1f5f9;")
+        panel_layout.addWidget(list_title)
         self.key_table = QTableWidget(0, 7)
-        self.key_table.setHorizontalHeaderLabels(["服务", "密钥", "状态", "上次检测", "使用次数", "异常原因", "ID"])
+        self.key_table.setHorizontalHeaderLabels(
+            ["服务", "密钥", "状态", "上次检测", "使用次数", "异常原因", "ID"]
+        )
         header = self.key_table.horizontalHeader()
         for column in range(5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.key_table.setColumnHidden(6, True)
         self.key_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.key_table.setMinimumHeight(180)
         self.key_table.cellDoubleClicked.connect(lambda row, column: self._show_key_error(row))
-        panel_layout.addWidget(self.key_table)
+        panel_layout.addWidget(self.key_table, 1)
         buttons = QHBoxLayout()
-        check_selected = QPushButton("检测选中"); check_selected.clicked.connect(self._check_selected_keys)
-        check_all = QPushButton("检测全部"); check_all.clicked.connect(self._check_all_keys)
-        details = QPushButton("查看异常详情"); details.clicked.connect(self._show_selected_key_error)
-        toggle = QPushButton("启用 / 停用"); toggle.clicked.connect(self._toggle_key)
-        remove = QPushButton("删除选中"); remove.clicked.connect(self._remove_key)
-        buttons.addWidget(check_selected); buttons.addWidget(check_all); buttons.addWidget(details); buttons.addWidget(toggle); buttons.addStretch(); buttons.addWidget(remove)
+        check_selected = QPushButton("检测选中")
+        check_selected.clicked.connect(self._check_selected_keys)
+        check_all = QPushButton("检测全部")
+        check_all.clicked.connect(self._check_all_keys)
+        details = QPushButton("查看异常详情")
+        details.clicked.connect(self._show_selected_key_error)
+        toggle = QPushButton("启用 / 停用")
+        toggle.clicked.connect(self._toggle_key)
+        remove = QPushButton("删除选中")
+        remove.clicked.connect(self._remove_key)
+        buttons.addWidget(check_selected)
+        buttons.addWidget(check_all)
+        buttons.addWidget(details)
+        buttons.addWidget(toggle)
+        buttons.addStretch()
+        buttons.addWidget(remove)
         panel_layout.addLayout(buttons)
         layout.addWidget(panel, 1)
+
         note = QLabel("安全提示：配置文件为本机明文保存，请勿共享该文件或整个用户配置目录。")
-        note.setStyleSheet("color:#f59e0b;")
+        note.setStyleSheet("color:#f59e0b;font-size:11px;")
         layout.addWidget(note)
         return page
 
@@ -4720,13 +4908,37 @@ class MainWindow(QMainWindow):
             if not clean_text:
                 raise RuntimeError("文案为空，无法生成语音。")
 
-            selected_voice = voice or "zh-CN-XiaoxiaoNeural"
-            locale = selected_voice[:5]
+            # 下拉项可能是「ShortName｜说明」
+            selected_voice = (str(voice or "").split("｜", 1)[0].strip() or "zh-CN-XiaoxiaoNeural")
+            locale_m = re.match(r"^([a-z]{2}-[A-Z]{2})", selected_voice)
+            locale = locale_m.group(1) if locale_m else selected_voice[:5]
+            # 多语言备用音色（同语种失败时自动换）
             voice_fallbacks = {
                 "pt-PT": ["pt-PT-RaquelNeural", "pt-PT-DuarteNeural"],
                 "pt-BR": ["pt-BR-FranciscaNeural", "pt-BR-AntonioNeural"],
-                "zh-CN": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural"],
-                "en-US": ["en-US-JennyNeural", "en-US-GuyNeural"],
+                "zh-CN": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-XiaoyiNeural"],
+                "zh-TW": ["zh-TW-HsiaoChenNeural", "zh-TW-YunJheNeural"],
+                "en-US": ["en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural"],
+                "en-GB": ["en-GB-SoniaNeural", "en-GB-RyanNeural"],
+                "es-ES": ["es-ES-ElviraNeural", "es-ES-AlvaroNeural"],
+                "es-MX": ["es-MX-DaliaNeural", "es-MX-JorgeNeural"],
+                "fr-FR": ["fr-FR-DeniseNeural", "fr-FR-HenriNeural"],
+                "de-DE": ["de-DE-KatjaNeural", "de-DE-ConradNeural"],
+                "it-IT": ["it-IT-ElsaNeural", "it-IT-DiegoNeural"],
+                "el-GR": ["el-GR-AthinaNeural", "el-GR-NestorasNeural"],
+                "ru-RU": ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"],
+                "tr-TR": ["tr-TR-EmelNeural", "tr-TR-AhmetNeural"],
+                "ar-SA": ["ar-SA-ZariyahNeural", "ar-SA-HamedNeural"],
+                "ar-EG": ["ar-EG-SalmaNeural", "ar-EG-ShakirNeural"],
+                "he-IL": ["he-IL-HilaNeural", "he-IL-AvriNeural"],
+                "ja-JP": ["ja-JP-NanamiNeural", "ja-JP-KeitaNeural"],
+                "ko-KR": ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"],
+                "hi-IN": ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural"],
+                "id-ID": ["id-ID-GadisNeural", "id-ID-ArdiNeural"],
+                "nl-NL": ["nl-NL-FennaNeural", "nl-NL-MaartenNeural"],
+                "pl-PL": ["pl-PL-AgnieszkaNeural", "pl-PL-MarekNeural"],
+                "vi-VN": ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"],
+                "th-TH": ["th-TH-PremwadeeNeural", "th-TH-NiwatNeural"],
             }
             voices = list(dict.fromkeys([selected_voice] + voice_fallbacks.get(locale, [])))
 
@@ -5017,6 +5229,48 @@ class MainWindow(QMainWindow):
         self.original_result.setPlainText(result.get("original", ""))
         self.chinese_result.setPlainText(result.get("chinese", ""))
 
+    def _flash_copied(self, message="✓ 已复制"):
+        """短暂显示绿色「已复制」提示，复制反馈更明显。"""
+        label = getattr(self, "copy_status", None)
+        if label is None:
+            return
+        label.setText(message)
+        label.setVisible(True)
+        QTimer.singleShot(2200, lambda: label.setVisible(False) if label is not None else None)
+
+    @staticmethod
+    def _bilingual_to_csv(original: str, chinese: str) -> str:
+        """原文/中文按行配对为 TSV 两列，粘贴到 Google 表格时自动左右并排。"""
+        def _lines(text: str):
+            text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+            if not text:
+                return []
+            return [line.strip() for line in text.split("\n")]
+
+        def _cell(value: str) -> str:
+            # 单元格内换行/制表符压成空格，避免破坏两列结构
+            return (value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+        orig_lines = _lines(original)
+        zh_lines = _lines(chinese)
+        # 若行数接近（差 ≤2），按行配对；否则各压成单格（两列一行）
+        if orig_lines and zh_lines and abs(len(orig_lines) - len(zh_lines)) <= 2:
+            n = max(len(orig_lines), len(zh_lines))
+            rows = []
+            for i in range(n):
+                o = orig_lines[i] if i < len(orig_lines) else ""
+                z = zh_lines[i] if i < len(zh_lines) else ""
+                rows.append(f"{_cell(o)}\t{_cell(z)}")
+            return "\n".join(rows)
+        return f"{_cell(original)}\t{_cell(chinese)}"
+
+    def _copy_current_original(self):
+        text = self.original_result.toPlainText()
+        if not text.strip():
+            return
+        QApplication.clipboard().setText(text)
+        self._flash_copied("✓ 已复制原文")
+
     def _copy_bilingual(self):
         name = self.result_combo.currentText()
         if name == ALL_RESULTS_LABEL:
@@ -5025,19 +5279,28 @@ class MainWindow(QMainWindow):
         result = self.subtitle_results.get(name)
         if not result:
             return
-        text = f"【原文】\n{result['original']}\n\n【简体中文】\n{result['chinese']}"
+        text = self._bilingual_to_csv(result.get("original", ""), result.get("chinese", ""))
         QApplication.clipboard().setText(text)
+        self._flash_copied("✓ 已复制对照（CSV 两列）")
 
     def _copy_all_original(self):
         text = "\n\n".join(f"【{name}】\n{result['original']}"
                             for name, result in self.subtitle_results.items())
+        if not text.strip():
+            return
         QApplication.clipboard().setText(text)
+        self._flash_copied("✓ 已复制全部原文")
 
     def _copy_all_bilingual(self):
         parts = []
         for name, result in self.subtitle_results.items():
-            parts.append(f"【{name}】\n【原文】\n{result['original']}\n\n【简体中文】\n{result['chinese']}")
-        QApplication.clipboard().setText("\n\n".join(parts))
+            block = self._bilingual_to_csv(result.get("original", ""), result.get("chinese", ""))
+            if block.strip():
+                parts.append(block)
+        if not parts:
+            return
+        QApplication.clipboard().setText("\n".join(parts))
+        self._flash_copied("✓ 已复制全部对照（CSV 两列）")
 
     def _export_all_subtitles(self):
         if not self.subtitle_results:
@@ -5082,9 +5345,19 @@ class MainWindow(QMainWindow):
 
         counts = {p: 0 for p in PROVIDERS}
         skipped, unknown = [], []
-        for key in keys:
+        probed_notes = []
+        for raw_key in keys:
+            key = normalize_api_key(raw_key)
+            if not key:
+                continue
             if mode == "auto":
                 provider = detect_api_provider(key)
+                how = "格式"
+                if not provider:
+                    # 规则认不出时：短超时联网探测，减少「找不到对应服务」
+                    provider, how = detect_api_provider_with_probe(key, timeout=8.0)
+                    if provider:
+                        probed_notes.append(f"{masked_key(key)}→{provider}（{how}）")
                 if not provider:
                     unknown.append(masked_key(key))
                     continue
@@ -5100,9 +5373,13 @@ class MainWindow(QMainWindow):
         self._refresh_keys()
         parts = [f"{p} {n} 枚" for p, n in counts.items() if n]
         message = "已添加：" + ("、".join(parts) if parts else "0 枚") + "。"
+        if probed_notes:
+            message += "\n联网辅助识别：" + "；".join(probed_notes[:6])
+            if len(probed_notes) > 6:
+                message += "…"
         if unknown:
             message += (
-                f"\n未能识别 {len(unknown)} 枚（请在上方下拉框选择服务后重试）："
+                f"\n仍未能识别 {len(unknown)} 枚（请在上方下拉框「强制归入 xxx」后重试）："
                 + "、".join(unknown[:5])
                 + ("…" if len(unknown) > 5 else "")
             )
