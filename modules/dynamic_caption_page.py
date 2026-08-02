@@ -1424,9 +1424,330 @@ def prepared_watermark_stack(paths, cache_dir):
     return destination
 
 
+# 动态水印扩展名：视频 + GIF（GIF 按循环视频叠层，不能当静态图）
+ANIMATED_WATERMARK_EXTENSIONS = set(VIDEO_EXTENSIONS) | {".gif"}
+
+# 动态水印帧缓存 path -> {kind, frames/cap, duration, last_t, last_img, ...}
+_WM_ANIM_CAP_CACHE: dict = {}
+
+
+def is_video_watermark_entry(item) -> bool:
+    """True if watermark layer is motion (video/GIF), not a still image."""
+    if not item:
+        return False
+    kind = str(item.get("media_type") or "").lower()
+    if kind in ("video", "movie", "clip", "gif", "animated"):
+        return True
+    path = Path(str(item.get("path") or ""))
+    return path.suffix.lower() in ANIMATED_WATERMARK_EXTENSIONS
+
+
+def split_watermark_entries(watermarks):
+    """Split layers into (image_entries, video_entries). GIF → video_entries."""
+    images, videos = [], []
+    for raw in watermarks or []:
+        item = dict(raw or {})
+        path = Path(str(item.get("path") or ""))
+        if not path.is_file():
+            continue
+        if is_video_watermark_entry(item):
+            item["media_type"] = "video" if path.suffix.lower() != ".gif" else "gif"
+            videos.append(item)
+        else:
+            item["media_type"] = "image"
+            images.append(item)
+    return images, videos
+
+
+def _pil_rgba_to_qimage(pil_img) -> QImage:
+    """Convert a Pillow RGBA image to QImage (deep copy)."""
+    if pil_img is None:
+        return QImage()
+    rgba = pil_img.convert("RGBA")
+    w, h = rgba.size
+    data = rgba.tobytes("raw", "RGBA")
+    return QImage(data, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+
+
+def _load_gif_rgba_sequence(path) -> tuple[list, list, float]:
+    """Load animated GIF frames with real alpha (OpenCV drops GIF transparency).
+
+    Returns (qimages, durations_sec, total_duration).
+    """
+    from PIL import Image, ImageSequence
+
+    im = Image.open(str(path))
+    w, h = im.size
+    frames: list[QImage] = []
+    durations: list[float] = []
+    # Composite disposal so partial frames keep correct transparency
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    prev_canvas = canvas.copy()
+    for frame in ImageSequence.Iterator(im):
+        duration_ms = frame.info.get("duration")
+        try:
+            duration = max(0.02, float(duration_ms or 100) / 1000.0)
+        except Exception:
+            duration = 0.1
+        disposal = 0
+        try:
+            disposal = int(getattr(frame, "disposal_method", None) or frame.info.get("disposal", 0) or 0)
+        except Exception:
+            disposal = 0
+        if disposal == 3:
+            # restore to previous — keep prev_canvas as backup
+            pass
+        fr = frame.convert("RGBA")
+        # paste with alpha mask so transparent pixels stay transparent
+        composed = canvas.copy()
+        composed.paste(fr, (0, 0), fr)
+        frames.append(_pil_rgba_to_qimage(composed))
+        durations.append(duration)
+        if disposal == 2:
+            # restore background (transparent)
+            canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        elif disposal == 3:
+            canvas = prev_canvas.copy()
+        else:
+            # dispose=0/1: leave as-is for next frame
+            prev_canvas = composed.copy()
+            canvas = composed
+    if not frames:
+        return [], [], 0.0
+    total = float(sum(durations)) or (len(frames) / 15.0)
+    return frames, durations, total
+
+
+def _qimage_from_bgr_frame(frame) -> QImage:
+    """OpenCV BGR/BGRA/gray frame → QImage; preserve alpha when present."""
+    if frame is None:
+        return QImage()
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        h, w = frame.shape[:2]
+        return QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888).copy()
+    if frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+        h, w = frame.shape[:2]
+        return QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGBA8888).copy()
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w = frame.shape[:2]
+    return QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888).copy()
+
+
+def _ensure_preview_watermark_alpha(image: QImage) -> QImage:
+    """Match export transparency: keep real alpha; else knockout solid black/white bg.
+
+    OpenCV often composites transparent video/GIF onto an opaque black plate, so
+    live preview looked solid while FFmpeg overlay used the real alpha channel.
+    """
+    if image is None or image.isNull():
+        return QImage()
+    if _watermark_image_has_useful_alpha(image):
+        return image.convertToFormat(QImage.Format.Format_ARGB32)
+    return _knockout_solid_background(image)
+
+
+def release_watermark_anim_cache(path: str | None = None):
+    """Close OpenCV captures / drop GIF frame caches for dynamic watermarks."""
+    global _WM_ANIM_CAP_CACHE
+    if path:
+        key = str(Path(path).resolve()) if path else ""
+        info = _WM_ANIM_CAP_CACHE.pop(key, None)
+        if info and info.get("cap") is not None:
+            try:
+                info["cap"].release()
+            except Exception:
+                pass
+        return
+    for info in list(_WM_ANIM_CAP_CACHE.values()):
+        try:
+            if info.get("cap") is not None:
+                info["cap"].release()
+        except Exception:
+            pass
+    _WM_ANIM_CAP_CACHE = {}
+
+
+def watermark_animated_frame_at(path, t_sec: float = 0.0) -> QImage:
+    """Sample a looping frame from video/GIF at timeline time t_sec (for live preview).
+
+    GIF: Pillow RGBA sequence (preserves transparency; OpenCV does not).
+    Video: OpenCV frames + alpha/knockout so preview matches FFmpeg export overlay.
+    """
+    p = Path(str(path or ""))
+    if not p.is_file():
+        return QImage()
+    key = str(p.resolve())
+    info = _WM_ANIM_CAP_CACHE.get(key)
+    suffix = p.suffix.lower()
+
+    # ---- GIF: full RGBA sequence via Pillow ----
+    if suffix == ".gif" or (info and info.get("kind") == "gif"):
+        if info is None or info.get("kind") != "gif" or not info.get("frames"):
+            try:
+                frames, durations, total = _load_gif_rgba_sequence(p)
+            except Exception:
+                frames, durations, total = [], [], 0.0
+            if not frames:
+                # fallback OpenCV + knockout
+                info = None
+                _WM_ANIM_CAP_CACHE.pop(key, None)
+            else:
+                info = {
+                    "kind": "gif",
+                    "frames": frames,
+                    "durations": durations,
+                    "duration": total,
+                    "nframes": len(frames),
+                    "cap": None,
+                    "last_t": -1.0,
+                    "last_img": QImage(),
+                }
+                _WM_ANIM_CAP_CACHE[key] = info
+        if info and info.get("kind") == "gif" and info.get("frames"):
+            t = max(0.0, float(t_sec or 0.0))
+            dur = float(info.get("duration") or 0.0)
+            if dur > 0.02:
+                t = t % dur
+            if abs(t - float(info.get("last_t", -1))) < 0.02 and not info["last_img"].isNull():
+                return info["last_img"]
+            # pick frame by cumulative duration
+            acc = 0.0
+            idx = 0
+            durs = info.get("durations") or []
+            for i, d in enumerate(durs):
+                if acc + d > t:
+                    idx = i
+                    break
+                acc += d
+                idx = i
+            img = info["frames"][max(0, min(idx, len(info["frames"]) - 1))]
+            img = _ensure_preview_watermark_alpha(img)
+            info["last_t"] = t
+            info["last_img"] = img
+            return img
+
+    # ---- Video (and GIF fallback): OpenCV + alpha / knockout ----
+    if info is None or info.get("kind") not in (None, "video") or info.get("cap") is None or not info["cap"].isOpened():
+        # release stale
+        if info and info.get("cap") is not None:
+            try:
+                info["cap"].release()
+            except Exception:
+                pass
+        cap = cv2.VideoCapture(str(p))
+        if not cap.isOpened():
+            return QImage()
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 15.0
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = (nframes / fps) if nframes > 1 and fps > 0 else 0.0
+        info = {
+            "kind": "video",
+            "cap": cap,
+            "fps": fps,
+            "nframes": nframes,
+            "duration": duration,
+            "last_t": -1.0,
+            "last_img": QImage(),
+        }
+        _WM_ANIM_CAP_CACHE[key] = info
+    cap = info["cap"]
+    t = max(0.0, float(t_sec or 0.0))
+    dur = float(info.get("duration") or 0.0)
+    if dur > 0.08:
+        t = t % dur
+    # 约 40ms 内复用，减轻 seek 压力
+    if abs(t - float(info.get("last_t", -1))) < 0.038 and not info["last_img"].isNull():
+        return info["last_img"]
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+        if not ok or frame is None:
+            return QImage()
+        img = _qimage_from_bgr_frame(frame)
+        # 关键：有 alpha 则保留；否则抠近黑/近白底（对齐静态水印与 FFmpeg 透明叠层观感）
+        img = _ensure_preview_watermark_alpha(img)
+        info["last_t"] = t
+        info["last_img"] = img
+        return img
+    except Exception:
+        return QImage()
+
+
+def watermark_corner_xy(position: str, margin: int) -> tuple[str, str]:
+    """FFmpeg overlay x/y expressions for corner placement."""
+    margin = max(0, min(300, int(margin or 0)))
+    positions = {
+        "左上角": (str(margin), str(margin)),
+        "右上角": (f"W-w-{margin}", str(margin)),
+        "左下角": (str(margin), f"H-h-{margin}"),
+        "右下角": (f"W-w-{margin}", f"H-h-{margin}"),
+        "画面中间": ("(W-w)/2", "(H-h)/2"),
+    }
+    return positions.get(str(position or "右上角"), positions["右上角"])
+
+
+def video_logo_filter_chain(base_label: str, logo_specs: list) -> tuple[str, str]:
+    """Build FFmpeg fragments for looping video logos over base_label.
+
+    logo_specs: list of (input_index, entry_dict)
+    Returns (final_video_label, filter_fragment_without_leading_semicolon).
+    """
+    if not logo_specs:
+        return base_label, ""
+    parts = []
+    current = base_label
+    for i, (inp, entry) in enumerate(logo_specs):
+        opacity = max(5, min(100, int(entry.get("opacity", 100) or 100))) / 100
+        width_frac = max(3, min(60, int(entry.get("width", 18) or 18))) / 100
+        margin = max(0, min(300, int(entry.get("margin", 28) or 28)))
+        position = entry.get("position", "右上角")
+        x, y = watermark_corner_xy(position, margin)
+        mode = str(entry.get("mode") or "小 Logo 自定义位置")
+        wm_a = f"wm_va{i}"
+        wm_s = f"wm_vs{i}"
+        base_s = f"wm_vb{i}"
+        out = f"wm_vout{i}"
+        if "全屏" in mode:
+            parts.append(
+                f"[{inp}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[{wm_a}];"
+                f"[{wm_a}][{current}]scale2ref=w=main_w:h=main_h[{wm_s}][{base_s}];"
+                f"[{base_s}][{wm_s}]overlay=0:0:format=auto:shortest=1:eof_action=repeat[{out}]"
+            )
+        else:
+            parts.append(
+                f"[{inp}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[{wm_a}];"
+                f"[{wm_a}][{current}]scale2ref=w=main_w*{width_frac:.4f}:h=ow/mdar[{wm_s}][{base_s}];"
+                f"[{base_s}][{wm_s}]overlay={x}:{y}:format=auto:shortest=1:eof_action=repeat[{out}]"
+            )
+        current = out
+    return current, ";".join(parts)
+
+
+def load_watermark_preview_image(path) -> QImage:
+    """Load a still for list/thumbnail: video/GIF → first frame (with alpha); image → prepared."""
+    p = Path(str(path or ""))
+    if not p.is_file():
+        return QImage()
+    if p.suffix.lower() in ANIMATED_WATERMARK_EXTENSIONS:
+        # watermark_animated_frame_at already preserves/knocks out alpha for preview
+        return watermark_animated_frame_at(str(p), 0.0)
+    return _prepare_watermark_source(p)
+
+
 def prepared_watermark_composite(ffmpeg,video,watermarks,cache_dir):
-    """Render independently positioned watermark layers into one exact-size transparent frame."""
-    entries=[dict(item) for item in watermarks if Path(str(item.get("path",""))).is_file()]
+    """Render independently positioned still-image watermark layers into one transparent frame.
+
+    Video logos are excluded here and overlaid live during FFmpeg export.
+    """
+    entries=[
+        dict(item) for item in watermarks
+        if Path(str(item.get("path",""))).is_file() and not is_video_watermark_entry(item)
+    ]
     if not entries: return Path("")
     width,height=media_video_size(ffmpeg,video); signatures=[]
     for item in entries:
@@ -2230,51 +2551,59 @@ def rounded_rect_path(width, height, radius):
             f"l 0 {r} b 0 {r-k} {r-k} 0 {r} 0")
 
 
-def watermark_filter_graph(ass_filter, settings, watermark_input_index, v_filter_str=None):
-    """Build FFmpeg graph: video + ASS captions + optional watermark overlay.
+def watermark_filter_graph(
+    ass_filter,
+    settings,
+    watermark_input_index=None,
+    v_filter_str=None,
+    video_logo_specs=None,
+    out_label="outv",
+):
+    """Build FFmpeg graph: video + ASS captions + optional still/video watermark overlays.
 
     已预合成（watermark_prepared）的 PNG 本身带透明通道与几何信息，只需 0,0 叠加，
     切勿再按「全屏」二次拉伸，否则会把透明区域变成黑底盖住成片。
+    video_logo_specs: optional list of (input_index, entry) for looping motion logos.
     """
     ass_expression=ass_filter_expression(ass_filter,settings)
     opacity = max(5, min(100, int(settings.get("watermark_opacity", 90)))) / 100
     mode = str(settings.get("watermark_mode", "9:16 全屏覆盖") or "9:16 全屏覆盖")
-    video_prefix = f"[0:v]{v_filter_str + ',' if v_filter_str else ''}{ass_expression}[captioned];"
-    # 预合成图层：已含位置/透明度，直接 overlay（format=auto 保留 alpha）
-    if settings.get("watermark_prepared"):
-        return (
-            video_prefix +
-            f"[{watermark_input_index}:v]format=rgba[wm];"
-            "[captioned][wm]overlay=0:0:format=auto:eof_action=repeat,"
-            "setpts=PTS-STARTPTS[outv]"
-        )
-    prefix = (
-        video_prefix +
-        f"[{watermark_input_index}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wm_alpha];"
-    )
-    if mode == "9:16 全屏覆盖" or "全屏" in mode:
-        return (
-            prefix + "[wm_alpha][captioned]scale2ref=w=main_w:h=main_h[wm][base];"
-            "[base][wm]overlay=0:0:format=auto:eof_action=repeat,"
-            "setpts=PTS-STARTPTS[outv]"
-        )
-    width = max(3, min(60, int(settings.get("watermark_width", 18)))) / 100
-    margin = max(0, min(300, int(settings.get("watermark_margin", 28))))
-    position = settings.get("watermark_position", "右上角")
-    positions = {
-        "左上角": (str(margin), str(margin)),
-        "右上角": (f"W-w-{margin}", str(margin)),
-        "左下角": (str(margin), f"H-h-{margin}"),
-        "右下角": (f"W-w-{margin}", f"H-h-{margin}"),
-        "画面中间": ("(W-w)/2", "(H-h)/2"),
-    }
-    x, y = positions.get(position, positions["右上角"])
-    return (
-        prefix +
-        f"[wm_alpha][captioned]scale2ref=w=main_w*{width:.4f}:h=ow/mdar[wm][base];"
-        f"[base][wm]overlay={x}:{y}:format=auto:eof_action=repeat,"
-        f"setpts=PTS-STARTPTS[outv]"
-    )
+    video_prefix = f"[0:v]{v_filter_str + ',' if v_filter_str else ''}{ass_expression}[captioned]"
+    parts = [video_prefix]
+    current = "captioned"
+    # 预合成静态图 / 单图水印
+    if watermark_input_index is not None:
+        if settings.get("watermark_prepared"):
+            parts.append(f"[{watermark_input_index}:v]format=rgba[wm]")
+            parts.append(f"[{current}][wm]overlay=0:0:format=auto:eof_action=repeat[wm_base]")
+            current = "wm_base"
+        else:
+            parts.append(
+                f"[{watermark_input_index}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wm_alpha]"
+            )
+            if mode == "9:16 全屏覆盖" or "全屏" in mode:
+                parts.append(f"[wm_alpha][{current}]scale2ref=w=main_w:h=main_h[wm][base]")
+                parts.append("[base][wm]overlay=0:0:format=auto:eof_action=repeat[wm_base]")
+            else:
+                width = max(3, min(60, int(settings.get("watermark_width", 18)))) / 100
+                margin = max(0, min(300, int(settings.get("watermark_margin", 28))))
+                position = settings.get("watermark_position", "右上角")
+                x, y = watermark_corner_xy(position, margin)
+                parts.append(
+                    f"[wm_alpha][{current}]scale2ref=w=main_w*{width:.4f}:h=ow/mdar[wm][base]"
+                )
+                parts.append(
+                    f"[base][wm]overlay={x}:{y}:format=auto:eof_action=repeat[wm_base]"
+                )
+            current = "wm_base"
+    # 动态视频 Logo（可多层，循环到主片结束）
+    if video_logo_specs:
+        final_label, logo_frag = video_logo_filter_chain(current, video_logo_specs)
+        if logo_frag:
+            parts.append(logo_frag)
+            current = final_label
+    parts.append(f"[{current}]setpts=PTS-STARTPTS[{out_label}]")
+    return ";".join(parts)
 
 
 def ass_filter_expression(ass_filter,settings):
@@ -3506,28 +3835,68 @@ class CaptionWorker(QObject):
                         f"[{index + 1}/{len(self.videos)}] 环境音：{Path(ambient_file).name}"
                         f"（音量 {int(self.settings.get('ambient_volume', 20) or 20)}%）。"
                     )
-                watermark_entries=[] if watermark_already_baked else (self.settings.get("watermarks") or [])
-                watermark_paths=[] if watermark_already_baked else (self.settings.get("watermark_paths") or [self.settings.get("watermark_path","")])
-                watermark = (prepared_watermark_composite(self.ffmpeg,render_video,watermark_entries,self.output)
-                             if watermark_entries else prepared_watermark_stack(watermark_paths,self.output))
-                watermark_enabled = bool(watermark) and Path(watermark).is_file()
-                render_settings=self.settings
-                if watermark_enabled and watermark_entries:
-                    # 预合成 PNG 已是视频分辨率+透明层，只做 0,0 overlay
-                    render_settings=dict(self.settings); render_settings.update({"watermark_prepared":True})
-                    self.log.emit(
-                        f"[{index + 1}/{len(self.videos)}] 水印已预合成透明层（黑/白底自动抠除），"
-                        "叠加时保留画面内容。"
+                raw_wm_entries=[] if watermark_already_baked else list(self.settings.get("watermarks") or [])
+                watermark_paths=[] if watermark_already_baked else (
+                    self.settings.get("watermark_paths") or [self.settings.get("watermark_path","")]
+                )
+                image_wm_entries, video_wm_entries = split_watermark_entries(raw_wm_entries)
+                # 兼容旧版仅 path 列表
+                if not image_wm_entries and not video_wm_entries and watermark_paths:
+                    for p in watermark_paths:
+                        if Path(str(p)).is_file():
+                            image_wm_entries.append({
+                                "path": str(p),
+                                "media_type": "image",
+                                "mode": self.settings.get("watermark_mode", "9:16 全屏覆盖"),
+                                "position": self.settings.get("watermark_position", "右上角"),
+                                "width": self.settings.get("watermark_width", 18),
+                                "opacity": self.settings.get("watermark_opacity", 90),
+                                "margin": self.settings.get("watermark_margin", 28),
+                            })
+                watermark = (
+                    prepared_watermark_composite(self.ffmpeg, render_video, image_wm_entries, self.output)
+                    if image_wm_entries else Path("")
+                )
+                if not watermark and image_wm_entries:
+                    # 回退 stack
+                    watermark = prepared_watermark_stack(
+                        [e["path"] for e in image_wm_entries], self.output
                     )
-                elif watermark_enabled and ("全屏" in str(self.settings.get("watermark_mode","9:16 全屏覆盖"))):
-                    watermark=prepared_fullframe_watermark(
-                        self.ffmpeg,render_video,watermark,self.output,self.settings.get("watermark_opacity",90))
-                    render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
-                # 小 logo 路径：不设 watermark_prepared，由 filter 按比例 scale2ref
-                watermark_input = 1
-                if external: watermark_input += 1
-                if bgm_file: watermark_input += 1
-                if ambient_file: watermark_input += 1
+                image_wm_enabled = bool(watermark) and Path(watermark).is_file()
+                video_wm_enabled = bool(video_wm_entries)
+                watermark_enabled = image_wm_enabled or video_wm_enabled
+                render_settings = dict(self.settings)
+                if image_wm_enabled and image_wm_entries:
+                    render_settings["watermark_prepared"] = True
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 静态水印已预合成 "
+                        f"{len(image_wm_entries)} 层（黑/白底自动抠除）。"
+                    )
+                elif image_wm_enabled and ("全屏" in str(self.settings.get("watermark_mode", "9:16 全屏覆盖"))):
+                    watermark = prepared_fullframe_watermark(
+                        self.ffmpeg, render_video, watermark, self.output,
+                        self.settings.get("watermark_opacity", 90),
+                    )
+                    render_settings["watermark_prepared"] = True
+                if video_wm_enabled:
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 动态视频 Logo ×{len(video_wm_entries)}："
+                        + "、".join(Path(e["path"]).name for e in video_wm_entries)
+                    )
+                # 输入序号：0=画面，外加配音/BGM/环境音/静态水印/视频 Logo
+                next_input = 1
+                if external:
+                    next_input += 1
+                if bgm_file:
+                    next_input += 1
+                if ambient_file:
+                    next_input += 1
+                watermark_input = None
+                if image_wm_enabled:
+                    watermark_input = next_input
+                    next_input += 1
+                video_logo_specs = []  # filled after -i added
+                _video_wm_start_index = next_input
                 
                 # 输出硬限：始终锁到目标时长，避免音轨略长时用末帧静帧填空
                 command += ["-t", f"{output_duration:.3f}"]
@@ -3603,13 +3972,24 @@ class CaptionWorker(QObject):
                         # 无主音轨图时，环境音单独输出
                         audio_graph = f"{amb_in}{amb_chain}[aout]"
                 if watermark_enabled:
-                    # Decode the static PNG once; overlay=eof_action=repeat keeps that frame
-                    # for the whole video without decoding/scaling the same image every frame.
-                    command += ["-i", str(watermark)]
-                    graph = watermark_filter_graph(ass_filter, render_settings, watermark_input, v_filter_str)
-                    if audio_graph: graph += ";" + audio_graph
-                    command += ["-filter_complex", graph,
-                                "-map", "[outv]"]
+                    video_logo_specs = []
+                    if image_wm_enabled:
+                        # 静态图预合成 PNG，整段 eof_action=repeat
+                        command += ["-i", str(watermark)]
+                    for offset, entry in enumerate(video_wm_entries):
+                        # 循环视频 Logo 到主片结束；忽略 Logo 音轨
+                        command += ["-stream_loop", "-1", "-an", "-i", str(entry["path"])]
+                        video_logo_specs.append((_video_wm_start_index + offset, entry))
+                    graph = watermark_filter_graph(
+                        ass_filter,
+                        render_settings,
+                        watermark_input_index=watermark_input,
+                        v_filter_str=v_filter_str,
+                        video_logo_specs=video_logo_specs or None,
+                    )
+                    if audio_graph:
+                        graph += ";" + audio_graph
+                    command += ["-filter_complex", graph, "-map", "[outv]"]
                 else:
                     vf_expr = ass_filter_expression(ass_filter,self.settings)
                     if v_filter_str:
@@ -3630,6 +4010,19 @@ class CaptionWorker(QObject):
                     else:
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 替换音频从 {audio_offset_ms / 1000:.2f} 秒开始，"
                                       "并已按当前视频时长自动裁剪或补静音。")
+                elif video_wm_enabled:
+                    # 循环视频 Logo 时强制以主片时长结束
+                    if mix_audio and not source_has_audio:
+                        command += ["-map", "1:a:0", "-shortest"]
+                    elif source_has_audio or (external and not replace_audio):
+                        command += [
+                            "-af",
+                            "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                            f"atrim=0:{output_duration:.3f},asetpts=PTS-STARTPTS",
+                            "-map", "0:a:0", "-shortest",
+                        ]
+                    else:
+                        command += ["-an", "-shortest"]
                 elif mix_audio and not source_has_audio:
                     command += ["-map", "1:a:0", "-shortest"]
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 当前视频没有原声音轨，已自动仅使用背景音。")
@@ -3816,19 +4209,42 @@ class PreviewWorker(QObject):
             source_has_audio = media_has_audio(self.ffmpeg, source)
             baked_watermarks={str(Path(path).resolve()) for path in self.settings.get("watermark_baked_videos",[]) }
             watermark_already_baked=str(Path(self.source).resolve()) in baked_watermarks or str(source.resolve()) in baked_watermarks
-            watermark_entries=[] if watermark_already_baked else (self.settings.get("watermarks") or [])
-            watermark_paths=[] if watermark_already_baked else (self.settings.get("watermark_paths") or [self.settings.get("watermark_path","")])
-            watermark = (prepared_watermark_composite(self.ffmpeg,source,watermark_entries,self.destination.parent)
-                         if watermark_entries else prepared_watermark_stack(watermark_paths,self.destination.parent))
-            watermark_enabled = bool(watermark) and Path(watermark).is_file()
-            render_settings=self.settings
-            if watermark_enabled and watermark_entries:
-                render_settings=dict(self.settings); render_settings.update({"watermark_prepared":True})
-            elif watermark_enabled and ("全屏" in str(self.settings.get("watermark_mode","9:16 全屏覆盖"))):
-                watermark=prepared_fullframe_watermark(
-                    self.ffmpeg,source,watermark,self.destination.parent,self.settings.get("watermark_opacity",100))
-                render_settings=dict(self.settings); render_settings["watermark_prepared"]=True
-            watermark_input = 2 if external else 1
+            raw_wm=[] if watermark_already_baked else list(self.settings.get("watermarks") or [])
+            watermark_paths=[] if watermark_already_baked else (
+                self.settings.get("watermark_paths") or [self.settings.get("watermark_path","")]
+            )
+            image_wm_entries, video_wm_entries = split_watermark_entries(raw_wm)
+            if not image_wm_entries and not video_wm_entries and watermark_paths:
+                for p in watermark_paths:
+                    if Path(str(p)).is_file():
+                        image_wm_entries.append({
+                            "path": str(p), "media_type": "image",
+                            "mode": self.settings.get("watermark_mode", "9:16 全屏覆盖"),
+                            "position": self.settings.get("watermark_position", "右上角"),
+                            "width": self.settings.get("watermark_width", 18),
+                            "opacity": self.settings.get("watermark_opacity", 100),
+                            "margin": self.settings.get("watermark_margin", 28),
+                        })
+            watermark = (
+                prepared_watermark_composite(self.ffmpeg, source, image_wm_entries, self.destination.parent)
+                if image_wm_entries else Path("")
+            )
+            if not watermark and image_wm_entries:
+                watermark = prepared_watermark_stack(
+                    [e["path"] for e in image_wm_entries], self.destination.parent
+                )
+            image_wm_enabled = bool(watermark) and Path(watermark).is_file()
+            video_wm_enabled = bool(video_wm_entries)
+            watermark_enabled = image_wm_enabled or video_wm_enabled
+            render_settings = dict(self.settings)
+            if image_wm_enabled and image_wm_entries:
+                render_settings["watermark_prepared"] = True
+            elif image_wm_enabled and ("全屏" in str(self.settings.get("watermark_mode", "9:16 全屏覆盖"))):
+                watermark = prepared_fullframe_watermark(
+                    self.ffmpeg, source, watermark, self.destination.parent,
+                    self.settings.get("watermark_opacity", 100),
+                )
+                render_settings["watermark_prepared"] = True
             # Target dimensions scaling
             src_w, src_h = media_video_size(self.ffmpeg, source)
             aspect_ratio = self.settings.get("aspect_ratio", "原始比例")
@@ -3873,18 +4289,26 @@ class PreviewWorker(QObject):
             if loop_video:
                 command += ["-stream_loop", "-1"]
             command += ["-i", str(source)]
+            next_input = 1
             if external:
                 if mix_audio: command += ["-stream_loop", "-1"]
                 preview_offset=max(0,int(self.settings.get("preview_audio_offset_ms",0)))
                 if preview_offset: command += ["-ss",f"{preview_offset/1000:.3f}"]
                 command += ["-i", str(preview_audio)]
+                next_input += 1
             if bgm_enabled:
                 if not bgm_clips:
                     command += ["-stream_loop", "-1"]
                 if bgm_offset_ms > 0:
                     command += ["-ss", f"{bgm_offset_ms / 1000:.3f}"]
                 command += ["-i", str(bgm_path)]
-                watermark_input = (3 if external else 2)
+                next_input += 1
+            watermark_input = None
+            video_logo_specs = []
+            if image_wm_enabled:
+                watermark_input = next_input
+                next_input += 1
+            _video_wm_start = next_input
 
             v_filters = []
             if need_resize:
@@ -3944,10 +4368,21 @@ class PreviewWorker(QObject):
             self.log.emit(f"轨道渲染预览：编码约 {preview_duration:.1f}s（含字幕/水印核对）…")
 
             if watermark_enabled:
-                graph = watermark_filter_graph(ass_filter, render_settings, watermark_input, v_filter_str)
-                if audio_graph: graph += ";" + audio_graph
-                command += ["-i", str(watermark), "-filter_complex",
-                            graph, "-map", "[outv]"]
+                if image_wm_enabled:
+                    command += ["-i", str(watermark)]
+                for offset, entry in enumerate(video_wm_entries):
+                    command += ["-stream_loop", "-1", "-an", "-i", str(entry["path"])]
+                    video_logo_specs.append((_video_wm_start + offset, entry))
+                graph = watermark_filter_graph(
+                    ass_filter,
+                    render_settings,
+                    watermark_input_index=watermark_input,
+                    v_filter_str=v_filter_str,
+                    video_logo_specs=video_logo_specs or None,
+                )
+                if audio_graph:
+                    graph += ";" + audio_graph
+                command += ["-filter_complex", graph, "-map", "[outv]"]
             else:
                 vf_expr = ass_filter_expression(ass_filter,self.settings)
                 if v_filter_str:
@@ -3967,6 +4402,8 @@ class PreviewWorker(QObject):
                 command += ["-ac", "2", "-shortest"]
             elif bgm_enabled:
                 command += ["-ac", "2", "-shortest"]
+            elif video_wm_enabled:
+                command += ["-shortest"]
             command += ["-movflags", "+faststart", str(self.destination)]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
@@ -5718,29 +6155,56 @@ class DynamicCaptionPage(QWidget):
         image_editor_layout.addWidget(self.image_quick_combo,2,4)
         layer_layout.addWidget(legacy_image_editor)
 
-        watermark_title=QLabel("公司水印烧录（实时预览，并应用到全部批量成品）")
+        watermark_title=QLabel("公司水印烧录（图片 + 动态视频 Logo，可叠加；导出时烧录）")
         watermark_title.setStyleSheet("color:#7dd3fc;font-weight:700;"); layer_layout.addWidget(watermark_title)
-        watermark_path_row=QHBoxLayout(); self.company_watermark=QLineEdit(); self.company_watermark.setReadOnly(True); self.company_watermark.setPlaceholderText("支持添加多张透明 PNG、WebP、JPG")
-        choose_watermark=QPushButton("添加图片…"); choose_watermark.setObjectName("primary"); choose_watermark.clicked.connect(self._choose_company_watermark)
+        watermark_path_row=QHBoxLayout()
+        self.company_watermark=QLineEdit()
+        self.company_watermark.setReadOnly(True)
+        self.company_watermark.setPlaceholderText("可添加多张图片水印 + 动态视频 Logo（mp4/mov…）")
+        choose_watermark=QPushButton("添加图片…")
+        choose_watermark.setObjectName("primary")
+        choose_watermark.clicked.connect(self._choose_company_watermark)
+        choose_video_logo=QPushButton("添加视频 Logo…")
+        choose_video_logo.setToolTip(
+            "添加动态视频 Logo（透明通道/绿幕均可尝试）。\n"
+            "可设左上/右上等位置与宽度，导出时循环叠到成片上，可与图片水印叠加。"
+        )
+        choose_video_logo.clicked.connect(self._choose_video_logo_watermark)
         clear_watermark=QPushButton("删除选中"); clear_watermark.clicked.connect(self._remove_selected_watermarks)
         clear_all_watermarks=QPushButton("清空"); clear_all_watermarks.clicked.connect(self._clear_company_watermark)
-        watermark_path_row.addWidget(self.company_watermark,1); watermark_path_row.addWidget(choose_watermark); watermark_path_row.addWidget(clear_watermark); watermark_path_row.addWidget(clear_all_watermarks); layer_layout.addLayout(watermark_path_row)
-        self.watermark_table=QTableWidget(0,4); self.watermark_table.setHorizontalHeaderLabels(["图片图层","位置","大小","透明度"])
-        self.watermark_table.verticalHeader().setVisible(False); self.watermark_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.watermark_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.watermark_table.setMaximumHeight(105)
+        watermark_path_row.addWidget(self.company_watermark,1)
+        watermark_path_row.addWidget(choose_watermark)
+        watermark_path_row.addWidget(choose_video_logo)
+        watermark_path_row.addWidget(clear_watermark)
+        watermark_path_row.addWidget(clear_all_watermarks)
+        layer_layout.addLayout(watermark_path_row)
+        self.watermark_table=QTableWidget(0,4)
+        self.watermark_table.setHorizontalHeaderLabels(["图层（图/视频）","位置","大小","透明度"])
+        self.watermark_table.verticalHeader().setVisible(False)
+        self.watermark_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.watermark_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.watermark_table.setMaximumHeight(120)
         self.watermark_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
         for column in (1,2,3): self.watermark_table.horizontalHeader().setSectionResizeMode(column,QHeaderView.ResizeMode.ResizeToContents)
-        self.watermark_table.currentCellChanged.connect(self._watermark_selection_changed); layer_layout.addWidget(self.watermark_table)
-        watermark_mode_row=QHBoxLayout(); self.watermark_mode=QComboBox(); self.watermark_mode.addItems(["9:16 全屏覆盖","小 Logo 自定义位置"])
-        watermark_mode_row.addWidget(QLabel("覆盖方式")); watermark_mode_row.addWidget(self.watermark_mode,1); layer_layout.addLayout(watermark_mode_row)
-        watermark_controls=QHBoxLayout(); self.watermark_position=QComboBox(); self.watermark_position.addItems(["右上角","左上角","右下角","左下角","画面中间"])
+        self.watermark_table.currentCellChanged.connect(self._watermark_selection_changed)
+        layer_layout.addWidget(self.watermark_table)
+        watermark_mode_row=QHBoxLayout()
+        self.watermark_mode=QComboBox()
+        self.watermark_mode.addItems(["小 Logo 自定义位置","9:16 全屏覆盖"])
+        self.watermark_mode.setToolTip("视频 Logo 建议用「小 Logo」+ 左上/右上等角位置；全屏仅适合铺满角标动画。")
+        watermark_mode_row.addWidget(QLabel("覆盖方式")); watermark_mode_row.addWidget(self.watermark_mode,1)
+        layer_layout.addLayout(watermark_mode_row)
+        watermark_controls=QHBoxLayout()
+        self.watermark_position=QComboBox()
+        self.watermark_position.addItems(["右上角","左上角","右下角","左下角","画面中间"])
         self.watermark_width=QSpinBox(); self.watermark_width.setRange(3,60); self.watermark_width.setValue(18); self.watermark_width.setSuffix(" %")
         self.watermark_opacity=QSpinBox(); self.watermark_opacity.setRange(5,100); self.watermark_opacity.setValue(100); self.watermark_opacity.setSuffix(" %")
         self.watermark_margin=QSpinBox(); self.watermark_margin.setRange(0,300); self.watermark_margin.setValue(28); self.watermark_margin.setSuffix(" px")
         watermark_controls.addWidget(QLabel("位置")); watermark_controls.addWidget(self.watermark_position,1)
         watermark_controls.addWidget(QLabel("宽度")); watermark_controls.addWidget(self.watermark_width)
         watermark_controls.addWidget(QLabel("透明度")); watermark_controls.addWidget(self.watermark_opacity)
-        watermark_controls.addWidget(QLabel("边距")); watermark_controls.addWidget(self.watermark_margin); layer_layout.addLayout(watermark_controls)
+        watermark_controls.addWidget(QLabel("边距")); watermark_controls.addWidget(self.watermark_margin)
+        layer_layout.addLayout(watermark_controls)
         self.watermark_mode.currentTextChanged.connect(self._watermark_mode_changed)
         self.watermark_position.currentTextChanged.connect(self._watermark_control_changed)
         for control in (self.watermark_width,self.watermark_opacity,self.watermark_margin): control.valueChanged.connect(self._watermark_control_changed)
@@ -6069,10 +6533,14 @@ class DynamicCaptionPage(QWidget):
         watermark_heading=QLabel("水印编辑")
         watermark_heading.setStyleSheet("font-size:18px;font-weight:800;color:#f8fafc;")
         watermark_editor_layout.addWidget(watermark_heading)
-        watermark_editor_layout.addWidget(QLabel("添加图片后，可分别设置位置、大小、透明度和边距。"))
+        watermark_editor_layout.addWidget(QLabel(
+            "可添加图片水印与动态视频 Logo；分别设置位置（左上/右上…）、大小与透明度，"
+            "导出时叠加烧录。视频 Logo 会循环到片尾。"
+        ))
         watermark_file_row=QHBoxLayout()
         choose_watermark.setText("添加图片")
         watermark_file_row.addWidget(choose_watermark)
+        watermark_file_row.addWidget(choose_video_logo)
         watermark_file_row.addWidget(self.company_watermark,1)
         watermark_file_row.addWidget(clear_watermark)
         watermark_file_row.addWidget(clear_all_watermarks)
@@ -8809,11 +9277,19 @@ class DynamicCaptionPage(QWidget):
                 preset = next((b.text() for b in self.preset_buttons if b.isChecked()), "")
             except Exception:
                 preset = ""
+            # 动态水印（视频/GIF）时把时间桶打进 key，保证预览逐帧换 Logo 画面
+            has_anim_wm = any(
+                is_video_watermark_entry(e)
+                for e in (getattr(self, "_watermark_entries", None) or [])
+            )
+            wm_t_bucket = int(max(0.0, float(seconds)) * 20) if has_anim_wm else 0  # 20fps 刷新 Logo
             overlay_key = (
                 display.width(), display.height(), progress, style_token, margin, preset,
                 bool(getattr(self, "_watermark_images", None) or (
                     hasattr(self, "_watermark_image") and not self._watermark_image.isNull()
                 )),
+                wm_t_bucket,
+                len(getattr(self, "_watermark_entries", None) or []),
             )
             caption_layer = getattr(self, "_preview_caption_overlay", QImage())
             if (
@@ -9386,17 +9862,29 @@ class DynamicCaptionPage(QWidget):
             if isinstance(saved.get("watermarks"),list):
                 entries=[]; images=[]; missing=[]
                 for item in saved["watermarks"]:
-                    path=str(item.get("path", "")) if isinstance(item,dict) else ""
-                    image=QImage(path) if path and Path(path).is_file() else QImage()
+                    if not isinstance(item, dict):
+                        continue
+                    path=str(item.get("path", ""))
+                    image=load_watermark_preview_image(path) if path else QImage()
                     if image.isNull():
                         if path: missing.append(path)
                         continue
-                    entries.append(dict(item)); images.append(image)
+                    entry=dict(item)
+                    if is_video_watermark_entry(entry) or Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+                        entry["media_type"]="video"
+                    else:
+                        entry["media_type"]=entry.get("media_type") or "image"
+                    entries.append(entry); images.append(image)
                 self._watermark_entries=entries; self._watermark_paths=[item["path"] for item in entries]
                 self._watermark_images=images; self._watermark_image=images[0] if images else QImage()
-                summary="；".join(Path(path).name for path in self._watermark_paths)
-                self.company_watermark.setText(f"已添加 {len(entries)} 张：{summary}" if summary else "")
-                self.company_watermark.setToolTip("\n".join(self._watermark_paths)); self._refresh_watermark_table(0)
+                self._live_watermark_cache=None
+                if hasattr(self, "_sync_watermark_summary_label"):
+                    self._sync_watermark_summary_label()
+                else:
+                    summary="；".join(Path(path).name for path in self._watermark_paths)
+                    self.company_watermark.setText(f"已添加 {len(entries)} 项：{summary}" if summary else "")
+                    self.company_watermark.setToolTip("\n".join(self._watermark_paths))
+                self._refresh_watermark_table(0)
                 if missing: self._append_run_log("模板中的水印文件在本机不存在，已跳过："+"；".join(missing))
         finally:
             self._restoring_style=previous
@@ -9951,45 +10439,124 @@ class DynamicCaptionPage(QWidget):
                 self._paint_live_caption(painter, image, seconds)
             # 成片已烧录水印时不再叠一层；红字若是成片里的烧录水印/字幕，属文件内容
             if not self._current_video_has_baked_watermark():
-                self._paint_live_watermark(painter)
+                self._paint_live_watermark(painter, float(seconds or 0.0))
         finally:
             painter.end()
 
-    def _paint_live_watermark(self, painter):
-        images=list(getattr(self,"_watermark_images",[])) or ([self._watermark_image] if not self._watermark_image.isNull() else [])
-        if not images or not hasattr(self,"watermark_width"):
+    def _paint_live_watermark(self, painter, seconds: float | None = None):
+        """Draw still + animated (video/GIF) watermarks. Animated layers follow preview clock."""
+        entries = list(getattr(self, "_watermark_entries", None) or [])
+        images = list(getattr(self, "_watermark_images", []) or [])
+        if not entries and not images:
+            if hasattr(self, "_watermark_image") and not self._watermark_image.isNull():
+                images = [self._watermark_image]
+            else:
+                return
+        if not hasattr(self, "watermark_width"):
             return
-        if self._live_watermark_cache is None:
-            prepared=[]; entries=list(getattr(self,"_watermark_entries",[]))
-            for index,source in enumerate(images):
-                item=entries[index] if index<len(entries) else {"mode":self.watermark_mode.currentText(),"position":self.watermark_position.currentText(),
-                                                                 "width":self.watermark_width.value(),"opacity":self.watermark_opacity.value(),"margin":self.watermark_margin.value()}
-                # 与导出一致：抠黑/白底，避免全屏 JPG 把预览盖黑
+        if seconds is None:
+            try:
+                seconds = max(0.0, float(self.player.position() or 0) / 1000.0)
+            except Exception:
+                seconds = 0.0
+        # 静态图：布局缓存；动态层：每帧按时间取画面
+        if getattr(self, "_live_watermark_static_cache", None) is None:
+            static_prepared = []
+            for index, item in enumerate(entries or [{"path": ""}] * len(images)):
+                if is_video_watermark_entry(item):
+                    continue
+                source = images[index] if index < len(images) else QImage()
                 src = _knockout_solid_background(source) if source and not source.isNull() else QImage()
                 if src.isNull():
                     continue
                 mode = str(item.get("mode") or self.watermark_mode.currentText())
-                opacity=max(5,min(100,int(item.get("opacity",100))))/100
+                opacity = max(5, min(100, int(item.get("opacity", 100)))) / 100
+                if mode == "9:16 全屏覆盖" and not _watermark_image_has_useful_alpha(src):
+                    mode = "小 Logo 自定义位置"
+                    item = dict(item)
+                    item.setdefault("position", "右下角")
+                    item.setdefault("width", 28)
                 if mode == "9:16 全屏覆盖":
-                    # 无有效透明时降级为角标，与导出逻辑一致
-                    if not _watermark_image_has_useful_alpha(src):
-                        mode = "小 Logo 自定义位置"
-                        item = dict(item)
-                        item.setdefault("position", "右下角")
-                        item.setdefault("width", 28)
-                if mode == "9:16 全屏覆盖":
-                    image=src.scaled(1080,1920,Qt.AspectRatioMode.IgnoreAspectRatio,Qt.TransformationMode.SmoothTransformation); x=y=0
+                    image = src.scaled(
+                        1080, 1920,
+                        Qt.AspectRatioMode.IgnoreAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    x = y = 0
                 else:
-                    width=max(1,round(1080*int(item.get("width",18))/100)); image=src.scaledToWidth(width,Qt.TransformationMode.SmoothTransformation)
-                    margin=int(item.get("margin",28)); position=item.get("position","右上角"); height=image.height()
-                    positions={"左上角":(margin,margin),"右上角":(1080-width-margin,margin),"左下角":(margin,1920-height-margin),
-                               "右下角":(1080-width-margin,1920-height-margin),"画面中间":((1080-width)//2,(1920-height)//2)}
-                    x,y=positions.get(position,positions["右上角"])
-                prepared.append((image,int(x),int(y),opacity))
-            self._live_watermark_cache=prepared
-        for image,x,y,opacity in self._live_watermark_cache:
-            painter.save(); painter.setOpacity(opacity)
-            painter.drawImage(x,y,image)
+                    width = max(1, round(1080 * int(item.get("width", 18)) / 100))
+                    image = src.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+                    margin = int(item.get("margin", 28))
+                    position = item.get("position", "右上角")
+                    height = image.height()
+                    positions = {
+                        "左上角": (margin, margin),
+                        "右上角": (1080 - width - margin, margin),
+                        "左下角": (margin, 1920 - height - margin),
+                        "右下角": (1080 - width - margin, 1920 - height - margin),
+                        "画面中间": ((1080 - width) // 2, (1920 - height) // 2),
+                    }
+                    x, y = positions.get(position, positions["右上角"])
+                static_prepared.append((image, int(x), int(y), opacity))
+            self._live_watermark_static_cache = static_prepared
+
+        for image, x, y, opacity in (self._live_watermark_static_cache or []):
+            painter.save()
+            painter.setOpacity(opacity)
+            painter.drawImage(x, y, image)
+            painter.restore()
+
+        # 动态视频 / GIF：按播放时间取样并缩放（帧内自带 alpha / 抠底，与导出透明一致）
+        for index, item in enumerate(entries):
+            if not is_video_watermark_entry(item):
+                continue
+            path = str(item.get("path") or "")
+            src = watermark_animated_frame_at(path, float(seconds))
+            if src.isNull():
+                # 回退列表缓存首帧，并补透明处理
+                if index < len(images) and not images[index].isNull():
+                    src = _ensure_preview_watermark_alpha(images[index])
+                else:
+                    continue
+            elif not _watermark_image_has_useful_alpha(src):
+                src = _ensure_preview_watermark_alpha(src)
+            mode = str(item.get("mode") or "小 Logo 自定义位置")
+            opacity = max(5, min(100, int(item.get("opacity", 100)))) / 100
+            if "全屏" not in mode:
+                mode = "小 Logo 自定义位置"
+            if mode == "9:16 全屏覆盖":
+                image = src.scaled(
+                    1080, 1920,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                x = y = 0
+            else:
+                width = max(1, round(1080 * int(item.get("width", 18)) / 100))
+                image = src.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+                margin = int(item.get("margin", 28))
+                position = item.get("position", "右上角")
+                height = image.height()
+                positions = {
+                    "左上角": (margin, margin),
+                    "右上角": (1080 - width - margin, margin),
+                    "左下角": (margin, 1920 - height - margin),
+                    "右下角": (1080 - width - margin, 1920 - height - margin),
+                    "画面中间": ((1080 - width) // 2, (1920 - height) // 2),
+                }
+                x, y = positions.get(position, positions["右上角"])
+            # 确保 ARGB，Qt 才能按像素 alpha 叠在预览上
+            if image.format() not in (
+                QImage.Format.Format_ARGB32,
+                QImage.Format.Format_ARGB32_Premultiplied,
+                QImage.Format.Format_RGBA8888,
+                QImage.Format.Format_RGBA8888_Premultiplied,
+            ):
+                image = image.convertToFormat(QImage.Format.Format_ARGB32)
+            painter.save()
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(opacity)
+            painter.drawImage(int(x), int(y), image)
             painter.restore()
 
     def _baked_watermark_matches(self,path,fingerprint=None):
@@ -10505,8 +11072,14 @@ class DynamicCaptionPage(QWidget):
         current=self.watermark_table.currentRow() if selected is None else selected
         self.watermark_table.blockSignals(True); self.watermark_table.setRowCount(len(self._watermark_entries))
         for row,item in enumerate(self._watermark_entries):
-            values=(Path(item["path"]).name,item.get("position","右上角"),
-                    "全屏" if item.get("mode")=="9:16 全屏覆盖" else f"{item.get('width',18)}%",f"{item.get('opacity',100)}%")
+            kind = "🎬 视频" if is_video_watermark_entry(item) else "🖼 图片"
+            name = f"{kind} · {Path(item['path']).name}"
+            values=(
+                name,
+                item.get("position","右上角"),
+                "全屏" if item.get("mode")=="9:16 全屏覆盖" else f"{item.get('width',18)}%",
+                f"{item.get('opacity',100)}%",
+            )
             for column,value in enumerate(values):
                 cell=QTableWidgetItem(str(value)); cell.setToolTip(item["path"]); self.watermark_table.setItem(row,column,cell)
         self.watermark_table.blockSignals(False)
@@ -10535,6 +11108,8 @@ class DynamicCaptionPage(QWidget):
                                                   "width":self.watermark_width.value(),"opacity":self.watermark_opacity.value(),
                                                   "margin":self.watermark_margin.value()})
             self._refresh_watermark_table(row)
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
         self._refresh_live_preview(); self._save_style_preferences()
 
     def _pick_mask_color(self):
@@ -10545,39 +11120,158 @@ class DynamicCaptionPage(QWidget):
             self.layers[row]["color"]=color.name().upper(); self.mask_color.setText(f"蒙版色 {color.name().upper()}")
             self._sync_layer_template_to_timeline(self.layers[row]); self._refresh_live_preview()
 
-    def _choose_company_watermark(self):
-        paths,_=QFileDialog.getOpenFileNames(self,"添加公司水印图片","","图片 (*.png *.webp *.jpg *.jpeg *.bmp)")
-        if not paths: return
-        invalid=[]
-        for path in paths:
-            if path in self._watermark_paths: continue
-            image=QImage(path)
-            if image.isNull(): invalid.append(path); continue
-            self._watermark_paths.append(path); self._watermark_images.append(image)
-            self._watermark_entries.append({"path":path,"mode":self.watermark_mode.currentText(),
-                                             "position":self.watermark_position.currentText(),"width":self.watermark_width.value(),
-                                             "opacity":100,"margin":self.watermark_margin.value()})
-        self._watermark_image=self._watermark_images[0] if self._watermark_images else QImage()
-        summary="；".join(Path(path).name for path in self._watermark_paths)
-        self.company_watermark.setText(f"已添加 {len(self._watermark_paths)} 张：{summary}")
+    def _append_watermark_entry(self, path: str, media_type: str = "image") -> bool:
+        """Add one image/video/GIF watermark layer; returns False if unreadable/duplicate."""
+        path = str(Path(path).resolve()) if path else ""
+        if not path or not Path(path).is_file():
+            return False
+        if path in self._watermark_paths:
+            return False
+        ext = Path(path).suffix.lower()
+        if (
+            media_type in ("video", "gif", "animated")
+            or ext in ANIMATED_WATERMARK_EXTENSIONS
+        ):
+            image = load_watermark_preview_image(path)
+            if image.isNull():
+                return False
+            media_type = "gif" if ext == ".gif" else "video"
+            # 动态 Logo 默认角标，避免误开全屏盖死画面
+            mode = "小 Logo 自定义位置"
+            position = self.watermark_position.currentText() or "右上角"
+        else:
+            image = load_watermark_preview_image(path)
+            if image.isNull():
+                return False
+            media_type = "image"
+            mode = self.watermark_mode.currentText()
+            position = self.watermark_position.currentText()
+        self._watermark_paths.append(path)
+        self._watermark_images.append(image)
+        self._watermark_entries.append({
+            "path": path,
+            "media_type": media_type,
+            "mode": mode,
+            "position": position,
+            "width": self.watermark_width.value(),
+            "opacity": 100 if media_type == "image" else max(50, self.watermark_opacity.value()),
+            "margin": self.watermark_margin.value(),
+        })
+        self._live_watermark_static_cache = None
+        return True
+
+    def _sync_watermark_summary_label(self):
+        n_img = sum(1 for e in self._watermark_entries if not is_video_watermark_entry(e))
+        n_vid = sum(1 for e in self._watermark_entries if is_video_watermark_entry(e))
+        if not self._watermark_entries:
+            self.company_watermark.clear()
+            self.company_watermark.setToolTip("")
+            return
+        parts = []
+        if n_img:
+            parts.append(f"{n_img} 张图")
+        if n_vid:
+            parts.append(f"{n_vid} 个视频 Logo")
+        names = "；".join(Path(p).name for p in self._watermark_paths[:6])
+        if len(self._watermark_paths) > 6:
+            names += "…"
+        self.company_watermark.setText(f"已添加 {' + '.join(parts)}：{names}")
         self.company_watermark.setToolTip("\n".join(self._watermark_paths))
-        self._refresh_watermark_table(len(self._watermark_entries)-1)
-        self._refresh_live_preview(); self._save_style_preferences(); self._append_run_log(f"已加载 {len(self._watermark_paths)} 张公司水印")
-        if invalid: self._append_run_log("以下水印图片无法读取，已跳过："+"；".join(invalid))
+
+    def _choose_company_watermark(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "添加公司水印图片", "",
+            "图片 (*.png *.webp *.jpg *.jpeg *.bmp);;GIF 动图 (*.gif);;所有文件 (*.*)",
+        )
+        if not paths:
+            return
+        invalid = []
+        added = 0
+        anim_n = 0
+        for path in paths:
+            # GIF 走动态层
+            kind = "gif" if Path(path).suffix.lower() == ".gif" else "image"
+            if self._append_watermark_entry(path, kind):
+                added += 1
+                if kind == "gif":
+                    anim_n += 1
+            else:
+                if path not in self._watermark_paths:
+                    invalid.append(path)
+        self._watermark_image = self._watermark_images[0] if self._watermark_images else QImage()
+        self._sync_watermark_summary_label()
+        self._refresh_watermark_table(len(self._watermark_entries) - 1)
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        if added:
+            msg = f"已添加 {added} 项图片水印"
+            if anim_n:
+                msg += f"（其中 {anim_n} 个 GIF 将按动图叠加）"
+            self._append_run_log(msg)
+        if invalid:
+            self._append_run_log("以下水印图片无法读取，已跳过：" + "；".join(invalid))
+
+    def _choose_video_logo_watermark(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "添加动态视频 / GIF Logo", "",
+            "动态素材 (*.mp4 *.mov *.webm *.mkv *.m4v *.avi *.gif);;视频 (*.mp4 *.mov *.webm);;GIF (*.gif);;所有文件 (*.*)",
+        )
+        if not paths:
+            return
+        invalid = []
+        added = 0
+        for path in paths:
+            kind = "gif" if Path(path).suffix.lower() == ".gif" else "video"
+            if self._append_watermark_entry(path, kind):
+                added += 1
+            else:
+                if path not in self._watermark_paths:
+                    invalid.append(Path(path).name)
+        self._watermark_image = self._watermark_images[0] if self._watermark_images else QImage()
+        self._sync_watermark_summary_label()
+        self._refresh_watermark_table(len(self._watermark_entries) - 1)
+        # 选中最后添加的视频层，方便立刻改角位置
+        if self._watermark_entries:
+            self.watermark_table.setCurrentCell(len(self._watermark_entries) - 1, 0)
+            self.watermark_mode.setCurrentText("小 Logo 自定义位置")
+            for control in (self.watermark_position, self.watermark_width, self.watermark_margin):
+                control.setEnabled(True)
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        if added:
+            self._append_run_log(
+                f"已添加 {added} 个动态 Logo（视频/GIF）。预览播放时会动；导出时循环叠到成片。"
+            )
+        if invalid:
+            self._append_run_log("以下动态 Logo 无法读取，已跳过：" + "；".join(invalid))
 
     def _clear_company_watermark(self):
+        for p in list(getattr(self, "_watermark_paths", []) or []):
+            release_watermark_anim_cache(p)
         self.company_watermark.clear(); self.company_watermark.setToolTip(""); self._watermark_image=QImage()
-        self._watermark_images=[]; self._watermark_paths=[]; self._watermark_entries=[]; self._refresh_watermark_table(); self._refresh_live_preview(); self._save_style_preferences()
+        self._watermark_images=[]; self._watermark_paths=[]; self._watermark_entries=[]
+        self._live_watermark_cache = None
+        self._live_watermark_static_cache = None
+        self._refresh_watermark_table(); self._refresh_live_preview(); self._save_style_preferences()
 
     def _remove_selected_watermarks(self):
         rows=sorted({index.row() for index in self.watermark_table.selectedIndexes()},reverse=True)
         for row in rows:
             if 0<=row<len(self._watermark_entries):
+                try:
+                    release_watermark_anim_cache(self._watermark_entries[row].get("path"))
+                except Exception:
+                    pass
                 self._watermark_entries.pop(row); self._watermark_paths.pop(row); self._watermark_images.pop(row)
         self._watermark_image=self._watermark_images[0] if self._watermark_images else QImage()
-        summary="；".join(Path(path).name for path in self._watermark_paths)
-        self.company_watermark.setText(f"已添加 {len(self._watermark_paths)} 张：{summary}" if summary else "")
-        self.company_watermark.setToolTip("\n".join(self._watermark_paths)); self._refresh_watermark_table(); self._refresh_live_preview(); self._save_style_preferences()
+        self._live_watermark_cache = None
+        self._live_watermark_static_cache = None
+        self._sync_watermark_summary_label()
+        self._refresh_watermark_table(); self._refresh_live_preview(); self._save_style_preferences()
 
     def _preview_margin_changed(self, value):
         if hasattr(self, "margin_v"):
