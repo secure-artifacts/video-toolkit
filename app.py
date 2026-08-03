@@ -75,7 +75,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.30").strip().lstrip("v") or "1.7.30"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.31").strip().lstrip("v") or "1.7.31"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -217,10 +217,10 @@ class ConfigStore:
         default = self._default()
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            # API 密钥落盘为密文；内存中解密为明文供调用
+            # API keys live in encrypted secrets.vault, never in config.json clear-text.
             try:
-                from modules.secret_crypto import unseal_provider_keys
-                loaded = unseal_provider_keys(loaded)
+                from modules.secret_crypto import restore_keys_from_vault
+                loaded = restore_keys_from_vault(loaded)
             except Exception:
                 pass
             for key in default:
@@ -304,12 +304,15 @@ class ConfigStore:
 
     def save(self):
         # Cross-process lock so multi-open instances do not corrupt config.json.
-        # API keys are sealed (Fernet) before any disk write — CodeQL CWE-312.
+        # CodeQL CWE-312: never write API key material into config.json.
+        # Secrets go only to Fernet-encrypted secrets.vault (binary).
         with self.lock, exclusive_file_lock(self.path.with_suffix(".lock"), timeout=12.0):
-            from modules.secret_crypto import seal_provider_keys
-            sealed = seal_provider_keys(self.data)
+            from modules.secret_crypto import extract_and_strip_keys, save_vault
+            safe_payload, vault = extract_and_strip_keys(self.data)
+            save_vault(vault)
             temp = self.path.with_suffix(".tmp")
-            temp.write_text(json.dumps(sealed, ensure_ascii=False, indent=2), encoding="utf-8")
+            # safe_payload has empty key fields only — no password/secret values.
+            temp.write_text(json.dumps(safe_payload, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.path)
 
 

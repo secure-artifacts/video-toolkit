@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.30**
+当前版本：**v1.7.31**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,15 +56,15 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.30.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.30/video-toolkit-windows-x64-v1.7.30.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.30/VideoToolkit_Setup_v1.7.30.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.30.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.30/video-toolkit-macos-arm64-v1.7.30.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.30.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.30/video-toolkit-macos-x64-v1.7.30.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.31.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.31/video-toolkit-windows-x64-v1.7.31.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.31/VideoToolkit_Setup_v1.7.31.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.31.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.31/video-toolkit-macos-arm64-v1.7.31.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.31.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.31/video-toolkit-macos-x64-v1.7.31.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
 
-### v1.7.30 · 2026-08-03
-- 安全：API 密钥落盘加密（Fernet + Windows DPAPI），修复代码扫描「明文存储敏感信息」高危告警。
-- 兼容：旧版明文密钥在首次保存时自动迁移为密文。
+### v1.7.31 · 2026-08-03
+- 安全：API 密钥不再写入 `config.json`；独立 `secrets.vault`（Fernet 密文 + Windows DPAPI 保护主密钥），修复代码扫描「明文存储敏感信息」高危。
+- 兼容：旧版明文密钥首次保存时自动迁入 vault。
 
 ### v1.7.29 · 2026-08-03
 - 多开：可同时开多个窗口并行做任务；临时文件/日志按实例隔离；`config.json` 并发保存加锁。
@@ -355,7 +355,7 @@ Reels 编辑器面向批量任务设计，每个视频、音频和文案组成�
 - Windows：`%APPDATA%\VideoToolkit\config.json`
 - macOS：`~/Library/Application Support/VideoToolkit/config.json`
 
-API 密钥在配置文件中以本机绑定的 Fernet 密文保存（Windows 下密钥材料经 DPAPI 保护），内存中才解密使用。请勿分享配置目录。只有选择在线识别、翻译或云端同步服务时，相应媒体或文本才会发送到所选服务；本地 Whisper 不需要上传媒体。
+API 密钥不写在 `config.json` 里，而是保存在同目录 `secrets.vault`（Fernet 密文；Windows 下主密钥经 DPAPI 保护），仅在内存中解密使用。请勿分享 `%APPDATA%\VideoToolkit` 配置目录。只有选择在线识别、翻译或云端同步服务时，相应媒体或文本才会发送到所选服务；本地 Whisper 不需要上传媒体。
 
 ## 本地运行
 
@@ -370,7 +370,7 @@ python app.py
 
 ```powershell
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.7.30"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.31"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -385,6 +385,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
 
 ```bash
-git tag -a v1.7.30 -m "Release version 1.7.30"
-git push origin v1.7.30
+git tag -a v1.7.31 -m "Release version 1.7.31"
+git push origin v1.7.31
 ```

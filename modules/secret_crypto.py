@@ -1,28 +1,34 @@
-"""At-rest encryption for API keys stored in config.json.
+"""At-rest protection for API keys.
 
-CodeQL flags clear-text storage of password-like values (CWE-312).
-Secrets remain plaintext only in process memory; disk holds Fernet ciphertext.
-The Fernet key is bound to this machine (Windows DPAPI when available).
+Disk layout:
+  - config.json  : never contains API key material (empty placeholder only)
+  - secrets.vault: Fernet ciphertext of {provider:id -> key}
+
+Windows: Fernet master key is wrapped with DPAPI (current user).
 """
 from __future__ import annotations
 
-import base64
+import json
 import os
 import sys
 from pathlib import Path
 
 from .platform_utils import app_data_dir
 
-_SECRET_PREFIX = "vtenc1:"
 _FERNET = None
+_VAULT_NAME = "secrets.vault"
+_KEY_BLOB_NAME = ".config_secret.key"
+
+
+def vault_path() -> Path:
+    return app_data_dir() / _VAULT_NAME
 
 
 def _key_blob_path() -> Path:
-    return app_data_dir() / ".config_secret.key"
+    return app_data_dir() / _KEY_BLOB_NAME
 
 
 def _dpapi_protect(data: bytes) -> bytes:
-    """Windows DPAPI encrypt (current user)."""
     import ctypes
     import ctypes.wintypes
 
@@ -34,10 +40,8 @@ def _dpapi_protect(data: bytes) -> bytes:
 
     crypt32 = ctypes.windll.crypt32
     kernel32 = ctypes.windll.kernel32
-    blob_in = DATA_BLOB(
-        len(data),
-        ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)),
-    )
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
     blob_out = DATA_BLOB()
     if not crypt32.CryptProtectData(
         ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
@@ -50,7 +54,6 @@ def _dpapi_protect(data: bytes) -> bytes:
 
 
 def _dpapi_unprotect(data: bytes) -> bytes:
-    """Windows DPAPI decrypt (current user)."""
     import ctypes
     import ctypes.wintypes
 
@@ -62,10 +65,8 @@ def _dpapi_unprotect(data: bytes) -> bytes:
 
     crypt32 = ctypes.windll.crypt32
     kernel32 = ctypes.windll.kernel32
-    blob_in = DATA_BLOB(
-        len(data),
-        ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)),
-    )
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
     blob_out = DATA_BLOB()
     if not crypt32.CryptUnprotectData(
         ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
@@ -78,7 +79,6 @@ def _dpapi_unprotect(data: bytes) -> bytes:
 
 
 def _load_or_create_fernet_key() -> bytes:
-    """Load machine-bound Fernet key; create once if missing."""
     from cryptography.fernet import Fernet
 
     path = _key_blob_path()
@@ -91,7 +91,6 @@ def _load_or_create_fernet_key() -> bytes:
                 pass
         if raw.startswith(b"vtplain:"):
             return raw[len(b"vtplain:") :]
-        # legacy: raw Fernet key bytes
         if len(raw) == 44:
             return raw
 
@@ -103,7 +102,6 @@ def _load_or_create_fernet_key() -> bytes:
             return key
         except OSError:
             pass
-    # Non-Windows / DPAPI unavailable: store with private prefix (chmod best-effort)
     path.write_bytes(b"vtplain:" + key)
     try:
         os.chmod(path, 0o600)
@@ -121,68 +119,111 @@ def _fernet():
     return _FERNET
 
 
-def is_sealed_secret(value: object) -> bool:
-    text = str(value or "")
-    return text.startswith(_SECRET_PREFIX)
+def _vault_key(provider: str, key_id: str) -> str:
+    return f"{provider}:{key_id}"
 
 
-def seal_secret(plaintext: str) -> str:
-    """Encrypt a secret for disk. Already-sealed values are returned unchanged."""
-    text = str(plaintext or "")
-    if not text or is_sealed_secret(text):
-        return text
-    # Fernet.encrypt is a cryptographic operation: ciphertext is safe to store.
-    token = _fernet().encrypt(text.encode("utf-8"))
-    return _SECRET_PREFIX + token.decode("ascii")
+def extract_and_strip_keys(data: dict) -> dict:
+    """Return {vault_key: plaintext} and blank every providers[*].key in a deep copy.
 
-
-def unseal_secret(value: str) -> str:
-    """Decrypt a sealed secret, or return legacy plaintext as-is."""
-    text = str(value or "")
-    if not text:
-        return ""
-    if not is_sealed_secret(text):
-        return text
-    token = text[len(_SECRET_PREFIX) :].encode("ascii")
-    try:
-        return _fernet().decrypt(token).decode("utf-8")
-    except Exception:
-        # Corrupted / other machine: leave empty rather than crash the app
-        return ""
-
-
-def seal_provider_keys(data: dict) -> dict:
-    """Deep-copy config and encrypt every providers[*].key for disk storage."""
+    The returned config copy is safe for JSON disk write (no secret values).
+    """
     import copy
 
     payload = copy.deepcopy(data)
+    vault: dict[str, str] = {}
     providers = payload.get("providers") or {}
     if isinstance(providers, dict):
-        for _name, items in providers.items():
+        for provider, items in providers.items():
             if not isinstance(items, list):
                 continue
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                raw = item.get("key")
-                if raw:
-                    item["key"] = seal_secret(str(raw))
-    payload["_secrets_sealed"] = True
-    return payload
+                kid = str(item.get("id") or "")
+                secret = str(item.get("key") or "")
+                if kid and secret:
+                    vault[_vault_key(str(provider), kid)] = secret
+                # Clear before any file write so clear-text never hits the disk path.
+                item["key"] = ""
+    # Legacy inline ciphertext (vtenc1:...) if any — drop from config JSON entirely
+    payload.pop("_secrets_sealed", None)
+    return payload, vault
 
 
-def unseal_provider_keys(data: dict) -> dict:
-    """Decrypt providers[*].key in-place after loading config from disk."""
+def restore_keys_from_vault(data: dict, vault: dict[str, str] | None = None) -> dict:
+    """Fill providers[*].key from vault (or legacy inline sealed/plain values)."""
+    if vault is None:
+        vault = load_vault()
     providers = data.get("providers") or {}
     if not isinstance(providers, dict):
         return data
-    for _name, items in providers.items():
+    for provider, items in providers.items():
         if not isinstance(items, list):
             continue
         for item in items:
             if not isinstance(item, dict):
                 continue
-            raw = item.get("key")
-            if raw:
-                item["key"] = unseal_secret(str(raw))
+            kid = str(item.get("id") or "")
+            current = str(item.get("key") or "")
+            if kid:
+                from_vault = vault.get(_vault_key(str(provider), kid), "")
+                if from_vault:
+                    item["key"] = from_vault
+                    continue
+            # Legacy: key still embedded (plain or old vtenc1:)
+            if current.startswith("vtenc1:"):
+                item["key"] = _unseal_legacy(current)
+            # else keep current (plain legacy) until next save migrates to vault
     return data
+
+
+def _unseal_legacy(value: str) -> str:
+    prefix = "vtenc1:"
+    if not value.startswith(prefix):
+        return value
+    try:
+        return _fernet().decrypt(value[len(prefix) :].encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def save_vault(vault: dict[str, str]) -> None:
+    """Encrypt and write the secret vault (binary). No clear-text on disk."""
+    path = vault_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(vault, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # Cryptographic sealing — ciphertext only is written.
+    blob = _fernet().encrypt(raw)
+    path.write_bytes(blob)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def load_vault() -> dict[str, str]:
+    path = vault_path()
+    if not path.is_file():
+        return {}
+    try:
+        plain = _fernet().decrypt(path.read_bytes())
+        data = json.loads(plain.decode("utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v}
+    except Exception:
+        return {}
+    return {}
+
+
+def migrate_inline_secrets_to_vault(data: dict) -> dict:
+    """If config still has inline keys, rebuild vault and strip them from the dict."""
+    payload, vault = extract_and_strip_keys(data)
+    # Also pull any values already restored in memory that extract saw
+    if vault:
+        # Merge with existing vault so we do not drop other providers
+        existing = load_vault()
+        existing.update(vault)
+        save_vault(existing)
+    # Restore into memory copy for the running process
+    return restore_keys_from_vault(payload, load_vault() if vault else load_vault())

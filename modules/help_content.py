@@ -149,11 +149,11 @@ def _build_changelog_html():
         _h1("📋 更新日志")
         + _p("新功能与重要改进一览。日常使用请看左侧其它章节；细节问答见「常见问题」。")
         + _changelog_item(
-            "1.7.30",
+            "1.7.31",
             "2026-08-03",
             [
-                "<b>安全</b>：API 密钥落盘加密（Fernet + Windows DPAPI），修复代码扫描「明文存储敏感信息」高危。",
-                "<b>兼容</b>：旧版明文密钥首次保存时自动迁移为密文；不影响正常调用。",
+                "<b>安全</b>：API 密钥不再写入 config.json；独立 secrets.vault（Fernet + DPAPI）密文存储，修复代码扫描高危。",
+                "<b>兼容</b>：旧版明文/内嵌密文密钥首次保存时自动迁入 vault。",
             ],
         )
         + _changelog_item(
