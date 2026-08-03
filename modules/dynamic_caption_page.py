@@ -1451,40 +1451,107 @@ def is_watermark_entry_enabled(item) -> bool:
     return item.get("enabled", True) is not False
 
 
-def ethereal_reverb_filter_chain(amount: int = 45) -> str:
-    """Reel-style soft ambient voice: dry/wet mix, clean stereo, no electric hiss.
+# 混响模式：与常见 DAW「房间类型」对应；均用 dry/wet + aecho，避免电流噪。
+REVERB_MODE_NAMES = ("小房间", "大厅", "教堂", "板式混响", "回声")
+REVERB_MODE_PRESETS = {
+    # delays(ms)|decay 系数；wet/dry 随强度再缩放
+    "小房间": {
+        "delays": "22|45|72|105",
+        "decay_factors": (1.0, 0.70, 0.48, 0.32),
+        "decay_lo": 0.14, "decay_hi": 0.28, "decay_cap": 0.32,
+        "wet_lo": 0.12, "wet_hi": 0.40, "dry_hi": 0.92, "dry_lo": 0.72,
+        "in_gain": 0.50, "out_gain": 0.60, "lp": 8200,
+        "sw_delay_lo": 8, "sw_delay_hi": 14, "sw_fb_lo": 0.08, "sw_fb_hi": 0.16,
+    },
+    "大厅": {
+        "delays": "48|96|155|230",
+        "decay_factors": (1.0, 0.75, 0.55, 0.40),
+        "decay_lo": 0.18, "decay_hi": 0.36, "decay_cap": 0.38,
+        "wet_lo": 0.16, "wet_hi": 0.54, "dry_hi": 0.90, "dry_lo": 0.65,
+        "in_gain": 0.45, "out_gain": 0.65, "lp": 7500,
+        "sw_delay_lo": 12, "sw_delay_hi": 22, "sw_fb_lo": 0.12, "sw_fb_hi": 0.30,
+    },
+    "教堂": {
+        "delays": "85|165|280|420",
+        "decay_factors": (1.0, 0.82, 0.62, 0.48),
+        "decay_lo": 0.22, "decay_hi": 0.42, "decay_cap": 0.45,
+        "wet_lo": 0.20, "wet_hi": 0.58, "dry_hi": 0.88, "dry_lo": 0.58,
+        "in_gain": 0.42, "out_gain": 0.68, "lp": 6800,
+        "sw_delay_lo": 16, "sw_delay_hi": 28, "sw_fb_lo": 0.14, "sw_fb_hi": 0.32,
+    },
+    "板式混响": {
+        "delays": "18|36|58|82|110|140",
+        "decay_factors": (1.0, 0.88, 0.72, 0.55, 0.42, 0.30),
+        "decay_lo": 0.20, "decay_hi": 0.38, "decay_cap": 0.40,
+        "wet_lo": 0.18, "wet_hi": 0.52, "dry_hi": 0.88, "dry_lo": 0.62,
+        "in_gain": 0.48, "out_gain": 0.62, "lp": 9000,
+        "sw_delay_lo": 10, "sw_delay_hi": 18, "sw_fb_lo": 0.10, "sw_fb_hi": 0.22,
+    },
+    "回声": {
+        "delays": "200|400",
+        "decay_factors": (0.55, 0.32),
+        "decay_lo": 0.28, "decay_hi": 0.48, "decay_cap": 0.52,
+        "wet_lo": 0.14, "wet_hi": 0.48, "dry_hi": 0.94, "dry_lo": 0.70,
+        "in_gain": 0.55, "out_gain": 0.70, "lp": 7000,
+        "sw_delay_lo": 6, "sw_delay_hi": 12, "sw_fb_lo": 0.05, "sw_fb_hi": 0.12,
+    },
+}
 
-    成片旁白常见做法：干声为主 + 一小部分柔和空间尾 + 轻立体展宽。
-    已去掉 chorus / extrastereo / 高增益 aecho（会出电流噪与金属声）。
 
-    amount 10–100 → wet ~20%–55%，人声始终清晰。
+def normalize_reverb_mode(mode) -> str:
+    text = str(mode or "").strip()
+    if text in REVERB_MODE_PRESETS:
+        return text
+    # 兼容旧文案 / 模糊匹配
+    aliases = {
+        "房间": "小房间", "room": "小房间", "small": "小房间",
+        "hall": "大厅", "大堂": "大厅", "空灵": "大厅",
+        "church": "教堂", "cathedral": "教堂",
+        "plate": "板式混响", "板式": "板式混响",
+        "echo": "回声", "delay": "回声",
+    }
+    low = text.casefold()
+    for key, target in aliases.items():
+        if key in low or key in text:
+            return target
+    return "大厅"
+
+
+def ethereal_reverb_filter_chain(amount: int = 45, mode: str = "大厅") -> str:
+    """Dry/wet spatial reverb by mode; clean stereo, no electric hiss.
+
+    modes: 小房间 / 大厅 / 教堂 / 板式混响 / 回声
+    amount 10–100 控制湿声与衰减强度；干声始终可辨。
     """
     amount = max(10, min(100, int(amount or 45)))
-    t = amount / 100.0  # 0.10–1.00
+    t = amount / 100.0
+    preset = REVERB_MODE_PRESETS[normalize_reverb_mode(mode)]
 
-    # 干湿比：干声始终占主导
-    dry = 0.90 - 0.25 * t               # 0.875–0.65
-    wet = 0.16 + 0.38 * t               # 0.20–0.54
-    # 湿声：短房间抽头，衰减保守
-    delays = "48|96|155|230"
-    decay_base = 0.18 + 0.18 * t        # 0.20–0.36
-    decays = "|".join(
-        f"{min(0.38, decay_base * f):.3f}"
-        for f in (1.0, 0.75, 0.55, 0.40)
-    )
-    # stereowiden：轻反馈展宽（比 extrastereo 干净）
-    sw_delay = 12 + 10 * t              # 13–22 ms
-    sw_fb = 0.12 + 0.18 * t             # 0.14–0.30
-    sw_cross = 0.15 + 0.15 * t
-    sw_dry = 0.85 - 0.10 * t
+    dry = float(preset["dry_hi"]) - (float(preset["dry_hi"]) - float(preset["dry_lo"])) * t
+    wet = float(preset["wet_lo"]) + (float(preset["wet_hi"]) - float(preset["wet_lo"])) * t
+    decay_base = float(preset["decay_lo"]) + (float(preset["decay_hi"]) - float(preset["decay_lo"])) * t
+    cap = float(preset["decay_cap"])
+    factors = preset["decay_factors"]
+    decays = "|".join(f"{min(cap, decay_base * float(f)):.3f}" for f in factors)
+    delays = str(preset["delays"])
+    in_g = float(preset["in_gain"])
+    out_g = float(preset["out_gain"])
+    lp = int(preset["lp"])
+
+    sw_delay = float(preset["sw_delay_lo"]) + (
+        float(preset["sw_delay_hi"]) - float(preset["sw_delay_lo"])
+    ) * t
+    sw_fb = float(preset["sw_fb_lo"]) + (float(preset["sw_fb_hi"]) - float(preset["sw_fb_lo"])) * t
+    sw_cross = 0.12 + 0.16 * t
+    sw_dry = 0.88 - 0.12 * t
 
     return (
         f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
         f"highpass=f=100,"
         f"asplit=2[dry][wet];"
         f"[dry]volume={dry:.3f}[d];"
-        f"[wet]aecho=0.45:0.65:{delays}:{decays},"
-        f"lowpass=f=7500,"
+        f"[wet]aecho={in_g:.2f}:{out_g:.2f}:{delays}:{decays},"
+        f"lowpass=f={lp},"
         f"volume={wet:.3f}[w];"
         f"[d][w]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
         f"stereowiden=delay={sw_delay:.1f}:feedback={sw_fb:.2f}:"
@@ -1494,12 +1561,12 @@ def ethereal_reverb_filter_chain(amount: int = 45) -> str:
     )
 
 
-def apply_ethereal_reverb_file(ffmpeg: str, audio_path, amount: int = 45) -> None:
+def apply_ethereal_reverb_file(ffmpeg: str, audio_path, amount: int = 45, mode: str = "大厅") -> None:
     """In-place ethereal reverb on an audio file via FFmpeg."""
     src = Path(str(audio_path))
     if not src.is_file() or src.stat().st_size < 256:
         return
-    af = ethereal_reverb_filter_chain(amount)
+    af = ethereal_reverb_filter_chain(amount, mode=mode)
     tmp = src.with_suffix(src.suffix + f".rvb{src.suffix}")
     cmd = [
         str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
@@ -5393,22 +5460,37 @@ class DynamicCaptionPage(QWidget):
         self.tts_generate = QPushButton("生成并入队"); self.tts_generate.setToolTip("批量生成文字配音并加入音频任务队列"); self.tts_generate.setObjectName("primary"); self.tts_generate.clicked.connect(self.generate_tts)
         tts_line1 = QHBoxLayout(); tts_line1.addWidget(self.tts_service); tts_line1.addWidget(self.tts_voice,1)
         text_tab_layout.addLayout(tts_line1)
-        # 配音音效：混响空灵（生成后用 FFmpeg 后处理）
+        # 配音音效：混响（模式 + 强度；生成后 FFmpeg 后处理）
         tts_fx_row = QHBoxLayout()
-        self.tts_reverb_enabled = QCheckBox("空灵混响")
+        self.tts_reverb_enabled = QCheckBox("混响")
         self.tts_reverb_enabled.setChecked(False)
         self.tts_reverb_enabled.setToolTip(
-            "生成配音后叠加多层混响 + 合唱 + 立体展宽（可听出明显空灵）。\n"
-            "30% 轻；65% 推荐；100% 很强。对白清晰优先时请关闭。"
+            "生成配音后叠加空间混响（干湿混合，无电流噪）。\n"
+            "可选小房间 / 大厅 / 教堂 / 板式 / 回声；强度控制湿声比例。"
+        )
+        self.tts_reverb_mode = QComboBox()
+        self.tts_reverb_mode.addItems(list(REVERB_MODE_NAMES))
+        self.tts_reverb_mode.setCurrentText("大厅")
+        self.tts_reverb_mode.setMinimumWidth(100)
+        self.tts_reverb_mode.setEnabled(False)
+        self.tts_reverb_mode.setToolTip(
+            "小房间：近场短反射\n"
+            "大厅：中等空间（推荐旁白）\n"
+            "教堂：长尾大空间\n"
+            "板式混响：密集光泽尾音\n"
+            "回声：可辨听的延迟回声"
         )
         self.tts_reverb_amount = QSpinBox()
         self.tts_reverb_amount.setRange(10, 100)
         self.tts_reverb_amount.setValue(50)
         self.tts_reverb_amount.setSuffix("%")
-        self.tts_reverb_amount.setToolTip("空灵立体：干湿混合；50% 推荐，无电流噪")
+        self.tts_reverb_amount.setToolTip("混响强度：干湿混合；50% 推荐")
         self.tts_reverb_amount.setEnabled(False)
         self.tts_reverb_enabled.toggled.connect(self.tts_reverb_amount.setEnabled)
+        self.tts_reverb_enabled.toggled.connect(self.tts_reverb_mode.setEnabled)
         tts_fx_row.addWidget(self.tts_reverb_enabled)
+        tts_fx_row.addWidget(QLabel("模式"))
+        tts_fx_row.addWidget(self.tts_reverb_mode)
         tts_fx_row.addWidget(QLabel("强度"))
         tts_fx_row.addWidget(self.tts_reverb_amount)
         tts_fx_row.addStretch(1)
@@ -5750,14 +5832,22 @@ class DynamicCaptionPage(QWidget):
         proj_voice_actions.addStretch(1)
         proj_settings_form.addRow("", proj_voice_actions)
 
-        # 空灵混响：单独一行，勾选与强度拉开间距
-        self.proj_tts_reverb = QCheckBox("启用空灵混响")
+        # 混响：启用 + 模式（小房间/大厅/…）+ 强度
+        self.proj_tts_reverb = QCheckBox("启用混响")
         self.proj_tts_reverb.setChecked(False)
         self.proj_tts_reverb.setToolTip(
-            "生成配音后叠加多层混响 + 合唱微抖 + 立体展宽 + 空气高频。\n"
-            "30% 偏房间感；60% 明显空灵；100% 大厅/漂浮感（效果较强）。\n"
-            "试听音色时若已勾选也会带上混响，方便对比。\n"
-            "与「视频字幕 → 批量配音」页开关同步。"
+            "生成配音后叠加空间混响（干湿混合，无电流噪）。\n"
+            "试听音色时若已勾选也会带上混响。\n"
+            "与「视频字幕 → 批量配音」页开关/模式同步。"
+        )
+        self.proj_tts_reverb_mode = QComboBox()
+        self.proj_tts_reverb_mode.addItems(list(REVERB_MODE_NAMES))
+        self.proj_tts_reverb_mode.setCurrentText("大厅")
+        self.proj_tts_reverb_mode.setMinimumWidth(110)
+        self.proj_tts_reverb_mode.setMinimumHeight(30)
+        self.proj_tts_reverb_mode.setEnabled(False)
+        self.proj_tts_reverb_mode.setToolTip(
+            "小房间 / 大厅 / 教堂 / 板式混响 / 回声"
         )
         self.proj_tts_reverb_amount = QSpinBox()
         self.proj_tts_reverb_amount.setRange(10, 100)
@@ -5766,22 +5856,27 @@ class DynamicCaptionPage(QWidget):
         self.proj_tts_reverb_amount.setMinimumWidth(88)
         self.proj_tts_reverb_amount.setMinimumHeight(30)
         self.proj_tts_reverb_amount.setToolTip(
-            "空灵立体（干湿混合，无电流噪）：\n"
-            "· 30% 轻空气感\n"
-            "· 50% 成片旁白空灵（推荐）\n"
-            "· 80% 更湿、更大空间，人声仍清晰"
+            "混响强度（干湿混合）：\n"
+            "· 30% 轻\n"
+            "· 50% 推荐\n"
+            "· 80% 更湿，人声仍清晰"
         )
         self.proj_tts_reverb_amount.setEnabled(False)
         self.proj_tts_reverb.toggled.connect(self.proj_tts_reverb_amount.setEnabled)
+        self.proj_tts_reverb.toggled.connect(self.proj_tts_reverb_mode.setEnabled)
         if hasattr(self, "tts_reverb_enabled"):
             self.proj_tts_reverb.toggled.connect(self._sync_reverb_from_project)
             self.tts_reverb_enabled.toggled.connect(self._sync_reverb_from_batch)
             self.proj_tts_reverb_amount.valueChanged.connect(self._sync_reverb_amount_from_project)
             self.tts_reverb_amount.valueChanged.connect(self._sync_reverb_amount_from_batch)
+            if hasattr(self, "tts_reverb_mode"):
+                self.proj_tts_reverb_mode.currentTextChanged.connect(self._sync_reverb_mode_from_project)
+                self.tts_reverb_mode.currentTextChanged.connect(self._sync_reverb_mode_from_batch)
         proj_reverb_row = QHBoxLayout()
-        proj_reverb_row.setSpacing(12)
+        proj_reverb_row.setSpacing(10)
         proj_reverb_row.addWidget(self.proj_tts_reverb)
-        proj_reverb_row.addSpacing(8)
+        proj_reverb_row.addWidget(QLabel("模式"))
+        proj_reverb_row.addWidget(self.proj_tts_reverb_mode)
         proj_reverb_row.addWidget(QLabel("强度"))
         proj_reverb_row.addWidget(self.proj_tts_reverb_amount)
         proj_reverb_row.addStretch(1)
@@ -5805,6 +5900,8 @@ class DynamicCaptionPage(QWidget):
         if hasattr(self, "proj_tts_reverb"):
             self.proj_tts_reverb.toggled.connect(self._save_style_preferences)
             self.proj_tts_reverb_amount.valueChanged.connect(self._save_style_preferences)
+            if hasattr(self, "proj_tts_reverb_mode"):
+                self.proj_tts_reverb_mode.currentTextChanged.connect(self._save_style_preferences)
         for page in (group_tab, video_tab, audio_tab, text_tab, project_tab): source_stack.addWidget(page)
         source_tools=QVBoxLayout(); source_tools.setContentsMargins(4,0,0,0); source_tools.setSpacing(5)
         self.source_tool_buttons=[]
@@ -10793,6 +10890,17 @@ class DynamicCaptionPage(QWidget):
             "proj_transition_dur": float(self.proj_transition_dur.value()) if hasattr(self, "proj_transition_dur") else 0.5,
             "proj_ai_service": self.proj_ai_service.currentText() if hasattr(self, "proj_ai_service") else "未启用 (使用本地变焦特效)",
             "proj_ai_key": "",
+            "tts_reverb_enabled": bool(
+                getattr(self, "proj_tts_reverb", None) and self.proj_tts_reverb.isChecked()
+            ),
+            "tts_reverb_amount": int(
+                self.proj_tts_reverb_amount.value()
+                if hasattr(self, "proj_tts_reverb_amount") else 50
+            ),
+            "tts_reverb_mode": normalize_reverb_mode(
+                self.proj_tts_reverb_mode.currentText()
+                if hasattr(self, "proj_tts_reverb_mode") else "大厅"
+            ),
         }
 
     def _get_audio_mode_internal(self, text=None):
@@ -10992,6 +11100,27 @@ class DynamicCaptionPage(QWidget):
             self.proj_transition_dur.setValue(float(saved["proj_transition_dur"]))
         if "proj_ai_service" in saved and hasattr(self, "proj_ai_service"):
             self.proj_ai_service.setCurrentText(str(saved["proj_ai_service"]))
+        if "tts_reverb_enabled" in saved:
+            on = bool(saved.get("tts_reverb_enabled"))
+            if hasattr(self, "proj_tts_reverb"):
+                self.proj_tts_reverb.setChecked(on)
+            if hasattr(self, "tts_reverb_enabled"):
+                self.tts_reverb_enabled.setChecked(on)
+        if "tts_reverb_amount" in saved:
+            try:
+                amt = int(saved.get("tts_reverb_amount") or 50)
+            except (TypeError, ValueError):
+                amt = 50
+            if hasattr(self, "proj_tts_reverb_amount"):
+                self.proj_tts_reverb_amount.setValue(amt)
+            if hasattr(self, "tts_reverb_amount"):
+                self.tts_reverb_amount.setValue(amt)
+        if "tts_reverb_mode" in saved:
+            mode = normalize_reverb_mode(saved.get("tts_reverb_mode"))
+            if hasattr(self, "proj_tts_reverb_mode"):
+                self.proj_tts_reverb_mode.setCurrentText(mode)
+            if hasattr(self, "tts_reverb_mode"):
+                self.tts_reverb_mode.setCurrentText(mode)
         self.clean_metadata.setChecked(bool(saved.get("clean_metadata",self.clean_metadata.isChecked())))
         offsets=saved.get("audio_offsets",{})
         if isinstance(offsets,dict):
@@ -13889,20 +14018,27 @@ class DynamicCaptionPage(QWidget):
                 self.tts_thread = None
         self.tts_generate.setEnabled(False); self.tts_generate.setText(f"排队生成 0/{len(jobs)}")
         self.tts_thread = QThread(self)
-        # 包装 TTS：生成后可选空灵混响
+        # 包装 TTS：生成后可选混响
         reverb_on = bool(getattr(self, "tts_reverb_enabled", None) and self.tts_reverb_enabled.isChecked())
         reverb_amt = int(self.tts_reverb_amount.value()) if hasattr(self, "tts_reverb_amount") else 45
+        reverb_mode = (
+            normalize_reverb_mode(self.tts_reverb_mode.currentText())
+            if hasattr(self, "tts_reverb_mode") else "大厅"
+        )
         base_tts = self.tts_callable
 
-        def tts_with_fx(text, service, voice, destination, _base=base_tts, _on=reverb_on, _amt=reverb_amt):
+        def tts_with_fx(
+            text, service, voice, destination,
+            _base=base_tts, _on=reverb_on, _amt=reverb_amt, _mode=reverb_mode,
+        ):
             path = _base(text, service, voice, destination)
             if _on:
                 try:
-                    self._apply_tts_reverb_effect(path, _amt)
+                    self._apply_tts_reverb_effect(path, _amt, _mode)
                 except Exception as fx_exc:
                     # 混响失败仍返回原音频
                     try:
-                        self._append_run_log(f"空灵混响处理失败（已保留原配音）：{fx_exc}")
+                        self._append_run_log(f"混响处理失败（已保留原配音）：{fx_exc}")
                     except Exception:
                         pass
             return path
@@ -13917,15 +14053,15 @@ class DynamicCaptionPage(QWidget):
         self.tts_thread.finished.connect(self._tts_ended); self.tts_thread.finished.connect(self.tts_thread.deleteLater)
         self.tts_thread.start()
         if reverb_on:
-            self._append_run_log(f"配音将叠加空灵混响（强度 {reverb_amt}%）。")
+            self._append_run_log(f"配音将叠加混响（{reverb_mode} · 强度 {reverb_amt}%）。")
 
-    def _apply_tts_reverb_effect(self, audio_path, amount: int = 45):
-        """FFmpeg 后处理：多层混响 + 合唱 + 立体展宽（强度拉满时更空灵明显）。"""
+    def _apply_tts_reverb_effect(self, audio_path, amount: int = 45, mode: str = "大厅"):
+        """FFmpeg 后处理：按模式叠加空间混响。"""
         try:
             ffmpeg = self.find_ffmpeg()
         except Exception:
             return
-        apply_ethereal_reverb_file(ffmpeg, audio_path, amount)
+        apply_ethereal_reverb_file(ffmpeg, audio_path, amount, mode=mode)
 
     def _load_voices_for_service(self, service: str, prefer_voice: str = ""):
         """按平台加载音色列表到 tts_voice，并尽量选中 prefer_voice（须属于该平台）。"""
@@ -14445,6 +14581,8 @@ class DynamicCaptionPage(QWidget):
         self.tts_reverb_enabled.blockSignals(False)
         if hasattr(self, "tts_reverb_amount"):
             self.tts_reverb_amount.setEnabled(bool(checked))
+        if hasattr(self, "tts_reverb_mode"):
+            self.tts_reverb_mode.setEnabled(bool(checked))
 
     def _sync_reverb_from_batch(self, checked: bool):
         if not hasattr(self, "proj_tts_reverb"):
@@ -14456,6 +14594,8 @@ class DynamicCaptionPage(QWidget):
         self.proj_tts_reverb.blockSignals(False)
         if hasattr(self, "proj_tts_reverb_amount"):
             self.proj_tts_reverb_amount.setEnabled(bool(checked))
+        if hasattr(self, "proj_tts_reverb_mode"):
+            self.proj_tts_reverb_mode.setEnabled(bool(checked))
 
     def _sync_reverb_amount_from_project(self, value: int):
         if not hasattr(self, "tts_reverb_amount"):
@@ -14474,6 +14614,26 @@ class DynamicCaptionPage(QWidget):
         self.proj_tts_reverb_amount.blockSignals(True)
         self.proj_tts_reverb_amount.setValue(int(value))
         self.proj_tts_reverb_amount.blockSignals(False)
+
+    def _sync_reverb_mode_from_project(self, text: str = ""):
+        if not hasattr(self, "tts_reverb_mode"):
+            return
+        mode = normalize_reverb_mode(text)
+        if self.tts_reverb_mode.currentText() == mode:
+            return
+        self.tts_reverb_mode.blockSignals(True)
+        self.tts_reverb_mode.setCurrentText(mode)
+        self.tts_reverb_mode.blockSignals(False)
+
+    def _sync_reverb_mode_from_batch(self, text: str = ""):
+        if not hasattr(self, "proj_tts_reverb_mode"):
+            return
+        mode = normalize_reverb_mode(text)
+        if self.proj_tts_reverb_mode.currentText() == mode:
+            return
+        self.proj_tts_reverb_mode.blockSignals(True)
+        self.proj_tts_reverb_mode.setCurrentText(mode)
+        self.proj_tts_reverb_mode.blockSignals(False)
 
     def _on_proj_tts_service_changed(self, text):
         """图文页切换平台：加载该平台音色，并同步批量配音页。"""
@@ -14888,9 +15048,13 @@ class DynamicCaptionPage(QWidget):
                 cache_dir.mkdir(parents=True, exist_ok=True)
             reverb_on = bool(getattr(self, "proj_tts_reverb", None) and self.proj_tts_reverb.isChecked())
             reverb_amt = int(self.proj_tts_reverb_amount.value()) if hasattr(self, "proj_tts_reverb_amount") else 65
+            reverb_mode = (
+                normalize_reverb_mode(self.proj_tts_reverb_mode.currentText())
+                if hasattr(self, "proj_tts_reverb_mode") else "大厅"
+            )
             voice_id = voice.split("｜", 1)[0].strip()
             fp = hashlib.sha256(
-                f"{service}|{voice_id}|{sample}|{int(reverb_on)}|{reverb_amt}|v4drywet".encode("utf-8")
+                f"{service}|{voice_id}|{sample}|{int(reverb_on)}|{reverb_amt}|{reverb_mode}|v5mode".encode("utf-8")
             ).hexdigest()[:16]
             out = cache_dir / f"preview_{fp}.mp3"
             if not out.is_file() or out.stat().st_size < 256:
@@ -14898,7 +15062,7 @@ class DynamicCaptionPage(QWidget):
                 self.tts_callable(sample, service, voice_id, str(out))
                 if reverb_on and out.is_file():
                     try:
-                        self._apply_tts_reverb_effect(str(out), reverb_amt)
+                        self._apply_tts_reverb_effect(str(out), reverb_amt, reverb_mode)
                     except Exception:
                         pass
             if not out.is_file() or out.stat().st_size < 256:
@@ -14919,7 +15083,7 @@ class DynamicCaptionPage(QWidget):
             self.audio_player.play()
             self._append_run_log(
                 f"试听音色：[{service}] {voice_id}"
-                + (" + 空灵混响" if reverb_on else "")
+                + (f" + 混响·{reverb_mode}" if reverb_on else "")
             )
         except Exception as exc:
             QMessageBox.warning(
@@ -15072,11 +15236,16 @@ class DynamicCaptionPage(QWidget):
         settings["transition_name"] = self.proj_img_transition.currentText()
         settings["transition_duration"] = self.proj_transition_dur.value()
         settings["provider"] = self.provider.currentText()
-        # 图文配音空灵混响
+        # 图文配音混响
         reverb_on = bool(getattr(self, "proj_tts_reverb", None) and self.proj_tts_reverb.isChecked())
         reverb_amt = int(self.proj_tts_reverb_amount.value()) if hasattr(self, "proj_tts_reverb_amount") else 45
+        reverb_mode = (
+            normalize_reverb_mode(self.proj_tts_reverb_mode.currentText())
+            if hasattr(self, "proj_tts_reverb_mode") else "大厅"
+        )
         settings["tts_reverb_enabled"] = reverb_on
         settings["tts_reverb_amount"] = reverb_amt
+        settings["tts_reverb_mode"] = reverb_mode
         # 重新合成时允许覆盖已存在成品
         settings["force_overwrite"] = True
         
@@ -15157,7 +15326,7 @@ class DynamicCaptionPage(QWidget):
             settings=settings
         )
         if reverb_on:
-            self._append_run_log(f"图文配音已启用空灵混响（强度 {reverb_amt}%）。")
+            self._append_run_log(f"图文配音已启用混响（{reverb_mode} · 强度 {reverb_amt}%）。")
         self._project_worker.moveToThread(self._project_thread)
         self._project_thread.started.connect(self._project_worker.run)
         self._project_worker.log.connect(self._append_run_log)
@@ -15530,9 +15699,9 @@ class ProjectGroupWorker(QObject):
     def cancel(self):
         self.cancelled = True
 
-    def _apply_project_tts_reverb(self, audio_path, amount: int = 45):
-        """图文成片配音后处理：多层空灵混响（与批量配音同一套增强算法）。"""
-        apply_ethereal_reverb_file(self.ffmpeg, audio_path, amount)
+    def _apply_project_tts_reverb(self, audio_path, amount: int = 45, mode: str = "大厅"):
+        """图文成片配音后处理：按模式混响（与批量配音同一套算法）。"""
+        apply_ethereal_reverb_file(self.ffmpeg, audio_path, amount, mode=mode)
 
     def run(self):
         import subprocess, shutil, hashlib, json, time, os, random
@@ -15616,8 +15785,9 @@ class ProjectGroupWorker(QObject):
             tts_state = tts_path.with_suffix(".tts.json")
             reverb_on = bool(self.settings.get("tts_reverb_enabled"))
             reverb_amt = int(self.settings.get("tts_reverb_amount", 45) or 45)
+            reverb_mode = normalize_reverb_mode(self.settings.get("tts_reverb_mode", "大厅"))
             tts_fingerprint = hashlib.sha256(
-                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:v4drywet".encode("utf-8")
+                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:{reverb_mode}:v5mode".encode("utf-8")
             ).hexdigest()
                     
             reused_tts = False
@@ -15634,16 +15804,17 @@ class ProjectGroupWorker(QObject):
                 self.tts_callable(script, self.tts_service, self.tts_voice, str(tts_path))
                 if reverb_on and Path(tts_path).is_file():
                     try:
-                        self._apply_project_tts_reverb(tts_path, reverb_amt)
-                        self.log.emit(f"已为项目 {name} 叠加空灵混响（{reverb_amt}%）。")
+                        self._apply_project_tts_reverb(tts_path, reverb_amt, reverb_mode)
+                        self.log.emit(f"已为项目 {name} 叠加混响（{reverb_mode} · {reverb_amt}%）。")
                     except Exception as rv_exc:
-                        self.log.emit(f"空灵混响失败（保留原配音）：{rv_exc}")
+                        self.log.emit(f"混响失败（保留原配音）：{rv_exc}")
                 tts_state.write_text(json.dumps({
                     "fingerprint": tts_fingerprint,
                     "service": self.tts_service,
                     "voice": self.tts_voice,
                     "reverb": reverb_on,
                     "reverb_amount": reverb_amt,
+                    "reverb_mode": reverb_mode,
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
             else:
                 self.log.emit(f"复用已生成的配音缓存: {name}")
