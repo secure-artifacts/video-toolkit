@@ -123,19 +123,23 @@ def _vault_key(provider: str, key_id: str) -> str:
     return f"{provider}:{key_id}"
 
 
-def extract_and_strip_keys(data: dict) -> dict:
-    """Return {vault_key: plaintext} and blank every providers[*].key in a deep copy.
+def extract_and_strip_keys(data: dict):
+    """Split secrets into a vault map; rebuild config without secret values.
 
-    The returned config copy is safe for JSON disk write (no secret values).
+    CodeQL taint does not clear when mutating a deep-copied dict that once held
+    passwords. Rebuild each provider row from non-secret fields and a *literal*
+    empty ``key`` so clear-text never flows into the JSON write.
     """
     import copy
 
-    payload = copy.deepcopy(data)
     vault: dict[str, str] = {}
-    providers = payload.get("providers") or {}
+    providers_out: dict[str, list] = {}
+    providers = data.get("providers") or {}
     if isinstance(providers, dict):
         for provider, items in providers.items():
+            out_list: list[dict] = []
             if not isinstance(items, list):
+                providers_out[str(provider)] = out_list
                 continue
             for item in items:
                 if not isinstance(item, dict):
@@ -144,9 +148,21 @@ def extract_and_strip_keys(data: dict) -> dict:
                 secret = str(item.get("key") or "")
                 if kid and secret:
                     vault[_vault_key(str(provider), kid)] = secret
-                # Clear before any file write so clear-text never hits the disk path.
-                item["key"] = ""
-    # Legacy inline ciphertext (vtenc1:...) if any — drop from config JSON entirely
+                # Brand-new dict: never assign the secret value into it.
+                out_list.append({
+                    "id": kid,
+                    "key": "",  # literal empty — not derived from secret
+                    "enabled": bool(item.get("enabled", True)),
+                    "status": str(item.get("status") or "未检测"),
+                    "last_checked": str(item.get("last_checked") or ""),
+                    "last_error": str(item.get("last_error") or "")[:300],
+                    "uses": int(item.get("uses") or 0),
+                })
+            providers_out[str(provider)] = out_list
+
+    # Copy only non-provider settings (no API keys live there).
+    payload = {k: copy.deepcopy(v) for k, v in data.items() if k != "providers"}
+    payload["providers"] = providers_out
     payload.pop("_secrets_sealed", None)
     return payload, vault
 

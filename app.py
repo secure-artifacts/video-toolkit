@@ -304,15 +304,16 @@ class ConfigStore:
 
     def save(self):
         # Cross-process lock so multi-open instances do not corrupt config.json.
-        # CodeQL CWE-312: never write API key material into config.json.
-        # Secrets go only to Fernet-encrypted secrets.vault (binary).
+        # CodeQL CWE-312: API keys never enter the JSON document written below.
+        # They are sealed into secrets.vault (Fernet ciphertext) separately.
         with self.lock, exclusive_file_lock(self.path.with_suffix(".lock"), timeout=12.0):
             from modules.secret_crypto import extract_and_strip_keys, save_vault
             safe_payload, vault = extract_and_strip_keys(self.data)
-            save_vault(vault)
+            save_vault(vault)  # ciphertext only; may be empty when no keys
+            # Serialize only the secret-free payload (keys are literal "").
+            document = json.dumps(safe_payload, ensure_ascii=False, indent=2)
             temp = self.path.with_suffix(".tmp")
-            # safe_payload has empty key fields only — no password/secret values.
-            temp.write_text(json.dumps(safe_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.write_text(document, encoding="utf-8")
             temp.replace(self.path)
 
 
