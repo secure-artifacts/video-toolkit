@@ -39,8 +39,8 @@ def translate_to_chinese_free(text):
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, QSettings, QThread, QTimer, Qt, QUrl, Signal, QDate, QMimeData
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QDrag, QFont, QFontDatabase, QFontInfo, QFontMetricsF, QImage, QPainter,
-    QPainterPath, QPen, QPixmap,
+    QBrush, QColor, QCursor, QDrag, QFont, QFontDatabase, QFontInfo, QFontMetricsF, QImage, QKeySequence, QPainter,
+    QPainterPath, QPen, QPixmap, QShortcut,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
@@ -1442,14 +1442,37 @@ def is_video_watermark_entry(item) -> bool:
     return path.suffix.lower() in ANIMATED_WATERMARK_EXTENSIONS
 
 
-def split_watermark_entries(watermarks):
-    """Split layers into (image_entries, video_entries). GIF → video_entries."""
-    images, videos = [], []
+def is_watermark_entry_enabled(item) -> bool:
+    """Per-layer enable flag; missing key defaults to True (backward compatible)."""
+    if item is None:
+        return False
+    if not isinstance(item, dict):
+        return False
+    return item.get("enabled", True) is not False
+
+
+def active_watermark_entries(watermarks):
+    """Only enabled layers that still exist on disk (for preview + export burn)."""
+    out = []
     for raw in watermarks or []:
         item = dict(raw or {})
-        path = Path(str(item.get("path") or ""))
-        if not path.is_file():
+        if not is_watermark_entry_enabled(item):
             continue
+        path = Path(str(item.get("path") or ""))
+        if path.is_file():
+            out.append(item)
+    return out
+
+
+def split_watermark_entries(watermarks):
+    """Split layers into (image_entries, video_entries). GIF → video_entries.
+
+    Only enabled layers are included (勾选启用的才导出/预览).
+    """
+    images, videos = [], []
+    for raw in active_watermark_entries(watermarks):
+        item = dict(raw or {})
+        path = Path(str(item.get("path") or ""))
         if is_video_watermark_entry(item):
             item["media_type"] = "video" if path.suffix.lower() != ".gif" else "gif"
             videos.append(item)
@@ -1743,10 +1766,11 @@ def prepared_watermark_composite(ffmpeg,video,watermarks,cache_dir):
     """Render independently positioned still-image watermark layers into one transparent frame.
 
     Video logos are excluded here and overlaid live during FFmpeg export.
+    Only enabled layers are burned.
     """
     entries=[
-        dict(item) for item in watermarks
-        if Path(str(item.get("path",""))).is_file() and not is_video_watermark_entry(item)
+        dict(item) for item in active_watermark_entries(watermarks)
+        if not is_video_watermark_entry(item)
     ]
     if not entries: return Path("")
     width,height=media_video_size(ffmpeg,video); signatures=[]
@@ -1802,7 +1826,7 @@ def prepared_watermark_composite(ffmpeg,video,watermarks,cache_dir):
 def watermark_config_fingerprint(watermarks):
     """Stable identity for the exact watermark files and per-layer geometry."""
     payload=[]
-    for item in watermarks or []:
+    for item in active_watermark_entries(watermarks):
         candidate=Path(str(item.get("path","")))
         if not candidate.is_file(): continue
         stat=candidate.stat()
@@ -3483,14 +3507,9 @@ class CaptionWorker(QObject):
                     if p
                 }
                 video_resolved = str(video.resolve())
-                # 合成阶段已按相同规则命名：导出时沿用当前文件名，避免二次重命名
-                if video_resolved in already_renamed:
-                    safe_name, _truncated = safe_filename(video.name, self.output)
-                    destination = self.output / safe_name
-                    self.log.emit(
-                        f"[{index + 1}/{len(self.videos)}] 合成时已命名，导出沿用：{safe_name}"
-                    )
-                elif self.settings.get("rename_enabled"):
+                # 批量导出重命名：始终用「当前」重命名面板的最新内容（前缀/标题/日期等）。
+                # 合成阶段可能已命名过；若用户之后改了重命名设置，导出必须按最新规则再命名。
+                if self.settings.get("rename_enabled"):
                     rename_prefix = self.settings.get("rename_prefix", "").strip()
                     rename_suffix_enabled = self.settings.get("rename_suffix_enabled", True)
                     rename_suffix = self.settings.get("rename_suffix", "").strip() if rename_suffix_enabled else ""
@@ -3551,6 +3570,14 @@ class CaptionWorker(QObject):
 
                     safe_name, _truncated = safe_filename(base + video.suffix, self.output)
                     destination = self.output / safe_name
+                    if video_resolved in already_renamed and destination.name == video.name:
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 重命名规则未变，沿用：{safe_name}"
+                        )
+                    elif video_resolved in already_renamed:
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 按最新重命名设置覆盖命名：{video.name} → {safe_name}"
+                        )
                     self.log.emit(
                         f"[{index + 1}/{len(self.videos)}] 成品重命名：{safe_name}（序号 {seq_str}）"
                     )
@@ -5618,7 +5645,9 @@ class DynamicCaptionPage(QWidget):
 
         # 右侧工作区中的视频播放器、时间轴和快速效果预览。
         center = QWidget(); center_layout = QVBoxLayout(center); center_layout.setContentsMargins(4,0,4,0); center_layout.setSpacing(6)
+        self.center_panel = center  # 整块预览工作区（可拆到独立窗口腾出主界面）
         preview_group = QGroupBox("视频预览与定位"); preview_layout = QVBoxLayout(preview_group); preview_layout.setContentsMargins(9,10,9,8)
+        self.preview_group = preview_group
         # Windows 上 QVideoWidget 在部分显卡/解码器组合下只有声音没有画面。
         # 画面统一交给 OpenCV 解码并显示，QMediaPlayer 只负责音频和播放时钟。
         self.video_widget = QLabel("添加或选择视频后在这里预览")
@@ -5647,14 +5676,18 @@ class DynamicCaptionPage(QWidget):
         if hasattr(self, "audio_player"):
             self.audio_player.errorOccurred.connect(self._on_preview_player_error)
         self.preview_capture = None
-        self.preview_base_image = QImage()  # 始终为 9:16 画布上的画面（不含实时字幕）
+        self.preview_base_image = QImage()  # 控件尺寸画布上的 letterbox 画面（不含实时字幕）
         self._preview_capture_pos_ms = -1.0  # 自维护 OpenCV 读头，不依赖 CAP_PROP_POS_MSEC
         self._preview_frame_ok_logged = False
         self._preview_native_size = (1080, 1920)  # 源视频宽高，用于判断横竖
+        self._preview_content_rect = (0, 0, 1080, 1920)  # letterbox 后画面内容区 (x,y,w,h)
         self._preview_ui_pos_ms = -1  # 节流进度条/时间轴刷新
         self._preview_last_caption_key = None
         self._preview_caption_overlay = QImage()  # 字幕/水印层缓存，视频帧变了可只重贴底图
         self._preview_caption_overlay_key = None
+        self._detached_preview_window = None
+        self._workspace_placeholder = None
+        self._preview_host_layout = preview_layout
         # ~24fps：流畅预览；字幕层有缓存，不会每帧重算排版
         self.preview_frame_timer = QTimer(self); self.preview_frame_timer.setInterval(42); self.preview_frame_timer.timeout.connect(self._render_preview_frame)
         self.live_refresh_timer = QTimer(self); self.live_refresh_timer.setSingleShot(True); self.live_refresh_timer.setInterval(33)
@@ -5667,7 +5700,13 @@ class DynamicCaptionPage(QWidget):
         preview_layout.addWidget(self.video_widget,1)
         timeline = QHBoxLayout()
         self.play_btn = QPushButton("播放")
+        self.play_btn.setToolTip("播放 / 暂停预览（快捷键：空格 Space）")
         self.play_btn.clicked.connect(self.toggle_preview)
+        # 空格：播放/暂停（输入框内打字时不拦截）
+        self._preview_space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._preview_space_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._preview_space_shortcut.setAutoRepeat(False)
+        self._preview_space_shortcut.activated.connect(self._on_space_toggle_preview)
         self.sound_btn = QPushButton("🔇 静音")
         self.sound_btn.setCheckable(True)
         self.sound_btn.setChecked(True)  # 默认静音
@@ -5677,12 +5716,23 @@ class DynamicCaptionPage(QWidget):
             "也可在静音状态下点「播放」——会自动开启声音。"
         )
         self.sound_btn.toggled.connect(self._on_preview_sound_toggled)
+        self.detach_preview_btn = QPushButton("拆出工作区")
+        self.detach_preview_btn.setMinimumWidth(100)
+        self.detach_preview_btn.setToolTip(
+            "把整块「预览工作区」拆到独立窗口（可放到第二块屏幕），\n"
+            "主界面腾出空间给左侧素材与右侧字幕/设置。\n"
+            "关闭独立窗口或点「收回工作区」即可还原。\n"
+            "画面始终等比完整显示，不裁剪。"
+        )
+        self.detach_preview_btn.setObjectName("primary")
+        self.detach_preview_btn.clicked.connect(self._toggle_detached_preview)
         self.seek = QSlider(Qt.Orientation.Horizontal)
         self.seek.setRange(0, 0)
         self.seek.sliderMoved.connect(self._seek_preview)
         self.time_label = QLabel("00:00 / 00:00")
         timeline.addWidget(self.play_btn)
         timeline.addWidget(self.sound_btn)
+        timeline.addWidget(self.detach_preview_btn)
         timeline.addWidget(self.seek, 1)
         timeline.addWidget(self.time_label)
         preview_layout.addLayout(timeline)
@@ -5790,8 +5840,15 @@ class DynamicCaptionPage(QWidget):
         self.audio_mode=QComboBox(); self.audio_mode.addItems([
             "视频原声",
             "视频原声＋背景音乐",
+            "视频原声＋背景音乐＋配乐",
             "视频配音＋背景音乐",
         ])
+        self.audio_mode.setToolTip(
+            "视频原声：只用原片音轨。\n"
+            "视频原声＋背景音乐：原片 + BGM。\n"
+            "视频原声＋背景音乐＋配乐：原片 + BGM + 下方「环境音/配乐」轨（氛围/配乐）。\n"
+            "视频配音＋背景音乐：用文字转语音/配音替换原声，再叠 BGM。"
+        )
         self.audio_mode.currentTextChanged.connect(self._rematch_current_video)
         self.audio_mode.currentTextChanged.connect(self._audio_mode_changed)
         self.original_volume=QSpinBox(); self.original_volume.setRange(0,200); self.original_volume.setValue(100); self.original_volume.setSuffix(" %")
@@ -6155,12 +6212,19 @@ class DynamicCaptionPage(QWidget):
         image_editor_layout.addWidget(self.image_quick_combo,2,4)
         layer_layout.addWidget(legacy_image_editor)
 
-        watermark_title=QLabel("公司水印烧录（图片 + 动态视频 Logo，可叠加；导出时烧录）")
+        watermark_title=QLabel("公司水印库（多图/视频入库 → 勾选启用本次要用的 → 导出只烧启用项）")
         watermark_title.setStyleSheet("color:#7dd3fc;font-weight:700;"); layer_layout.addWidget(watermark_title)
+        watermark_tip=QLabel(
+            "可先添加多张 Logo 作为资料库；表格里勾选「启用」决定本次预览/导出用哪几张。"
+            "点「仅用选中」可一键只开某一张，方便每次换 Logo。"
+        )
+        watermark_tip.setWordWrap(True)
+        watermark_tip.setStyleSheet("color:#94a3b8;font-size:11px;")
+        layer_layout.addWidget(watermark_tip)
         watermark_path_row=QHBoxLayout()
         self.company_watermark=QLineEdit()
         self.company_watermark.setReadOnly(True)
-        self.company_watermark.setPlaceholderText("可添加多张图片水印 + 动态视频 Logo（mp4/mov…）")
+        self.company_watermark.setPlaceholderText("资料库：可添加多张图片 + 动态视频 Logo，勾选后才参与导出")
         choose_watermark=QPushButton("添加图片…")
         choose_watermark.setObjectName("primary")
         choose_watermark.clicked.connect(self._choose_company_watermark)
@@ -6171,23 +6235,60 @@ class DynamicCaptionPage(QWidget):
         )
         choose_video_logo.clicked.connect(self._choose_video_logo_watermark)
         clear_watermark=QPushButton("删除选中"); clear_watermark.clicked.connect(self._remove_selected_watermarks)
-        clear_all_watermarks=QPushButton("清空"); clear_all_watermarks.clicked.connect(self._clear_company_watermark)
+        clear_all_watermarks=QPushButton("清空库"); clear_all_watermarks.clicked.connect(self._clear_company_watermark)
         watermark_path_row.addWidget(self.company_watermark,1)
         watermark_path_row.addWidget(choose_watermark)
         watermark_path_row.addWidget(choose_video_logo)
         watermark_path_row.addWidget(clear_watermark)
         watermark_path_row.addWidget(clear_all_watermarks)
         layer_layout.addLayout(watermark_path_row)
-        self.watermark_table=QTableWidget(0,4)
-        self.watermark_table.setHorizontalHeaderLabels(["图层（图/视频）","位置","大小","透明度"])
+        # 勾选启用 / 仅用选中 等快捷操作
+        watermark_select_row=QHBoxLayout()
+        self.watermark_enable_selected_btn=QPushButton("启用选中")
+        self.watermark_enable_selected_btn.setToolTip("把当前选中行的水印勾选为启用（可多选行）")
+        self.watermark_enable_selected_btn.clicked.connect(lambda: self._set_selected_watermarks_enabled(True))
+        self.watermark_disable_selected_btn=QPushButton("禁用选中")
+        self.watermark_disable_selected_btn.clicked.connect(lambda: self._set_selected_watermarks_enabled(False))
+        self.watermark_solo_btn=QPushButton("仅用选中")
+        self.watermark_solo_btn.setObjectName("primary")
+        self.watermark_solo_btn.setToolTip("只启用当前选中的水印，其它全部关闭（适合每次换一张 Logo）")
+        self.watermark_solo_btn.clicked.connect(self._solo_selected_watermark)
+        self.watermark_enable_all_btn=QPushButton("全部启用")
+        self.watermark_enable_all_btn.clicked.connect(lambda: self._set_all_watermarks_enabled(True))
+        self.watermark_disable_all_btn=QPushButton("全部禁用")
+        self.watermark_disable_all_btn.clicked.connect(lambda: self._set_all_watermarks_enabled(False))
+        for b in (
+            self.watermark_enable_selected_btn, self.watermark_disable_selected_btn,
+            self.watermark_solo_btn, self.watermark_enable_all_btn, self.watermark_disable_all_btn,
+        ):
+            watermark_select_row.addWidget(b)
+        watermark_select_row.addStretch(1)
+        layer_layout.addLayout(watermark_select_row)
+        watermark_table_row=QHBoxLayout()
+        self.watermark_table=QTableWidget(0,5)
+        self.watermark_table.setHorizontalHeaderLabels(["启用","图层（图/视频）","位置","大小","透明度"])
         self.watermark_table.verticalHeader().setVisible(False)
         self.watermark_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.watermark_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.watermark_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.watermark_table.setMaximumHeight(120)
-        self.watermark_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
-        for column in (1,2,3): self.watermark_table.horizontalHeader().setSectionResizeMode(column,QHeaderView.ResizeMode.ResizeToContents)
+        self.watermark_table.setMinimumHeight(140)
+        self.watermark_table.setMaximumHeight(220)
+        self.watermark_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.ResizeToContents)
+        self.watermark_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch)
+        for column in (2,3,4): self.watermark_table.horizontalHeader().setSectionResizeMode(column,QHeaderView.ResizeMode.ResizeToContents)
         self.watermark_table.currentCellChanged.connect(self._watermark_selection_changed)
-        layer_layout.addWidget(self.watermark_table)
+        self.watermark_table.itemChanged.connect(self._watermark_table_item_changed)
+        watermark_table_row.addWidget(self.watermark_table,1)
+        # 选中项缩略图
+        self.watermark_thumb=QLabel("选中\n预览")
+        self.watermark_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.watermark_thumb.setFixedSize(96,96)
+        self.watermark_thumb.setStyleSheet(
+            "background:#02050b;color:#64748b;border:1px solid #334155;border-radius:8px;font-size:11px;"
+        )
+        self.watermark_thumb.setToolTip("当前选中水印的缩略图预览")
+        watermark_table_row.addWidget(self.watermark_thumb)
+        layer_layout.addLayout(watermark_table_row)
         watermark_mode_row=QHBoxLayout()
         self.watermark_mode=QComboBox()
         self.watermark_mode.addItems(["小 Logo 自定义位置","9:16 全屏覆盖"])
@@ -6534,8 +6635,8 @@ class DynamicCaptionPage(QWidget):
         watermark_heading.setStyleSheet("font-size:18px;font-weight:800;color:#f8fafc;")
         watermark_editor_layout.addWidget(watermark_heading)
         watermark_editor_layout.addWidget(QLabel(
-            "可添加图片水印与动态视频 Logo；分别设置位置（左上/右上…）、大小与透明度，"
-            "导出时叠加烧录。视频 Logo 会循环到片尾。"
+            "先把多张 Logo 加进资料库，再勾选本次要用的；点「仅用选中」可一键只开一张。\n"
+            "未勾选的保留在库中不烧录。视频 Logo 会循环到片尾。"
         ))
         watermark_file_row=QHBoxLayout()
         choose_watermark.setText("添加图片")
@@ -6545,7 +6646,24 @@ class DynamicCaptionPage(QWidget):
         watermark_file_row.addWidget(clear_watermark)
         watermark_file_row.addWidget(clear_all_watermarks)
         watermark_editor_layout.addLayout(watermark_file_row)
-        watermark_editor_layout.addWidget(self.watermark_table,1)
+        # 水印页也放启用快捷按钮（与设置页同一组控件）
+        if hasattr(self, "watermark_solo_btn"):
+            wm_sel2 = QHBoxLayout()
+            for b in (
+                self.watermark_enable_selected_btn, self.watermark_disable_selected_btn,
+                self.watermark_solo_btn, self.watermark_enable_all_btn, self.watermark_disable_all_btn,
+            ):
+                wm_sel2.addWidget(b)
+            wm_sel2.addStretch(1)
+            watermark_editor_layout.addLayout(wm_sel2)
+        # 表格 + 缩略图：若已在上面 layout 里，先 reparent
+        if hasattr(self, "watermark_thumb"):
+            wm_table_wrap = QHBoxLayout()
+            wm_table_wrap.addWidget(self.watermark_table, 1)
+            wm_table_wrap.addWidget(self.watermark_thumb)
+            watermark_editor_layout.addLayout(wm_table_wrap, 1)
+        else:
+            watermark_editor_layout.addWidget(self.watermark_table,1)
         self.group_burn_watermark.setText("合成时启用水印")
         watermark_editor_layout.addWidget(self.group_burn_watermark)
         self.proj_burn_watermark.setParent(self)
@@ -6603,24 +6721,24 @@ class DynamicCaptionPage(QWidget):
         bgm_source_layout.addLayout(bgm_mode_row)
         bgm_editor_layout.addWidget(bgm_source_group)
 
-        # 环境音：独立于 BGM，显示在时间轴「环境音」轨道，可拖边找时间点
-        ambient_group = QGroupBox("环境音（独立轨道）")
+        # 环境音/配乐：独立于 BGM，时间轴「环境音」轨道；声音合成可选「原声＋BGM＋配乐」
+        ambient_group = QGroupBox("环境音 / 配乐（独立轨道）")
         ambient_layout = QVBoxLayout(ambient_group)
         ambient_tip = QLabel(
-            "【怎么用】环境音 = 氛围/现场音，独立于「视频原声」和 BGM。\n"
-            "1）点「选择环境音」→ 时间轴会出现青色「环境音」轨道（不是视频声音轨）。\n"
-            "2）「保留视频原声」只控制原片人声/现场；关了也不会关掉环境音。\n"
-            "3）环境音可单独拖左右边找时间点；导出时按音量叠到成片，不绑原声轨。"
+            "【怎么用】环境音/配乐 = 氛围音或额外配乐，独立于「视频原声」和 BGM。\n"
+            "1）点「选择配乐」→ 时间轴出现青色「环境音」轨道。\n"
+            "2）声音合成选「视频原声＋背景音乐＋配乐」时会自动启用本轨并叠到成片。\n"
+            "3）可单独拖左右边找时间点；音量建议低于对白与 BGM。"
         )
         ambient_tip.setWordWrap(True)
         ambient_tip.setStyleSheet("color:#7dd3fc;font-size:11px;")
         ambient_layout.addWidget(ambient_tip)
         ambient_row = QHBoxLayout()
-        self.ambient_enabled = QCheckBox("启用环境音")
+        self.ambient_enabled = QCheckBox("启用环境音/配乐")
         self.ambient_enabled.setChecked(False)
         self.ambient_enabled.toggled.connect(self._ambient_enabled_changed)
-        choose_ambient = QPushButton("选择环境音…")
-        choose_ambient.setToolTip("选择环境音/氛围音效文件（mp3/wav…）")
+        choose_ambient = QPushButton("选择配乐…")
+        choose_ambient.setToolTip("选择环境音/配乐文件（mp3/wav…）")
         choose_ambient.clicked.connect(self._choose_ambient_file)
         clear_ambient = QPushButton("清除")
         clear_ambient.clicked.connect(self._clear_ambient_file)
@@ -6631,15 +6749,15 @@ class DynamicCaptionPage(QWidget):
         ambient_layout.addLayout(ambient_row)
         self.ambient_source_display = QLineEdit()
         self.ambient_source_display.setReadOnly(True)
-        self.ambient_source_display.setPlaceholderText("尚未选择环境音")
+        self.ambient_source_display.setPlaceholderText("尚未选择环境音/配乐")
         ambient_layout.addWidget(self.ambient_source_display)
         ambient_vol_row = QHBoxLayout()
-        ambient_vol_row.addWidget(QLabel("环境音音量"))
+        ambient_vol_row.addWidget(QLabel("配乐音量"))
         self.ambient_volume = QSpinBox()
         self.ambient_volume.setRange(0, 200)
         self.ambient_volume.setValue(20)
         self.ambient_volume.setSuffix("%")
-        self.ambient_volume.setToolTip("环境音相对音量；建议低于对白与 BGM")
+        self.ambient_volume.setToolTip("环境音/配乐相对音量；建议低于对白与 BGM")
         ambient_vol_row.addWidget(self.ambient_volume)
         ambient_vol_row.addStretch()
         ambient_layout.addLayout(ambient_vol_row)
@@ -6754,6 +6872,43 @@ class DynamicCaptionPage(QWidget):
         caption_model_row.addWidget(self.local_whisper_model, 1)
         caption_tools_layout.addLayout(caption_model_row)
         self._sync_local_whisper_model_enabled(self.provider.currentText())
+        # 识别语言：易识别语言用自动；马达加斯加语等拉丁小语种请固定选择
+        caption_lang_row = QHBoxLayout()
+        caption_lang_row.addWidget(QLabel("识别语言"))
+        self.asr_language = QComboBox()
+        self.asr_language.setEditable(True)
+        fill_writing_language_combo(self.asr_language, "")
+        self.asr_language.setToolTip(
+            "传给 Whisper / 云识别的语言码。\n"
+            "· 英语、西语、法语等常见语言：可保持「自动检测」。\n"
+            "· 马达加斯加语（Malagasy / mg）等易被误判为英语/法语：请固定选「Malagasy 马达加斯加语」。\n"
+            "· 也可直接输入语言码：en / pt / es / fr / mg / el …\n"
+            "会与「书写语言」同步，影响识别与字幕标点规范。"
+        )
+        # 与书写语言双向同步（避免两处不一致）
+        try:
+            if hasattr(self, "writing_language") and self.writing_language.currentText():
+                fill_writing_language_combo(self.asr_language, writing_language_from_ui(self.writing_language.currentText()) or "")
+                # 若书写语言是自动，保持 asr 自动
+                if str(self.writing_language.currentText()).startswith("自动"):
+                    self.asr_language.setCurrentIndex(0)
+                else:
+                    # 尽量选中相同标签
+                    for i in range(self.asr_language.count()):
+                        if self.asr_language.itemText(i) == self.writing_language.currentText():
+                            self.asr_language.setCurrentIndex(i)
+                            break
+        except Exception:
+            pass
+        self.asr_language.currentTextChanged.connect(self._on_asr_language_changed)
+        if hasattr(self, "writing_language"):
+            self.writing_language.currentTextChanged.connect(self._on_writing_language_changed_for_asr)
+        caption_lang_row.addWidget(self.asr_language, 1)
+        caption_tools_layout.addLayout(caption_lang_row)
+        asr_lang_hint = QLabel("马达加斯加语请选 Malagasy；其它常用语言可自动检测")
+        asr_lang_hint.setStyleSheet("color:#94a3b8;font-size:11px;")
+        asr_lang_hint.setWordWrap(True)
+        caption_tools_layout.addWidget(asr_lang_hint)
         caption_tools_layout.addWidget(self.combination_label)
         caption_tools_layout.addWidget(self.timeline_source_label)
         caption_buttons = QHBoxLayout()
@@ -7225,7 +7380,26 @@ class DynamicCaptionPage(QWidget):
 
         # 右侧工作设置区：预览与全部设置；下方独立放置 Canva 风格多轨时间轴。
         work_group=QGroupBox("工作设置区 · 实时预览与字幕设计")
+        self.work_group = work_group
         work_group_layout=QVBoxLayout(work_group); work_group_layout.setContentsMargins(7,10,7,7)
+        # 主界面顶部：拆出/收回整块预览工作区（腾出空间给列表与字幕设置）
+        work_top_bar = QHBoxLayout()
+        work_top_bar.setContentsMargins(0, 0, 0, 2)
+        work_top_hint = QLabel("双屏推荐：把预览工作区拆到第二屏，主屏专注素材与字幕设置")
+        work_top_hint.setStyleSheet("color:#7dd3fc;font-size:11px;")
+        work_top_hint.setWordWrap(True)
+        self.detach_workspace_btn = QPushButton("拆出预览工作区")
+        self.detach_workspace_btn.setObjectName("primary")
+        self.detach_workspace_btn.setMinimumWidth(130)
+        self.detach_workspace_btn.setToolTip(
+            "把整块预览工作区（画面+播放条+字幕位置）拆到独立窗口，\n"
+            "可拖到第二块屏幕；主界面自动腾出空间给左侧与字幕设置。\n"
+            "再点「收回工作区」或关闭独立窗口即可还原。"
+        )
+        self.detach_workspace_btn.clicked.connect(self._toggle_detached_preview)
+        work_top_bar.addWidget(work_top_hint, 1)
+        work_top_bar.addWidget(self.detach_workspace_btn)
+        work_group_layout.addLayout(work_top_bar)
         work_splitter=QSplitter(Qt.Orientation.Horizontal); work_splitter.setChildrenCollapsible(True)
         self.work_splitter = work_splitter
         center.setMinimumWidth(240); right_panel.setMinimumWidth(280)
@@ -7296,6 +7470,17 @@ class DynamicCaptionPage(QWidget):
         super().resizeEvent(event)
         width=max(1,event.size().width())
         height=max(1,event.size().height())
+        # 预览控件尺寸变化时按新区域 letterbox 重绘，保证小屏仍见全画面
+        try:
+            if not getattr(self, "preview_base_image", None) is None and not self.preview_base_image.isNull():
+                if not hasattr(self, "_preview_resize_timer"):
+                    self._preview_resize_timer = QTimer(self)
+                    self._preview_resize_timer.setSingleShot(True)
+                    self._preview_resize_timer.setInterval(80)
+                    self._preview_resize_timer.timeout.connect(self._on_preview_area_resized)
+                self._preview_resize_timer.start()
+        except Exception:
+            pass
         bucket="compact" if width<1250 else ("medium" if width<1650 else "wide")
         if hasattr(self,"flow_label"):
             self.flow_label.setVisible(bucket=="wide")
@@ -8856,6 +9041,38 @@ class DynamicCaptionPage(QWidget):
                 except Exception:
                     pass
 
+    def _is_text_input_focused(self) -> bool:
+        """当前焦点是否在文字/数字输入控件上（此时空格应正常输入，不切换播放）。"""
+        w = QApplication.focusWidget()
+        while w is not None:
+            if isinstance(w, (QLineEdit, QPlainTextEdit, QTextBrowser)):
+                return True
+            if isinstance(w, QAbstractSpinBox):
+                return True
+            if isinstance(w, QComboBox) and w.isEditable():
+                return True
+            # 可编辑表格单元格
+            try:
+                from PySide6.QtWidgets import QAbstractItemView
+                if isinstance(w, QAbstractItemView) and w.state() == QAbstractItemView.State.EditingState:
+                    return True
+            except Exception:
+                pass
+            w = w.parentWidget()
+        return False
+
+    def _on_space_toggle_preview(self):
+        """空格键：播放 / 暂停预览。"""
+        if self._is_text_input_focused():
+            return
+        # 页面不可见时不响应（避免切到其它板块仍占空格）
+        try:
+            if not self.isVisible():
+                return
+        except Exception:
+            pass
+        self.toggle_preview()
+
     def toggle_preview(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
@@ -9059,43 +9276,42 @@ class DynamicCaptionPage(QWidget):
         return True
 
     def _preview_canvas_size(self):
-        """预览用 9:16 画布：尽量贴合控件，上限约 540×960（清晰且仍远小于源 1080p）。"""
+        """预览画布 = 控件客户区尺寸（偶数），不强制 9:16，保证小屏也能装下全画幅。"""
         ww = 400
         wh = 712
         if hasattr(self, "video_widget") and self.video_widget is not None:
-            ww = max(200, min(540, int(self.video_widget.width()) - 4))
-            wh = max(360, min(960, int(self.video_widget.height()) - 4))
-        # 强制 9:16 竖屏
-        if ww * 16 > wh * 9:
-            pw = max(160, int(wh * 9 / 16))
-            ph = max(200, wh)
-        else:
-            pw = max(160, ww)
-            ph = max(200, int(ww * 16 / 9))
-        pw -= pw % 2
-        ph -= ph % 2
-        return max(160, pw), max(200, ph)
+            ww = max(160, int(self.video_widget.width()) - 4)
+            wh = max(160, int(self.video_widget.height()) - 4)
+        # 独立窗口可更大，仍限制上限以免超大帧拖慢
+        ww = min(ww, 1920)
+        wh = min(wh, 1920)
+        ww -= ww % 2
+        wh -= wh % 2
+        return max(160, ww), max(160, wh)
 
     def _bgr_frame_to_qimage(self, frame):
-        """BGR 帧 → 9:16 预览画布 RGB32。用 LINEAR 缩放，比 AREA 更跟手。"""
+        """BGR 帧 → 预览画布 RGB32：等比完整放入（letterbox），不裁剪。"""
         try:
             import numpy as np
             h, w = frame.shape[:2]
             if h < 2 or w < 2:
                 return QImage()
             tw, th = self._preview_canvas_size()
-            scale = max(tw / float(w), th / float(h))
-            nw = max(2, int(w * scale) & ~1)
-            nh = max(2, int(h * scale) & ~1)
+            # contain：min 缩放，完整画面 + 黑边，不 crop
+            scale = min(tw / float(w), th / float(h))
+            nw = max(2, int(round(w * scale)) & ~1)
+            nh = max(2, int(round(h * scale)) & ~1)
             if nw != w or nh != h:
-                # 预览优先流畅：LINEAR 比 AREA 快，观感也更跟手
                 frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-            y0 = max(0, (frame.shape[0] - th) // 2)
-            x0 = max(0, (frame.shape[1] - tw) // 2)
-            frame = frame[y0:y0 + th, x0:x0 + tw]
-            if frame.shape[0] != th or frame.shape[1] != tw:
-                frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LINEAR)
-            rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            x0 = max(0, (tw - frame.shape[1]) // 2)
+            y0 = max(0, (th - frame.shape[0]) // 2)
+            self._preview_content_rect = (int(x0), int(y0), int(frame.shape[1]), int(frame.shape[0]))
+            canvas = np.zeros((th, tw, 3), dtype=np.uint8)
+            # 深色底与 QLabel 背景一致
+            canvas[:, :] = (5, 8, 14)  # BGR ≈ #02050b
+            fh, fw = frame.shape[:2]
+            canvas[y0:y0 + fh, x0:x0 + fw] = frame
+            rgb = np.ascontiguousarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
         except Exception:
             return QImage()
         height, width, channels = rgb.shape
@@ -9105,33 +9321,34 @@ class DynamicCaptionPage(QWidget):
         return image.convertToFormat(QImage.Format.Format_RGB32)
 
     def _make_916_canvas(self, content: QImage | None = None) -> QImage:
-        """生成固定 9:16 画布；有内容则等比居中贴入（不加拉伸）。"""
+        """生成贴合控件的预览画布；内容等比完整居中（letterbox，不裁剪）。"""
         cw, ch = self._preview_canvas_size()
         canvas = QImage(cw, ch, QImage.Format.Format_RGB32)
         canvas.fill(QColor("#02050b"))
         if content is None or content.isNull():
+            self._preview_content_rect = (0, 0, cw, ch)
             return canvas
         if content.format() != QImage.Format.Format_RGB32:
             content = content.convertToFormat(QImage.Format.Format_RGB32)
         fitted = content.scaled(
             cw, ch,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
+            Qt.TransformationMode.SmoothTransformation,
         )
         x = (cw - fitted.width()) // 2
         y = (ch - fitted.height()) // 2
+        self._preview_content_rect = (int(x), int(y), int(fitted.width()), int(fitted.height()))
         painter = QPainter(canvas)
         painter.drawImage(x, y, fitted)
         painter.end()
         return canvas
 
     def _store_preview_base(self, image: QImage) -> QImage:
-        """缓存为 9:16 底图，避免后续字幕按控件宽高比非等比缩放而拉长。"""
+        """缓存 letterbox 底图：完整画幅、不裁剪、保持源比例。"""
         if image is None or image.isNull():
             self.preview_base_image = QImage()
             return self.preview_base_image
         cw, ch = self._preview_canvas_size()
-        # 已是目标 9:16 尺寸则直接缓存，省一次 fill+scale+painter
         if (
             image.width() == cw
             and image.height() == ch
@@ -9236,18 +9453,23 @@ class DynamicCaptionPage(QWidget):
         return (text or "", active_out or "", int(cut), t_bucket)
 
     def _present_preview_image(self, base: QImage, seconds: float | None = None):
-        """在 9:16 底图上叠实时字幕效果后 setPixmap。
+        """在完整画幅 letterbox 底图上叠实时字幕效果后 setPixmap。
 
         字幕时间以播放器时钟为准（与声音同步）；词级高亮随 cut 变化刷新，避免缓存冻住效果。
+        不裁剪源画面，等比完整显示。
         """
         if base is None or base.isNull():
             display = self._make_916_canvas(None)
         else:
-            bw, bh = base.width(), base.height()
-            if bh > 0 and abs(bw / bh - 9 / 16) > 0.04:
-                display = self._make_916_canvas(base)
+            cw, ch = self._preview_canvas_size()
+            if (
+                base.width() == cw
+                and base.height() == ch
+                and base.format() == QImage.Format.Format_RGB32
+            ):
+                display = base
             else:
-                display = base if base.format() == QImage.Format.Format_RGB32 else base.convertToFormat(QImage.Format.Format_RGB32)
+                display = self._make_916_canvas(base)
         # 永远用播放器时间对齐口播节奏（OpenCV 读头可能略滞后）
         try:
             clock_ms = int(self.player.position() or 0)
@@ -9314,9 +9536,219 @@ class DynamicCaptionPage(QWidget):
         pm = QPixmap.fromImage(display)
         if pm.isNull():
             return
-        self.video_widget.setPixmap(pm)
-        self.video_widget.setText("")
-        self.video_widget.setScaledContents(False)
+        # KeepAspectRatio 再贴到控件，小屏也能看到全画面（不裁切）
+        if hasattr(self, "video_widget") and self.video_widget is not None:
+            target = self.video_widget.size()
+            if target.width() > 8 and target.height() > 8:
+                pm = pm.scaled(
+                    target,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self.video_widget.setPixmap(pm)
+            self.video_widget.setText("")
+            self.video_widget.setScaledContents(False)
+
+    def _on_preview_area_resized(self):
+        """窗口/预览区尺寸变化后按新区域重绘（优先重读帧，避免二次 letterbox）。"""
+        try:
+            self._invalidate_preview_caption_overlay()
+            if getattr(self, "preview_capture", None) is not None:
+                self._render_preview_frame(force=True)
+            elif not getattr(self, "preview_base_image", None) is None and not self.preview_base_image.isNull():
+                self._display_cached_preview()
+        except Exception:
+            pass
+
+    def _toggle_detached_preview(self):
+        """拆出 / 收回整块预览工作区（腾出主界面空间，可放到第二屏）。"""
+        if self._detached_preview_window is not None and self._detached_preview_window.isVisible():
+            self._dock_preview_window()
+            return
+        self._detach_preview_window()
+
+    def _set_detach_buttons_text(self, detached: bool):
+        label = "收回工作区" if detached else "拆出工作区"
+        top_label = "收回预览工作区" if detached else "拆出预览工作区"
+        if hasattr(self, "detach_preview_btn") and self.detach_preview_btn is not None:
+            self.detach_preview_btn.setText(label)
+        if hasattr(self, "detach_workspace_btn") and self.detach_workspace_btn is not None:
+            self.detach_workspace_btn.setText(top_label)
+
+    def _detach_preview_window(self):
+        """把整块 center 预览工作区拆到独立窗口，主界面 work_splitter 只留字幕设置。"""
+        center = getattr(self, "center_panel", None)
+        splitter = getattr(self, "work_splitter", None)
+        if center is None or splitter is None:
+            return
+        if self._detached_preview_window is not None and self._detached_preview_window.isVisible():
+            return
+
+        win = QDialog(self)
+        win.setWindowTitle("VideoToolkit · 预览工作区（可拖到第二屏）")
+        win.setWindowFlag(Qt.WindowType.Window, True)
+        win.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        win.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        win.setMinimumSize(420, 560)
+        # 默认尽量铺满第二屏；只有一块屏则用主屏右侧大半
+        try:
+            screens = QApplication.screens()
+            if screens and len(screens) > 1:
+                geo = screens[1].availableGeometry()
+                win.setGeometry(geo.adjusted(12, 12, -12, -12))
+            else:
+                geo = (screens[0].availableGeometry() if screens else None)
+                if geo is not None:
+                    # 主屏右半，避免完全挡住主界面
+                    w = max(480, int(geo.width() * 0.48))
+                    h = max(640, int(geo.height() * 0.9))
+                    win.setGeometry(
+                        geo.x() + geo.width() - w - 16,
+                        geo.y() + max(16, (geo.height() - h) // 2),
+                        w,
+                        h,
+                    )
+                else:
+                    win.resize(720, 1080)
+        except Exception:
+            win.resize(720, 1080)
+
+        lay = QVBoxLayout(win)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        bar = QHBoxLayout()
+        tip = QLabel("整块预览工作区 · 主界面已腾出空间给素材列表与字幕设置 · 关闭本窗或点「收回」还原")
+        tip.setStyleSheet("color:#7dd3fc;font-size:12px;")
+        tip.setWordWrap(True)
+        dock_btn = QPushButton("收回工作区")
+        dock_btn.setObjectName("primary")
+        dock_btn.clicked.connect(self._dock_preview_window)
+        bar.addWidget(tip, 1)
+        bar.addWidget(dock_btn)
+        lay.addLayout(bar)
+
+        # 主界面占位：极窄条，真正把横向空间让给右侧设置
+        placeholder = QFrame()
+        placeholder.setObjectName("workspacePlaceholder")
+        placeholder.setStyleSheet(
+            "QFrame#workspacePlaceholder{background:#0b1220;border:1px dashed #334155;border-radius:8px;}"
+        )
+        ph_lay = QVBoxLayout(placeholder)
+        ph_lay.setContentsMargins(8, 12, 8, 12)
+        ph_lay.setSpacing(8)
+        ph_title = QLabel("预览工作区\n已拆出")
+        ph_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ph_title.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:700;")
+        ph_title.setWordWrap(True)
+        ph_btn = QPushButton("收回")
+        ph_btn.setToolTip("把预览工作区收回主界面")
+        ph_btn.clicked.connect(self._dock_preview_window)
+        ph_lay.addStretch(1)
+        ph_lay.addWidget(ph_title)
+        ph_lay.addWidget(ph_btn)
+        ph_lay.addStretch(1)
+        placeholder.setMinimumWidth(72)
+        placeholder.setMaximumWidth(110)
+        placeholder.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._workspace_placeholder = placeholder
+
+        # 从 splitter 取出 center，塞进独立窗口
+        try:
+            idx = splitter.indexOf(center)
+        except Exception:
+            idx = 0
+        if idx < 0:
+            idx = 0
+        splitter.replaceWidget(idx, placeholder)
+        center.setParent(win)
+        center.setMinimumWidth(320)
+        center.setMaximumWidth(16777215)
+        lay.addWidget(center, 1)
+
+        # 主界面：几乎全部宽度给右侧字幕/设置
+        try:
+            total = max(400, splitter.size().width() or 900)
+            splitter.setSizes([90, max(300, total - 90)])
+            splitter.setStretchFactor(0, 0)
+            splitter.setStretchFactor(1, 1)
+        except Exception:
+            pass
+
+        win.finished.connect(self._on_detached_preview_finished)
+        self._detached_preview_window = win
+        self._set_detach_buttons_text(True)
+        win.show()
+        # 已按第二屏几何摆好则不再 showMaximized（避免被吸回主屏）
+        try:
+            screens = QApplication.screens()
+            if not screens or len(screens) <= 1:
+                win.showMaximized()
+        except Exception:
+            pass
+        win.raise_()
+        win.activateWindow()
+        self._invalidate_preview_caption_overlay()
+        QTimer.singleShot(50, self._on_preview_area_resized)
+        self._refresh_live_preview()
+        try:
+            self._append_run_log("预览工作区已拆出到独立窗口，主界面已腾出空间。")
+        except Exception:
+            pass
+
+    def _on_detached_preview_finished(self, *_args):
+        self._dock_preview_window()
+
+    def _dock_preview_window(self):
+        """把预览工作区收回主界面 work_splitter。"""
+        win = self._detached_preview_window
+        center = getattr(self, "center_panel", None)
+        splitter = getattr(self, "work_splitter", None)
+        placeholder = getattr(self, "_workspace_placeholder", None)
+
+        if center is not None and splitter is not None:
+            center.setParent(None)
+            if placeholder is not None and splitter.indexOf(placeholder) >= 0:
+                idx = splitter.indexOf(placeholder)
+                splitter.replaceWidget(idx, center)
+                try:
+                    placeholder.setParent(None)
+                    placeholder.deleteLater()
+                except Exception:
+                    pass
+            elif splitter.indexOf(center) < 0:
+                splitter.insertWidget(0, center)
+            self._workspace_placeholder = None
+            center.setMinimumWidth(240)
+            center.setMaximumWidth(16777215)
+            center.show()
+            try:
+                total = max(400, splitter.size().width() or 900)
+                preview_w = max(280, int(total * 0.52))
+                splitter.setSizes([preview_w, max(260, total - preview_w)])
+                splitter.setStretchFactor(0, 3)
+                splitter.setStretchFactor(1, 2)
+            except Exception:
+                pass
+
+        if win is not None:
+            try:
+                win.finished.disconnect(self._on_detached_preview_finished)
+            except Exception:
+                pass
+            try:
+                win.hide()
+                win.deleteLater()
+            except Exception:
+                pass
+        self._detached_preview_window = None
+        self._set_detach_buttons_text(False)
+        self._invalidate_preview_caption_overlay()
+        QTimer.singleShot(50, self._on_preview_area_resized)
+        self._refresh_live_preview()
+        try:
+            self._append_run_log("预览工作区已收回主界面。")
+        except Exception:
+            pass
 
     def _video_frame_changed(self, frame):
         # OpenCV 已负责画面时，忽略 QVideoSink（避免黑帧覆盖 + 省掉每帧 Python 回调）
@@ -10198,6 +10630,8 @@ class DynamicCaptionPage(QWidget):
         if "writing_language" in saved or "caption_language" in saved:
             code = str(saved.get("writing_language") or saved.get("caption_language") or "")
             fill_writing_language_combo(self.writing_language, code)
+            if hasattr(self, "asr_language"):
+                fill_writing_language_combo(self.asr_language, code)
         if "rtl_word_highlight" in saved:
             self.rtl_word_highlight.setChecked(bool(saved["rtl_word_highlight"]))
 
@@ -10398,11 +10832,21 @@ class DynamicCaptionPage(QWidget):
             layers = list(layers) + [{"type": "caption", "name": "字幕层", "enabled": True}]
         painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # 最终 ASS 始终在 1080x1920 上排版。实时预览也使用同一虚拟画布，
-        # 最后整体缩放到播放器画面，避免小预览窗口重新计算字体和换行。
-        w = max(1, image.width())
-        h = max(1, image.height())
-        painter.scale(w / 1080.0, h / 1920.0)
+        # 最终 ASS 在 1080×1920 虚拟画布上排版；预览叠到 letterbox 后的「内容区」
+        # （不是整张含黑边的控件），避免横竖屏被裁切或字幕拉扁。
+        rect = getattr(self, "_preview_content_rect", None) or (0, 0, image.width(), image.height())
+        try:
+            cx, cy, cw, ch = [int(v) for v in rect]
+        except Exception:
+            cx, cy, cw, ch = 0, 0, max(1, image.width()), max(1, image.height())
+        cw = max(1, cw)
+        ch = max(1, ch)
+        # 将 1080×1920 等比放入内容区
+        scale = min(cw / 1080.0, ch / 1920.0)
+        ox = cx + (cw - 1080.0 * scale) / 2.0
+        oy = cy + (ch - 1920.0 * scale) / 2.0
+        painter.translate(ox, oy)
+        painter.scale(scale, scale)
         try:
             painted_caption = False
             for layer in reversed(layers):
@@ -10444,7 +10888,10 @@ class DynamicCaptionPage(QWidget):
             painter.end()
 
     def _paint_live_watermark(self, painter, seconds: float | None = None):
-        """Draw still + animated (video/GIF) watermarks. Animated layers follow preview clock."""
+        """Draw still + animated (video/GIF) watermarks. Animated layers follow preview clock.
+
+        Only entries with enabled=True (勾选启用) are drawn.
+        """
         entries = list(getattr(self, "_watermark_entries", None) or [])
         images = list(getattr(self, "_watermark_images", []) or [])
         if not entries and not images:
@@ -10459,10 +10906,12 @@ class DynamicCaptionPage(QWidget):
                 seconds = max(0.0, float(self.player.position() or 0) / 1000.0)
             except Exception:
                 seconds = 0.0
-        # 静态图：布局缓存；动态层：每帧按时间取画面
+        # 静态图：布局缓存；动态层：每帧按时间取画面（仅启用项）
         if getattr(self, "_live_watermark_static_cache", None) is None:
             static_prepared = []
             for index, item in enumerate(entries or [{"path": ""}] * len(images)):
+                if item and not is_watermark_entry_enabled(item):
+                    continue
                 if is_video_watermark_entry(item):
                     continue
                 source = images[index] if index < len(images) else QImage()
@@ -10508,6 +10957,8 @@ class DynamicCaptionPage(QWidget):
 
         # 动态视频 / GIF：按播放时间取样并缩放（帧内自带 alpha / 抠底，与导出透明一致）
         for index, item in enumerate(entries):
+            if not is_watermark_entry_enabled(item):
+                continue
             if not is_video_watermark_entry(item):
                 continue
             path = str(item.get("path") or "")
@@ -11070,24 +11521,151 @@ class DynamicCaptionPage(QWidget):
     def _refresh_watermark_table(self,selected=None):
         if not hasattr(self,"watermark_table"): return
         current=self.watermark_table.currentRow() if selected is None else selected
-        self.watermark_table.blockSignals(True); self.watermark_table.setRowCount(len(self._watermark_entries))
+        self.watermark_table.blockSignals(True)
+        self.watermark_table.setRowCount(len(self._watermark_entries))
         for row,item in enumerate(self._watermark_entries):
-            kind = "🎬 视频" if is_video_watermark_entry(item) else "🖼 图片"
-            name = f"{kind} · {Path(item['path']).name}"
-            values=(
-                name,
-                item.get("position","右上角"),
-                "全屏" if item.get("mode")=="9:16 全屏覆盖" else f"{item.get('width',18)}%",
-                f"{item.get('opacity',100)}%",
+            enabled = is_watermark_entry_enabled(item)
+            check = QTableWidgetItem()
+            check.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
             )
-            for column,value in enumerate(values):
-                cell=QTableWidgetItem(str(value)); cell.setToolTip(item["path"]); self.watermark_table.setItem(row,column,cell)
+            check.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            check.setToolTip("勾选 = 本次预览/导出启用；取消勾选 = 保留在库中但不烧录")
+            self.watermark_table.setItem(row, 0, check)
+            kind = "🎬 视频" if is_video_watermark_entry(item) else "🖼 图片"
+            mark = "✓ " if enabled else "○ "
+            name = f"{mark}{kind} · {Path(item['path']).name}"
+            values = (
+                name,
+                item.get("position", "右上角"),
+                "全屏" if item.get("mode") == "9:16 全屏覆盖" else f"{item.get('width', 18)}%",
+                f"{item.get('opacity', 100)}%",
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setToolTip(item["path"] + ("\n（已启用）" if enabled else "\n（未启用，不参与导出）"))
+                if not enabled:
+                    cell.setForeground(QBrush(QColor("#64748b")))
+                self.watermark_table.setItem(row, column + 1, cell)
         self.watermark_table.blockSignals(False)
         if self._watermark_entries:
-            self.watermark_table.setCurrentCell(max(0,min(current,len(self._watermark_entries)-1)),0)
+            self.watermark_table.setCurrentCell(max(0, min(current, len(self._watermark_entries) - 1)), 1)
+            self._update_watermark_thumb(self.watermark_table.currentRow())
+        else:
+            self._update_watermark_thumb(-1)
+        self._sync_watermark_summary_label()
+
+    def _update_watermark_thumb(self, row: int):
+        if not hasattr(self, "watermark_thumb"):
+            return
+        if not (0 <= row < len(self._watermark_entries)):
+            self.watermark_thumb.setPixmap(QPixmap())
+            self.watermark_thumb.setText("选中\n预览")
+            return
+        img = QImage()
+        if row < len(getattr(self, "_watermark_images", []) or []):
+            img = self._watermark_images[row]
+        if img is None or img.isNull():
+            path = self._watermark_entries[row].get("path")
+            img = load_watermark_preview_image(path)
+        if img is None or img.isNull():
+            self.watermark_thumb.setPixmap(QPixmap())
+            self.watermark_thumb.setText("无法\n预览")
+            return
+        pm = QPixmap.fromImage(img)
+        pm = pm.scaled(90, 90, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.watermark_thumb.setPixmap(pm)
+        self.watermark_thumb.setText("")
+
+    def _watermark_table_item_changed(self, item):
+        """勾选「启用」列时更新 entry 并刷新预览。"""
+        if item is None or item.column() != 0:
+            return
+        row = item.row()
+        if not (0 <= row < len(self._watermark_entries)):
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        self._watermark_entries[row]["enabled"] = bool(enabled)
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        # 轻量刷新名称列灰显状态，避免递归 itemChanged
+        self.watermark_table.blockSignals(True)
+        try:
+            name_item = self.watermark_table.item(row, 1)
+            if name_item is not None:
+                kind = "🎬 视频" if is_video_watermark_entry(self._watermark_entries[row]) else "🖼 图片"
+                mark = "✓ " if enabled else "○ "
+                name_item.setText(f"{mark}{kind} · {Path(self._watermark_entries[row]['path']).name}")
+                name_item.setForeground(QBrush(QColor("#e2e8f0" if enabled else "#64748b")))
+        finally:
+            self.watermark_table.blockSignals(False)
+        self._sync_watermark_summary_label()
+        self._refresh_live_preview()
+        self._save_style_preferences()
+
+    def _selected_watermark_rows(self) -> list[int]:
+        if not hasattr(self, "watermark_table"):
+            return []
+        rows = sorted({idx.row() for idx in self.watermark_table.selectedIndexes()})
+        return [r for r in rows if 0 <= r < len(self._watermark_entries)]
+
+    def _set_selected_watermarks_enabled(self, enabled: bool):
+        rows = self._selected_watermark_rows()
+        if not rows:
+            QMessageBox.information(self, "水印", "请先在列表中选中要操作的水印行。")
+            return
+        for row in rows:
+            self._watermark_entries[row]["enabled"] = bool(enabled)
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        self._refresh_watermark_table(rows[0])
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        self._append_run_log(
+            f"已{'启用' if enabled else '禁用'} {len(rows)} 个水印图层。"
+        )
+
+    def _set_all_watermarks_enabled(self, enabled: bool):
+        if not self._watermark_entries:
+            return
+        for item in self._watermark_entries:
+            item["enabled"] = bool(enabled)
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        self._refresh_watermark_table(self.watermark_table.currentRow() if hasattr(self, "watermark_table") else 0)
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        self._append_run_log(f"已{'全部启用' if enabled else '全部禁用'}水印库（共 {len(self._watermark_entries)} 项）。")
+
+    def _solo_selected_watermark(self):
+        """只启用当前选中的水印（一张或多张），其余关闭——方便每次换 Logo。"""
+        rows = self._selected_watermark_rows()
+        if not rows:
+            # 无多选时用当前行
+            if hasattr(self, "watermark_table"):
+                r = self.watermark_table.currentRow()
+                if 0 <= r < len(self._watermark_entries):
+                    rows = [r]
+        if not rows:
+            QMessageBox.information(self, "水印", "请先选中要用的水印行，再点「仅用选中」。")
+            return
+        row_set = set(rows)
+        for i, item in enumerate(self._watermark_entries):
+            item["enabled"] = i in row_set
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        self._refresh_watermark_table(rows[0])
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        names = "、".join(Path(self._watermark_entries[r]["path"]).name for r in rows[:5])
+        self._append_run_log(f"仅启用选中水印（{len(rows)} 项）：{names}")
 
     def _watermark_selection_changed(self,current_row,*_args):
-        if not (0<=current_row<len(self._watermark_entries)): return
+        if not (0<=current_row<len(self._watermark_entries)):
+            self._update_watermark_thumb(-1)
+            return
         item=self._watermark_entries[current_row]
         controls=((self.watermark_mode,"mode"),(self.watermark_position,"position"),(self.watermark_width,"width"),
                   (self.watermark_opacity,"opacity"),(self.watermark_margin,"margin"))
@@ -11099,14 +11677,20 @@ class DynamicCaptionPage(QWidget):
             for control,key in controls: control.blockSignals(False)
         custom=self.watermark_mode.currentText()=="小 Logo 自定义位置"
         for control in (self.watermark_position,self.watermark_width,self.watermark_margin): control.setEnabled(custom)
+        self._update_watermark_thumb(current_row)
 
     def _watermark_control_changed(self,*_args):
         if not hasattr(self,"watermark_table"): return
         row=self.watermark_table.currentRow()
         if 0<=row<len(self._watermark_entries):
-            self._watermark_entries[row].update({"mode":self.watermark_mode.currentText(),"position":self.watermark_position.currentText(),
-                                                  "width":self.watermark_width.value(),"opacity":self.watermark_opacity.value(),
-                                                  "margin":self.watermark_margin.value()})
+            self._watermark_entries[row].update({
+                "mode":self.watermark_mode.currentText(),
+                "position":self.watermark_position.currentText(),
+                "width":self.watermark_width.value(),
+                "opacity":self.watermark_opacity.value(),
+                "margin":self.watermark_margin.value(),
+                "enabled": self._watermark_entries[row].get("enabled", True),
+            })
             self._refresh_watermark_table(row)
         self._live_watermark_static_cache = None
         self._live_watermark_cache = None
@@ -11156,27 +11740,41 @@ class DynamicCaptionPage(QWidget):
             "width": self.watermark_width.value(),
             "opacity": 100 if media_type == "image" else max(50, self.watermark_opacity.value()),
             "margin": self.watermark_margin.value(),
+            "enabled": True,  # 新加入库默认启用；可用勾选关闭
         })
         self._live_watermark_static_cache = None
         return True
 
     def _sync_watermark_summary_label(self):
-        n_img = sum(1 for e in self._watermark_entries if not is_video_watermark_entry(e))
-        n_vid = sum(1 for e in self._watermark_entries if is_video_watermark_entry(e))
         if not self._watermark_entries:
             self.company_watermark.clear()
             self.company_watermark.setToolTip("")
             return
-        parts = []
-        if n_img:
-            parts.append(f"{n_img} 张图")
-        if n_vid:
-            parts.append(f"{n_vid} 个视频 Logo")
-        names = "；".join(Path(p).name for p in self._watermark_paths[:6])
-        if len(self._watermark_paths) > 6:
+        n_all = len(self._watermark_entries)
+        n_on = sum(1 for e in self._watermark_entries if is_watermark_entry_enabled(e))
+        n_img = sum(1 for e in self._watermark_entries if not is_video_watermark_entry(e))
+        n_vid = sum(1 for e in self._watermark_entries if is_video_watermark_entry(e))
+        on_names = [
+            Path(e["path"]).name
+            for e in self._watermark_entries
+            if is_watermark_entry_enabled(e)
+        ][:4]
+        names = "；".join(on_names)
+        if n_on > 4:
             names += "…"
-        self.company_watermark.setText(f"已添加 {' + '.join(parts)}：{names}")
-        self.company_watermark.setToolTip("\n".join(self._watermark_paths))
+        if n_on == 0:
+            self.company_watermark.setText(
+                f"资料库 {n_all} 项（图 {n_img} / 视频 {n_vid}）· 当前未启用任何水印"
+            )
+        else:
+            self.company_watermark.setText(
+                f"资料库 {n_all} 项 · 启用 {n_on}：{names or '—'}"
+            )
+        tips = []
+        for e in self._watermark_entries:
+            mark = "✓" if is_watermark_entry_enabled(e) else "○"
+            tips.append(f"{mark} {e.get('path','')}")
+        self.company_watermark.setToolTip("\n".join(tips))
 
     def _choose_company_watermark(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -11429,7 +12027,11 @@ class DynamicCaptionPage(QWidget):
                 path=self.videos.item(index).text()
                 if self._baked_watermark_matches(path,watermark_fingerprint):
                     baked_videos.append(str(Path(path).resolve()))
-        writing_lang = writing_language_from_ui(self.writing_language.currentText())
+        # 识别语言优先（字幕识别下拉），否则书写语言
+        if hasattr(self, "asr_language_code"):
+            writing_lang = self.asr_language_code() or writing_language_from_ui(self.writing_language.currentText())
+        else:
+            writing_lang = writing_language_from_ui(self.writing_language.currentText())
         return {"preset":preset,"font":self.font.currentText(),"font_size":self.font_size.value(),
                 "caption_mode":self.caption_mode.currentText(),
                 "free_animation":self.free_animation.currentText(),
@@ -11468,7 +12070,13 @@ class DynamicCaptionPage(QWidget):
                 "selected_bgm_path":self._selected_bgm_path,
                 "selected_ambient_path": getattr(self, "_selected_ambient_path", "") or "",
                 "ambient_enabled": (
-                    self.ambient_enabled.isChecked() if hasattr(self, "ambient_enabled") else False
+                    (
+                        self.ambient_enabled.isChecked() if hasattr(self, "ambient_enabled") else False
+                    )
+                    or (
+                        "配乐" in str(self.audio_mode.currentText() if hasattr(self, "audio_mode") else "")
+                        and "视频配音" not in str(self.audio_mode.currentText() if hasattr(self, "audio_mode") else "")
+                    )
                 ),
                 "ambient_volume": (
                     self.ambient_volume.value() if hasattr(self, "ambient_volume") else 20
@@ -11841,11 +12449,29 @@ class DynamicCaptionPage(QWidget):
 
     def _audio_mode_changed(self, mode_text):
         mode = self._get_audio_mode_internal(mode_text)
-        uses_bgm="背景音乐" in str(mode_text)
-        self.bgm_enabled.setChecked(uses_bgm)
+        text = str(mode_text or "")
+        uses_bgm = "背景音乐" in text or "BGM" in text.upper()
+        # 「…＋配乐」= 原声 + BGM + 环境音/配乐轨
+        uses_score = ("配乐" in text) and ("视频配音" not in text)
+        if hasattr(self, "bgm_enabled"):
+            self.bgm_enabled.blockSignals(True)
+            self.bgm_enabled.setChecked(uses_bgm)
+            self.bgm_enabled.blockSignals(False)
+        if hasattr(self, "ambient_enabled") and uses_score:
+            self.ambient_enabled.blockSignals(True)
+            self.ambient_enabled.setChecked(True)
+            self.ambient_enabled.blockSignals(False)
+            try:
+                self._ambient_enabled_changed(True)
+            except Exception:
+                pass
         self.audio_match_mode.setCurrentText("自动匹配（同名优先，其次按队列）")
-        self.original_volume.setEnabled(uses_bgm and mode=="保留视频原音")
+        self.original_volume.setEnabled(uses_bgm and mode == "保留视频原音")
         self.background_volume.setEnabled(uses_bgm)
+        if hasattr(self, "ambient_volume"):
+            self.ambient_volume.setEnabled(uses_score or (
+                hasattr(self, "ambient_enabled") and self.ambient_enabled.isChecked()
+            ))
         self._update_preview_audio_levels()
         self._audio_fade_mode_changed(self.audio_fade_mode.currentText())
         self._refresh_live_preview()
@@ -12496,20 +13122,97 @@ class DynamicCaptionPage(QWidget):
         except Exception as exc:
             self._append_run_log(f"保存本地模型失败：{exc}")
 
+    def _on_asr_language_changed(self, text=""):
+        """字幕识别语言 → 同步书写语言，并写入偏好。"""
+        if getattr(self, "_syncing_asr_language", False):
+            return
+        self._syncing_asr_language = True
+        try:
+            label = str(text or "").strip()
+            if hasattr(self, "writing_language") and label:
+                # 尽量匹配已有项，否则直接设文本
+                matched = False
+                for i in range(self.writing_language.count()):
+                    if self.writing_language.itemText(i) == label:
+                        self.writing_language.setCurrentIndex(i)
+                        matched = True
+                        break
+                if not matched:
+                    code = writing_language_from_ui(label)
+                    if code:
+                        fill_writing_language_combo(self.writing_language, code)
+                    else:
+                        self.writing_language.setCurrentIndex(0)
+            try:
+                self._save_style_preferences()
+            except Exception:
+                pass
+            code = writing_language_from_ui(label) if label else ""
+            if hasattr(self, "_append_run_log"):
+                self._append_run_log(
+                    f"识别语言：{label or '自动检测'}"
+                    + (f"（码 {code}）" if code else "（auto）")
+                )
+        finally:
+            self._syncing_asr_language = False
+
+    def _on_writing_language_changed_for_asr(self, text=""):
+        """书写语言改动时回写识别语言下拉。"""
+        if getattr(self, "_syncing_asr_language", False):
+            return
+        if not hasattr(self, "asr_language"):
+            return
+        self._syncing_asr_language = True
+        try:
+            label = str(text or "").strip()
+            for i in range(self.asr_language.count()):
+                if self.asr_language.itemText(i) == label:
+                    self.asr_language.setCurrentIndex(i)
+                    break
+            else:
+                if label.startswith("自动") or not label:
+                    self.asr_language.setCurrentIndex(0)
+        finally:
+            self._syncing_asr_language = False
+
+    def asr_language_code(self) -> str:
+        """当前识别语言码；空字符串表示 auto。"""
+        try:
+            if hasattr(self, "asr_language"):
+                code = writing_language_from_ui(self.asr_language.currentText())
+                if code:
+                    return code
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "writing_language"):
+                code = writing_language_from_ui(self.writing_language.currentText())
+                if code:
+                    return code
+        except Exception:
+            pass
+        return ""
+
     def extract_timeline(self):
         source=self._timeline_source()
         if not source:
             QMessageBox.information(self,"没有音频","请先选中一个音频；未添加音频时也可以选中包含声音的视频。"); return
         if self.timeline_thread and self.timeline_thread.isRunning(): return
         provider=self.provider.currentText(); self.extract_timeline_btn.setEnabled(False); self.extract_timeline_btn.setText("正在识别中…")
-        lang_label = self.writing_language.currentText() if hasattr(self, "writing_language") else "自动"
+        lang_label = (
+            self.asr_language.currentText() if hasattr(self, "asr_language")
+            else (self.writing_language.currentText() if hasattr(self, "writing_language") else "自动")
+        )
+        lang_code = self.asr_language_code() if hasattr(self, "asr_language_code") else ""
         local_m = ""
         if hasattr(self, "local_whisper_model"):
             local_m = str(self.local_whisper_model.currentData() or "")
         self._append_run_log(
             f"开始提取选中素材字幕：{Path(source).name}（识别服务：{provider}"
             + (f"；本地模型：{local_m}" if local_m and ("本地" in provider or provider.startswith("自动")) else "")
-            + f"；书写语言：{lang_label}；已清除旧缓存）"
+            + f"；识别语言：{lang_label}"
+            + (f" / {lang_code}" if lang_code else " / auto")
+            + "；已清除旧缓存）"
         )
         # 清掉内存里的旧结果，避免界面仍显示坏字幕
         try:

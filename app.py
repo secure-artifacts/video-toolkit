@@ -65,7 +65,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.27").strip().lstrip("v") or "1.7.27"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.28").strip().lstrip("v") or "1.7.28"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -4808,9 +4808,21 @@ class MainWindow(QMainWindow):
         return LOCAL_PROVIDER
 
     def _caption_asr_language(self) -> str:
-        """Reels 文案语言 → Whisper/云识别 language 码；自动则 auto。"""
+        """Reels 识别语言 → Whisper/云识别 language 码；自动则 auto。
+
+        优先「字幕识别」页的识别语言（可固定马达加斯加语等）；
+        其次书写语言；再次字幕提取页语言框。
+        """
         try:
             page = getattr(self, "dynamic_caption_page", None)
+            if page is not None and hasattr(page, "asr_language_code"):
+                code = page.asr_language_code()
+                if code:
+                    return code
+            if page is not None and hasattr(page, "asr_language"):
+                code = writing_language_from_ui(page.asr_language.currentText())
+                if code:
+                    return code
             if page is not None and hasattr(page, "writing_language"):
                 code = writing_language_from_ui(page.writing_language.currentText())
                 if code:
