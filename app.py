@@ -53,7 +53,17 @@ from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
 from modules.text_rules import normalize_required_capitalization, normalize_subtitle_text
 from modules.metadata_page import MetadataPage
-from modules.platform_utils import app_data_dir, bundled_media_tool, media_tool_name, validate_media_tool
+from modules.platform_utils import (
+    app_data_dir,
+    bundled_media_tool,
+    exclusive_file_lock,
+    instance_id,
+    instance_slot,
+    live_instance_count,
+    media_tool_name,
+    register_instance,
+    validate_media_tool,
+)
 from modules.path_picker import default_output_path
 from modules.app_logging import app_log_path, read_app_log, write_app_log
 from modules.help_content import FAQ_JUMP, HELP_CSS, HELP_FAQ_TAB_INDEX, HELP_TABS, SETTINGS_NAV
@@ -65,7 +75,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.28").strip().lstrip("v") or "1.7.28"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.30").strip().lstrip("v") or "1.7.30"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
@@ -207,6 +217,12 @@ class ConfigStore:
         default = self._default()
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            # API 密钥落盘为密文；内存中解密为明文供调用
+            try:
+                from modules.secret_crypto import unseal_provider_keys
+                loaded = unseal_provider_keys(loaded)
+            except Exception:
+                pass
             for key in default:
                 if key not in loaded:
                     loaded[key] = default[key]
@@ -287,10 +303,15 @@ class ConfigStore:
             return default
 
     def save(self):
-        with self.lock:
+        # Cross-process lock so multi-open instances do not corrupt config.json.
+        # API keys are sealed (Fernet) before any disk write — CodeQL CWE-312.
+        with self.lock, exclusive_file_lock(self.path.with_suffix(".lock"), timeout=12.0):
+            from modules.secret_crypto import seal_provider_keys
+            sealed = seal_provider_keys(self.data)
             temp = self.path.with_suffix(".tmp")
-            temp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.write_text(json.dumps(sealed, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.path)
+
 
     def add_key(self, provider: str, key: str):
         key = normalize_api_key(key)
@@ -2869,7 +2890,7 @@ class MainWindow(QMainWindow):
         self.pending_upload_files = []
         self.pending_upload_records = []
         self.pending_sheet_uploads = []; self.pending_sheet_folder_url = ""
-        self.setWindowTitle(APP_DISPLAY_NAME)
+        self.setWindowTitle(self._window_title_text())
         self.resize(1380, 820)
         self.setMinimumSize(1080, 680)
         icon = resource_path("logo.ico")
@@ -2888,6 +2909,30 @@ class MainWindow(QMainWindow):
         _startup_trace("keys refreshed")
         # 启动后自动在后台静默检查更新（延迟3秒，不阻塞主UI展示）
         QTimer.singleShot(3000, lambda: self._check_update(manual=False))
+        # 多开时周期性刷新标题槽位，便于区分窗口
+        QTimer.singleShot(1500, self._refresh_multi_instance_title)
+        self._multi_title_timer = QTimer(self)
+        self._multi_title_timer.setInterval(8000)
+        self._multi_title_timer.timeout.connect(self._refresh_multi_instance_title)
+        self._multi_title_timer.start()
+
+    def _window_title_text(self) -> str:
+        try:
+            slot = instance_slot()
+            total = live_instance_count()
+        except Exception:
+            slot, total = 1, 1
+        if total > 1 or slot > 1:
+            return f"{APP_DISPLAY_NAME}  ·  多开#{slot}/{total}"
+        return APP_DISPLAY_NAME
+
+    def _refresh_multi_instance_title(self) -> None:
+        try:
+            title = self._window_title_text()
+            if self.windowTitle() != title:
+                self.setWindowTitle(title)
+        except Exception:
+            pass
 
     def _build_ui(self):
         root = QWidget()
@@ -3411,7 +3456,16 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("视频工具合集 · 软件运行日志")
         dialog.resize(920, 600)
         box = QVBoxLayout(dialog)
-        hint = QLabel("记录批处理进度、API 配额/密钥异常、自动切换和无法继续的错误，方便后续排查。")
+        try:
+            slot = instance_slot()
+            total = live_instance_count()
+            multi_tip = f"当前窗口多开槽位 #{slot}/{total}；每个窗口使用独立日志文件。"
+        except Exception:
+            multi_tip = "每个多开窗口使用独立日志文件。"
+        hint = QLabel(
+            "记录批处理进度、API 配额/密钥异常、自动切换和无法继续的错误，方便后续排查。\n"
+            + multi_tip
+        )
         hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;")
         box.addWidget(hint)
         viewer = QPlainTextEdit(); viewer.setReadOnly(True); viewer.setPlainText(read_app_log())
@@ -5813,7 +5867,24 @@ def main():
     if os.environ.get("VIDEO_TOOLKIT_MEDIA_PROBE") == "1":
         return
     _startup_trace("main entered")
-    write_app_log(f"启动 {APP_DISPLAY_NAME}","INFO","应用")
+    try:
+        slot = register_instance()
+        peers = live_instance_count()
+    except Exception:
+        slot, peers = 1, 1
+    write_app_log(
+        f"启动 {APP_DISPLAY_NAME} | instance={instance_id()} | 多开槽位 #{slot}/{peers}",
+        "INFO",
+        "应用",
+    )
+    if peers > 1:
+        write_app_log(
+            "检测到多开：各窗口任务临时文件/日志已隔离；"
+            "请尽量使用不同「输出目录」，避免成品与断点文件互相覆盖。"
+            "全局配置（密钥/服务设置）仍共享。",
+            "INFO",
+            "多开",
+        )
     original_hook=sys.excepthook
     def log_unhandled(exc_type,exc_value,exc_traceback):
         import traceback
@@ -5840,7 +5911,8 @@ def main():
     window.activateWindow()
     _startup_trace(
         f"window shown platform={app.platformName()} visible={window.isVisible()} "
-        f"winId={int(window.winId())} geometry={window.geometry().getRect()}"
+        f"winId={int(window.winId())} geometry={window.geometry().getRect()} "
+        f"instance={instance_id()} slot={slot}/{peers}"
     )
     QTimer.singleShot(350, lambda: (window.raise_(), window.activateWindow()))
     # 打包后自动化启动检查使用；普通用户启动时不会触发。

@@ -104,11 +104,25 @@ class FakeResponse:
     def json(self):
         return self._payload
 
+# 假响应需足够长，避免触发「结果过稀」防护（≥12s 分段：字数/词数门槛）
+# 90s 分段门槛约：字数 ≥225、词数 ≥54
+_chunk_text_a = ("one " * 120).strip()
+_chunk_text_b = ("two " * 120).strip()
+_chunk_words_a = [{"start": i * 0.4, "end": i * 0.4 + 0.3, "word": "one"} for i in range(80)]
+_chunk_words_b = [{"start": i * 0.4, "end": i * 0.4 + 0.3, "word": "two"} for i in range(80)]
 post_calls = []
 responses = [
-    FakeResponse(200, {"text": "one", "segments": [{"start": 0, "end": 1, "text": "one"}]}),
+    FakeResponse(200, {
+        "text": _chunk_text_a,
+        "segments": [{"start": 0, "end": 30, "text": _chunk_text_a}],
+        "words": _chunk_words_a,
+    }),
     FakeResponse(429, {"error": {"message": "quota"}}),
-    FakeResponse(200, {"text": "two", "segments": [{"start": 0, "end": 1, "text": "two"}]}),
+    FakeResponse(200, {
+        "text": _chunk_text_b,
+        "segments": [{"start": 0, "end": 30, "text": _chunk_text_b}],
+        "words": _chunk_words_b,
+    }),
 ]
 
 def fake_post(*args, **kwargs):
@@ -129,6 +143,12 @@ finally:
     toolkit.requests.post = original_post
 assert post_calls == ["chunk_000.wav", "chunk_001.wav", "chunk_001.wav"]
 assert "one" in plain and "two" in plain and len(raw["chunks"]) == 2
+# 稀疏结果防护：超短文本 + 长时长应被识别
+_sparse = groq_worker._groq_payload_is_suspicious(
+    {"text": "one", "segments": [{"start": 0, "end": 1, "text": "one"}], "words": []},
+    90.0,
+)
+assert _sparse and "过稀" in _sparse
 
 # 本地模型：ONNX Runtime 缺失时必须自动关闭 VAD，而不是终止任务。
 fake_faster_whisper = types.ModuleType("faster_whisper")

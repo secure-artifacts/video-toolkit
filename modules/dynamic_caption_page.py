@@ -1451,6 +1451,90 @@ def is_watermark_entry_enabled(item) -> bool:
     return item.get("enabled", True) is not False
 
 
+def ethereal_reverb_filter_chain(amount: int = 45) -> str:
+    """Reel-style soft ambient voice: dry/wet mix, clean stereo, no electric hiss.
+
+    成片旁白常见做法：干声为主 + 一小部分柔和空间尾 + 轻立体展宽。
+    已去掉 chorus / extrastereo / 高增益 aecho（会出电流噪与金属声）。
+
+    amount 10–100 → wet ~20%–55%，人声始终清晰。
+    """
+    amount = max(10, min(100, int(amount or 45)))
+    t = amount / 100.0  # 0.10–1.00
+
+    # 干湿比：干声始终占主导
+    dry = 0.90 - 0.25 * t               # 0.875–0.65
+    wet = 0.16 + 0.38 * t               # 0.20–0.54
+    # 湿声：短房间抽头，衰减保守
+    delays = "48|96|155|230"
+    decay_base = 0.18 + 0.18 * t        # 0.20–0.36
+    decays = "|".join(
+        f"{min(0.38, decay_base * f):.3f}"
+        for f in (1.0, 0.75, 0.55, 0.40)
+    )
+    # stereowiden：轻反馈展宽（比 extrastereo 干净）
+    sw_delay = 12 + 10 * t              # 13–22 ms
+    sw_fb = 0.12 + 0.18 * t             # 0.14–0.30
+    sw_cross = 0.15 + 0.15 * t
+    sw_dry = 0.85 - 0.10 * t
+
+    return (
+        f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        f"highpass=f=100,"
+        f"asplit=2[dry][wet];"
+        f"[dry]volume={dry:.3f}[d];"
+        f"[wet]aecho=0.45:0.65:{delays}:{decays},"
+        f"lowpass=f=7500,"
+        f"volume={wet:.3f}[w];"
+        f"[d][w]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
+        f"stereowiden=delay={sw_delay:.1f}:feedback={sw_fb:.2f}:"
+        f"crossfeed={sw_cross:.2f}:drymix={sw_dry:.2f},"
+        f"alimiter=limit=0.93:attack=5:release=50,"
+        f"volume=0.96"
+    )
+
+
+def apply_ethereal_reverb_file(ffmpeg: str, audio_path, amount: int = 45) -> None:
+    """In-place ethereal reverb on an audio file via FFmpeg."""
+    src = Path(str(audio_path))
+    if not src.is_file() or src.stat().st_size < 256:
+        return
+    af = ethereal_reverb_filter_chain(amount)
+    tmp = src.with_suffix(src.suffix + f".rvb{src.suffix}")
+    cmd = [
+        str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(src),
+        "-af", af,
+        "-ar", "48000", "-ac", "2",
+        str(tmp),
+    ]
+    try:
+        from .settings_page import hidden_kwargs
+        kw = hidden_kwargs()
+    except Exception:
+        kw = {}
+        if os.name == "nt":
+            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", **kw,
+    )
+    if result.returncode != 0 or not tmp.is_file() or tmp.stat().st_size < 256:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError((result.stderr or "混响处理失败").strip())
+    try:
+        os.replace(str(tmp), str(src))
+    except OSError:
+        shutil.copyfile(str(tmp), str(src))
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def active_watermark_entries(watermarks):
     """Only enabled layers that still exist on disk (for preview + export burn)."""
     out = []
@@ -2653,8 +2737,12 @@ def escape_ffmpeg_filter_path(path):
 
 def temporary_ass_path(prefix="caption"):
     """Create a short ASCII-only ASS path outside user-selected directories."""
-    folder=Path(tempfile.gettempdir())/"video_toolkit_ass"
-    folder.mkdir(parents=True,exist_ok=True)
+    try:
+        from modules.platform_utils import instance_temp_dir
+        folder = instance_temp_dir("ass")
+    except Exception:
+        folder = Path(tempfile.gettempdir()) / "video_toolkit_ass"
+        folder.mkdir(parents=True, exist_ok=True)
     descriptor,name=tempfile.mkstemp(prefix=f"{prefix}_",suffix=".ass",dir=folder)
     os.close(descriptor)
     return Path(name)
@@ -3586,7 +3674,14 @@ class CaptionWorker(QObject):
                 # Keep libass intermediate paths short. Long source titles can exceed
                 # the Windows/libass path limit even when the source video opens fine.
                 ass = temporary_ass_path(f"caption_{short_media_id(video)}")
-                video_settings = settings_with_timeline_overlays(self.settings, edit_state)
+                # 单视频独立样式优先，否则用批量共用样式
+                base_style = dict(self.settings or {})
+                overrides = base_style.get("video_style_overrides") or {}
+                vkey = str(video.resolve())
+                per = overrides.get(vkey) or overrides.get(str(video)) or overrides.get(video.name)
+                if isinstance(per, dict) and per:
+                    base_style.update(per)
+                video_settings = settings_with_timeline_overlays(base_style, edit_state)
                 write_ass(ass, phrase_srt, video_settings, word_srt)
                 baked_watermarks={str(Path(path).resolve()) for path in self.settings.get("watermark_baked_videos",[]) }
                 watermark_already_baked=str(video.resolve()) in baked_watermarks
@@ -5091,6 +5186,10 @@ class DynamicCaptionPage(QWidget):
         self._selected_bgm_path = ""
         self._selected_ambient_path = ""  # 环境音（独立于 BGM，可上时间轴）
         self._already_renamed_videos = set()  # 合成阶段已命名的成品，导出时跳过二次命名
+        # 单视频字幕样式覆盖：有记录的视频导出/预览用独立样式，其余用批量共用样式
+        self.video_style_overrides = {}
+        self._loading_video_style = False  # 切换视频加载独立样式时不写回 override
+        self._batch_style_snapshot = None  # 最近一次批量样式快照
         self._timeline_activity_started=0.0; self._timeline_activity_label=""
         self._timeline_activity_base=0; self._timeline_activity_cap=90
         self._timeline_activity_timer=QTimer(self); self._timeline_activity_timer.setInterval(800)
@@ -5285,13 +5384,36 @@ class DynamicCaptionPage(QWidget):
         remove_scripts=QPushButton("删除选中"); remove_scripts.clicked.connect(self.tts_text.remove_selected_rows)
         script_actions.addWidget(add_script); script_actions.addWidget(paste_scripts); script_actions.addWidget(remove_scripts)
         text_tab_layout.addLayout(script_actions)
+        # 默认微软文字转语音（与图文成片页一致，试听/生成都用当前平台音色）
         self.tts_service = QComboBox(); self.tts_service.addItems(
-            ["Gemini 自然语音", "ElevenLabs API", "微软文字转语音"])
-        self.tts_voice = QComboBox(); self.tts_voice.setEditable(True); self._load_gemini_voices()
+            ["微软文字转语音", "Gemini 自然语音", "ElevenLabs API"])
+        self.tts_voice = QComboBox(); self.tts_voice.setEditable(True)
+        self._load_microsoft_voices()
         self.tts_service.currentTextChanged.connect(self.tts_service_changed)
         self.tts_generate = QPushButton("生成并入队"); self.tts_generate.setToolTip("批量生成文字配音并加入音频任务队列"); self.tts_generate.setObjectName("primary"); self.tts_generate.clicked.connect(self.generate_tts)
         tts_line1 = QHBoxLayout(); tts_line1.addWidget(self.tts_service); tts_line1.addWidget(self.tts_voice,1)
-        text_tab_layout.addLayout(tts_line1); text_tab_layout.addWidget(self.tts_generate)
+        text_tab_layout.addLayout(tts_line1)
+        # 配音音效：混响空灵（生成后用 FFmpeg 后处理）
+        tts_fx_row = QHBoxLayout()
+        self.tts_reverb_enabled = QCheckBox("空灵混响")
+        self.tts_reverb_enabled.setChecked(False)
+        self.tts_reverb_enabled.setToolTip(
+            "生成配音后叠加多层混响 + 合唱 + 立体展宽（可听出明显空灵）。\n"
+            "30% 轻；65% 推荐；100% 很强。对白清晰优先时请关闭。"
+        )
+        self.tts_reverb_amount = QSpinBox()
+        self.tts_reverb_amount.setRange(10, 100)
+        self.tts_reverb_amount.setValue(50)
+        self.tts_reverb_amount.setSuffix("%")
+        self.tts_reverb_amount.setToolTip("空灵立体：干湿混合；50% 推荐，无电流噪")
+        self.tts_reverb_amount.setEnabled(False)
+        self.tts_reverb_enabled.toggled.connect(self.tts_reverb_amount.setEnabled)
+        tts_fx_row.addWidget(self.tts_reverb_enabled)
+        tts_fx_row.addWidget(QLabel("强度"))
+        tts_fx_row.addWidget(self.tts_reverb_amount)
+        tts_fx_row.addStretch(1)
+        text_tab_layout.addLayout(tts_fx_row)
+        text_tab_layout.addWidget(self.tts_generate)
 
         group_tab = QScrollArea(); group_tab.setWidgetResizable(True)
         group_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -5343,16 +5465,26 @@ class DynamicCaptionPage(QWidget):
         sort_row.addWidget(self.group_sort_mode,1); group_layout.addLayout(sort_row)
         trim_mode_row=QHBoxLayout(); trim_mode_row.addWidget(QLabel("裁剪")); trim_mode_row.addWidget(self.group_trim_mode,1)
         group_layout.addLayout(trim_mode_row)
-        # 不转文案：合成后不自动提取字幕（快速声音边界尤其常用；与左侧「合成并转文字」联动）
+        # 不转文案：合成后不自动提取字幕；自然排序时合成阶段也不跑 ASR（改用声音边界）
         self.group_skip_transcript = QCheckBox("不转文案")
         self.group_skip_transcript.setToolTip(
-            "勾选后：分组合成完成不自动提取字幕（不跑转文字）。\n"
-            "适合「快速声音边界」大批量去口气；需要字幕时可取消勾选或事后手动提取。\n"
-            "注意：若排序为「按分段文案自动匹配」，合成过程中仍会识别语音用于排序，与本选项无关。"
+            "勾选后：\n"
+            "1）合成结束后不会自动提取字幕/转中文；\n"
+            "2）文件名自然排序时，合成阶段也不跑语音识别（强制用快速声音边界去口气）。\n"
+            "需要字幕请取消勾选，或合成后再点「批量提取」。\n"
+            "仅当排序为「按分段文案匹配」时，合成中仍会识别语音用于排序。"
         )
         self.group_skip_transcript.setChecked(False)
+        # 合成时是否按重命名规则立刻改名（默认关；导出时再命名）
+        self.group_rename_on_merge = QCheckBox("合成后自动重命名")
+        self.group_rename_on_merge.setChecked(False)
+        self.group_rename_on_merge.setToolTip(
+            "默认不勾选：合成成品保留原文件名，到「批量导出」再按重命名规则命名。\n"
+            "勾选后：合成结束立刻按下方/导出区的重命名规则改名（前缀、标题列表等请先填好）。"
+        )
         skip_row = QHBoxLayout()
         skip_row.addWidget(self.group_skip_transcript)
+        skip_row.addWidget(self.group_rename_on_merge)
         skip_row.addStretch(1)
         group_layout.addLayout(skip_row)
         self.group_head_padding.setMinimumWidth(78); self.group_tail_padding.setMinimumWidth(78)
@@ -5382,7 +5514,10 @@ class DynamicCaptionPage(QWidget):
         group_action_panel=QWidget(); self.group_action_panel=group_action_panel
         group_action_layout=QVBoxLayout(group_action_panel); group_action_layout.setContentsMargins(2,4,2,2); group_action_layout.setSpacing(5)
         self.group_auto_timeline = QCheckBox("合成并转文字"); self.group_auto_timeline.setChecked(True)
-        self.group_auto_timeline.setToolTip("与右侧「不转文案」相反：勾选则合成后自动批量提取字幕。")
+        self.group_auto_timeline.setToolTip(
+            "与「不转文案」相反：勾选则合成后自动批量提取字幕。\n"
+            "若已勾选「不转文案」，本项会自动关闭且不会提取。"
+        )
         self.group_auto_timeline.toggled.connect(self._sync_group_transcript_flags_from_auto)
         self.group_skip_transcript.toggled.connect(self._sync_group_transcript_flags_from_skip)
         self.group_trim_mode.currentTextChanged.connect(self._on_group_trim_mode_changed)
@@ -5396,7 +5531,11 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_selected.setMinimumHeight(34)
         self.group_merge_selected.clicked.connect(self._run_context_resynthesis)
         self.group_merge_report_btn = QPushButton("合成报表"); self.group_merge_report_btn.setMinimumHeight(34); self.group_merge_report_btn.clicked.connect(self._show_group_merge_report)
+        # 左侧也显示「不转文案」状态（与右侧勾选同步）
         group_action_layout.addWidget(self.group_auto_timeline)
+        if hasattr(self, "group_skip_transcript"):
+            # 再放一行提示：避免用户只看到「合成并转文字」勾着却不知道右侧「不转文案」
+            pass
         self.group_watermark_button=QPushButton("水印 / 蒙版")
         self.group_watermark_button.clicked.connect(lambda:self._open_left_setting("watermark"))
         group_action_layout.addWidget(self.group_watermark_button)
@@ -5533,16 +5672,15 @@ class DynamicCaptionPage(QWidget):
         proj_toolbar.addWidget(add_proj_btn)
         proj_toolbar.addWidget(del_proj_btn)
         proj_toolbar.addWidget(clear_proj_btn)
+        edit_proj_btn = QPushButton("✎ 编辑选中")
+        edit_proj_btn.setToolTip("打开项目弹窗查看/编辑文案、素材与配音（双击行也可）")
+        edit_proj_btn.clicked.connect(self._edit_selected_projects)
+        proj_toolbar.addWidget(edit_proj_btn)
         proj_toolbar.addStretch()
         proj_layout.insertLayout(0, proj_toolbar)
-        
-        # Large plain text editor at bottom for editing current row's script
-        self.project_script_edit = QPlainTextEdit()
-        self.project_script_edit.setPlaceholderText("在此处编辑当前选中项目的详细多行长文案...")
-        self.project_script_edit.setMinimumHeight(65)
-        self.project_script_edit.textChanged.connect(self._project_script_edit_changed)
-        proj_layout.addWidget(QLabel("选中行文案详细编辑区域:"), 0)
-        proj_layout.addWidget(self.project_script_edit, 1)
+
+        # 不再占用大块「选中行文案详细编辑」区域；文案请在项目弹窗中查看/修改
+        # 腾出位置给配音试听等功能按钮
         
         # Project tab settings form - spaced out beautifully
         proj_settings_form = QFormLayout()
@@ -5568,18 +5706,90 @@ class DynamicCaptionPage(QWidget):
         
         self.proj_tts_service = QComboBox()
         self.proj_tts_service.addItems(["微软文字转语音", "Gemini 自然语音", "ElevenLabs API"])
-        self.proj_tts_service.currentTextChanged.connect(self._on_proj_tts_service_changed)
+        self.proj_tts_service.setCurrentText("微软文字转语音")
+        self.proj_tts_service.setMinimumHeight(32)
+        self.proj_tts_service.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.proj_tts_service.setToolTip(
+            "切换平台会自动加载该平台音色列表。\n"
+            "试听/合成均使用此处选中的服务与音色，不会串台。"
+        )
         proj_settings_form.addRow("配音转写服务:", self.proj_tts_service)
         
         self.proj_tts_voice = QComboBox()
         self.proj_tts_voice.setEditable(True)
-        # Load voices matching the initial tts_voice
-        for idx in range(self.tts_voice.count()):
-            self.proj_tts_voice.addItem(self.tts_voice.itemText(idx))
-        self.proj_tts_voice.setCurrentText(self.tts_voice.currentText())
+        self.proj_tts_voice.setMinimumHeight(32)
+        self.proj_tts_voice.setMinimumContentsLength(18)
+        self.proj_tts_voice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.proj_tts_voice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # 与当前服务一致：默认微软 → 已加载微软音色
+        self._copy_tts_voices_to_project(prefer_current=True)
+        self.proj_tts_service.currentTextChanged.connect(self._on_proj_tts_service_changed)
         self.proj_tts_voice.currentTextChanged.connect(self._on_proj_tts_voice_changed)
+        # 音色单独占满一行，避免和按钮挤在一起
         proj_settings_form.addRow("语音配音音色:", self.proj_tts_voice)
+
+        # 试听单独一行，按钮更宽敞
+        self.proj_voice_preview_btn = QPushButton("▶ 试听音色")
+        self.proj_voice_preview_btn.setObjectName("primary")
+        self.proj_voice_preview_btn.setMinimumHeight(34)
+        self.proj_voice_preview_btn.setMinimumWidth(110)
+        self.proj_voice_preview_btn.setToolTip(
+            "用当前服务与音色生成一小段试听，方便确认是不是想要的声音。\n"
+            "试听文案可用当前选中项目的前几字；无文案时用默认样句。"
+        )
+        self.proj_voice_preview_btn.clicked.connect(self._preview_project_voice)
+        self.proj_voice_stop_btn = QPushButton("停止试听")
+        self.proj_voice_stop_btn.setMinimumHeight(34)
+        self.proj_voice_stop_btn.setMinimumWidth(90)
+        self.proj_voice_stop_btn.setToolTip("停止试听播放")
+        self.proj_voice_stop_btn.clicked.connect(self._stop_project_voice_preview)
+        proj_voice_actions = QHBoxLayout()
+        proj_voice_actions.setSpacing(10)
+        proj_voice_actions.addWidget(self.proj_voice_preview_btn)
+        proj_voice_actions.addWidget(self.proj_voice_stop_btn)
+        proj_voice_actions.addStretch(1)
+        proj_settings_form.addRow("", proj_voice_actions)
+
+        # 空灵混响：单独一行，勾选与强度拉开间距
+        self.proj_tts_reverb = QCheckBox("启用空灵混响")
+        self.proj_tts_reverb.setChecked(False)
+        self.proj_tts_reverb.setToolTip(
+            "生成配音后叠加多层混响 + 合唱微抖 + 立体展宽 + 空气高频。\n"
+            "30% 偏房间感；60% 明显空灵；100% 大厅/漂浮感（效果较强）。\n"
+            "试听音色时若已勾选也会带上混响，方便对比。\n"
+            "与「视频字幕 → 批量配音」页开关同步。"
+        )
+        self.proj_tts_reverb_amount = QSpinBox()
+        self.proj_tts_reverb_amount.setRange(10, 100)
+        self.proj_tts_reverb_amount.setValue(50)
+        self.proj_tts_reverb_amount.setSuffix("%")
+        self.proj_tts_reverb_amount.setMinimumWidth(88)
+        self.proj_tts_reverb_amount.setMinimumHeight(30)
+        self.proj_tts_reverb_amount.setToolTip(
+            "空灵立体（干湿混合，无电流噪）：\n"
+            "· 30% 轻空气感\n"
+            "· 50% 成片旁白空灵（推荐）\n"
+            "· 80% 更湿、更大空间，人声仍清晰"
+        )
+        self.proj_tts_reverb_amount.setEnabled(False)
+        self.proj_tts_reverb.toggled.connect(self.proj_tts_reverb_amount.setEnabled)
+        if hasattr(self, "tts_reverb_enabled"):
+            self.proj_tts_reverb.toggled.connect(self._sync_reverb_from_project)
+            self.tts_reverb_enabled.toggled.connect(self._sync_reverb_from_batch)
+            self.proj_tts_reverb_amount.valueChanged.connect(self._sync_reverb_amount_from_project)
+            self.tts_reverb_amount.valueChanged.connect(self._sync_reverb_amount_from_batch)
+        proj_reverb_row = QHBoxLayout()
+        proj_reverb_row.setSpacing(12)
+        proj_reverb_row.addWidget(self.proj_tts_reverb)
+        proj_reverb_row.addSpacing(8)
+        proj_reverb_row.addWidget(QLabel("强度"))
+        proj_reverb_row.addWidget(self.proj_tts_reverb_amount)
+        proj_reverb_row.addStretch(1)
+        proj_settings_form.addRow("配音音效:", proj_reverb_row)
         
+        # 表单本身加一点行距，整体不挤
+        proj_settings_form.setVerticalSpacing(12)
+        proj_settings_form.setHorizontalSpacing(12)
         proj_layout.addLayout(proj_settings_form)
         
         # Initialize default row
@@ -5592,6 +5802,9 @@ class DynamicCaptionPage(QWidget):
         self.proj_ai_service.currentTextChanged.connect(self._save_style_preferences)
         self.proj_tts_service.currentTextChanged.connect(self._save_style_preferences)
         self.proj_tts_voice.currentTextChanged.connect(self._save_style_preferences)
+        if hasattr(self, "proj_tts_reverb"):
+            self.proj_tts_reverb.toggled.connect(self._save_style_preferences)
+            self.proj_tts_reverb_amount.valueChanged.connect(self._save_style_preferences)
         for page in (group_tab, video_tab, audio_tab, text_tab, project_tab): source_stack.addWidget(page)
         source_tools=QVBoxLayout(); source_tools.setContentsMargins(4,0,0,0); source_tools.setSpacing(5)
         self.source_tool_buttons=[]
@@ -5917,9 +6130,26 @@ class DynamicCaptionPage(QWidget):
         form.addRow("字体",font_line); form.addRow("自然分句",phrase_line); form.addRow("每屏行数",self.max_lines); form.addRow("排版宽度",width_line); form.addRow("字幕间距",spacing_line)
         form.addRow("行间距",line_spacing_line); form.addRow("色块留白",effect_line); form.addRow("跟读动画",self.animation_speed)
         form.addRow("字幕位置",position_line); form.addRow("描边宽度",self.outline_width)
-        batch_style_hint=QLabel("✓ 样式批量应用")
-        batch_style_hint.setToolTip("每个视频、匹配音频和文案组成独立任务；这里批量套用字幕样式、蒙版与动画。")
-        batch_style_hint.setWordWrap(False); batch_style_hint.setStyleSheet("color:#67e8f9;background:#0b1830;padding:3px 6px;border-radius:5px;")
+        batch_style_row = QHBoxLayout()
+        self.batch_style_hint=QLabel("✓ 批量共用样式")
+        self.batch_style_hint.setToolTip(
+            "默认改样式 = 批量共用（所有未单独设置的视频）。\n"
+            "勾选「仅当前视频」后再改字体/颜色/预设 = 只绑到当前视频，其它仍用批量样式。"
+        )
+        self.batch_style_hint.setWordWrap(False)
+        self.batch_style_hint.setStyleSheet("color:#67e8f9;background:#0b1830;padding:3px 6px;border-radius:5px;")
+        self.style_scope_video_only = QCheckBox("仅当前视频")
+        self.style_scope_video_only.setToolTip(
+            "勾选后：后续样式调整只作用于当前选中视频，导出时该视频用独立样式。\n"
+            "不勾选：样式作为批量共用，未单独设置的视频都用它。"
+        )
+        self.clear_video_style_btn = QPushButton("清除本视频独立样式")
+        self.clear_video_style_btn.setToolTip("让当前视频重新使用批量共用样式")
+        self.clear_video_style_btn.clicked.connect(self._clear_current_video_style_override)
+        self.clear_video_style_btn.setEnabled(False)
+        batch_style_row.addWidget(self.batch_style_hint, 1)
+        batch_style_row.addWidget(self.style_scope_video_only)
+        batch_style_row.addWidget(self.clear_video_style_btn)
         colors=QGridLayout()
         self.text_color=QPushButton("普通文字 #FFFFFF")
         self.background_color=QPushButton("普通背景 #168AAD")
@@ -5977,7 +6207,7 @@ class DynamicCaptionPage(QWidget):
         compact_style_grid.setColumnStretch(1, 1)
         compact_style_grid.setColumnStretch(3, 1)
         style_controls_layout.addLayout(compact_style_grid)
-        style_controls_layout.addWidget(batch_style_hint)
+        style_controls_layout.addLayout(batch_style_row)
         style_controls_layout.addLayout(colors)
         style_controls_layout.addStretch()
         preset_panel=QWidget(); preset_panel.setMinimumWidth(130); preset_panel.setMaximumWidth(180)
@@ -6444,6 +6674,10 @@ class DynamicCaptionPage(QWidget):
         rename_layout = QVBoxLayout(rename_group); rename_layout.setContentsMargins(9,11,9,8); rename_layout.setSpacing(6)
         self.rename_enabled = QCheckBox("启用自动重命名最终成品")
         self.rename_enabled.setChecked(False)
+        self.rename_enabled.setToolTip(
+            "用于「批量导出」时按下方规则命名。\n"
+            "合成阶段默认不改名；若要在合成结束立刻改名，请在分组合成设置勾选「合成后自动重命名」。"
+        )
         rename_layout.addWidget(self.rename_enabled)
         
         rename_form = QFormLayout()
@@ -7968,8 +8202,15 @@ class DynamicCaptionPage(QWidget):
             )
             
         self._active_group_watermark_fingerprint = watermark_fingerprint if burn_watermark else ""
+        skip_transcript = hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked()
+        settings["skip_post_transcript"] = bool(skip_transcript)
+        if skip_transcript and settings.get("sort_mode") == "natural" and settings.get("trim_mode") in ("hybrid", "text"):
+            settings["trim_mode"] = "fast"
+            self._append_run_log("已勾选「不转文案」：本任务合成阶段用快速声音边界，不跑语音识别。")
         self._group_auto_extract_requested = self._group_wants_auto_transcript()
         self._group_auto_extract_pending = False
+        if not self._group_auto_extract_requested:
+            self._append_run_log("本任务已关闭自动转文字。")
         # 只更新选中组：不要清空已有合成列表与视频队列，避免其它组微调丢失
         self._group_merge_replace_queue = False
         self._group_merge_session_outputs = []
@@ -8079,10 +8320,21 @@ class DynamicCaptionPage(QWidget):
                 str(prepared_watermark_composite(ffmpeg,video,entries,cache))
             )
         self._active_group_watermark_fingerprint=watermark_fingerprint if burn_watermark else ""
+        # 不转文案：自然排序时强制快速声音边界，合成阶段也不跑 ASR
+        skip_transcript = hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked()
+        settings["skip_post_transcript"] = bool(skip_transcript)
+        if skip_transcript and settings.get("sort_mode") == "natural" and settings.get("trim_mode") in ("hybrid", "text"):
+            settings["trim_mode"] = "fast"
+            self._append_run_log(
+                "已勾选「不转文案」：合成阶段改用「快速声音边界」，不跑语音识别；"
+                "合成后也不会自动提取字幕。"
+            )
         # Lock the user's choice at task start.  Changing the checkbox while a long
         # merge is running must not unexpectedly start or suppress transcription.
         self._group_auto_extract_requested=self._group_wants_auto_transcript()
         self._group_auto_extract_pending=False
+        if not self._group_auto_extract_requested:
+            self._append_run_log("本任务已关闭自动转文字（「不转文案」或未勾选「合成并转文字」）。")
         # 全量合成：完成后用全部成品刷新队列；仍保留非分组合成的其它视频条目
         self._group_merge_replace_queue = False
         self._group_merge_session_outputs = []
@@ -8159,10 +8411,20 @@ class DynamicCaptionPage(QWidget):
             self.log.appendPlainText("正在停止当前处理；已完成内容会保留，下次可直接断点续接。")
 
     def _group_wants_auto_transcript(self):
-        """是否在合成后自动转文字。勾选「不转文案」时关闭。"""
+        """是否在合成后自动转文字。勾选「不转文案」时强制关闭。"""
         if hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked():
             return False
-        return bool(getattr(self, "group_auto_timeline", None) and self.group_auto_timeline.isChecked())
+        # 双重保险：左侧「合成并转文字」与右侧「不转文案」任一关闭转文字即不提取
+        auto_on = bool(getattr(self, "group_auto_timeline", None) and self.group_auto_timeline.isChecked())
+        if not auto_on:
+            return False
+        return True
+
+    def _group_wants_rename_on_merge(self) -> bool:
+        """合成结束是否立刻重命名。默认关；与导出区 rename_enabled 独立。"""
+        if hasattr(self, "group_rename_on_merge"):
+            return bool(self.group_rename_on_merge.isChecked())
+        return False
 
     def _sync_group_transcript_flags_from_skip(self, checked: bool):
         self._user_set_transcript_pref = True
@@ -8171,6 +8433,11 @@ class DynamicCaptionPage(QWidget):
         self.group_auto_timeline.blockSignals(True)
         self.group_auto_timeline.setChecked(not bool(checked))
         self.group_auto_timeline.blockSignals(False)
+        if checked:
+            try:
+                self._append_run_log("已勾选「不转文案」：合成后不自动提取字幕；自然排序时合成阶段也不跑语音识别。")
+            except Exception:
+                pass
 
     def _sync_group_transcript_flags_from_auto(self, checked: bool):
         self._user_set_transcript_pref = True
@@ -8280,12 +8547,14 @@ class DynamicCaptionPage(QWidget):
         return base
 
     def _auto_rename_group_merge_outputs(self) -> int:
-        """合成结束后按批量导出规则自动重命名；返回成功重命名数量。
+        """合成结束后按重命名规则立刻改名；返回成功数量。
 
-        已命名路径记入 self._already_renamed_videos，导出时跳过二次命名。
+        仅当合成区勾选「合成后自动重命名」时执行。
+        默认不改名，留给批量导出阶段命名。
         """
-        if not hasattr(self, "rename_enabled") or not self.rename_enabled.isChecked():
+        if not self._group_wants_rename_on_merge():
             return 0
+        # 合成时改名使用导出区同一套规则（前缀/标题列表等），但不要求勾选「启用自动重命名最终成品」
         session = list(getattr(self, "_group_merge_session_outputs", None) or [])
         if not session:
             session = list(getattr(self, "group_merge_outputs", None) or [])
@@ -8456,29 +8725,42 @@ class DynamicCaptionPage(QWidget):
                         session.append(path)
             except Exception:
                 pass
-            # 合成结束后若启用了自动重命名，按批量导出相同规则立刻改名
+            # 合成后重命名：仅当「合成后自动重命名」勾选；默认不改名，导出时再命名
             try:
-                renamed = self._auto_rename_group_merge_outputs()
-                if renamed:
-                    self.log.appendPlainText(
-                        f"合成后自动重命名：已处理 {renamed} 个成品（导出时将跳过二次命名）。"
-                    )
+                if self._group_wants_rename_on_merge():
+                    renamed = self._auto_rename_group_merge_outputs()
+                    if renamed:
+                        self.log.appendPlainText(
+                            f"合成后自动重命名：已处理 {renamed} 个成品。"
+                        )
+                    else:
+                        self.log.appendPlainText("合成后自动重命名：已勾选但没有需要改名的文件。")
+                else:
+                    self.log.appendPlainText("合成后未重命名（默认；可在批量导出时再命名）。")
             except Exception as rename_exc:
                 self.log.appendPlainText(f"合成后自动重命名失败（不影响成品）：{rename_exc}")
             self.progress.setValue(100)
             self._load_group_merge_outputs(auto_extract=False, only_session=only_session)
             session_n = len(getattr(self, "_group_merge_session_outputs", None) or self.group_merge_outputs)
-            # 自动转文字：仅针对本次会话新成品（避免重合成一组时重提全部字幕）
-            pending_paths = list(getattr(self, "_group_merge_session_outputs", None) or [])
-            self._group_auto_extract_paths = pending_paths if pending_paths else list(self.group_merge_outputs)
-            self._group_auto_extract_pending = bool(
-                self._group_auto_extract_requested and self._group_auto_extract_paths
-            )
-            self.log.appendPlainText(
-                f"分组合成完成：本次更新 {session_n} 个完整视频（队列中其它条目未清空）。"
-                + (" 线程释放后将仅为本次成品提取字幕。" if self._group_auto_extract_pending else " 未启用自动转文字，可稍后手动提取。")
-            )
-            self.run_status.setText("当前状态：分组合成完成" + ("，等待提取字幕" if self._group_auto_extract_pending else ""))
+            # 自动转文字：锁定在任务开始时的选择，并再次核对「不转文案」
+            want_extract = bool(self._group_auto_extract_requested) and self._group_wants_auto_transcript()
+            if not want_extract:
+                self._group_auto_extract_pending = False
+                self._group_auto_extract_paths = []
+                self.log.appendPlainText(
+                    f"分组合成完成：本次更新 {session_n} 个完整视频。"
+                    " 已跳过自动转文字（勾选了「不转文案」或未勾选「合成并转文字」）。"
+                )
+                self.run_status.setText("当前状态：分组合成完成（未转文字）")
+            else:
+                pending_paths = list(getattr(self, "_group_merge_session_outputs", None) or [])
+                self._group_auto_extract_paths = pending_paths if pending_paths else list(self.group_merge_outputs)
+                self._group_auto_extract_pending = bool(self._group_auto_extract_paths)
+                self.log.appendPlainText(
+                    f"分组合成完成：本次更新 {session_n} 个完整视频（队列中其它条目未清空）。"
+                    " 线程释放后将仅为本次成品提取字幕。"
+                )
+                self.run_status.setText("当前状态：分组合成完成，等待提取字幕")
         else:
             self._group_auto_extract_pending=False
             self._group_auto_extract_paths = []
@@ -8495,7 +8777,12 @@ class DynamicCaptionPage(QWidget):
                 self.run_status.setText("当前状态：分组合成失败，请查看日志")
 
     def _group_merge_ended(self):
-        should_extract=bool(self._group_auto_extract_pending)
+        # 结束时再拦一次：防止中途勾选变化或旧逻辑误触发
+        should_extract = (
+            bool(self._group_auto_extract_pending)
+            and bool(self._group_auto_extract_requested)
+            and self._group_wants_auto_transcript()
+        )
         extract_paths = list(getattr(self, "_group_auto_extract_paths", None) or [])
         self.group_merge_start.setEnabled(True); self.group_merge_start.setText("合成"); self.group_merge_stop.setEnabled(False); self.group_merge_selected.setEnabled(True)
         self.group_merge_worker = None; self.group_merge_thread = None
@@ -8505,7 +8792,7 @@ class DynamicCaptionPage(QWidget):
         self._group_merge_session_outputs = []
         self._group_merge_target_names = set()
         self._append_run_log("分组合成任务已释放，可以直接开始下一次任务。")
-        if should_extract:
+        if should_extract and extract_paths:
             self.run_status.setText("当前状态：合成完成，正在提取字幕")
             if extract_paths and len(extract_paths) < max(1, self.videos.count()):
                 self._append_run_log(
@@ -8515,6 +8802,8 @@ class DynamicCaptionPage(QWidget):
             else:
                 self._append_run_log("已启用“合成并转文字”：现在开始对合成成品提取字幕。")
                 QTimer.singleShot(0, self.extract_all_timelines)
+        elif not should_extract:
+            self._append_run_log("未启动自动转文字（「不转文案」或未勾选「合成并转文字」）。")
 
     def _on_task_queue_dropped(self, paths):
         videos = []
@@ -10143,11 +10432,20 @@ class DynamicCaptionPage(QWidget):
         name = item["name"]
         for btn in self.preset_buttons:
             btn.setChecked(btn.name == name)
+        # 应用预设 = 更新批量共用样式；当前若在「独立样式」视频上则也覆盖该视频
+        self._loading_video_style = False
         if item["is_custom"]:
             self._apply_style_template_data(item["data"])
             self._append_run_log(f"已应用自定义预设：{name}")
         else:
             self.apply_preset(name)
+        self._remember_batch_style_snapshot()
+        # 若当前视频已有独立样式，预设也写入该视频（用户主动点预设）
+        if self._has_video_style_override():
+            self._mark_current_video_style_override()
+        else:
+            # 批量样式变化不自动给未标记视频写 override
+            self._update_batch_style_hint()
 
     def _delete_preset_by_index(self, idx):
         if idx < 0 or idx >= len(self.all_presets):
@@ -10524,6 +10822,113 @@ class DynamicCaptionPage(QWidget):
             )
         except Exception:
             pass
+        # 样式写入：勾选「仅当前视频」→ 独立样式；否则更新批量共用快照
+        try:
+            if not getattr(self, "_loading_video_style", False) and not getattr(self, "_restoring_style", False):
+                if hasattr(self, "style_scope_video_only") and self.style_scope_video_only.isChecked():
+                    self._mark_current_video_style_override()
+                else:
+                    self._remember_batch_style_snapshot()
+                    # 若当前视频已有独立样式且未勾选「仅当前视频」，不覆盖独立样式
+                    self._update_batch_style_hint()
+        except Exception:
+            pass
+
+    def _style_override_key(self, video_path: str = "") -> str:
+        path = video_path or (self._current_video_key() if hasattr(self, "_current_video_key") else "")
+        if not path:
+            return ""
+        try:
+            return str(Path(path).resolve())
+        except Exception:
+            return str(path)
+
+    def _has_video_style_override(self, video_path: str = "") -> bool:
+        key = self._style_override_key(video_path)
+        return bool(key and key in (getattr(self, "video_style_overrides", None) or {}))
+
+    def _mark_current_video_style_override(self):
+        """把当前 UI 样式快照绑到当前选中视频。"""
+        key = self._style_override_key()
+        if not key:
+            return
+        if not hasattr(self, "video_style_overrides"):
+            self.video_style_overrides = {}
+        snap = self._style_template_snapshot() if hasattr(self, "_style_template_snapshot") else {}
+        # 也带上当前 preset 名
+        try:
+            preset = next((b.text() for b in self.preset_buttons if b.isChecked()), "")
+            if preset:
+                snap["preset"] = preset
+        except Exception:
+            pass
+        self.video_style_overrides[key] = snap
+        self._update_batch_style_hint()
+        self._live_caption_style_cache = None
+
+    def _clear_current_video_style_override(self):
+        key = self._style_override_key()
+        if key and key in getattr(self, "video_style_overrides", {}):
+            self.video_style_overrides.pop(key, None)
+            self._append_run_log(f"已清除独立样式，恢复批量共用：{Path(key).name}")
+        # 恢复批量样式到 UI
+        if getattr(self, "_batch_style_snapshot", None):
+            self._loading_video_style = True
+            try:
+                self._apply_style_template_data(self._batch_style_snapshot)
+            finally:
+                self._loading_video_style = False
+        self._update_batch_style_hint()
+        self._live_caption_style_cache = None
+        self._refresh_live_preview()
+        self._save_style_preferences()
+
+    def _update_batch_style_hint(self):
+        if not hasattr(self, "batch_style_hint"):
+            return
+        key = self._style_override_key()
+        has = self._has_video_style_override(key)
+        if hasattr(self, "clear_video_style_btn"):
+            self.clear_video_style_btn.setEnabled(bool(has))
+        if has:
+            name = Path(key).name if key else "当前视频"
+            self.batch_style_hint.setText(f"★ 本视频独立样式：{name}")
+            self.batch_style_hint.setStyleSheet(
+                "color:#fde68a;background:#422006;padding:3px 6px;border-radius:5px;"
+            )
+        else:
+            n = len(getattr(self, "video_style_overrides", {}) or {})
+            self.batch_style_hint.setText(
+                "✓ 批量共用样式" + (f"（另有 {n} 个视频独立样式）" if n else "")
+            )
+            self.batch_style_hint.setStyleSheet(
+                "color:#67e8f9;background:#0b1830;padding:3px 6px;border-radius:5px;"
+            )
+
+    def _settings_for_video_path(self, video_path: str) -> dict:
+        """导出/预览用：有独立样式则合并，否则当前批量 UI 设置。"""
+        base = self._current_settings() if hasattr(self, "_current_settings") else {}
+        key = self._style_override_key(video_path)
+        overrides = getattr(self, "video_style_overrides", None) or {}
+        per = overrides.get(key) if key else None
+        if not per:
+            # 兼容仅文件名
+            try:
+                per = overrides.get(Path(video_path).name)
+            except Exception:
+                per = None
+        if isinstance(per, dict) and per:
+            merged = dict(base)
+            merged.update(per)
+            return merged
+        return base
+
+    def _remember_batch_style_snapshot(self):
+        """在应用批量预设时记录「共用样式」快照。"""
+        try:
+            self._batch_style_snapshot = self._style_template_snapshot()
+        except Exception:
+            self._batch_style_snapshot = None
 
     def _load_style_preferences(self):
         if os.environ.get("VIDEO_TOOLKIT_DISABLE_STYLE_MEMORY")=="1": return
@@ -11066,7 +11471,16 @@ class DynamicCaptionPage(QWidget):
 
     def _paint_live_caption(self, painter, image, seconds):
         if self._live_caption_style_cache is None:
-            settings=self._current_settings()
+            # 当前选中视频若有独立样式，预览用独立样式；否则批量共用
+            settings = None
+            try:
+                key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+                if hasattr(self, "_settings_for_video_path"):
+                    settings = self._settings_for_video_path(key)
+            except Exception:
+                settings = None
+            if not settings:
+                settings = self._current_settings() if hasattr(self, "_current_settings") else {}
             preset_name = settings.get("preset")
             if preset_name in ("Reels 白字柔影", "Reels 重点放大"):
                 preset_name = "Reels 语义重点"
@@ -12116,6 +12530,9 @@ class DynamicCaptionPage(QWidget):
                 "rename_padding": self.rename_padding.value(),
                 "rename_titles": self._rename_titles_list(),
                 "already_renamed_videos": list(getattr(self, "_already_renamed_videos", set()) or []),
+                "video_style_overrides": json.loads(json.dumps(
+                    getattr(self, "video_style_overrides", {}) or {}, ensure_ascii=False
+                )),
                 "motion_tracks": json.loads(json.dumps(self.motion_tracks, ensure_ascii=False)),
                 }
 
@@ -12392,11 +12809,33 @@ class DynamicCaptionPage(QWidget):
             self.combination_label.setText(
                 f"当前任务组合：{Path(video_path).name}  ＋  {Path(source).name if source else '未匹配音频'}  ＋  "
                 f"{'已保存文案' if saved else '待填写文案'}")
+
+        # 切换视频：若有独立样式则加载到 UI；否则显示批量共用样式
+        try:
+            self._load_style_ui_for_video(video_path)
+        except Exception:
+            pass
                 
         # Debounce the heavy media loading to prevent QMediaPlayer deadlocks
         self._pending_video_path = video_path
         self._pending_video_source = source
         self.selection_debounce_timer.start()
+
+    def _load_style_ui_for_video(self, video_path: str):
+        """选中视频时：独立样式载入 UI；否则恢复批量快照。"""
+        key = self._style_override_key(video_path)
+        overrides = getattr(self, "video_style_overrides", None) or {}
+        per = overrides.get(key) if key else None
+        self._loading_video_style = True
+        try:
+            if isinstance(per, dict) and per:
+                self._apply_style_template_data(per)
+            elif getattr(self, "_batch_style_snapshot", None):
+                self._apply_style_template_data(self._batch_style_snapshot)
+            self._update_batch_style_hint()
+            self._live_caption_style_cache = None
+        finally:
+            self._loading_video_style = False
 
     def _audio_selection_changed(self, source):
         if self._syncing_media_selection: return
@@ -13450,17 +13889,51 @@ class DynamicCaptionPage(QWidget):
                 self.tts_thread = None
         self.tts_generate.setEnabled(False); self.tts_generate.setText(f"排队生成 0/{len(jobs)}")
         self.tts_thread = QThread(self)
-        self.tts_worker = BatchTtsWorker(self.tts_callable, jobs, self.tts_service.currentText(),
-                                        self.tts_voice.currentText().strip())
+        # 包装 TTS：生成后可选空灵混响
+        reverb_on = bool(getattr(self, "tts_reverb_enabled", None) and self.tts_reverb_enabled.isChecked())
+        reverb_amt = int(self.tts_reverb_amount.value()) if hasattr(self, "tts_reverb_amount") else 45
+        base_tts = self.tts_callable
+
+        def tts_with_fx(text, service, voice, destination, _base=base_tts, _on=reverb_on, _amt=reverb_amt):
+            path = _base(text, service, voice, destination)
+            if _on:
+                try:
+                    self._apply_tts_reverb_effect(path, _amt)
+                except Exception as fx_exc:
+                    # 混响失败仍返回原音频
+                    try:
+                        self._append_run_log(f"空灵混响处理失败（已保留原配音）：{fx_exc}")
+                    except Exception:
+                        pass
+            return path
+
+        self.tts_worker = BatchTtsWorker(
+            tts_with_fx, jobs, self.tts_service.currentText(),
+            self.tts_voice.currentText().strip(),
+        )
         self.tts_worker.moveToThread(self.tts_thread); self.tts_thread.started.connect(self.tts_worker.run)
         self.tts_worker.item_done.connect(self._tts_item_done)
         self.tts_worker.finished.connect(self._tts_done); self.tts_worker.finished.connect(self.tts_thread.quit)
         self.tts_thread.finished.connect(self._tts_ended); self.tts_thread.finished.connect(self.tts_thread.deleteLater)
         self.tts_thread.start()
+        if reverb_on:
+            self._append_run_log(f"配音将叠加空灵混响（强度 {reverb_amt}%）。")
 
-    def tts_service_changed(self, service):
-        if not hasattr(self, "tts_voice"): return
-        current = self.tts_voice.currentText()
+    def _apply_tts_reverb_effect(self, audio_path, amount: int = 45):
+        """FFmpeg 后处理：多层混响 + 合唱 + 立体展宽（强度拉满时更空灵明显）。"""
+        try:
+            ffmpeg = self.find_ffmpeg()
+        except Exception:
+            return
+        apply_ethereal_reverb_file(ffmpeg, audio_path, amount)
+
+    def _load_voices_for_service(self, service: str, prefer_voice: str = ""):
+        """按平台加载音色列表到 tts_voice，并尽量选中 prefer_voice（须属于该平台）。"""
+        if not hasattr(self, "tts_voice"):
+            return
+        service = str(service or "微软文字转语音")
+        prefer = str(prefer_voice or "").strip()
+        prefer_short = prefer.split("｜", 1)[0].strip()
         if service == "微软文字转语音":
             self._load_microsoft_voices()
         elif service == "Gemini 自然语音":
@@ -13472,35 +13945,87 @@ class DynamicCaptionPage(QWidget):
                 "在 ElevenLabs → Voice Library 选好多语音色，复制 Voice ID 粘贴到此。\n"
                 "密钥请在「API 密钥管理」添加（sk_ 前缀）。"
             )
-        # 尽量恢复上次选择
-        if current:
-            short = current.split("｜", 1)[0].strip()
-            if service == "微软文字转语音" and ("Neural" in short or short.endswith("Neural")):
-                # 在列表中找同 ShortName
-                for i in range(self.tts_voice.count()):
-                    if self.tts_voice.itemText(i).split("｜", 1)[0].strip() == short:
+        # 选中合法音色：优先匹配 prefer；否则平台默认第一项
+        chosen = False
+        if prefer_short:
+            for i in range(self.tts_voice.count()):
+                item = self.tts_voice.itemText(i)
+                short = item.split("｜", 1)[0].strip()
+                if short == prefer_short or item == prefer:
+                    # 校验音色是否属于该平台，避免微软列表里残留 Gemini 名
+                    if self._voice_matches_service(item, service):
                         self.tts_voice.setCurrentIndex(i)
+                        chosen = True
                         break
+        if not chosen and self.tts_voice.count() > 0:
+            # 切换平台时不要沿用上一平台的音色名
+            self.tts_voice.setCurrentIndex(0)
+
+    def _voice_matches_service(self, voice: str, service: str) -> bool:
+        """音色字符串是否像该平台的合法选项。"""
+        v = str(voice or "").strip()
+        if not v:
+            return False
+        short = v.split("｜", 1)[0].strip()
+        if service == "微软文字转语音":
+            return "Neural" in short or bool(re.match(r"^[a-z]{2}-[A-Z]{2}-", short))
+        if service == "Gemini 自然语音":
+            # Gemini 预置名多为 Kore / Aoede 等，或带中文说明
+            if "Neural" in short:
+                return False
+            if short.startswith("请粘贴"):
+                return False
+            return True
+        if service == "ElevenLabs API":
+            if "Neural" in short or short.startswith("请粘贴"):
+                return False
+            # Voice ID 通常较短字母数字
+            return len(short) >= 8 and " " not in short
+        return True
+
+    def _copy_tts_voices_to_project(self, prefer_current: bool = True):
+        """把批量配音页的音色列表同步到图文成片页。"""
+        if not hasattr(self, "proj_tts_voice") or not hasattr(self, "tts_voice"):
+            return
+        try:
+            self.proj_tts_voice.blockSignals(True)
+            cur = self.proj_tts_voice.currentText() if prefer_current else ""
+            self.proj_tts_voice.clear()
+            for i in range(self.tts_voice.count()):
+                self.proj_tts_voice.addItem(self.tts_voice.itemText(i))
+            target = self.tts_voice.currentText()
+            if cur and any(
+                self.proj_tts_voice.itemText(i) == cur
+                or self.proj_tts_voice.itemText(i).split("｜", 1)[0].strip() == cur.split("｜", 1)[0].strip()
+                for i in range(self.proj_tts_voice.count())
+            ):
+                # 仅当 cur 仍在新列表中
+                for i in range(self.proj_tts_voice.count()):
+                    if self.proj_tts_voice.itemText(i) == cur or self.proj_tts_voice.itemText(i).split("｜", 1)[0].strip() == cur.split("｜", 1)[0].strip():
+                        if self._voice_matches_service(self.proj_tts_voice.itemText(i), self.proj_tts_service.currentText() if hasattr(self, "proj_tts_service") else ""):
+                            self.proj_tts_voice.setCurrentIndex(i)
+                            break
                 else:
-                    self.tts_voice.setCurrentText(current if "｜" in current else current)
-            elif service == "Gemini 自然语音" and ("｜" in current or current):
-                self.tts_voice.setCurrentText(current)
-            elif service == "ElevenLabs API" and "Neural" not in current and "｜" not in current:
-                self.tts_voice.setCurrentText(current)
-        # 同步图文成片页音色列表
-        if hasattr(self, "proj_tts_voice") and hasattr(self, "tts_voice"):
+                    self.proj_tts_voice.setCurrentText(target)
+            else:
+                self.proj_tts_voice.setCurrentText(target)
+        finally:
+            self.proj_tts_voice.blockSignals(False)
+
+    def tts_service_changed(self, service):
+        if not hasattr(self, "tts_voice"):
+            return
+        current = self.tts_voice.currentText()
+        self._load_voices_for_service(service, prefer_voice=current)
+        # 同步图文成片：服务名 + 音色列表（与平台一致）
+        if hasattr(self, "proj_tts_service"):
             try:
-                self.proj_tts_voice.blockSignals(True)
-                cur_proj = self.proj_tts_voice.currentText()
-                self.proj_tts_voice.clear()
-                for i in range(self.tts_voice.count()):
-                    self.proj_tts_voice.addItem(self.tts_voice.itemText(i))
-                if cur_proj:
-                    self.proj_tts_voice.setCurrentText(cur_proj)
-                elif self.tts_voice.currentText():
-                    self.proj_tts_voice.setCurrentText(self.tts_voice.currentText())
+                self.proj_tts_service.blockSignals(True)
+                if self.proj_tts_service.currentText() != service:
+                    self.proj_tts_service.setCurrentText(service)
             finally:
-                self.proj_tts_voice.blockSignals(False)
+                self.proj_tts_service.blockSignals(False)
+        self._copy_tts_voices_to_project(prefer_current=False)
 
     def _tts_item_done(self, ok, result, message, index, total):
         self.tts_generate.setText(f"排队生成 {index}/{total}")
@@ -13572,6 +14097,10 @@ class DynamicCaptionPage(QWidget):
             self.preview_position_slider.blockSignals(False)
             self.preview_position_value.setText(f"距底部 {self.margin_v.value()}")
         self.update_style_preview(); self._refresh_live_preview()
+        try:
+            self._remember_batch_style_snapshot()
+        except Exception:
+            pass
         self._save_style_preferences()
 
     def update_style_preview(self):
@@ -13906,44 +14435,93 @@ class DynamicCaptionPage(QWidget):
         else:
             QMessageBox.critical(self, "生成失败", f"转场视频生成失败：\n{result}")
 
+    def _sync_reverb_from_project(self, checked: bool):
+        if not hasattr(self, "tts_reverb_enabled"):
+            return
+        if self.tts_reverb_enabled.isChecked() == bool(checked):
+            return
+        self.tts_reverb_enabled.blockSignals(True)
+        self.tts_reverb_enabled.setChecked(bool(checked))
+        self.tts_reverb_enabled.blockSignals(False)
+        if hasattr(self, "tts_reverb_amount"):
+            self.tts_reverb_amount.setEnabled(bool(checked))
+
+    def _sync_reverb_from_batch(self, checked: bool):
+        if not hasattr(self, "proj_tts_reverb"):
+            return
+        if self.proj_tts_reverb.isChecked() == bool(checked):
+            return
+        self.proj_tts_reverb.blockSignals(True)
+        self.proj_tts_reverb.setChecked(bool(checked))
+        self.proj_tts_reverb.blockSignals(False)
+        if hasattr(self, "proj_tts_reverb_amount"):
+            self.proj_tts_reverb_amount.setEnabled(bool(checked))
+
+    def _sync_reverb_amount_from_project(self, value: int):
+        if not hasattr(self, "tts_reverb_amount"):
+            return
+        if self.tts_reverb_amount.value() == int(value):
+            return
+        self.tts_reverb_amount.blockSignals(True)
+        self.tts_reverb_amount.setValue(int(value))
+        self.tts_reverb_amount.blockSignals(False)
+
+    def _sync_reverb_amount_from_batch(self, value: int):
+        if not hasattr(self, "proj_tts_reverb_amount"):
+            return
+        if self.proj_tts_reverb_amount.value() == int(value):
+            return
+        self.proj_tts_reverb_amount.blockSignals(True)
+        self.proj_tts_reverb_amount.setValue(int(value))
+        self.proj_tts_reverb_amount.blockSignals(False)
+
     def _on_proj_tts_service_changed(self, text):
+        """图文页切换平台：加载该平台音色，并同步批量配音页。"""
+        service = str(text or "微软文字转语音")
         try:
-            if hasattr(self, "tts_service") and self.tts_service and self.tts_service.currentText() != text:
-                self.tts_service.setCurrentText(text)
+            # 直接按平台重载音色（不依赖环回信号顺序）
+            if hasattr(self, "tts_service"):
+                self.tts_service.blockSignals(True)
+                try:
+                    if self.tts_service.currentText() != service:
+                        self.tts_service.setCurrentText(service)
+                finally:
+                    self.tts_service.blockSignals(False)
+            # 换平台时不要 prefer 旧平台音色
+            self._load_voices_for_service(service, prefer_voice="")
+            self._copy_tts_voices_to_project(prefer_current=False)
+            self._append_run_log(f"图文配音平台已切换为：{service}（音色列表已更新）")
         except RuntimeError:
             pass
             
     def _on_proj_tts_voice_changed(self, text):
         try:
             if hasattr(self, "tts_voice") and self.tts_voice and self.tts_voice.currentText() != text:
-                self.tts_voice.setCurrentText(text)
+                # 仅当音色属于当前平台时才回写
+                svc = self.proj_tts_service.currentText() if hasattr(self, "proj_tts_service") else ""
+                if self._voice_matches_service(text, svc):
+                    self.tts_voice.setCurrentText(text)
         except RuntimeError:
             pass
             
     def _on_global_tts_service_changed(self, text):
+        # tts_service_changed 已负责同步；此处仅兜底
         try:
             if hasattr(self, "proj_tts_service") and self.proj_tts_service:
-                self.proj_tts_service.blockSignals(True)
-                self.proj_tts_service.setCurrentText(text)
-                self.proj_tts_service.blockSignals(False)
-        except RuntimeError:
-            pass
-            
-        # Repopulate project voices dropdown
-        try:
-            if hasattr(self, "proj_tts_voice") and self.proj_tts_voice and hasattr(self, "tts_voice") and self.tts_voice:
-                self.proj_tts_voice.blockSignals(True)
-                self.proj_tts_voice.clear()
-                for idx in range(self.tts_voice.count()):
-                    self.proj_tts_voice.addItem(self.tts_voice.itemText(idx))
-                self.proj_tts_voice.setCurrentText(self.tts_voice.currentText())
-                self.proj_tts_voice.blockSignals(False)
+                if self.proj_tts_service.currentText() != text:
+                    self.proj_tts_service.blockSignals(True)
+                    self.proj_tts_service.setCurrentText(text)
+                    self.proj_tts_service.blockSignals(False)
+                    self._copy_tts_voices_to_project(prefer_current=False)
         except RuntimeError:
             pass
             
     def _on_global_tts_voice_changed(self, text):
         try:
             if hasattr(self, "proj_tts_voice") and self.proj_tts_voice:
+                svc = self.proj_tts_service.currentText() if hasattr(self, "proj_tts_service") else ""
+                if not self._voice_matches_service(text, svc):
+                    return
                 self.proj_tts_voice.blockSignals(True)
                 self.proj_tts_voice.setCurrentText(text)
                 self.proj_tts_voice.blockSignals(False)
@@ -14165,7 +14743,6 @@ class DynamicCaptionPage(QWidget):
         self._edit_selected_projects()
 
     def _project_current_cell_changed(self, currentRow, currentColumn, previousRow, previousColumn):
-        self._refresh_project_script_edit()
         if currentRow is not None and currentRow >= 0 and currentRow != previousRow:
             data = self._project_row_data(currentRow)
             self._schedule_project_material_preview(
@@ -14241,28 +14818,129 @@ class DynamicCaptionPage(QWidget):
             self._append_run_log(f"项目素材预览失败：{Path(target).name} — {exc}")
 
     def _refresh_project_script_edit(self):
-        row = self.project_table.currentRow()
-        if row >= 0:
-            script_item = self.project_table.item(row, 1)
-            script_text = script_item.text() if script_item else ""
-            self._updating_project_script = True
-            try:
-                self.project_script_edit.setPlainText(script_text)
-            finally:
-                self._updating_project_script = False
-        else:
-            self.project_script_edit.clear()
+        """兼容旧调用：文案编辑区已移除，改为无操作。"""
+        return
 
     def _project_script_edit_changed(self):
-        if getattr(self, "_updating_project_script", False):
+        """兼容旧调用：文案编辑区已移除。"""
+        return
+
+    def _preview_project_voice(self):
+        """用当前图文页选中的平台 + 该平台音色生成短句并试听。"""
+        if not callable(getattr(self, "tts_callable", None)):
+            QMessageBox.information(self, "无法试听", "文字转语音组件不可用。")
             return
-        row = self.project_table.currentRow()
+        service = (
+            self.proj_tts_service.currentText()
+            if hasattr(self, "proj_tts_service") else "微软文字转语音"
+        )
+        # 切换后若列表未同步，先按服务重载再取音色
+        voice = (
+            self.proj_tts_voice.currentText().strip()
+            if hasattr(self, "proj_tts_voice") else ""
+        )
+        if not voice or not self._voice_matches_service(voice, service):
+            self._load_voices_for_service(service, prefer_voice="")
+            self._copy_tts_voices_to_project(prefer_current=False)
+            voice = self.proj_tts_voice.currentText().strip() if hasattr(self, "proj_tts_voice") else ""
+        if not voice or voice.startswith("请粘贴"):
+            QMessageBox.information(
+                self, "未选音色",
+                f"当前平台「{service}」没有可用音色。\n"
+                "请先在下拉框选择该平台的音色，或切换到微软/Gemini。"
+            )
+            return
+        if not self._voice_matches_service(voice, service):
+            QMessageBox.warning(
+                self, "音色与平台不匹配",
+                f"当前服务是「{service}」，但音色「{voice}」不像该平台选项。\n"
+                "请重新选择配音服务，音色列表会自动切换。"
+            )
+            return
+        # 试听文案：按平台给默认样句；有项目文案则用前几字
+        sample = ""
+        row = self.project_table.currentRow() if hasattr(self, "project_table") else -1
         if row >= 0:
             item = self.project_table.item(row, 1)
-            if not item:
-                item = QTableWidgetItem()
-                self.project_table.setItem(row, 1, item)
-            item.setText(self.project_script_edit.toPlainText())
+            raw = (item.text() if item else "").strip()
+            if raw and not (Path(raw).suffix.lower() in AUDIO_EXTENSIONS and Path(raw).is_file()):
+                sample = re.sub(r"\s+", " ", raw)[:48]
+        if not sample:
+            if service == "微软文字转语音" and voice.lower().startswith("zh"):
+                sample = "你好，这是微软语音的试听。"
+            elif service == "微软文字转语音":
+                sample = "Hello, this is a short Microsoft voice preview."
+            elif service == "Gemini 自然语音":
+                sample = "你好，这是 Gemini 语音试听。Hello from Gemini."
+            else:
+                sample = "Hello, this is a short voice preview."
+        btn = getattr(self, "proj_voice_preview_btn", None)
+        if btn:
+            btn.setEnabled(False)
+            btn.setText("生成中…")
+        QApplication.processEvents()
+        try:
+            try:
+                from modules.platform_utils import instance_temp_dir
+                cache_dir = instance_temp_dir("voice_preview")
+            except Exception:
+                cache_dir = Path(tempfile.gettempdir()) / "video_toolkit_voice_preview"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            reverb_on = bool(getattr(self, "proj_tts_reverb", None) and self.proj_tts_reverb.isChecked())
+            reverb_amt = int(self.proj_tts_reverb_amount.value()) if hasattr(self, "proj_tts_reverb_amount") else 65
+            voice_id = voice.split("｜", 1)[0].strip()
+            fp = hashlib.sha256(
+                f"{service}|{voice_id}|{sample}|{int(reverb_on)}|{reverb_amt}|v4drywet".encode("utf-8")
+            ).hexdigest()[:16]
+            out = cache_dir / f"preview_{fp}.mp3"
+            if not out.is_file() or out.stat().st_size < 256:
+                # 明确传入当前平台与音色 ID
+                self.tts_callable(sample, service, voice_id, str(out))
+                if reverb_on and out.is_file():
+                    try:
+                        self._apply_tts_reverb_effect(str(out), reverb_amt)
+                    except Exception:
+                        pass
+            if not out.is_file() or out.stat().st_size < 256:
+                raise RuntimeError(
+                    f"「{service}」未能生成试听音频。\n"
+                    "请确认：微软需网络；Gemini/ElevenLabs 需有效密钥。"
+                )
+            if not hasattr(self, "audio_player") or self.audio_player is None:
+                self.audio_player = QMediaPlayer(self)
+                self.audio_preview_output = QAudioOutput(self)
+                self.audio_player.setAudioOutput(self.audio_preview_output)
+            try:
+                self.audio_preview_output.setVolume(0.9)
+            except Exception:
+                pass
+            self.audio_player.stop()
+            self.audio_player.setSource(QUrl.fromLocalFile(str(out.resolve())))
+            self.audio_player.play()
+            self._append_run_log(
+                f"试听音色：[{service}] {voice_id}"
+                + (" + 空灵混响" if reverb_on else "")
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "试听失败",
+                f"平台：{service}\n音色：{voice}\n\n{exc}"
+            )
+            try:
+                self._append_run_log(f"试听音色失败：{service} / {voice} → {exc}")
+            except Exception:
+                pass
+        finally:
+            if btn:
+                btn.setEnabled(True)
+                btn.setText("▶ 试听音色")
+
+    def _stop_project_voice_preview(self):
+        try:
+            if hasattr(self, "audio_player") and self.audio_player is not None:
+                self.audio_player.stop()
+        except Exception:
+            pass
 
     def _add_project_row(self, name="", script="", materials="", bgm="随机分配 (全局BGM)", dim="9:16"):
         row = self.project_table.rowCount()
@@ -14394,6 +15072,11 @@ class DynamicCaptionPage(QWidget):
         settings["transition_name"] = self.proj_img_transition.currentText()
         settings["transition_duration"] = self.proj_transition_dur.value()
         settings["provider"] = self.provider.currentText()
+        # 图文配音空灵混响
+        reverb_on = bool(getattr(self, "proj_tts_reverb", None) and self.proj_tts_reverb.isChecked())
+        reverb_amt = int(self.proj_tts_reverb_amount.value()) if hasattr(self, "proj_tts_reverb_amount") else 45
+        settings["tts_reverb_enabled"] = reverb_on
+        settings["tts_reverb_amount"] = reverb_amt
         # 重新合成时允许覆盖已存在成品
         settings["force_overwrite"] = True
         
@@ -14453,18 +15136,28 @@ class DynamicCaptionPage(QWidget):
         self._append_run_log(f"图文成片：{mode_tip}（成功后覆盖同名成品，可反复重做）。")
         
         self._project_thread = QThread(self)
+        tts_svc = (
+            self.proj_tts_service.currentText()
+            if hasattr(self, "proj_tts_service") else self.tts_service.currentText()
+        )
+        tts_voi = (
+            self.proj_tts_voice.currentText()
+            if hasattr(self, "proj_tts_voice") else self.tts_voice.currentText()
+        )
         self._project_worker = ProjectGroupWorker(
             ffmpeg=ffmpeg,
             ffprobe=str(Path(ffmpeg).with_name("ffprobe" + Path(ffmpeg).suffix)),
             tts_callable=self.tts_callable,
             transcribe_callable=self.transcribe_callable,
-            tts_service=self.tts_service.currentText(),
-            tts_voice=self.tts_voice.currentText(),
+            tts_service=tts_svc,
+            tts_voice=tts_voi,
             tts_speed=getattr(self, "tts_speed", None),
             bgm_dir=bgm_dir,
             projects=projects,
             settings=settings
         )
+        if reverb_on:
+            self._append_run_log(f"图文配音已启用空灵混响（强度 {reverb_amt}%）。")
         self._project_worker.moveToThread(self._project_thread)
         self._project_thread.started.connect(self._project_worker.run)
         self._project_worker.log.connect(self._append_run_log)
@@ -14653,7 +15346,13 @@ class SlideshowWorker(QObject):
         try:
             import subprocess, shutil
             # Ensure images have same dimensions. Scale to standard 1080x1920 portrait first.
-            temp_dir = self.destination.parent / f"temp_{self.destination.stem}"
+            # Include instance/pid so multi-open jobs writing nearby do not share work dirs.
+            try:
+                from modules.platform_utils import instance_id
+                temp_suffix = instance_id()
+            except Exception:
+                temp_suffix = str(os.getpid())
+            temp_dir = self.destination.parent / f"temp_{self.destination.stem}_{temp_suffix}"
             temp_dir.mkdir(parents=True, exist_ok=True)
             
             self.log.emit(f"开始处理 {len(self.images)} 张图片，统一分辨率为 1080x1920，准备生成转场视频…")
@@ -14831,6 +15530,10 @@ class ProjectGroupWorker(QObject):
     def cancel(self):
         self.cancelled = True
 
+    def _apply_project_tts_reverb(self, audio_path, amount: int = 45):
+        """图文成片配音后处理：多层空灵混响（与批量配音同一套增强算法）。"""
+        apply_ethereal_reverb_file(self.ffmpeg, audio_path, amount)
+
     def run(self):
         import subprocess, shutil, hashlib, json, time, os, random
         from pathlib import Path
@@ -14911,7 +15614,11 @@ class ProjectGroupWorker(QObject):
                 return
                     
             tts_state = tts_path.with_suffix(".tts.json")
-            tts_fingerprint = hashlib.sha256(f"{self.tts_service}\n{self.tts_voice}\n{script}".encode("utf-8")).hexdigest()
+            reverb_on = bool(self.settings.get("tts_reverb_enabled"))
+            reverb_amt = int(self.settings.get("tts_reverb_amount", 45) or 45)
+            tts_fingerprint = hashlib.sha256(
+                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:v4drywet".encode("utf-8")
+            ).hexdigest()
                     
             reused_tts = False
             if tts_state.exists() and tts_path.exists() and tts_path.stat().st_size > 256:
@@ -14925,7 +15632,19 @@ class ProjectGroupWorker(QObject):
             if not reused_tts:
                 self.log.emit(f"正在为项目 {name} 生成语音配音...")
                 self.tts_callable(script, self.tts_service, self.tts_voice, str(tts_path))
-                tts_state.write_text(json.dumps({"fingerprint": tts_fingerprint, "service": self.tts_service, "voice": self.tts_voice}, ensure_ascii=False, indent=2), encoding="utf-8")
+                if reverb_on and Path(tts_path).is_file():
+                    try:
+                        self._apply_project_tts_reverb(tts_path, reverb_amt)
+                        self.log.emit(f"已为项目 {name} 叠加空灵混响（{reverb_amt}%）。")
+                    except Exception as rv_exc:
+                        self.log.emit(f"空灵混响失败（保留原配音）：{rv_exc}")
+                tts_state.write_text(json.dumps({
+                    "fingerprint": tts_fingerprint,
+                    "service": self.tts_service,
+                    "voice": self.tts_voice,
+                    "reverb": reverb_on,
+                    "reverb_amount": reverb_amt,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
             else:
                 self.log.emit(f"复用已生成的配音缓存: {name}")
                 

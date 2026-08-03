@@ -97,8 +97,11 @@ expression = ass_filter_expression(problem_path, settings)
 assert "ass=filename='" in expression
 temporary = temporary_ass_path("mac_export")
 try:
-    assert temporary.parent == Path(tempfile.gettempdir()) / "video_toolkit_ass"
+    # Multi-open: ASS temps live under per-instance VideoToolkit temp root.
+    parent_name = temporary.parent.name
     assert temporary.suffix == ".ass" and temporary.is_file()
+    assert parent_name == "ass" or parent_name == "video_toolkit_ass"
+    assert "VideoToolkit" in str(temporary) or "video_toolkit" in str(temporary).lower()
 finally:
     temporary.unlink(missing_ok=True)
 print("caption live/ASS layout coordinates: OK")

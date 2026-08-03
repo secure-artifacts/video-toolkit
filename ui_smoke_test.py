@@ -99,12 +99,12 @@ image_effect_name, image_effect_button = window.dynamic_caption_page.image_trans
 image_effect_button.click()
 assert image_effect_name in window.dynamic_caption_page.image_transition_selected_label.text()
 assert image_effect_button.isChecked()
-assert window.dynamic_caption_page.right_settings_stack.count() == 7
+assert window.dynamic_caption_page.right_settings_stack.count() == 6
 assert window.dynamic_caption_page.left_settings_stack.count() == 3
 assert [button.text() for button in window.dynamic_caption_page.right_setting_buttons] == [
-    "字幕识别", "字幕设置", "字幕预设", "蒙版", "视频设置", "视频效果", "图片效果",
+    "字幕识别", "字幕样式", "蒙版与图层", "字幕预设", "视频与转场", "图片效果",
 ]
-window.dynamic_caption_page._show_right_setting(3)
+window.dynamic_caption_page._show_right_setting(2)  # 蒙版与图层
 window.dynamic_caption_page._add_text_layer()
 text_row = window.dynamic_caption_page.layer_list.currentRow()
 assert window.dynamic_caption_page.layers[text_row]["type"] == "text"
@@ -114,6 +114,24 @@ assert window.dynamic_caption_page.layers[text_row]["text"] == "测试文字图�
 assert [button.text().replace("└ ", "") for button in window.dynamic_caption_page.left_setting_buttons] == [
     "上传", "编码", "输出/日志",
 ]
+# 近期功能控件：多开不挡 UI；音频模式 / 空灵 / 不转文案 / 马达加斯加语
+assert hasattr(window.dynamic_caption_page, "group_skip_transcript")
+assert hasattr(window.dynamic_caption_page, "proj_tts_reverb")
+assert hasattr(window.dynamic_caption_page, "proj_voice_preview_btn")
+assert hasattr(window.dynamic_caption_page, "video_style_overrides")
+assert hasattr(window.dynamic_caption_page, "rename_enabled")
+assert window.dynamic_caption_page.rename_enabled.isChecked() is False
+audio_items = [window.dynamic_caption_page.audio_mode.itemText(i)
+               for i in range(window.dynamic_caption_page.audio_mode.count())]
+assert "视频原声＋背景音乐＋配乐" in audio_items
+asr_items = [window.dynamic_caption_page.asr_language.itemText(i)
+             for i in range(window.dynamic_caption_page.asr_language.count())]
+assert any("Malagasy" in t or "马达加斯加" in t for t in asr_items)
+window.dynamic_caption_page.audio_mode.setCurrentText("视频原声＋背景音乐＋配乐")
+settings_triple = window.dynamic_caption_page._current_settings()
+assert settings_triple.get("bgm_enabled") is True
+assert settings_triple.get("ambient_enabled") is True
+assert window.dynamic_caption_page._get_audio_mode_internal() == "保留视频原音"
 assert window.merge_report_nav_btn.text() == "合成报表"
 assert window.dynamic_caption_page.font.currentText() == "Arial"
 assert hasattr(window.dynamic_caption_page, "writing_language")
@@ -137,7 +155,9 @@ assert window.dynamic_caption_page._get_audio_mode_internal() == "保留视频�
 window.dynamic_caption_page.audio_mode.setCurrentText("视频配音＋背景音乐")
 assert window.dynamic_caption_page._get_audio_mode_internal() == "替换为添加的音频"
 assert window.dynamic_caption_page.audio_match_mode.isHidden()
-assert not hasattr(window.dynamic_caption_page, "view_log_btn")
+# Reels 页可有「运行日志」入口；主导航也必须有全局日志
+assert hasattr(window.dynamic_caption_page, "view_log_btn")
+assert window.dynamic_caption_page.view_log_btn.text() == "运行日志"
 assert window.log_nav_btn.text() == "查看软件日志"
 assert window.settings_page.count() == 4
 assert "字体" in window.settings_page.tabText(1)
@@ -153,7 +173,7 @@ assert any("常见问题" in b.text() for b in window._help_nav_buttons)
 assert window.dynamic_caption_page.videos.isHidden()
 assert window.dynamic_caption_page.task_queue.parent() is not None
 assert window.dynamic_caption_page.watermark_opacity.value() == 100
-assert window.dynamic_caption_page.watermark_table.columnCount() == 4
+assert window.dynamic_caption_page.watermark_table.columnCount() == 5  # 启用/图层/位置/大小/透明度
 assert window.dynamic_caption_page.group_burn_watermark.isChecked() is False
 assert Path(window.dynamic_caption_page.output.text()).is_absolute()
 assert Path(window.dynamic_caption_page.output.text()).parent != Path(Path(window.dynamic_caption_page.output.text()).anchor)
@@ -196,9 +216,23 @@ extract_calls=[]
 style_page.extract_all_timelines=lambda:extract_calls.append("all")
 style_page._load_group_merge_outputs(auto_extract=True)
 qt.processEvents(); assert not extract_calls
+# 「合成并转文字」：需 pending + requested，且未勾选「不转文案」
+if hasattr(style_page, "group_skip_transcript"):
+    style_page.group_skip_transcript.setChecked(False)
 style_page._group_auto_extract_pending=True
+style_page._group_auto_extract_requested=True
+style_page._group_auto_extract_paths=["dummy_out.mp4"]
 style_page._group_merge_ended(); qt.processEvents()
-assert extract_calls==["all"]
+# QTimer.singleShot(0, ...) 需再跑事件循环
+qt.processEvents()
+assert extract_calls==["all"] or extract_calls==[]  # timer 可能下一轮
+# 强制 flush 定时器
+from PySide6.QtCore import QTimer
+for _ in range(5):
+    qt.processEvents()
+    if extract_calls:
+        break
+assert extract_calls==["all"], extract_calls
 assert window.rename_page.date_enabled.isChecked() and window.rename_page.suffix_enabled.isChecked()
 assert not window.rename_page.direct_replace.isChecked()
 assert not hasattr(window.rename_page,"subfolders") and not hasattr(window.rename_page,"task_name")
