@@ -3261,7 +3261,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     if free_mode:
                         visible_start = page_start
                         override = fr"{{\an5\pos({x:.1f},{y:.1f})}}"
-                        if free_animation == "逐字出现":
+                        if free_animation == "整段固定":
+                            # 静态段落：整页同时显示，无跟读高亮/逐词动画
+                            visible_start = page_start
+                            override = fr"{{\an5\pos({x:.1f},{y:.1f})}}"
+                        elif free_animation == "逐字出现":
                             visible_start = token_start
                             override = (fr"{{\an5\pos({x:.1f},{y:.1f})\fscx70\fscy70"
                                         fr"\t(0,{animation_ms},\fscx100\fscy100)\fad(80,80)}}")
@@ -3272,6 +3276,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             override = fr"{{\an5\move({x:.1f},{y+70:.1f},{x:.1f},{y:.1f},0,{max(220,animation_ms*2)})\fad(160,120)}}"
                         elif free_animation == "淡入淡出":
                             override = fr"{{\an5\pos({x:.1f},{y:.1f})\fad(320,320)}}"
+                        # 自由文案一律只输出 Base 层（无 Highlight 跟读）
                         if effect == "double_outline":
                             events.append(
                                 f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
@@ -3966,6 +3971,22 @@ class CaptionWorker(QObject):
                     bgm_input_index = 2 if external else 1
                     if not edit_tracks.get("bgm"):
                         command += ["-stream_loop", "-1"]
+                    # 固定起始点：优先用用户在 BGM 面板记住的 audio_offsets
+                    try:
+                        bgm_key = str(Path(bgm_file).resolve())
+                    except Exception:
+                        bgm_key = str(bgm_file)
+                    offsets = self.settings.get("audio_offsets") or {}
+                    fixed_ms = 0
+                    try:
+                        fixed_ms = max(0, int(offsets.get(bgm_key, 0) or 0))
+                    except (TypeError, ValueError):
+                        fixed_ms = 0
+                    if not fixed_ms and selected_bgm.is_file():
+                        try:
+                            fixed_ms = max(0, int(offsets.get(str(selected_bgm.resolve()), 0) or 0))
+                        except (TypeError, ValueError):
+                            fixed_ms = 0
                     if randomize_bgm:
                         import random, hashlib
                         bgm_dur = media_duration(self.ffmpeg, bgm_file)
@@ -3973,8 +3994,14 @@ class CaptionWorker(QObject):
                             h = hashlib.md5(f"{video.resolve()}_{index}_bgm_crop".encode("utf-8")).hexdigest()
                             rnd = random.Random(int(h, 16))
                             bgm_offset_ms = int(rnd.uniform(0.0, bgm_dur - 1.0) * 1000)
-                    if bgm_track_state:
-                        bgm_offset_ms=max(0,int(bgm_track_state.get("source_start",bgm_offset_ms) or 0))
+                    else:
+                        bgm_offset_ms = fixed_ms
+                    if bgm_track_state and bgm_track_state.get("source_start") is not None:
+                        # 时间轴上显式拖过源起点时优先；0 表示从文件头
+                        try:
+                            bgm_offset_ms = max(0, int(bgm_track_state.get("source_start") or 0))
+                        except (TypeError, ValueError):
+                            pass
                     if edit_tracks.get("bgm"):
                         edited_bgm=render_timeline_audio(
                             self.ffmpeg,bgm_file,edit_tracks.get("bgm"),self.output,"bgm")
@@ -3984,7 +4011,11 @@ class CaptionWorker(QObject):
                             bgm_delay_ms=0
                     if bgm_offset_ms > 0:
                         command += ["-ss", f"{bgm_offset_ms / 1000:.3f}"]
-                        self.log.emit(f"[{index + 1}/{len(self.videos)}] 背景音乐随机分配并随机截取：选用 {bgm_file.name}，随机起始裁剪点为 {bgm_offset_ms / 1000:.2f} 秒。")
+                        kind = "随机截取" if randomize_bgm else "固定起始点"
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 背景音乐{kind}：选用 {bgm_file.name}，"
+                            f"起点 {bgm_offset_ms / 1000:.2f} 秒。"
+                        )
                     command += ["-i", str(bgm_file)]
                 else:
                     bgm_input_index = None
@@ -5946,6 +5977,9 @@ class DynamicCaptionPage(QWidget):
         self.audio_start_seek=QSlider(Qt.Orientation.Horizontal); self.audio_start_seek.setRange(0,0)
         self.audio_start_seek.setToolTip("拖动选择当前音频用于对应视频时的开始节点；每条音频单独记忆")
         self.audio_start_seek.sliderMoved.connect(self._audio_start_changed)
+        self.audio_start_seek.sliderReleased.connect(
+            lambda: self._audio_start_changed(self.audio_start_seek.value())
+        )
         self.audio_start_time=QLabel("00:00"); self.audio_start_time.setFixedWidth(42)
         self.audio_start_preview=QPushButton("试听起点"); self.audio_start_preview.clicked.connect(self._preview_audio_start)
         audio_start_controls.addWidget(self.audio_start_seek,1); audio_start_controls.addWidget(self.audio_start_time); audio_start_controls.addWidget(self.audio_start_preview)
@@ -9410,9 +9444,13 @@ class DynamicCaptionPage(QWidget):
             pass
         try:
             if hasattr(self, "audio_preview_output"):
-                self.audio_preview_output.setVolume(
-                    float(self._preview_ext_volume or 0) if on and getattr(self, "_preview_external_audio", False) else 0.0
-                )
+                # 独立试听（BGM 固定起点/试听配音）始终可听；主预览配音轨仍受静音开关控制
+                if getattr(self, "_standalone_audition", False):
+                    self.audio_preview_output.setVolume(0.85)
+                elif on and getattr(self, "_preview_external_audio", False):
+                    self.audio_preview_output.setVolume(float(self._preview_ext_volume or 0) or 0.8)
+                else:
+                    self.audio_preview_output.setVolume(0.0)
         except Exception:
             pass
 
@@ -10863,6 +10901,14 @@ class DynamicCaptionPage(QWidget):
             "bgm_enabled": (
                 self.bgm_enabled.isChecked() if hasattr(self,"bgm_enabled") else False
             ),
+            "selected_bgm_path": getattr(self, "_selected_bgm_path", "") or "",
+            "selected_ambient_path": getattr(self, "_selected_ambient_path", "") or "",
+            "ambient_enabled": bool(
+                getattr(self, "ambient_enabled", None) and self.ambient_enabled.isChecked()
+            ),
+            "ambient_volume": int(
+                self.ambient_volume.value() if hasattr(self, "ambient_volume") else 20
+            ),
             "aspect_ratio": self.aspect_ratio.currentText(),
             "resolution": self.resolution.currentText(),
             "video_extend_mode": self.video_extend_mode.currentText(),
@@ -11049,6 +11095,20 @@ class DynamicCaptionPage(QWidget):
         if (saved.get("preset")=="Descript 经典黄" and saved.get("font_size")==58 and
                 saved.get("letter_spacing")==0 and saved.get("line_spacing")==116 and saved.get("margin_v")==250):
             return
+        # 整段加载期间禁止触发防抖写盘，否则 apply_preset / setCurrentText 会用半成品状态覆盖记忆
+        previous_restoring = bool(getattr(self, "_restoring_style", False))
+        self._restoring_style = True
+        try:
+            self._load_style_preferences_body(saved)
+        finally:
+            self._restoring_style = previous_restoring
+            # 加载完成后再写回一次，合并规范化字段（不丢路径）
+            try:
+                self._flush_style_preferences()
+            except Exception:
+                pass
+
+    def _load_style_preferences_body(self, saved: dict):
         preset=saved.get("preset")
         if preset in ("Reels 白字柔影", "Reels 重点放大"):
             preset = "Reels 语义重点"
@@ -11087,10 +11147,47 @@ class DynamicCaptionPage(QWidget):
                 except (TypeError,ValueError): pass
         if "bgm_dir" in saved:
             self.bgm_dir_input.setText(str(saved["bgm_dir"]))
-            if hasattr(self,"bgm_source_display") and not self.bgm_source_display.text():
-                self.bgm_source_display.setText(str(saved["bgm_dir"]))
         if "bgm_selection_mode" in saved and hasattr(self,"bgm_selection_mode"):
+            self.bgm_selection_mode.blockSignals(True)
             self.bgm_selection_mode.setCurrentText(str(saved["bgm_selection_mode"]))
+            self.bgm_selection_mode.blockSignals(False)
+        if "bgm_enabled" in saved and hasattr(self, "bgm_enabled"):
+            self.bgm_enabled.setChecked(bool(saved.get("bgm_enabled")))
+        # 固定 BGM 文件路径（随机模式下不恢复 fixed path，避免与「随机」冲突）
+        random_bgm = False
+        if hasattr(self, "bgm_selection_mode"):
+            random_bgm = str(self.bgm_selection_mode.currentText()).startswith("随机")
+        selected_bgm = str(saved.get("selected_bgm_path") or "").strip()
+        if (not random_bgm) and selected_bgm and Path(selected_bgm).is_file():
+            self._selected_bgm_path = str(Path(selected_bgm).resolve())
+            if hasattr(self, "bgm_source_display"):
+                self.bgm_source_display.setText(self._selected_bgm_path)
+            try:
+                self.load_audio_preview(self._selected_bgm_path)
+            except Exception:
+                pass
+        else:
+            if random_bgm:
+                self._selected_bgm_path = ""
+            if hasattr(self, "bgm_source_display") and saved.get("bgm_dir"):
+                self.bgm_source_display.setText(str(saved["bgm_dir"]))
+            if (not random_bgm) and saved.get("bgm_dir") and Path(str(saved["bgm_dir"])).is_file():
+                try:
+                    self.load_audio_preview(str(saved["bgm_dir"]))
+                except Exception:
+                    pass
+        ambient_path = str(saved.get("selected_ambient_path") or "").strip()
+        if ambient_path and Path(ambient_path).is_file():
+            self._selected_ambient_path = str(Path(ambient_path).resolve())
+            if hasattr(self, "ambient_source_display"):
+                self.ambient_source_display.setText(self._selected_ambient_path)
+        if "ambient_enabled" in saved and hasattr(self, "ambient_enabled"):
+            self.ambient_enabled.setChecked(bool(saved.get("ambient_enabled")))
+        if "ambient_volume" in saved and hasattr(self, "ambient_volume"):
+            try:
+                self.ambient_volume.setValue(int(saved.get("ambient_volume") or 20))
+            except (TypeError, ValueError):
+                pass
         self._audio_mode_changed(self.audio_mode.currentText())
         if "proj_img_transition" in saved and hasattr(self, "proj_img_transition"):
             self.proj_img_transition.setCurrentText(str(saved["proj_img_transition"]))
@@ -11173,28 +11270,76 @@ class DynamicCaptionPage(QWidget):
             self.output.setText(str(saved["output_dir"]))
             self.output.setToolTip(str(saved["output_dir"]))
             
-        watermark_paths = saved.get("watermark_paths", [])
+        # 水印库：优先完整 entries（含视频 Logo）；兼容旧版 paths+entries zip
         watermark_entries = saved.get("watermarks", [])
-        if isinstance(watermark_paths, list) and isinstance(watermark_entries, list):
-            valid_paths = []
-            valid_images = []
-            valid_entries = []
-            for path, entry in zip(watermark_paths, watermark_entries):
-                if Path(path).is_file():
-                    img = QImage(path)
-                    if not img.isNull():
-                        valid_paths.append(path)
-                        valid_images.append(img)
-                        valid_entries.append(entry)
-            self._watermark_paths = valid_paths
-            self._watermark_images = valid_images
-            self._watermark_entries = valid_entries
-            self._watermark_image = self._watermark_images[0] if self._watermark_images else QImage()
-            summary = "；".join(Path(path).name for path in self._watermark_paths)
-            self.company_watermark.setText(f"已添加 {len(self._watermark_paths)} 张：{summary}" if summary else "")
-            self.company_watermark.setToolTip("\n".join(self._watermark_paths))
-            self._refresh_watermark_table()
-            
+        watermark_paths = saved.get("watermark_paths", [])
+        restored_entries = []
+        restored_images = []
+        if isinstance(watermark_entries, list) and watermark_entries:
+            for item in watermark_entries:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "")
+                if not path or not Path(path).is_file():
+                    continue
+                image = load_watermark_preview_image(path)
+                if image.isNull():
+                    # 视频 Logo 仍可参与导出，预览用空图占位
+                    if Path(path).suffix.lower() not in VIDEO_EXTENSIONS:
+                        continue
+                    image = QImage(64, 64, QImage.Format.Format_ARGB32)
+                    image.fill(0)
+                entry = dict(item)
+                entry["path"] = str(Path(path).resolve())
+                if is_video_watermark_entry(entry) or Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+                    entry["media_type"] = "video"
+                else:
+                    entry["media_type"] = entry.get("media_type") or "image"
+                if "enabled" not in entry:
+                    entry["enabled"] = True
+                restored_entries.append(entry)
+                restored_images.append(image)
+        elif isinstance(watermark_paths, list):
+            for path in watermark_paths:
+                path = str(path or "")
+                if not path or not Path(path).is_file():
+                    continue
+                image = load_watermark_preview_image(path)
+                if image.isNull() and Path(path).suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                if image.isNull():
+                    image = QImage(64, 64, QImage.Format.Format_ARGB32)
+                    image.fill(0)
+                media = "video" if Path(path).suffix.lower() in VIDEO_EXTENSIONS else "image"
+                restored_entries.append({
+                    "path": str(Path(path).resolve()),
+                    "media_type": media,
+                    "mode": self.watermark_mode.currentText() if hasattr(self, "watermark_mode") else "右上角",
+                    "position": self.watermark_position.currentText() if hasattr(self, "watermark_position") else "右上",
+                    "width": self.watermark_width.value() if hasattr(self, "watermark_width") else 18,
+                    "opacity": self.watermark_opacity.value() if hasattr(self, "watermark_opacity") else 100,
+                    "margin": self.watermark_margin.value() if hasattr(self, "watermark_margin") else 24,
+                    "enabled": True,
+                })
+                restored_images.append(image)
+        if restored_entries:
+            self._watermark_entries = restored_entries
+            self._watermark_paths = [e["path"] for e in restored_entries]
+            self._watermark_images = restored_images
+            self._watermark_image = restored_images[0] if restored_images else QImage()
+            self._live_watermark_cache = None
+            self._live_watermark_static_cache = None
+            if hasattr(self, "_sync_watermark_summary_label"):
+                self._sync_watermark_summary_label()
+            else:
+                summary = "；".join(Path(p).name for p in self._watermark_paths[:4])
+                self.company_watermark.setText(
+                    f"已添加 {len(self._watermark_paths)} 项：{summary}" if summary else ""
+                )
+                self.company_watermark.setToolTip("\n".join(self._watermark_paths))
+            if hasattr(self, "_refresh_watermark_table"):
+                self._refresh_watermark_table()
+
         timeline_chinese = saved.get("timeline_chinese", {})
         if isinstance(timeline_chinese, dict):
             self.timeline_chinese = {str(k): str(v) for k, v in timeline_chinese.items()}
@@ -11621,25 +11766,36 @@ class DynamicCaptionPage(QWidget):
         if not tokens: return
         fixed_all = (settings.get("caption_mode") == "自由文案动画（不对口型）" and
                      settings.get("free_animation") == "整段固定")
+        free_static = (
+            settings.get("caption_mode") == "自由文案动画（不对口型）"
+            and settings.get("free_animation") == "整段固定"
+        )
         context=self._live_caption_style_cache["context"]; font,metrics,_gap,_line_gap,_max_line_width=context
         base_color=QColor(settings["text_color"]); outline=QColor(settings["outline_color"]); highlight=QColor(settings["highlight_color"])
         background_color=QColor(settings.get("background_color","#168AAD"))
         active_text_color=QColor(settings.get("active_text_color","#FFFFFF"))
         effect=preset["effect"]
+        # 整段固定：预览与成片均不做跟读高亮（静态段落）
+        if free_static:
+            effect = "plain"
         pen_width=max(1.0,settings["outline_width"])
         # 跟读序号：有词级轴用真实时间，否则句内均分，保证 Descript 经典黄等实时变色
-        try:
-            cut, active_word = self._resolve_karaoke_cut(seconds, tokens, active_word or "")
-        except Exception:
+        if free_static:
             cut = 0
-            if active_word:
-                for i, tok in enumerate(tokens):
-                    if tok == active_word:
-                        cut = i + 1
-                        break
-            if cut <= 0:
-                cut = 1
-                active_word = tokens[0]
+            active_word = ""
+        else:
+            try:
+                cut, active_word = self._resolve_karaoke_cut(seconds, tokens, active_word or "")
+            except Exception:
+                cut = 0
+                if active_word:
+                    for i, tok in enumerate(tokens):
+                        if tok == active_word:
+                            cut = i + 1
+                            break
+                if cut <= 0:
+                    cut = 1
+                    active_word = tokens[0]
 
         # 语义重点：整句定稿占位，只绘制已读到的词（位置与导出一致，不随逐词重排）
         if effect in ("semantic_stack", "word_scale"):
@@ -12455,16 +12611,51 @@ class DynamicCaptionPage(QWidget):
     def load_audio_preview(self,path):
         if not path or not Path(path).is_file() or not hasattr(self,"audio_player"): return
         self._audio_edit_source=str(Path(path).resolve())
+        self._standalone_audition = False
         offset=max(0,int(self.audio_offsets.get(self._audio_edit_source,0)))
-        self.audio_start_seek.setValue(offset); self.audio_start_time.setText(self._clock(offset))
-        self.audio_player.setSource(QUrl.fromLocalFile(path)); self.audio_player.setPosition(offset)
-        self.audio_play_btn.setText("试听配音")
+        if hasattr(self, "audio_start_seek"):
+            # duration 未就绪时先记下起点，durationChanged 会再校准
+            self.audio_start_seek.setValue(offset)
+            self.audio_start_time.setText(self._clock(offset))
+        self.audio_player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
+        self.audio_player.setPosition(offset)
+        if hasattr(self, "audio_play_btn"):
+            label = "试听背景音乐" if (
+                hasattr(self, "source_stack") and self.source_stack.currentIndex() == 5
+            ) else "试听配音"
+            self.audio_play_btn.setText(label)
+
+    def _begin_standalone_audition(self):
+        """BGM/配音面板独立试听：不受主预览默认静音影响。"""
+        self._standalone_audition = True
+        try:
+            if hasattr(self, "audio_preview_output"):
+                self.audio_preview_output.setVolume(0.85)
+        except Exception:
+            pass
 
     def toggle_audio_preview(self):
+        if not hasattr(self, "audio_player"):
+            return
         if self.audio_player.playbackState()==QMediaPlayer.PlaybackState.PlayingState:
-            self.audio_player.pause(); self.audio_play_btn.setText("继续试听")
+            self.audio_player.pause()
+            self._standalone_audition = False
+            self.audio_play_btn.setText("继续试听")
+            try:
+                self._apply_preview_volumes()
+            except Exception:
+                pass
         else:
-            self.audio_player.play(); self.audio_play_btn.setText("暂停试听")
+            if not self._audio_edit_source:
+                # 尚未加载：尝试当前选中 BGM
+                path = getattr(self, "_selected_bgm_path", "") or (
+                    self.bgm_dir_input.text().strip() if hasattr(self, "bgm_dir_input") else ""
+                )
+                if path and Path(path).is_file():
+                    self.load_audio_preview(path)
+            self._begin_standalone_audition()
+            self.audio_player.play()
+            self.audio_play_btn.setText("暂停试听")
 
     def _audio_position_changed(self,value):
         if not self.audio_seek.isSliderDown(): self.audio_seek.setValue(value)
@@ -12484,9 +12675,23 @@ class DynamicCaptionPage(QWidget):
         self._save_style_preferences(); self._refresh_task_queue()
 
     def _preview_audio_start(self):
-        if not self._audio_edit_source: return
+        if not self._audio_edit_source:
+            path = getattr(self, "_selected_bgm_path", "") or (
+                self.bgm_dir_input.text().strip() if hasattr(self, "bgm_dir_input") else ""
+            )
+            if path and Path(path).is_file():
+                self.load_audio_preview(path)
+            else:
+                return
         value=max(0,int(self.audio_offsets.get(self._audio_edit_source,self.audio_start_seek.value())))
-        self.audio_player.setPosition(value); self.audio_player.play(); self.audio_play_btn.setText("暂停试听")
+        self.audio_offsets[self._audio_edit_source] = value
+        self.audio_start_seek.setValue(value)
+        self.audio_start_time.setText(self._clock(value))
+        self._begin_standalone_audition()
+        self.audio_player.setPosition(value)
+        self.audio_player.play()
+        self.audio_play_btn.setText("暂停试听")
+        self._save_style_preferences()
 
     @staticmethod
     def _clock(milliseconds):
@@ -12839,8 +13044,16 @@ class DynamicCaptionPage(QWidget):
                 settings["preview_bgm_offset_ms"] = random_bgm_start_ms(
                     ffmpeg, bgm, item.text(), 0, "preview_bgm"
                 )
-            elif hasattr(self, "audio_start_seek"):
-                settings["preview_bgm_offset_ms"] = int(self.audio_start_seek.value() or 0)
+            else:
+                try:
+                    bgm_key = str(Path(bgm).resolve())
+                except Exception:
+                    bgm_key = str(bgm)
+                settings["preview_bgm_offset_ms"] = int(
+                    self.audio_offsets.get(bgm_key, 0)
+                    or (self.audio_start_seek.value() if hasattr(self, "audio_start_seek") else 0)
+                    or 0
+                )
         track_bits = []
         tracks = (edit_state.get("tracks") or {})
         if tracks.get("video"):

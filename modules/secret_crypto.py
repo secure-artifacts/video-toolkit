@@ -204,11 +204,27 @@ def _unseal_legacy(value: str) -> str:
         return ""
 
 
-def save_vault(vault: dict[str, str]) -> None:
-    """Encrypt and write the secret vault (binary). No clear-text on disk."""
+def save_vault(vault: dict[str, str], *, merge: bool = True) -> None:
+    """Encrypt and write the secret vault (binary). No clear-text on disk.
+
+    multi-open: default merge=True so one instance saving empty/partial keys
+    cannot wipe secrets still used by another window.
+    """
     path = vault_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(vault, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload = dict(vault or {})
+    if merge:
+        try:
+            existing = load_vault()
+        except Exception:
+            existing = {}
+        # Keep disk secrets unless this process provides a non-empty replacement.
+        merged = dict(existing)
+        for key, value in payload.items():
+            if value:
+                merged[key] = value
+        payload = merged
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     # Cryptographic sealing — ciphertext only is written.
     blob = _fernet().encrypt(raw)
     path.write_bytes(blob)
