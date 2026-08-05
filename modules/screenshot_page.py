@@ -8,10 +8,12 @@ import urllib.request
 import ctypes
 import logging
 import tempfile
+from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
     QTextEdit, QLineEdit, QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
-    QFrame, QFormLayout, QGroupBox, QScrollArea, QSplitter,
+    QFrame, QFormLayout, QGroupBox, QScrollArea, QSplitter, QCheckBox, QSpinBox,
+    QTabWidget,
 )
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QIcon
@@ -38,6 +40,20 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     encoding='utf-8'
 )
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp",
+    ".heic", ".heif", ".avif",
+}
+IMAGE_OUTPUT_FORMATS = {
+    "PNG（无损）": ("PNG", ".png"),
+    "WebP（无损）": ("WEBP", ".webp"),
+    "TIFF（无损）": ("TIFF", ".tiff"),
+    "BMP（无损）": ("BMP", ".bmp"),
+    "HEIF / HEIC（无损优先）": ("HEIF", ".heic"),
+    "AVIF（无损优先）": ("AVIF", ".avif"),
+    "JPEG（最高质量，有损格式）": ("JPEG", ".jpg"),
+}
 
 # --- 核心處理線程 ---
 class ProcessThread(QThread):
@@ -231,16 +247,132 @@ class ProcessThread(QThread):
         logging.info("=== 所有任务执行完毕 ===")
         self.finished_signal.emit()
 
+
+class ImageConvertThread(QThread):
+    """批量图片格式转换；无损格式保持像素，JPEG 明确按最高质量输出。"""
+    log_signal = Signal(str)
+    progress_signal = Signal(int)
+    finished_signal = Signal(int, int, str)
+
+    def __init__(self, paths, output_dir, format_label, quality=100,
+                 preserve_metadata=True, overwrite=False):
+        super().__init__()
+        self.paths = [str(Path(p)) for p in paths]
+        self.output_dir = str(output_dir)
+        self.format_label = str(format_label)
+        self.quality = max(1, min(100, int(quality)))
+        self.preserve_metadata = bool(preserve_metadata)
+        self.overwrite = bool(overwrite)
+
+    @staticmethod
+    def _register_heif():
+        try:
+            from pillow_heif import register_heif_opener, register_avif_opener
+            register_heif_opener()
+            try:
+                register_avif_opener()
+            except Exception:
+                pass
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    @staticmethod
+    def _flatten_alpha(image):
+        from PIL import Image
+        if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            background = Image.new("RGB", rgba.size, "white")
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            return background
+        return image.convert("RGB")
+
+    def _destination(self, src: Path, extension: str) -> Path:
+        out = Path(self.output_dir) / f"{src.stem}{extension}"
+        if self.overwrite or not out.exists():
+            return out
+        index = 2
+        while True:
+            candidate = out.with_name(f"{out.stem}_{index}{out.suffix}")
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def run(self):
+        try:
+            from PIL import Image, ImageOps
+        except Exception as exc:
+            self.log_signal.emit(f"❌ Pillow 不可用：{exc}")
+            self.finished_signal.emit(0, len(self.paths), self.output_dir)
+            return
+        fmt, extension = IMAGE_OUTPUT_FORMATS.get(
+            self.format_label, IMAGE_OUTPUT_FORMATS["PNG（无损）"]
+        )
+        heif_ok, heif_error = self._register_heif()
+        if (fmt in {"HEIF", "AVIF"} or any(Path(p).suffix.lower() in {".heic", ".heif", ".avif"}
+                                            for p in self.paths)) and not heif_ok:
+            self.log_signal.emit(
+                "❌ HEIF/HEIC/AVIF 编解码组件不可用。请安装或更新 pillow-heif。"
+                + (f" 详情：{heif_error}" if heif_error else "")
+            )
+            self.finished_signal.emit(0, len(self.paths), self.output_dir)
+            return
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        ok = fail = 0
+        self.log_signal.emit("════════ 图片格式转换开始 ════════")
+        self.log_signal.emit(f"输入 {len(self.paths)} 张 → {self.format_label} → {self.output_dir}")
+        for index, path_text in enumerate(self.paths, 1):
+            src = Path(path_text)
+            try:
+                with Image.open(src) as opened:
+                    opened.load()
+                    image = ImageOps.exif_transpose(opened)
+                    metadata = {}
+                    if self.preserve_metadata:
+                        exif = opened.info.get("exif")
+                        icc = opened.info.get("icc_profile")
+                        if exif:
+                            metadata["exif"] = exif
+                        if icc:
+                            metadata["icc_profile"] = icc
+                    save_options = dict(metadata)
+                    if fmt == "PNG":
+                        save_options.update(optimize=True, compress_level=9)
+                    elif fmt == "WEBP":
+                        save_options.update(lossless=True, quality=100, method=6)
+                    elif fmt == "TIFF":
+                        save_options.update(compression="tiff_lzw")
+                    elif fmt == "JPEG":
+                        image = self._flatten_alpha(image)
+                        save_options.update(quality=self.quality, subsampling=0, optimize=True)
+                    elif fmt == "BMP":
+                        image = self._flatten_alpha(image)
+                    elif fmt in {"HEIF", "AVIF"}:
+                        save_options.update(quality=100, lossless=True, chroma="444")
+                    destination = self._destination(src, extension)
+                    image.save(str(destination), format=fmt, **save_options)
+                ok += 1
+                self.log_signal.emit(
+                    f"✓ [{index}/{len(self.paths)}] {src.name} → {destination.name}"
+                )
+            except Exception as exc:
+                fail += 1
+                self.log_signal.emit(f"❌ [{index}/{len(self.paths)}] {src.name}：{exc}")
+            self.progress_signal.emit(int(index / max(1, len(self.paths)) * 100))
+        self.log_signal.emit(f"════════ 转换完成：成功 {ok}｜失败 {fail} ════════")
+        self.finished_signal.emit(ok, fail, self.output_dir)
+
 # --- 主界面 ---
 class VideoTool(QMainWindow):
     def __init__(self):
         super().__init__()
         self.last_folder = ""
+        self.image_convert_paths = []
+        self.convert_thread = None
         self.initUI()
 
     def initUI(self):
-        # 与自动流水线一致：左参数配置，右输出日志
-        self.setWindowTitle("批量截图")
+        self.setWindowTitle("图片工具")
         self.setMinimumSize(760, 620)
         self.setStyleSheet("")
 
@@ -250,10 +382,10 @@ class VideoTool(QMainWindow):
         root.setContentsMargins(18, 14, 18, 14)
         root.setSpacing(8)
 
-        title = QLabel("📷 批量截图")
+        title = QLabel("🖼 图片工具")
         title.setObjectName("heading")
         root.addWidget(title)
-        sub = QLabel("支持网络链接与本地视频；左侧配置参数，右侧查看执行日志。依赖与 FFmpeg 请在顶部「设置与组件」管理。")
+        sub = QLabel("使用标签页切换「批量截图」与「图片格式转换」。依赖与 FFmpeg 请在顶部「设置与组件」管理。")
         sub.setWordWrap(True)
         sub.setStyleSheet("color:#94a3b8;")
         root.addWidget(sub)
@@ -261,18 +393,28 @@ class VideoTool(QMainWindow):
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
 
+        # ─── 左侧面板 ─────────────────────────────
         left = QFrame()
         left.setObjectName("panel")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(12, 10, 12, 10)
         left_layout.setSpacing(8)
 
-        left_layout.addWidget(QLabel("1. 视频来源（每行一个；支持 YouTube / Facebook / Instagram / TikTok）"))
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setDocumentMode(True)
+
+        # ═══════════ Tab 1: 批量截图 ═══════════
+        tab_screenshot = QWidget()
+        tab_ss_layout = QVBoxLayout(tab_screenshot)
+        tab_ss_layout.setContentsMargins(0, 8, 0, 0)
+        tab_ss_layout.setSpacing(8)
+
+        tab_ss_layout.addWidget(QLabel("1. 视频来源（每行一个；支持 YouTube / Facebook / Instagram / TikTok）"))
         self.url_input = DropTextEdit()
         self.url_input.paths_dropped.connect(self.add_local_paths)
         self.url_input.setPlaceholderText("粘贴网络链接，或直接拖入本地视频/文件夹")
         self.url_input.setMinimumHeight(120)
-        left_layout.addWidget(self.url_input, 1)
+        tab_ss_layout.addWidget(self.url_input, 1)
         source_btns = QHBoxLayout()
         self.btn_local = QPushButton("＋ 添加本地视频")
         self.btn_local.clicked.connect(self.add_local_videos)
@@ -281,7 +423,7 @@ class VideoTool(QMainWindow):
         source_btns.addWidget(self.btn_local)
         source_btns.addWidget(self.btn_folder)
         source_btns.addStretch()
-        left_layout.addLayout(source_btns)
+        tab_ss_layout.addLayout(source_btns)
 
         params_group = QGroupBox("2. 截图参数")
         form = QFormLayout(params_group)
@@ -302,9 +444,95 @@ class VideoTool(QMainWindow):
         path_widget = QWidget()
         path_widget.setLayout(path_row)
         form.addRow("输出目录", path_widget)
-        left_layout.addWidget(params_group)
+        tab_ss_layout.addWidget(params_group)
 
-        tools = QGroupBox("3. 维护与输出")
+        self.ss_pbar = QProgressBar()
+        tab_ss_layout.addWidget(self.ss_pbar)
+        self.run_btn = QPushButton("开始批量截图")
+        self.run_btn.setObjectName("primary")
+        self.run_btn.setMinimumHeight(36)
+        self.run_btn.clicked.connect(self.start_task)
+        tab_ss_layout.addWidget(self.run_btn)
+
+        self.tab_widget.addTab(tab_screenshot, "📷 批量截图")
+
+        # ═══════════ Tab 2: 图片格式转换 ═══════════
+        tab_convert = QWidget()
+        tab_cv_layout = QVBoxLayout(tab_convert)
+        tab_cv_layout.setContentsMargins(0, 8, 0, 0)
+        tab_cv_layout.setSpacing(8)
+
+        convert_group = QGroupBox("图片格式转换（支持 HEIF / HEIC）")
+        convert_form = QFormLayout(convert_group)
+        convert_form.setContentsMargins(10, 12, 10, 10)
+        convert_form.setSpacing(7)
+        self.convert_source = QLineEdit()
+        self.convert_source.setReadOnly(True)
+        self.convert_source.setPlaceholderText("尚未选择图片；支持 JPG、PNG、WebP、TIFF、BMP、HEIF、HEIC、AVIF")
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.convert_source, 1)
+        choose_images = QPushButton("选图片")
+        choose_images.setToolTip("选择一张或多张图片进行批量格式转换")
+        choose_images.clicked.connect(self.select_convert_images)
+        choose_image_folder = QPushButton("选文件夹")
+        choose_image_folder.setToolTip("递归读取文件夹内支持的图片格式")
+        choose_image_folder.clicked.connect(self.select_convert_folder)
+        source_row.addWidget(choose_images)
+        source_row.addWidget(choose_image_folder)
+        convert_form.addRow("图片来源", source_row)
+
+        self.convert_format = QComboBox()
+        self.convert_format.addItems(list(IMAGE_OUTPUT_FORMATS))
+        self.convert_format.setCurrentText("PNG（无损）")
+        self.convert_format.setToolTip(
+            "PNG/WebP/TIFF/BMP 使用无损编码；HEIF/AVIF 使用编解码器的无损模式；"
+            "JPEG 格式本身有损，将使用最高质量和 4:4:4 色度。"
+        )
+        convert_form.addRow("目标格式", self.convert_format)
+
+        convert_options = QHBoxLayout()
+        self.convert_quality = QSpinBox()
+        self.convert_quality.setRange(80, 100)
+        self.convert_quality.setValue(100)
+        self.convert_quality.setSuffix(" %")
+        self.convert_quality.setToolTip("仅 JPEG 使用此质量；其他目标格式优先使用无损模式")
+        self.convert_metadata = QCheckBox("保留 EXIF / 色彩配置")
+        self.convert_metadata.setChecked(True)
+        self.convert_overwrite = QCheckBox("覆盖同名")
+        convert_options.addWidget(QLabel("JPEG质量"))
+        convert_options.addWidget(self.convert_quality)
+        convert_options.addWidget(self.convert_metadata)
+        convert_options.addWidget(self.convert_overwrite)
+        convert_form.addRow(convert_options)
+
+        self.convert_output = QLineEdit(os.path.join(os.path.expanduser("~"), "Pictures", "Converted"))
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.convert_output, 1)
+        choose_convert_output = QPushButton("选择")
+        choose_convert_output.clicked.connect(self.select_convert_output)
+        output_row.addWidget(choose_convert_output)
+        convert_form.addRow("保存目录", output_row)
+
+        convert_hint = QLabel("无损指像素不经有损压缩；不同色彩空间之间转换仍可能受格式能力限制。")
+        convert_hint.setWordWrap(True)
+        convert_hint.setStyleSheet("color:#94a3b8;font-size:11px;")
+        convert_form.addRow(convert_hint)
+        tab_cv_layout.addWidget(convert_group, 1)
+
+        self.cv_pbar = QProgressBar()
+        tab_cv_layout.addWidget(self.cv_pbar)
+        self.convert_btn = QPushButton("开始转换")
+        self.convert_btn.setObjectName("primary")
+        self.convert_btn.setMinimumHeight(36)
+        self.convert_btn.clicked.connect(self.start_image_conversion)
+        tab_cv_layout.addWidget(self.convert_btn)
+
+        self.tab_widget.addTab(tab_convert, "🖼 图片格式转换")
+
+        left_layout.addWidget(self.tab_widget, 1)
+
+        # ─── 公共工具栏（始终可见）───────────────────
+        tools = QGroupBox("维护与输出")
         tools_layout = QVBoxLayout(tools)
         tools_layout.setContentsMargins(10, 10, 10, 10)
         tools_layout.setSpacing(6)
@@ -330,19 +558,12 @@ class VideoTool(QMainWindow):
         tools_layout.addLayout(out_row)
         left_layout.addWidget(tools)
 
-        self.pbar = QProgressBar()
-        left_layout.addWidget(self.pbar)
-        self.run_btn = QPushButton("开始批量截图")
-        self.run_btn.setObjectName("primary")
-        self.run_btn.setMinimumHeight(36)
-        self.run_btn.clicked.connect(self.start_task)
-        left_layout.addWidget(self.run_btn)
-
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setWidget(left)
 
+        # ─── 右侧日志面板（共享）─────────────────────
         right = QFrame()
         right.setObjectName("panel")
         right_layout = QVBoxLayout(right)
@@ -393,6 +614,82 @@ class VideoTool(QMainWindow):
         existing.extend(path for path in files if path not in existing)
         self.url_input.setPlainText("\n".join(existing))
 
+    def _set_convert_paths(self, paths):
+        existing = set(self.image_convert_paths)
+        for path in paths or []:
+            resolved = str(Path(path).resolve())
+            if Path(resolved).is_file() and Path(resolved).suffix.lower() in IMAGE_EXTENSIONS:
+                existing.add(resolved)
+        self.image_convert_paths = sorted(existing, key=lambda value: value.lower())
+        if self.image_convert_paths:
+            names = "；".join(Path(p).name for p in self.image_convert_paths[:3])
+            if len(self.image_convert_paths) > 3:
+                names += "…"
+            self.convert_source.setText(f"已选 {len(self.image_convert_paths)} 张：{names}")
+            self.convert_source.setToolTip("\n".join(self.image_convert_paths))
+        else:
+            self.convert_source.clear()
+            self.convert_source.setToolTip("")
+
+    def select_convert_images(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择要转换的图片", "",
+            "图片 (*.jpg *.jpeg *.png *.webp *.tif *.tiff *.bmp *.heic *.heif *.avif);;所有文件 (*.*)",
+        )
+        self._set_convert_paths(files)
+
+    def select_convert_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
+        if not folder:
+            return
+        files = [
+            str(path) for path in Path(folder).rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        self._set_convert_paths(files)
+
+    def select_convert_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择转换图片保存目录", self.convert_output.text().strip()
+        )
+        if folder:
+            self.convert_output.setText(folder)
+
+    def start_image_conversion(self):
+        if self.convert_thread and self.convert_thread.isRunning():
+            QMessageBox.information(self, "图片转换", "当前转换任务仍在运行。")
+            return
+        if not self.image_convert_paths:
+            QMessageBox.warning(self, "图片转换", "请先选择图片或图片文件夹。")
+            return
+        output = self.convert_output.text().strip()
+        if not output:
+            QMessageBox.warning(self, "图片转换", "请选择保存目录。")
+            return
+        self.convert_btn.setEnabled(False)
+        self.cv_pbar.setValue(0)
+        self.convert_thread = ImageConvertThread(
+            self.image_convert_paths,
+            output,
+            self.convert_format.currentText(),
+            self.convert_quality.value(),
+            self.convert_metadata.isChecked(),
+            self.convert_overwrite.isChecked(),
+        )
+        self.convert_thread.log_signal.connect(self.log_view.append)
+        self.convert_thread.progress_signal.connect(self.cv_pbar.setValue)
+        self.convert_thread.finished_signal.connect(self._image_conversion_finished)
+        self.convert_thread.start()
+
+    def _image_conversion_finished(self, ok, fail, folder):
+        self.convert_btn.setEnabled(True)
+        if ok:
+            self.last_folder = folder
+            self.btn_open.setEnabled(True)
+        if fail:
+            QMessageBox.warning(self, "图片转换完成", f"成功 {ok} 张，失败 {fail} 张。详情请查看右侧日志。")
+        else:
+            QMessageBox.information(self, "图片转换完成", f"已成功转换 {ok} 张图片。")
 
 
     def clear_history(self):
@@ -408,7 +705,7 @@ class VideoTool(QMainWindow):
         self.thread = ProcessThread(urls, int(self.count_in.text()), float(self.interval_in.text()),
                                    self.path_edit.text(), self.prefix_in.text())
         self.thread.log_signal.connect(self.log_view.append)
-        self.thread.progress_signal.connect(self.pbar.setValue)
+        self.thread.progress_signal.connect(self.ss_pbar.setValue)
         self.thread.folder_ready_signal.connect(lambda p: (setattr(self, 'last_folder', p), self.btn_open.setEnabled(True)))
         self.thread.finished_signal.connect(lambda: self.run_btn.setEnabled(True))
         self.thread.start()

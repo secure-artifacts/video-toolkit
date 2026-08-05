@@ -51,6 +51,7 @@ from modules.settings_page import SettingsPage, component_bin, hidden_kwargs
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
+from modules.video_preset_page import VideoPresetPage
 from modules.text_rules import normalize_required_capitalization, normalize_subtitle_text
 from modules.metadata_page import MetadataPage
 from modules.platform_utils import (
@@ -58,10 +59,7 @@ from modules.platform_utils import (
     bundled_media_tool,
     exclusive_file_lock,
     instance_id,
-    instance_slot,
-    live_instance_count,
     media_tool_name,
-    register_instance,
     validate_media_tool,
 )
 from modules.path_picker import default_output_path
@@ -77,6 +75,7 @@ _startup_trace("tool modules ready")
 APP_NAME = "视频工具合集"
 APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.33").strip().lstrip("v") or "1.7.33"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
+_SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
 ASR_PROVIDERS = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
 PROVIDERS = ASR_PROVIDERS + ["Luma", "Kling"]
@@ -2894,7 +2893,7 @@ class MainWindow(QMainWindow):
         self.pending_upload_files = []
         self.pending_upload_records = []
         self.pending_sheet_uploads = []; self.pending_sheet_folder_url = ""
-        self.setWindowTitle(self._window_title_text())
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1380, 820)
         self.setMinimumSize(1080, 680)
         icon = resource_path("logo.ico")
@@ -2913,31 +2912,6 @@ class MainWindow(QMainWindow):
         _startup_trace("keys refreshed")
         # 启动后自动在后台静默检查更新（延迟3秒，不阻塞主UI展示）
         QTimer.singleShot(3000, lambda: self._check_update(manual=False))
-        # 多开时周期性刷新标题槽位，便于区分窗口
-        QTimer.singleShot(1500, self._refresh_multi_instance_title)
-        self._multi_title_timer = QTimer(self)
-        self._multi_title_timer.setInterval(8000)
-        self._multi_title_timer.timeout.connect(self._refresh_multi_instance_title)
-        self._multi_title_timer.start()
-
-    def _window_title_text(self) -> str:
-        try:
-            slot = instance_slot()
-            total = live_instance_count()
-        except Exception:
-            slot, total = 1, 1
-        if total > 1 or slot > 1:
-            return f"{APP_DISPLAY_NAME}  ·  多开#{slot}/{total}"
-        return APP_DISPLAY_NAME
-
-    def _refresh_multi_instance_title(self) -> None:
-        try:
-            title = self._window_title_text()
-            if self.windowTitle() != title:
-                self.setWindowTitle(title)
-        except Exception:
-            pass
-
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
@@ -2956,12 +2930,13 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(brand)
         nav_layout.addSpacing(16)
         self.nav_buttons = []
-        # 索引与 self.pages 顺序一致：0 首页 … 4 批量重命名 … 8 流水线 … 10 元数据
+        # 索引与 self.pages 顺序一致：0 首页 … 4 批量重命名 … 8 流水线 … 10 元数据 … 11 视频预设
         nav_items = (
             ("首页", 0),
-            ("批量截图", 1),
+            ("图片工具", 1),
             ("智能剪辑", 2),
             ("Reels 编辑器", 3),
+            ("视频预设", 11),
             ("批量重命名", 4),
             ("清除元数据", 10),
             ("字幕提取", 5),
@@ -3045,6 +3020,13 @@ class MainWindow(QMainWindow):
         self.metadata_page = MetadataPage()
         self.pages.addWidget(self.metadata_page)
         _startup_trace("metadata page ready")
+        self.video_preset_page = VideoPresetPage(
+            text_to_speech_fn=self._text_to_speech,
+            find_ffmpeg_fn=self._find_ffmpeg,
+        )
+        self.video_preset_page.navigate_requested.connect(self._show_page)
+        self.pages.addWidget(self.video_preset_page)
+        _startup_trace("video preset page ready")
         outer.addWidget(self.pages, 1)
         self._show_page(0)
 
@@ -3285,6 +3267,9 @@ class MainWindow(QMainWindow):
             ("▶", "Reels 编辑器",
              "• 分组合成、批量配音与字幕智能识别\n• 字幕样式、字幕校对、视频预览和公司水印\n• 每个视频对应自己的音频与文案并批量生成\n• 可选生成后上传云端并按方案填写 Google Sheets",
              "#34d399", "page:3"),
+            ("◆", "视频预设",
+             "• 固定标题/正文样式与白蒙版字幕效果\n• 按字符数自动正文字号（最小 20）\n• 时间轴、BGM 固定/随机、文案转语音\n• 预设保存导入导出与批量渲染",
+             "#f472b6", "page:11"),
             ("A↔", "视频 / 文件重命名",
              "• 文件自然排序及 Windows 安全名称处理\n• 标题、日期、前后缀和连续编号组合\n• 执行前完整预览新旧文件名\n• 多套前缀与后缀方案保存和快速切换",
              "#fbbf24", "page:4"),
@@ -3460,15 +3445,8 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("视频工具合集 · 软件运行日志")
         dialog.resize(920, 600)
         box = QVBoxLayout(dialog)
-        try:
-            slot = instance_slot()
-            total = live_instance_count()
-            multi_tip = f"当前窗口多开槽位 #{slot}/{total}；每个窗口使用独立日志文件。"
-        except Exception:
-            multi_tip = "每个多开窗口使用独立日志文件。"
         hint = QLabel(
-            "记录批处理进度、API 配额/密钥异常、自动切换和无法继续的错误，方便后续排查。\n"
-            + multi_tip
+            "记录批处理进度、API 配额/密钥异常、自动切换和无法继续的错误，方便后续排查。"
         )
         hint.setWordWrap(True); hint.setStyleSheet("color:#7dd3fc;")
         box.addWidget(hint)
@@ -4026,8 +4004,8 @@ class MainWindow(QMainWindow):
             nav_index = 7
             self.settings_page.setCurrentWidget(self.key_settings_page)
         self.pages.setCurrentIndex(index)
-        page_names={0:"首页",1:"批量截图",2:"智能剪辑",3:"Reels 编辑器",4:"批量重命名",5:"字幕提取",
-                    6:"密钥管理",7:"设置与组件",8:"自动流水线",9:"帮助",10:"清除元数据"}
+        page_names={0:"首页",1:"图片工具",2:"智能剪辑",3:"Reels 编辑器",4:"批量重命名",5:"字幕提取",
+                    6:"密钥管理",7:"设置与组件",8:"自动流水线",9:"帮助",10:"清除元数据",11:"视频预设"}
         write_app_log(f"切换页面：{page_names.get(requested_index,requested_index)}","INFO","界面")
         for btn in self.nav_buttons:
             btn.setChecked(int(btn.property("pageIndex")) == nav_index)
@@ -4966,6 +4944,60 @@ class MainWindow(QMainWindow):
             return cached.get("original", ""), cached.get("chinese", ""), cached.get("srt", "")
         return self._caption_transcribe(str(path), AUTO_PROVIDER)
 
+    @staticmethod
+    def _elevenlabs_alignment_to_srt(alignment, srt_path):
+        """VideoKit 同款：把 with-timestamps 的 character 对齐写成简易 SRT。"""
+        chars = alignment.get("characters") or []
+        starts = alignment.get("character_start_times_seconds") or []
+        ends = alignment.get("character_end_times_seconds") or []
+        if not chars or not starts or not ends:
+            return
+        n = min(len(chars), len(starts), len(ends))
+        if n <= 0:
+            return
+
+        def fmt(sec):
+            sec = max(0.0, float(sec))
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = int(sec % 60)
+            ms = int(round((sec - int(sec)) * 1000))
+            if ms >= 1000:
+                s += 1
+                ms = 0
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+        # 按停顿/标点拆成字幕块
+        delimiters = set(" \t\n，。！？,.!?;；:：\"'“”")
+        sentence_end = set("。！？.!?")
+        blocks = []
+        buf, b_start, b_end = "", None, 0.0
+        for i in range(n):
+            ch = chars[i]
+            st, en = float(starts[i]), float(ends[i])
+            if b_start is None:
+                b_start = st
+            buf += ch
+            b_end = en
+            pause = (float(starts[i + 1]) - en) if i + 1 < n else 0.0
+            end_here = (
+                i == n - 1
+                or ch in sentence_end
+                or pause >= 0.35
+                or (ch in delimiters and len(buf.strip()) >= 28)
+            )
+            if end_here:
+                clean = buf.strip()
+                if clean:
+                    blocks.append((b_start, max(b_start + 0.08, b_end), clean))
+                buf, b_start = "", None
+        if not blocks:
+            return
+        lines = []
+        for idx, (st, en, txt) in enumerate(blocks, 1):
+            lines.append(f"{idx}\n{fmt(st)} --> {fmt(en)}\n{txt}\n")
+        Path(srt_path).write_text("\n".join(lines), encoding="utf-8")
+
     def _text_to_speech(self, text, service, voice, destination):
         """生成配音；ElevenLabs 失败时自动轮换下一枚可用密钥。"""
         target = Path(destination); target.parent.mkdir(parents=True, exist_ok=True)
@@ -5161,38 +5193,108 @@ class MainWindow(QMainWindow):
 
         voice_id = voice.strip()
         if not voice_id or voice_id.endswith("Neural"):
-            raise RuntimeError("使用 ElevenLabs 时，请在音色框输入 ElevenLabs Voice ID。")
+            raise RuntimeError(
+                "使用 ElevenLabs 时，请在音色框输入 ElevenLabs Voice ID"
+                "（在 elevenlabs.io 音色库复制，不是微软 Neural 名称）。"
+            )
         candidates = self.store.candidates("ElevenLabs")
         if not candidates:
-            raise RuntimeError("没有可用的 ElevenLabs 密钥，请先到密钥管理添加并检测。")
+            raise RuntimeError(
+                "没有可用的 ElevenLabs 密钥，请先到「设置与组件 → 密钥」添加 sk_ 密钥并检测。\n"
+                "说明：开源 VideoKit 除了 API Key，还支持网页 Cookie/登录态；"
+                "本工具只走官方 xi-api-key，需在 ElevenLabs 后台创建 API Key。"
+            )
         last_error = ""
+        payload = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }
         for item in candidates:
             try:
+                # 与 VideoKit 一致：优先 with-timestamps（JSON + audio_base64，可顺带生成 SRT）
+                # 失败再回退普通 text-to-speech 原始音频流。
+                audio_bytes = None
+                ts_url = (
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+                )
                 response = requests.post(
-                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                    ts_url,
                     headers={"xi-api-key": item["key"], "Content-Type": "application/json",
-                             "Accept": "audio/mpeg"},
-                    json={"text": text, "model_id": "eleven_multilingual_v2",
-                          "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}, timeout=180)
-                if response.status_code >= 400:
+                             "Accept": "application/json"},
+                    json=payload, timeout=180,
+                )
+                if response.status_code < 400:
+                    try:
+                        data = response.json()
+                        b64 = data.get("audio_base64") or data.get("audio")
+                        if b64:
+                            import base64 as _b64
+                            audio_bytes = _b64.b64decode(b64)
+                            # 可选：把对齐信息写成同名 .srt（方便字幕同步）
+                            alignment = data.get("alignment") or data.get("normalized_alignment")
+                            if alignment and isinstance(alignment, dict):
+                                try:
+                                    self._elevenlabs_alignment_to_srt(
+                                        alignment, target.with_suffix(".srt"))
+                                except Exception:
+                                    pass
+                    except (ValueError, TypeError, KeyError) as parse_exc:
+                        last_error = f"with-timestamps 响应解析失败：{parse_exc}"
+                        audio_bytes = None
+                else:
                     last_error = response_error(response)
-                    self.store.mark_use("ElevenLabs", item["id"],
-                                        "失效" if response.status_code in (401, 403) else
-                                        "额度受限" if response.status_code == 429 else "异常", last_error)
-                    continue
-                content_type = response.headers.get("Content-Type", "").lower()
-                if len(response.content) < 256 or (content_type and "audio" not in content_type):
-                    last_error = ("接口没有返回有效音频"
-                                  f"（Content-Type: {content_type or '未知'}，{len(response.content)} 字节）")
+                    # 401/403/429 仍标记密钥状态；其它错误再试 plain 端点
+                    if response.status_code in (401, 403, 429):
+                        self.store.mark_use(
+                            "ElevenLabs", item["id"],
+                            "失效" if response.status_code in (401, 403) else "额度受限",
+                            last_error,
+                        )
+                        continue
+
+                if audio_bytes is None or len(audio_bytes) < 256:
+                    plain = requests.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                        headers={"xi-api-key": item["key"], "Content-Type": "application/json",
+                                 "Accept": "audio/mpeg"},
+                        json=payload, timeout=180,
+                    )
+                    if plain.status_code >= 400:
+                        last_error = response_error(plain)
+                        self.store.mark_use(
+                            "ElevenLabs", item["id"],
+                            "失效" if plain.status_code in (401, 403) else
+                            "额度受限" if plain.status_code == 429 else "异常",
+                            last_error,
+                        )
+                        continue
+                    content_type = plain.headers.get("Content-Type", "").lower()
+                    if len(plain.content) < 256 or (content_type and "audio" not in content_type
+                                                     and "octet" not in content_type):
+                        last_error = (
+                            "接口没有返回有效音频"
+                            f"（Content-Type: {content_type or '未知'}，{len(plain.content)} 字节）"
+                        )
+                        self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
+                        continue
+                    audio_bytes = plain.content
+
+                if not audio_bytes or len(audio_bytes) < 256:
+                    last_error = last_error or "未取得有效音频数据"
                     self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
                     continue
-                target.write_bytes(response.content)
+                target.write_bytes(audio_bytes)
                 self.store.mark_use("ElevenLabs", item["id"], "有效", "")
                 return target
             except requests.RequestException as exc:
                 last_error = f"网络请求失败：{exc}"
                 self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
-        raise RuntimeError(f"ElevenLabs 可用密钥均生成失败。最后错误：{last_error}")
+        raise RuntimeError(
+            f"ElevenLabs 可用密钥均生成失败。最后错误：{last_error}\n"
+            "排查：① Voice ID 是否正确 ② sk_ API Key 是否有效且有额度 "
+            "③ 网络是否可访问 api.elevenlabs.io（VideoKit 若用网页登录态则无需 Key，本工具需要 Key）"
+        )
 
     def _find_ffmpeg(self):
         executable = media_tool_name("ffmpeg")
@@ -5865,30 +5967,42 @@ QSplitter::handle:hover { background:#3b82f6; }
 """
 
 
+def _acquire_single_instance() -> bool:
+    """Keep one VideoToolkit window on Windows; retain the mutex for process lifetime."""
+    global _SINGLE_INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, "Local\\VideoToolkit_SingleInstance")
+        if not handle:
+            return True
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            return False
+        _SINGLE_INSTANCE_MUTEX = handle
+    except Exception:
+        return True
+    return True
+
+
 def main():
     # A damaged macOS bundle once resolved "ffmpeg" to the app bootloader.
     # Media probes must never construct a second application window.
     if os.environ.get("VIDEO_TOOLKIT_MEDIA_PROBE") == "1":
         return
+    if not _acquire_single_instance():
+        write_app_log("程序已在运行，本次重复启动已退出。", "INFO", "应用")
+        return
     _startup_trace("main entered")
-    try:
-        slot = register_instance()
-        peers = live_instance_count()
-    except Exception:
-        slot, peers = 1, 1
     write_app_log(
-        f"启动 {APP_DISPLAY_NAME} | instance={instance_id()} | 多开槽位 #{slot}/{peers}",
+        f"启动 {APP_DISPLAY_NAME} | instance={instance_id()}",
         "INFO",
         "应用",
     )
-    if peers > 1:
-        write_app_log(
-            "检测到多开：各窗口任务临时文件/日志已隔离；"
-            "请尽量使用不同「输出目录」，避免成品与断点文件互相覆盖。"
-            "全局配置（密钥/服务设置）仍共享。",
-            "INFO",
-            "多开",
-        )
     original_hook=sys.excepthook
     def log_unhandled(exc_type,exc_value,exc_traceback):
         import traceback
@@ -5916,7 +6030,7 @@ def main():
     _startup_trace(
         f"window shown platform={app.platformName()} visible={window.isVisible()} "
         f"winId={int(window.winId())} geometry={window.geometry().getRect()} "
-        f"instance={instance_id()} slot={slot}/{peers}"
+        f"instance={instance_id()}"
     )
     QTimer.singleShot(350, lambda: (window.raise_(), window.activateWindow()))
     # 打包后自动化启动检查使用；普通用户启动时不会触发。
