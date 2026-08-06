@@ -763,6 +763,73 @@ def fix_srt_overlaps(srt, gap_ms=20, min_duration_ms=80):
     return "\n\n".join(blocks)+"\n",fixed
 
 
+def align_word_srt_to_phrase_srt(word_srt, phrase_srt, old_phrase_srt=""):
+    """Make the word/karaoke track use the same clock as the visible phrase track.
+
+    Recognition providers may return overlapping word timestamps.  The phrase track is
+    subsequently repaired and can also be resized on the visual timeline.  Keeping the
+    original word cache in either case makes the highlight run on a different clock.
+    This routine preserves real word pacing when possible, but fits it monotonically
+    inside the current phrase boundaries.  Text corrections that add/remove words are
+    redistributed inside that phrase instead of reusing the wrong word by index.
+    """
+    words = parse_srt(word_srt)
+    phrases = parse_srt(phrase_srt)
+    old_phrases = parse_srt(old_phrase_srt) if old_phrase_srt else phrases
+    if not words or not phrases:
+        return word_srt or ""
+
+    result = []
+    cursor = 0
+    for index, (new_start, new_end, new_text) in enumerate(phrases):
+        new_tokens = tokens_for(new_text)
+        if not new_tokens or new_end <= new_start:
+            continue
+        if index < len(old_phrases):
+            old_start, old_end, old_text = old_phrases[index]
+            consume = max(1, len(tokens_for(old_text)))
+        else:
+            old_start, old_end = new_start, new_end
+            consume = len(new_tokens)
+        source_words = words[cursor:cursor + consume]
+        cursor += consume
+        duration = max(0.04, new_end - new_start)
+
+        if len(source_words) == len(new_tokens) and old_end > old_start + 1e-6:
+            scale = duration / (old_end - old_start)
+            raw = [
+                (
+                    new_start + (item[0] - old_start) * scale,
+                    new_start + (item[1] - old_start) * scale,
+                    token,
+                )
+                for item, token in zip(source_words, new_tokens)
+            ]
+        else:
+            step = duration / len(new_tokens)
+            raw = [
+                (new_start + step * i, new_start + step * (i + 1), token)
+                for i, token in enumerate(new_tokens)
+            ]
+
+        # Clamp provider overlaps and rounding drift.  Leave a tiny monotonic slot for
+        # every remaining word so no highlight can escape into the adjacent sentence.
+        fitted = []
+        previous_end = new_start
+        count = len(raw)
+        for word_index, (start, end, token) in enumerate(raw):
+            remaining = count - word_index - 1
+            latest_end = new_end - remaining * 0.001
+            start = max(new_start, previous_end, min(float(start), latest_end - 0.001))
+            end = min(new_end, max(start + 0.001, float(end)))
+            if end <= start:
+                end = min(new_end, start + 0.001)
+            fitted.append((start, end, token))
+            previous_end = end
+        result.extend(fitted)
+    return events_to_srt(result) if result else (word_srt or "")
+
+
 def group_word_srt(srt, max_chars=36, max_duration=4.6, max_words=999, return_fix_count=False):
     """把词级时间轴合并成便于阅读/编辑的逐句 SRT，保留首尾真实时间。"""
     words = parse_srt(srt)
@@ -1866,7 +1933,7 @@ def watermark_corner_xy(position: str, margin: int) -> tuple[str, str]:
 
 
 def video_logo_filter_chain(base_label: str, logo_specs: list) -> tuple[str, str]:
-    """Build FFmpeg fragments for looping video logos over base_label.
+    """Build FFmpeg fragments for looping video logos / full-frame effect videos.
 
     logo_specs: list of (input_index, entry_dict)
     Returns (final_video_label, filter_fragment_without_leading_semicolon).
@@ -1882,21 +1949,58 @@ def video_logo_filter_chain(base_label: str, logo_specs: list) -> tuple[str, str
         position = entry.get("position", "右上角")
         x, y = watermark_corner_xy(position, margin)
         mode = str(entry.get("mode") or "小 Logo 自定义位置")
+        usage = str(entry.get("usage") or "动态 Logo")
+        blend_label = str(entry.get("blend") or "正常叠加")
+        start_sec = max(0.0, float(entry.get("start_sec", 0) or 0))
+        end_sec = max(0.0, float(entry.get("end_sec", 0) or 0))
+        enable = (
+            f"between(t,{start_sec:.3f},{end_sec:.3f})"
+            if end_sec > start_sec else f"gte(t,{start_sec:.3f})"
+        )
         wm_a = f"wm_va{i}"
         wm_s = f"wm_vs{i}"
         base_s = f"wm_vb{i}"
         out = f"wm_vout{i}"
-        if "全屏" in mode:
+        is_effect = usage == "全屏特效" or str(entry.get("media_type")) == "effect"
+        if is_effect:
+            blend_modes = {
+                "滤色（黑底特效）": "screen",
+                "相加（光效）": "addition",
+                "柔光": "softlight",
+                "正片叠底": "multiply",
+            }
+            pre_filter = "format=rgba"
+            if blend_label == "绿幕抠除":
+                pre_filter += ",chromakey=0x00FF00:0.18:0.08"
+            if blend_label not in blend_modes:
+                pre_filter += f",colorchannelmixer=aa={opacity:.3f}"
+            parts.append(
+                f"[{inp}:v]{pre_filter}[{wm_a}];"
+                f"[{wm_a}][{current}]scale2ref=w=main_w:h=main_h[{wm_s}][{base_s}]"
+            )
+            if blend_label in blend_modes:
+                parts[-1] += (
+                    f";[{base_s}][{wm_s}]blend=all_mode={blend_modes[blend_label]}:"
+                    f"all_opacity={opacity:.3f}:enable='{enable}'[{out}]"
+                )
+            else:
+                parts[-1] += (
+                    f";[{base_s}][{wm_s}]overlay=0:0:format=auto:shortest=1:"
+                    f"eof_action=repeat:enable='{enable}'[{out}]"
+                )
+        elif "全屏" in mode:
             parts.append(
                 f"[{inp}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[{wm_a}];"
                 f"[{wm_a}][{current}]scale2ref=w=main_w:h=main_h[{wm_s}][{base_s}];"
-                f"[{base_s}][{wm_s}]overlay=0:0:format=auto:shortest=1:eof_action=repeat[{out}]"
+                f"[{base_s}][{wm_s}]overlay=0:0:format=auto:shortest=1:eof_action=repeat:"
+                f"enable='{enable}'[{out}]"
             )
         else:
             parts.append(
                 f"[{inp}:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[{wm_a}];"
                 f"[{wm_a}][{current}]scale2ref=w=main_w*{width_frac:.4f}:h=ow/mdar[{wm_s}][{base_s}];"
-                f"[{base_s}][{wm_s}]overlay={x}:{y}:format=auto:shortest=1:eof_action=repeat[{out}]"
+                f"[{base_s}][{wm_s}]overlay={x}:{y}:format=auto:shortest=1:eof_action=repeat:"
+                f"enable='{enable}'[{out}]"
             )
         current = out
     return current, ";".join(parts)
@@ -1983,7 +2087,9 @@ def watermark_config_fingerprint(watermarks):
         stat=candidate.stat()
         payload.append({"path":str(candidate.resolve()),"size":stat.st_size,"mtime":stat.st_mtime_ns,
                         "mode":item.get("mode"),"position":item.get("position"),"width":item.get("width"),
-                        "opacity":item.get("opacity"),"margin":item.get("margin")})
+                        "opacity":item.get("opacity"),"margin":item.get("margin"),
+                        "usage":item.get("usage"),"blend":item.get("blend"),
+                        "start_sec":item.get("start_sec"),"end_sec":item.get("end_sec")})
     if not payload: return ""
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -3136,7 +3242,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # could produce two highlighted words at the same time.
         phrase_words=[item for item in precise_words
                       if start-.01 <= (item[0]+item[1])/2 <= end+.01]
-        if len(phrase_words) >= len(tokens):
+        if len(phrase_words) == len(tokens):
             timings=[(phrase_words[i][0],phrase_words[i][1]) for i in range(len(tokens))]
         else:
             duration=max(.08,(end-start)/len(tokens)); timings=[(start+duration*i,min(end,start+duration*(i+1))) for i in range(len(tokens))]
@@ -5841,6 +5947,36 @@ class DynamicCaptionPage(QWidget):
         # 音色单独占满一行，避免和按钮挤在一起
         proj_settings_form.addRow("语音配音音色:", self.proj_tts_voice)
 
+        # ElevenLabs：拉取音色库 / 手动加 ID / 保存播放列表
+        el_voice_row = QHBoxLayout()
+        el_voice_row.setSpacing(8)
+        self.el_fetch_voices_btn = QPushButton("拉取音色库")
+        self.el_fetch_voices_btn.setToolTip(
+            "用密钥管理中的 ElevenLabs API Key 或网页会话，拉取账号音色库到下拉列表。"
+        )
+        self.el_fetch_voices_btn.clicked.connect(self._fetch_elevenlabs_voices)
+        self.el_add_voice_btn = QPushButton("添加 Voice ID")
+        self.el_add_voice_btn.setToolTip("手动粘贴 Voice ID（可带备注名），加入列表并写入播放列表。")
+        self.el_add_voice_btn.clicked.connect(self._add_elevenlabs_voice_manual)
+        self.el_save_playlist_btn = QPushButton("保存播放列表")
+        self.el_save_playlist_btn.setToolTip("把当前下拉中的 ElevenLabs 音色保存为播放列表（下次自动加载）。")
+        self.el_save_playlist_btn.clicked.connect(self._save_elevenlabs_voice_playlist)
+        self.el_manage_playlist_btn = QPushButton("管理列表")
+        self.el_manage_playlist_btn.setToolTip("查看/删除已保存的音色播放列表项。")
+        self.el_manage_playlist_btn.clicked.connect(self._manage_elevenlabs_voice_playlist)
+        for b in (
+            self.el_fetch_voices_btn, self.el_add_voice_btn,
+            self.el_save_playlist_btn, self.el_manage_playlist_btn,
+        ):
+            b.setMinimumHeight(30)
+            el_voice_row.addWidget(b)
+        el_voice_row.addStretch(1)
+        proj_settings_form.addRow("ElevenLabs 音色:", el_voice_row)
+        self._sync_elevenlabs_voice_buttons()
+        self.proj_tts_service.currentTextChanged.connect(
+            lambda *_: self._sync_elevenlabs_voice_buttons()
+        )
+
         # 试听单独一行，按钮更宽敞
         self.proj_voice_preview_btn = QPushButton("▶ 试听音色")
         self.proj_voice_preview_btn.setObjectName("primary")
@@ -6595,11 +6731,18 @@ class DynamicCaptionPage(QWidget):
             "可设左上/右上等位置与宽度，导出时循环叠到成片上，可与图片水印叠加。"
         )
         choose_video_logo.clicked.connect(self._choose_video_logo_watermark)
+        choose_effect_video=QPushButton("添加特效视频…")
+        choose_effect_video.setToolTip(
+            "添加粒子、光斑、下雪、烟雾等效果视频并铺满画面。\n"
+            "黑底素材建议选“滤色”，绿幕素材选择“绿幕抠除”。"
+        )
+        choose_effect_video.clicked.connect(self._choose_effect_overlay_video)
         clear_watermark=QPushButton("删除选中"); clear_watermark.clicked.connect(self._remove_selected_watermarks)
         clear_all_watermarks=QPushButton("清空库"); clear_all_watermarks.clicked.connect(self._clear_company_watermark)
         watermark_path_row.addWidget(self.company_watermark,1)
         watermark_path_row.addWidget(choose_watermark)
         watermark_path_row.addWidget(choose_video_logo)
+        watermark_path_row.addWidget(choose_effect_video)
         watermark_path_row.addWidget(clear_watermark)
         watermark_path_row.addWidget(clear_all_watermarks)
         layer_layout.addLayout(watermark_path_row)
@@ -6656,6 +6799,22 @@ class DynamicCaptionPage(QWidget):
         self.watermark_mode.setToolTip("视频 Logo 建议用「小 Logo」+ 左上/右上等角位置；全屏仅适合铺满角标动画。")
         watermark_mode_row.addWidget(QLabel("覆盖方式")); watermark_mode_row.addWidget(self.watermark_mode,1)
         layer_layout.addLayout(watermark_mode_row)
+        effect_controls=QGridLayout()
+        effect_controls.setHorizontalSpacing(6); effect_controls.setVerticalSpacing(5)
+        self.watermark_usage=QComboBox(); self.watermark_usage.addItems(["图片水印","动态 Logo","全屏特效"])
+        self.watermark_blend=QComboBox(); self.watermark_blend.addItems([
+            "正常叠加","滤色（黑底特效）","相加（光效）","柔光","正片叠底","绿幕抠除"
+        ])
+        self.watermark_blend.setEnabled(False)
+        self.watermark_start=QDoubleSpinBox(); self.watermark_start.setRange(0,86400)
+        self.watermark_start.setDecimals(2); self.watermark_start.setSuffix(" s")
+        self.watermark_end=QDoubleSpinBox(); self.watermark_end.setRange(0,86400)
+        self.watermark_end.setDecimals(2); self.watermark_end.setSpecialValueText("到结尾"); self.watermark_end.setSuffix(" s")
+        effect_controls.addWidget(QLabel("用途"),0,0); effect_controls.addWidget(self.watermark_usage,0,1)
+        effect_controls.addWidget(QLabel("混合"),0,2); effect_controls.addWidget(self.watermark_blend,0,3)
+        effect_controls.addWidget(QLabel("开始"),1,0); effect_controls.addWidget(self.watermark_start,1,1)
+        effect_controls.addWidget(QLabel("结束"),1,2); effect_controls.addWidget(self.watermark_end,1,3)
+        layer_layout.addLayout(effect_controls)
         watermark_controls=QHBoxLayout()
         self.watermark_position=QComboBox()
         self.watermark_position.addItems(["右上角","左上角","右下角","左下角","画面中间"])
@@ -6669,7 +6828,10 @@ class DynamicCaptionPage(QWidget):
         layer_layout.addLayout(watermark_controls)
         self.watermark_mode.currentTextChanged.connect(self._watermark_mode_changed)
         self.watermark_position.currentTextChanged.connect(self._watermark_control_changed)
-        for control in (self.watermark_width,self.watermark_opacity,self.watermark_margin): control.valueChanged.connect(self._watermark_control_changed)
+        self.watermark_usage.currentTextChanged.connect(self._watermark_usage_changed)
+        self.watermark_blend.currentTextChanged.connect(self._watermark_control_changed)
+        for control in (self.watermark_width,self.watermark_opacity,self.watermark_margin,
+                        self.watermark_start,self.watermark_end): control.valueChanged.connect(self._watermark_control_changed)
         settings_layout.addWidget(layer_group)
         revise_group=QGroupBox("📝 3. 字幕提取与文字编辑"); revise_layout=QVBoxLayout(revise_group); revise_layout.setContentsMargins(9,11,9,8)
         provider_row=QHBoxLayout(); provider_row.addWidget(QLabel("字幕识别服务")); provider_row.addWidget(self.provider,1); revise_layout.addLayout(provider_row)
@@ -7007,6 +7169,7 @@ class DynamicCaptionPage(QWidget):
         choose_watermark.setText("添加图片")
         watermark_file_row.addWidget(choose_watermark)
         watermark_file_row.addWidget(choose_video_logo)
+        watermark_file_row.addWidget(choose_effect_video)
         watermark_file_row.addWidget(self.company_watermark,1)
         watermark_file_row.addWidget(clear_watermark)
         watermark_file_row.addWidget(clear_all_watermarks)
@@ -7036,6 +7199,12 @@ class DynamicCaptionPage(QWidget):
         watermark_mode_editor=QHBoxLayout()
         watermark_mode_editor.addWidget(QLabel("覆盖方式")); watermark_mode_editor.addWidget(self.watermark_mode,1)
         watermark_editor_layout.addLayout(watermark_mode_editor)
+        watermark_effect_editor=QGridLayout()
+        watermark_effect_editor.addWidget(QLabel("用途"),0,0); watermark_effect_editor.addWidget(self.watermark_usage,0,1)
+        watermark_effect_editor.addWidget(QLabel("混合"),0,2); watermark_effect_editor.addWidget(self.watermark_blend,0,3)
+        watermark_effect_editor.addWidget(QLabel("开始"),1,0); watermark_effect_editor.addWidget(self.watermark_start,1,1)
+        watermark_effect_editor.addWidget(QLabel("结束"),1,2); watermark_effect_editor.addWidget(self.watermark_end,1,3)
+        watermark_editor_layout.addLayout(watermark_effect_editor)
         watermark_control_editor=QHBoxLayout()
         watermark_control_editor.addWidget(QLabel("位置")); watermark_control_editor.addWidget(self.watermark_position,1)
         watermark_control_editor.addWidget(QLabel("宽度")); watermark_control_editor.addWidget(self.watermark_width)
@@ -9825,7 +9994,7 @@ class DynamicCaptionPage(QWidget):
                     if start - 0.02 <= (w[0] + w[1]) / 2 <= end + 0.02
                 ]
             # 与 write_ass 相同：词级足够则用真实时间，否则句内均分
-            if len(phrase_words) >= n:
+            if len(phrase_words) == n:
                 timings = [(float(phrase_words[i][0]), float(phrase_words[i][1])) for i in range(n)]
             else:
                 duration = max(0.08, (end - start) / n)
@@ -11640,6 +11809,10 @@ class DynamicCaptionPage(QWidget):
                 continue
             if not is_video_watermark_entry(item):
                 continue
+            start_sec = max(0.0, float(item.get("start_sec", 0) or 0))
+            end_sec = max(0.0, float(item.get("end_sec", 0) or 0))
+            if float(seconds) < start_sec or (end_sec > start_sec and float(seconds) > end_sec):
+                continue
             path = str(item.get("path") or "")
             src = watermark_animated_frame_at(path, float(seconds))
             if src.isNull():
@@ -11684,7 +11857,16 @@ class DynamicCaptionPage(QWidget):
             ):
                 image = image.convertToFormat(QImage.Format.Format_ARGB32)
             painter.save()
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            blend = str(item.get("blend") or "正常叠加")
+            preview_modes = {
+                "滤色（黑底特效）": QPainter.CompositionMode.CompositionMode_Screen,
+                "相加（光效）": QPainter.CompositionMode.CompositionMode_Plus,
+                "柔光": QPainter.CompositionMode.CompositionMode_SoftLight,
+                "正片叠底": QPainter.CompositionMode.CompositionMode_Multiply,
+            }
+            painter.setCompositionMode(
+                preview_modes.get(blend, QPainter.CompositionMode.CompositionMode_SourceOver)
+            )
             painter.setOpacity(opacity)
             painter.drawImage(int(x), int(y), image)
             painter.restore()
@@ -12217,6 +12399,13 @@ class DynamicCaptionPage(QWidget):
         self._watermark_control_changed()
         self._refresh_live_preview()
 
+    def _watermark_usage_changed(self, *_args):
+        is_effect = self.watermark_usage.currentText() == "全屏特效"
+        self.watermark_blend.setEnabled(is_effect)
+        if is_effect:
+            self.watermark_mode.setCurrentText("9:16 全屏覆盖")
+        self._watermark_control_changed()
+
     def _refresh_watermark_table(self,selected=None):
         if not hasattr(self,"watermark_table"): return
         current=self.watermark_table.currentRow() if selected is None else selected
@@ -12233,7 +12422,10 @@ class DynamicCaptionPage(QWidget):
             check.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
             check.setToolTip("勾选 = 本次预览/导出启用；取消勾选 = 保留在库中但不烧录")
             self.watermark_table.setItem(row, 0, check)
-            kind = "🎬 视频" if is_video_watermark_entry(item) else "🖼 图片"
+            if str(item.get("usage")) == "全屏特效" or str(item.get("media_type")) == "effect":
+                kind = "✨ 特效视频"
+            else:
+                kind = "🎬 动态 Logo" if is_video_watermark_entry(item) else "🖼 图片"
             mark = "✓ " if enabled else "○ "
             name = f"{mark}{kind} · {Path(item['path']).name}"
             values = (
@@ -12294,7 +12486,11 @@ class DynamicCaptionPage(QWidget):
         try:
             name_item = self.watermark_table.item(row, 1)
             if name_item is not None:
-                kind = "🎬 视频" if is_video_watermark_entry(self._watermark_entries[row]) else "🖼 图片"
+                current_entry = self._watermark_entries[row]
+                if str(current_entry.get("usage")) == "全屏特效" or str(current_entry.get("media_type")) == "effect":
+                    kind = "✨ 特效视频"
+                else:
+                    kind = "🎬 动态 Logo" if is_video_watermark_entry(current_entry) else "🖼 图片"
                 mark = "✓ " if enabled else "○ "
                 name_item.setText(f"{mark}{kind} · {Path(self._watermark_entries[row]['path']).name}")
                 name_item.setForeground(QBrush(QColor("#e2e8f0" if enabled else "#64748b")))
@@ -12367,15 +12563,24 @@ class DynamicCaptionPage(QWidget):
             return
         item=self._watermark_entries[current_row]
         controls=((self.watermark_mode,"mode"),(self.watermark_position,"position"),(self.watermark_width,"width"),
-                  (self.watermark_opacity,"opacity"),(self.watermark_margin,"margin"))
+                  (self.watermark_opacity,"opacity"),(self.watermark_margin,"margin"),
+                  (self.watermark_usage,"usage"),(self.watermark_blend,"blend"),
+                  (self.watermark_start,"start_sec"),(self.watermark_end,"end_sec"))
         for control,key in controls: control.blockSignals(True)
         try:
             self.watermark_mode.setCurrentText(item.get("mode","9:16 全屏覆盖")); self.watermark_position.setCurrentText(item.get("position","右上角"))
             self.watermark_width.setValue(int(item.get("width",18))); self.watermark_opacity.setValue(int(item.get("opacity",100))); self.watermark_margin.setValue(int(item.get("margin",28)))
+            default_usage = "动态 Logo" if is_video_watermark_entry(item) else "图片水印"
+            self.watermark_usage.setCurrentText(str(item.get("usage") or default_usage))
+            self.watermark_blend.setCurrentText(str(item.get("blend") or "正常叠加"))
+            self.watermark_start.setValue(float(item.get("start_sec",0) or 0))
+            self.watermark_end.setValue(float(item.get("end_sec",0) or 0))
         finally:
             for control,key in controls: control.blockSignals(False)
         custom=self.watermark_mode.currentText()=="小 Logo 自定义位置"
         for control in (self.watermark_position,self.watermark_width,self.watermark_margin): control.setEnabled(custom)
+        self.watermark_blend.setEnabled(self.watermark_usage.currentText()=="全屏特效")
+        self.watermark_usage.setEnabled(is_video_watermark_entry(item))
         self._update_watermark_thumb(current_row)
 
     def _watermark_control_changed(self,*_args):
@@ -12388,6 +12593,10 @@ class DynamicCaptionPage(QWidget):
                 "width":self.watermark_width.value(),
                 "opacity":self.watermark_opacity.value(),
                 "margin":self.watermark_margin.value(),
+                "usage":self.watermark_usage.currentText(),
+                "blend":self.watermark_blend.currentText(),
+                "start_sec":self.watermark_start.value(),
+                "end_sec":self.watermark_end.value(),
                 "enabled": self._watermark_entries[row].get("enabled", True),
             })
             self._refresh_watermark_table(row)
@@ -12411,16 +12620,17 @@ class DynamicCaptionPage(QWidget):
         if path in self._watermark_paths:
             return False
         ext = Path(path).suffix.lower()
+        requested_effect = media_type == "effect"
         if (
-            media_type in ("video", "gif", "animated")
+            media_type in ("video", "gif", "animated", "effect")
             or ext in ANIMATED_WATERMARK_EXTENSIONS
         ):
             image = load_watermark_preview_image(path)
             if image.isNull():
                 return False
-            media_type = "gif" if ext == ".gif" else "video"
+            media_type = "effect" if requested_effect else ("gif" if ext == ".gif" else "video")
             # 动态 Logo 默认角标，避免误开全屏盖死画面
-            mode = "小 Logo 自定义位置"
+            mode = "9:16 全屏覆盖" if requested_effect else "小 Logo 自定义位置"
             position = self.watermark_position.currentText() or "右上角"
         else:
             image = load_watermark_preview_image(path)
@@ -12439,6 +12649,10 @@ class DynamicCaptionPage(QWidget):
             "width": self.watermark_width.value(),
             "opacity": 100 if media_type == "image" else max(50, self.watermark_opacity.value()),
             "margin": self.watermark_margin.value(),
+            "usage": "全屏特效" if requested_effect else ("动态 Logo" if media_type != "image" else "图片水印"),
+            "blend": "滤色（黑底特效）" if requested_effect else "正常叠加",
+            "start_sec": 0.0,
+            "end_sec": 0.0,
             "enabled": True,  # 新加入库默认启用；可用勾选关闭
         })
         self._live_watermark_static_cache = None
@@ -12545,6 +12759,39 @@ class DynamicCaptionPage(QWidget):
             )
         if invalid:
             self._append_run_log("以下动态 Logo 无法读取，已跳过：" + "；".join(invalid))
+
+    def _choose_effect_overlay_video(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "添加全屏叠加特效视频", "",
+            "特效视频 (*.mp4 *.mov *.webm *.mkv *.m4v *.avi *.gif);;所有文件 (*.*)",
+        )
+        if not paths:
+            return
+        added = 0
+        invalid = []
+        for path in paths:
+            if self._append_watermark_entry(path, "effect"):
+                added += 1
+            elif path not in self._watermark_paths:
+                invalid.append(Path(path).name)
+        self._watermark_image = self._watermark_images[0] if self._watermark_images else QImage()
+        self._sync_watermark_summary_label()
+        self._refresh_watermark_table(len(self._watermark_entries) - 1)
+        if self._watermark_entries:
+            self.watermark_table.setCurrentCell(len(self._watermark_entries) - 1, 1)
+            self.watermark_usage.setCurrentText("全屏特效")
+            self.watermark_blend.setCurrentText("滤色（黑底特效）")
+            self.watermark_mode.setCurrentText("9:16 全屏覆盖")
+        self._live_watermark_static_cache = None
+        self._live_watermark_cache = None
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        if added:
+            self._append_run_log(
+                f"已添加 {added} 个全屏特效视频；默认使用“滤色”去除黑底并循环到成片结束。"
+            )
+        if invalid:
+            self._append_run_log("以下特效视频无法读取，已跳过：" + "；".join(invalid))
 
     def _clear_company_watermark(self):
         for p in list(getattr(self, "_watermark_paths", []) or []):
@@ -13338,7 +13585,12 @@ class DynamicCaptionPage(QWidget):
         try: self.override_text.setPlainText(fixed)
         finally: self._loading_timeline=False
         source=self._timeline_source()
-        if source: self.timeline_overrides[self._timeline_key(source)]=fixed
+        if source:
+            key=self._timeline_key(source)
+            self.timeline_overrides[key]=fixed
+            if key in self.timeline_words:
+                self.timeline_words[key]=align_word_srt_to_phrase_srt(
+                    self.timeline_words[key], fixed, text)
         self._refresh_task_queue(); self._refresh_live_preview()
         self._append_run_log(f"已自动修正 {count} 处字幕时间重叠，文字内容和词级时间轴保持不变。")
 
@@ -13383,7 +13635,15 @@ class DynamicCaptionPage(QWidget):
         """Apply edge drags from the visual track to the existing SRT source of truth."""
         if not hasattr(self, "override_text"):
             return
-        self.override_text.setPlainText(str(text or ""))
+        new_text=str(text or "")
+        source=self._timeline_source()
+        key=self._timeline_key(source) if source else ""
+        old_text=self.timeline_overrides.get(key, self.override_text.toPlainText()) if key else self.override_text.toPlainText()
+        self.override_text.setPlainText(new_text)
+        if key and key in self.timeline_words:
+            self.timeline_words[key]=align_word_srt_to_phrase_srt(
+                self.timeline_words[key], new_text, old_text)
+            self._live_timeline_cache_key=None
         self._append_run_log("已从多轨时间轴更新字幕起止时间，并同步到 SRT 编辑器。")
 
     def _timeline_range_rippled(self, start_ms: int, end_ms: int):
@@ -13834,6 +14094,9 @@ class DynamicCaptionPage(QWidget):
         key = self._timeline_key(source) if source else ""
         if key:
             self.timeline_overrides[key] = corrected
+            if key in self.timeline_words:
+                self.timeline_words[key] = align_word_srt_to_phrase_srt(
+                    self.timeline_words[key], corrected, timeline)
         if hasattr(self, "source_proofread"):
             self.source_proofread.setPlainText(dialog.source_script())
         if hasattr(self, "canva_timeline"):
@@ -13872,6 +14135,9 @@ class DynamicCaptionPage(QWidget):
         key = self._timeline_key(source) if source else ""
         if key:
             self.timeline_overrides[key] = corrected
+            if key in self.timeline_words:
+                self.timeline_words[key] = align_word_srt_to_phrase_srt(
+                    self.timeline_words[key], corrected, timeline)
         if hasattr(self, "canva_timeline"):
             self.canva_timeline.set_srt(corrected)
         self._refresh_task_queue()
@@ -14068,7 +14334,7 @@ class DynamicCaptionPage(QWidget):
     def _batch_timeline_item_done(self,source,srt,chinese,index,total):
         self._stop_timeline_activity(round(index/max(1,total)*100))
         key=self._timeline_key(source); phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
-        self.timeline_words[key]=srt; self.timeline_overrides[key]=phrase_srt
+        self.timeline_words[key]=align_word_srt_to_phrase_srt(srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
         if chinese: self.timeline_chinese[key]=chinese
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             self.free_texts[key]=phrase_srt
@@ -14102,7 +14368,7 @@ class DynamicCaptionPage(QWidget):
     def _worker_timeline_ready(self,source,word_srt,phrase_srt):
         key=self._timeline_key(source)
         phrase_srt,fixes=fix_srt_overlaps(phrase_srt)
-        self.timeline_words[key]=word_srt; self.timeline_overrides[key]=phrase_srt
+        self.timeline_words[key]=align_word_srt_to_phrase_srt(word_srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             self.free_texts[key]=phrase_srt
         if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠：{Path(source).name}")
@@ -14126,7 +14392,7 @@ class DynamicCaptionPage(QWidget):
         if ok:
             source=self._timeline_pending_source or self._timeline_source(); phrase_srt,fixes=self._group_words_for_current_layout(result,True)
             if source:
-                key=self._timeline_key(source); self.timeline_words[key]=result; self.timeline_overrides[key]=phrase_srt
+                key=self._timeline_key(source); self.timeline_words[key]=align_word_srt_to_phrase_srt(result, phrase_srt); self.timeline_overrides[key]=phrase_srt
                 if chinese: self.timeline_chinese[key]=chinese
                 if self.caption_mode.currentText() == "自由文案动画（不对口型）":
                     self.free_texts[key]=phrase_srt
@@ -14288,12 +14554,7 @@ class DynamicCaptionPage(QWidget):
         elif service == "Gemini 自然语音":
             self._load_gemini_voices()
         else:
-            self.tts_voice.clear()
-            self.tts_voice.addItem("请粘贴 ElevenLabs Voice ID（在 elevenlabs.io 音色库复制）")
-            self.tts_voice.setToolTip(
-                "在 ElevenLabs → Voice Library 选好多语音色，复制 Voice ID 粘贴到此。\n"
-                "密钥请在「API 密钥管理」添加（sk_ 前缀）。"
-            )
+            self._load_elevenlabs_voices(prefer_voice=prefer)
         # 选中合法音色：优先匹配 prefer；否则平台默认第一项
         chosen = False
         if prefer_short:
@@ -14326,11 +14587,318 @@ class DynamicCaptionPage(QWidget):
                 return False
             return True
         if service == "ElevenLabs API":
-            if "Neural" in short or short.startswith("请粘贴"):
+            if "Neural" in short or short.startswith("请粘贴") or short.startswith("（"):
                 return False
-            # Voice ID 通常较短字母数字
-            return len(short) >= 8 and " " not in short
+            # Voice ID 通常为字母数字/下划线
+            return len(short) >= 8 and not any(ch.isspace() for ch in short)
         return True
+
+    # ------------------------------------------------------------------ ElevenLabs 音色库 / 播放列表
+    def _elevenlabs_playlist_path(self) -> Path:
+        try:
+            from .platform_utils import app_data_dir
+            folder = app_data_dir() / "elevenlabs"
+        except Exception:
+            folder = Path(os.environ.get("APPDATA") or Path.home()) / "VideoToolkit" / "elevenlabs"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / "voice_playlist.json"
+
+    def _load_elevenlabs_playlist(self) -> list[dict]:
+        path = self._elevenlabs_playlist_path()
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            items = data.get("voices") if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                return []
+            result = []
+            for item in items:
+                if isinstance(item, str):
+                    vid = item.strip()
+                    if vid:
+                        result.append({"voice_id": vid, "name": vid, "display": vid})
+                elif isinstance(item, dict):
+                    vid = str(item.get("voice_id") or item.get("id") or "").strip()
+                    if not vid:
+                        continue
+                    name = str(item.get("name") or vid).strip()
+                    display = str(item.get("display") or f"{vid}｜{name}").strip()
+                    result.append({"voice_id": vid, "name": name, "display": display})
+            return result
+        except Exception:
+            return []
+
+    def _write_elevenlabs_playlist(self, voices: list[dict]) -> None:
+        path = self._elevenlabs_playlist_path()
+        # 按 voice_id 去重，保留顺序
+        seen = set()
+        clean = []
+        for item in voices:
+            vid = str(item.get("voice_id") or "").strip()
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            name = str(item.get("name") or vid).strip()
+            display = str(item.get("display") or f"{vid}｜{name}").strip()
+            clean.append({"voice_id": vid, "name": name, "display": display})
+        path.write_text(
+            json.dumps({"version": 1, "voices": clean}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_elevenlabs_voices(self, prefer_voice: str = ""):
+        """加载本地播放列表到 tts_voice；无列表时给占位提示。"""
+        if not hasattr(self, "tts_voice"):
+            return
+        playlist = self._load_elevenlabs_playlist()
+        self.tts_voice.blockSignals(True)
+        self.tts_voice.clear()
+        if playlist:
+            for item in playlist:
+                self.tts_voice.addItem(item.get("display") or item.get("voice_id") or "")
+            self.tts_voice.setToolTip(
+                "ElevenLabs 音色播放列表。\n"
+                "可点「拉取音色库」从账号同步，或「添加 Voice ID」手动加入。\n"
+                "格式：VoiceID｜名称"
+            )
+        else:
+            self.tts_voice.addItem("（空）请拉取音色库或添加 Voice ID")
+            self.tts_voice.setToolTip(
+                "尚无保存的音色。\n"
+                "1. 先在密钥管理添加 ElevenLabs API Key 或网页会话\n"
+                "2. 点「拉取音色库」或「添加 Voice ID」\n"
+                "3. 「保存播放列表」写入本机"
+            )
+        self.tts_voice.blockSignals(False)
+        prefer = str(prefer_voice or "").strip()
+        prefer_short = prefer.split("｜", 1)[0].strip()
+        if prefer_short:
+            for i in range(self.tts_voice.count()):
+                item = self.tts_voice.itemText(i)
+                short = item.split("｜", 1)[0].strip()
+                if short == prefer_short or item == prefer:
+                    self.tts_voice.setCurrentIndex(i)
+                    break
+        self._sync_elevenlabs_voice_buttons()
+
+    def _sync_elevenlabs_voice_buttons(self):
+        is_el = (
+            hasattr(self, "proj_tts_service")
+            and self.proj_tts_service.currentText() == "ElevenLabs API"
+        )
+        for name in (
+            "el_fetch_voices_btn", "el_add_voice_btn",
+            "el_save_playlist_btn", "el_manage_playlist_btn",
+        ):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(bool(is_el))
+                btn.setVisible(True)
+
+    def _elevenlabs_first_secret(self) -> str:
+        if not self.store:
+            raise RuntimeError("未接入密钥库，请从主窗口打开。")
+        candidates = self.store.candidates("ElevenLabs")
+        if not candidates:
+            raise RuntimeError(
+                "没有可用的 ElevenLabs 凭证。\n"
+                "请到「设置与组件 → 密钥」添加 sk_ API Key 或网页会话。"
+            )
+        return candidates[0]["key"]
+
+    def _fetch_elevenlabs_voices(self):
+        """从 ElevenLabs 账号拉取音色库并合并进播放列表。"""
+        try:
+            secret = self._elevenlabs_first_secret()
+        except RuntimeError as exc:
+            QMessageBox.information(self, "无法拉取", str(exc))
+            return
+        try:
+            from modules import elevenlabs_web_auth as el_web
+        except Exception:
+            from . import elevenlabs_web_auth as el_web  # type: ignore
+        self._append_run_log("正在从 ElevenLabs 拉取音色库…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            remote = el_web.list_voices(secret)
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "拉取失败", str(exc))
+            self._append_run_log(f"拉取音色库失败：{exc}")
+            return
+        finally:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+        if not remote:
+            QMessageBox.information(self, "音色库为空", "账号下没有返回音色，请到 elevenlabs.io 音色库确认。")
+            return
+        # 合并本地播放列表 + 远端
+        local = {item["voice_id"]: item for item in self._load_elevenlabs_playlist()}
+        for item in remote:
+            local[item["voice_id"]] = {
+                "voice_id": item["voice_id"],
+                "name": item.get("name") or item["voice_id"],
+                "display": item.get("display") or f"{item['voice_id']}｜{item.get('name')}",
+            }
+        merged = list(local.values())
+        merged.sort(key=lambda x: (x.get("name") or "").casefold())
+        self._write_elevenlabs_playlist(merged)
+        current = self.tts_voice.currentText() if hasattr(self, "tts_voice") else ""
+        self._load_elevenlabs_voices(prefer_voice=current)
+        self._copy_tts_voices_to_project(prefer_current=True)
+        self._append_run_log(f"已拉取并保存 {len(remote)} 个音色（列表共 {len(merged)} 项）。")
+        QMessageBox.information(
+            self, "音色库已更新",
+            f"从账号拉取 {len(remote)} 个音色。\n"
+            f"播放列表合计 {len(merged)} 项（已自动保存）。\n"
+            "可在下拉框选择，或点「管理列表」删减。"
+        )
+
+    def _add_elevenlabs_voice_manual(self):
+        vid, ok = QInputDialog.getText(
+            self, "添加 Voice ID",
+            "粘贴 ElevenLabs Voice ID（可附备注，用空格或｜分隔）：\n"
+            "示例：21m00Tcm4TlvDq8ikWAM\n"
+            "或：21m00Tcm4TlvDq8ikWAM｜Rachel",
+        )
+        if not ok:
+            return
+        raw = str(vid or "").strip()
+        if not raw:
+            return
+        if "｜" in raw:
+            voice_id, name = raw.split("｜", 1)
+        elif "|" in raw:
+            voice_id, name = raw.split("|", 1)
+        elif " " in raw:
+            parts = raw.split(None, 1)
+            voice_id, name = parts[0], parts[1] if len(parts) > 1 else parts[0]
+        else:
+            voice_id, name = raw, raw
+        voice_id = voice_id.strip()
+        name = name.strip() or voice_id
+        if len(voice_id) < 8:
+            QMessageBox.warning(self, "无效 ID", "Voice ID 太短，请从 elevenlabs.io 音色库复制完整 ID。")
+            return
+        display = f"{voice_id}｜{name}"
+        playlist = self._load_elevenlabs_playlist()
+        # 更新或追加
+        found = False
+        for item in playlist:
+            if item.get("voice_id") == voice_id:
+                item["name"] = name
+                item["display"] = display
+                found = True
+                break
+        if not found:
+            playlist.append({"voice_id": voice_id, "name": name, "display": display})
+        self._write_elevenlabs_playlist(playlist)
+        self._load_elevenlabs_voices(prefer_voice=display)
+        self._copy_tts_voices_to_project(prefer_current=True)
+        # 确保选中新项
+        if hasattr(self, "proj_tts_voice"):
+            self.proj_tts_voice.setCurrentText(display)
+        self._append_run_log(f"已添加音色到播放列表：{display}")
+
+    def _save_elevenlabs_voice_playlist(self):
+        """把当前下拉中的有效 ElevenLabs 项写入播放列表。"""
+        if not hasattr(self, "tts_voice") and not hasattr(self, "proj_tts_voice"):
+            return
+        combo = self.tts_voice if hasattr(self, "tts_voice") else self.proj_tts_voice
+        # 若当前是 ElevenLabs 且 proj 列表更完整，优先读 tts_voice（同步源）
+        if hasattr(self, "tts_voice"):
+            combo = self.tts_voice
+        voices = []
+        for i in range(combo.count()):
+            text = combo.itemText(i).strip()
+            if not text or text.startswith("（") or text.startswith("请"):
+                continue
+            if not self._voice_matches_service(text, "ElevenLabs API"):
+                continue
+            short = text.split("｜", 1)[0].strip()
+            name = text.split("｜", 1)[1].strip() if "｜" in text else short
+            voices.append({"voice_id": short, "name": name, "display": text if "｜" in text else f"{short}｜{name}"})
+        if not voices:
+            QMessageBox.information(self, "无音色", "当前下拉没有可保存的 ElevenLabs 音色，请先拉取或添加。")
+            return
+        self._write_elevenlabs_playlist(voices)
+        self._append_run_log(f"已保存 ElevenLabs 播放列表：{len(voices)} 项 → {self._elevenlabs_playlist_path()}")
+        QMessageBox.information(
+            self, "已保存",
+            f"已保存 {len(voices)} 个音色到播放列表。\n{self._elevenlabs_playlist_path()}"
+        )
+
+    def _manage_elevenlabs_voice_playlist(self):
+        playlist = self._load_elevenlabs_playlist()
+        if not playlist:
+            QMessageBox.information(self, "播放列表为空", "还没有保存的音色，请先拉取音色库或添加 Voice ID。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("ElevenLabs 音色播放列表")
+        dialog.resize(560, 420)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"共 {len(playlist)} 项 · 双击可复制 Voice ID"))
+        table = QTableWidget(len(playlist), 2)
+        table.setHorizontalHeaderLabels(["Voice ID", "名称 / 显示"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        for row, item in enumerate(playlist):
+            table.setItem(row, 0, QTableWidgetItem(item.get("voice_id") or ""))
+            table.setItem(row, 1, QTableWidgetItem(item.get("display") or item.get("name") or ""))
+        layout.addWidget(table, 1)
+
+        def remove_selected():
+            rows = sorted({idx.row() for idx in table.selectionModel().selectedRows()}, reverse=True)
+            if not rows:
+                return
+            for row in rows:
+                table.removeRow(row)
+
+        def save_and_close():
+            voices = []
+            for row in range(table.rowCount()):
+                vid = (table.item(row, 0).text() if table.item(row, 0) else "").strip()
+                disp = (table.item(row, 1).text() if table.item(row, 1) else "").strip()
+                if not vid:
+                    continue
+                name = disp.split("｜", 1)[-1].strip() if "｜" in disp else (disp or vid)
+                display = disp if "｜" in disp else f"{vid}｜{name}"
+                voices.append({"voice_id": vid, "name": name, "display": display})
+            self._write_elevenlabs_playlist(voices)
+            self._load_elevenlabs_voices()
+            self._copy_tts_voices_to_project(prefer_current=True)
+            dialog.accept()
+
+        def copy_id():
+            row = table.currentRow()
+            if row < 0:
+                return
+            vid = table.item(row, 0).text() if table.item(row, 0) else ""
+            if vid:
+                QApplication.clipboard().setText(vid)
+
+        table.doubleClicked.connect(lambda *_: copy_id())
+        btn_row = QHBoxLayout()
+        del_btn = QPushButton("删除选中")
+        del_btn.clicked.connect(remove_selected)
+        copy_btn = QPushButton("复制 Voice ID")
+        copy_btn.clicked.connect(copy_id)
+        save_btn = QPushButton("保存并关闭")
+        save_btn.setObjectName("primary")
+        save_btn.clicked.connect(save_and_close)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_row.addWidget(del_btn)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+        dialog.exec()
 
     def _copy_tts_voices_to_project(self, prefer_current: bool = True):
         """把批量配音页的音色列表同步到图文成片页。"""

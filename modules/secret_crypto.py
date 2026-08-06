@@ -149,7 +149,7 @@ def extract_and_strip_keys(data: dict):
                 if kid and secret:
                     vault[_vault_key(str(provider), kid)] = secret
                 # Brand-new dict: never assign the secret value into it.
-                out_list.append({
+                row = {
                     "id": kid,
                     "key": "",  # literal empty — not derived from secret
                     "enabled": bool(item.get("enabled", True)),
@@ -157,7 +157,12 @@ def extract_and_strip_keys(data: dict):
                     "last_checked": str(item.get("last_checked") or ""),
                     "last_error": str(item.get("last_error") or "")[:300],
                     "uses": int(item.get("uses") or 0),
-                })
+                }
+                # 非密钥元数据（网页会话标签等）可明文保留在 config
+                for meta in ("auth_kind", "label"):
+                    if item.get(meta) not in (None, ""):
+                        row[meta] = item.get(meta)
+                out_list.append(row)
             providers_out[str(provider)] = out_list
 
     # Copy only non-provider settings (no API keys live there).

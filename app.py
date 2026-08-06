@@ -64,6 +64,7 @@ from modules.platform_utils import (
 )
 from modules.path_picker import default_output_path
 from modules.app_logging import app_log_path, read_app_log, write_app_log
+from modules import elevenlabs_web_auth as el_web
 from modules.help_content import FAQ_JUMP, HELP_CSS, HELP_FAQ_TAB_INDEX, HELP_TABS, SETTINGS_NAV
 from modules.language_style import (
     fill_writing_language_combo, import_language_pack_file, reload_language_packs,
@@ -73,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.33").strip().lstrip("v") or "1.7.33"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.35").strip().lstrip("v") or "1.7.35"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -316,22 +317,31 @@ class ConfigStore:
             temp.replace(self.path)
 
 
-    def add_key(self, provider: str, key: str):
-        key = normalize_api_key(key)
-        if not key:
+    def add_key(self, provider: str, key: str, **meta):
+        # 网页会话 JSON 不能走 normalize（会破坏内容）；API Key 仍规范化
+        if provider == "ElevenLabs" and el_web.is_web_secret(key):
+            raw_key = str(key).strip()
+        else:
+            raw_key = normalize_api_key(key)
+        if not raw_key:
             raise ValueError("密钥不能为空")
         with self.lock:
-            if any(item["key"] == key for item in self.data["providers"][provider]):
+            if any(item["key"] == raw_key for item in self.data["providers"][provider]):
                 raise ValueError("该密钥已存在")
-            self.data["providers"][provider].append({
+            row = {
                 "id": uuid.uuid4().hex,
-                "key": key,
+                "key": raw_key,
                 "enabled": True,
                 "status": "未检测",
                 "last_checked": "",
                 "last_error": "",
                 "uses": 0,
-            })
+            }
+            if meta.get("auth_kind"):
+                row["auth_kind"] = str(meta["auth_kind"])
+            if meta.get("label"):
+                row["label"] = str(meta["label"])
+            self.data["providers"][provider].append(row)
             self.save()
 
     def update_key(self, provider: str, key_id: str, **changes):
@@ -382,6 +392,12 @@ class ConfigStore:
 
 
 def masked_key(key: str) -> str:
+    # ElevenLabs 网页会话：显示标签，不泄露完整 Cookie
+    try:
+        if el_web.is_web_secret(key):
+            return el_web.display_secret(key)
+    except Exception:
+        pass
     if len(key) <= 9:
         return "•" * len(key)
     return f"{key[:4]}…{key[-4:]}"
@@ -533,8 +549,9 @@ def check_api_key(provider: str, key: str, timeout: float = 20.0) -> tuple[bool,
             resp = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                                 headers={**headers, "x-goog-api-key": key}, timeout=timeout)
         elif provider == "ElevenLabs":
-            resp = requests.get("https://api.elevenlabs.io/v1/user",
-                                headers={**headers, "xi-api-key": key}, timeout=timeout)
+            # API Key 与网页会话统一走 verify_session（含 US/国际域 + TTS 探测）
+            ok, message, _quota = el_web.verify_session(key, timeout=max(timeout, 45.0))
+            return ok, message
         elif provider == "Luma":
             return True, "密钥格式有效，免联机检测"
         elif provider == "Kling":
@@ -3872,7 +3889,18 @@ class MainWindow(QMainWindow):
         add_btn.setMinimumHeight(34)
         add_btn.clicked.connect(self._add_keys_unified)
         add_layout.addWidget(add_btn)
-        hint = QLabel("gsk_→Groq · AIza/AQ.→Gemini · sk_→ElevenLabs · UUID→Gladia")
+        el_web_btn = QPushButton("添加 ElevenLabs 网页会话（Cookie）")
+        el_web_btn.setToolTip(
+            "用浏览器登录 ElevenLabs 后粘贴 Cookie，可扣该账号免费点数转语音。\n"
+            "支持多个账户轮询；凭证加密保存，之后无需每次开浏览器。"
+        )
+        el_web_btn.setMinimumHeight(32)
+        el_web_btn.clicked.connect(self._add_elevenlabs_web_session)
+        add_layout.addWidget(el_web_btn)
+        hint = QLabel(
+            "gsk_→Groq · AIza/AQ.→Gemini · sk_→ElevenLabs API · UUID→Gladia\n"
+            "ElevenLabs 推荐：网页会话 Cookie（多账户点数）或 sk_ API Key"
+        )
         hint.setStyleSheet("color:#7dd3fc;font-size:11px;")
         hint.setWordWrap(True)
         add_layout.addWidget(hint)
@@ -3913,7 +3941,8 @@ class MainWindow(QMainWindow):
             "• <b>Gemini 自然语音</b> "
             "<a href='https://ai.google.dev/gemini-api/docs/speech-generation' style='color:#60a5fa;'>文档</a><br/>"
             "• <b>ElevenLabs TTS</b> "
-            "<a href='https://elevenlabs.io/docs/api-reference/text-to-speech' style='color:#60a5fa;'>TTS API</a><br/>"
+            "<a href='https://elevenlabs.io/docs/api-reference/text-to-speech' style='color:#60a5fa;'>TTS API</a> · "
+            "也可用左侧「网页会话 Cookie」扣账号点数（多账户）<br/>"
             "• <b>Azure Speech</b>（商用可选）"
             "<a href='https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeechServices' style='color:#60a5fa;'>创建资源</a> · "
             "<a href='https://speech.microsoft.com/' style='color:#93c5fd;'>官网</a><br/><br/>"
@@ -5200,100 +5229,51 @@ class MainWindow(QMainWindow):
         candidates = self.store.candidates("ElevenLabs")
         if not candidates:
             raise RuntimeError(
-                "没有可用的 ElevenLabs 密钥，请先到「设置与组件 → 密钥」添加 sk_ 密钥并检测。\n"
-                "说明：开源 VideoKit 除了 API Key，还支持网页 Cookie/登录态；"
-                "本工具只走官方 xi-api-key，需在 ElevenLabs 后台创建 API Key。"
+                "没有可用的 ElevenLabs 凭证。\n"
+                "请到「设置与组件 → 密钥」任选其一：\n"
+                "• 添加 sk_ API Key；或\n"
+                "• 添加「网页会话（Cookie）」——用账号免费点数，支持多账户轮询。\n"
+                "粘贴一次 Cookie 后即可在本软件内转语音，无需每次开浏览器。"
             )
         last_error = ""
-        payload = {
-            "text": text,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-        }
         for item in candidates:
+            secret = item.get("key") or ""
             try:
-                # 与 VideoKit 一致：优先 with-timestamps（JSON + audio_base64，可顺带生成 SRT）
-                # 失败再回退普通 text-to-speech 原始音频流。
-                audio_bytes = None
-                ts_url = (
-                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+                audio_bytes, alignment = el_web.tts_request(
+                    secret, voice_id, text, timeout=180,
                 )
-                response = requests.post(
-                    ts_url,
-                    headers={"xi-api-key": item["key"], "Content-Type": "application/json",
-                             "Accept": "application/json"},
-                    json=payload, timeout=180,
-                )
-                if response.status_code < 400:
+                if alignment:
                     try:
-                        data = response.json()
-                        b64 = data.get("audio_base64") or data.get("audio")
-                        if b64:
-                            import base64 as _b64
-                            audio_bytes = _b64.b64decode(b64)
-                            # 可选：把对齐信息写成同名 .srt（方便字幕同步）
-                            alignment = data.get("alignment") or data.get("normalized_alignment")
-                            if alignment and isinstance(alignment, dict):
-                                try:
-                                    self._elevenlabs_alignment_to_srt(
-                                        alignment, target.with_suffix(".srt"))
-                                except Exception:
-                                    pass
-                    except (ValueError, TypeError, KeyError) as parse_exc:
-                        last_error = f"with-timestamps 响应解析失败：{parse_exc}"
-                        audio_bytes = None
-                else:
-                    last_error = response_error(response)
-                    # 401/403/429 仍标记密钥状态；其它错误再试 plain 端点
-                    if response.status_code in (401, 403, 429):
-                        self.store.mark_use(
-                            "ElevenLabs", item["id"],
-                            "失效" if response.status_code in (401, 403) else "额度受限",
-                            last_error,
-                        )
-                        continue
-
-                if audio_bytes is None or len(audio_bytes) < 256:
-                    plain = requests.post(
-                        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-                        headers={"xi-api-key": item["key"], "Content-Type": "application/json",
-                                 "Accept": "audio/mpeg"},
-                        json=payload, timeout=180,
-                    )
-                    if plain.status_code >= 400:
-                        last_error = response_error(plain)
-                        self.store.mark_use(
-                            "ElevenLabs", item["id"],
-                            "失效" if plain.status_code in (401, 403) else
-                            "额度受限" if plain.status_code == 429 else "异常",
-                            last_error,
-                        )
-                        continue
-                    content_type = plain.headers.get("Content-Type", "").lower()
-                    if len(plain.content) < 256 or (content_type and "audio" not in content_type
-                                                     and "octet" not in content_type):
-                        last_error = (
-                            "接口没有返回有效音频"
-                            f"（Content-Type: {content_type or '未知'}，{len(plain.content)} 字节）"
-                        )
-                        self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
-                        continue
-                    audio_bytes = plain.content
-
+                        self._elevenlabs_alignment_to_srt(
+                            alignment, target.with_suffix(".srt"))
+                    except Exception:
+                        pass
                 if not audio_bytes or len(audio_bytes) < 256:
-                    last_error = last_error or "未取得有效音频数据"
+                    last_error = "接口未返回有效音频"
                     self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
                     continue
                 target.write_bytes(audio_bytes)
                 self.store.mark_use("ElevenLabs", item["id"], "有效", "")
                 return target
+            except RuntimeError as exc:
+                err = str(exc)
+                last_error = err
+                status = "异常"
+                if "401" in err or "403" in err:
+                    status = "失效"
+                elif "429" in err or "quota" in err.lower() or "limit" in err.lower():
+                    status = "额度受限"
+                self.store.mark_use("ElevenLabs", item["id"], status, last_error)
             except requests.RequestException as exc:
                 last_error = f"网络请求失败：{exc}"
                 self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
+            except Exception as exc:
+                last_error = str(exc)
+                self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
         raise RuntimeError(
-            f"ElevenLabs 可用密钥均生成失败。最后错误：{last_error}\n"
-            "排查：① Voice ID 是否正确 ② sk_ API Key 是否有效且有额度 "
-            "③ 网络是否可访问 api.elevenlabs.io（VideoKit 若用网页登录态则无需 Key，本工具需要 Key）"
+            f"ElevenLabs 可用凭证均生成失败。最后错误：{last_error}\n"
+            "排查：① Voice ID ② sk_ 密钥或网页 Cookie 是否过期 "
+            "③ 账号是否还有字符点数 ④ 可添加多个账户轮询"
         )
 
     def _find_ffmpeg(self):
@@ -5559,6 +5539,125 @@ class MainWindow(QMainWindow):
             message += f"\n跳过 {len(skipped)} 枚重复或无效内容。"
         QMessageBox.information(self, "添加完成", message)
 
+    def _add_elevenlabs_web_session(self):
+        """添加 ElevenLabs 网页会话（Cookie），支持多账户，扣各自免费点数。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("添加 ElevenLabs 网页会话")
+        dialog.resize(560, 520)
+        box = QVBoxLayout(dialog)
+        tip = QLabel(
+            "<b>用途</b>：用自己账号登录态在软件内转语音，扣该账号点数；可多账户轮询。<br/><br/>"
+            "<b style='color:#fbbf24'>重要：不要复制 Application→Cookies 的 JSON 列表</b>"
+            "（那是统计 Cookie，会报 401）。请按下面做：<br/>"
+            "1. 浏览器打开并登录 "
+            "<a href='https://elevenlabs.io/app/home'>elevenlabs.io/app/home</a><br/>"
+            "2. F12 → <b>Network（网络）</b> → 刷新页面<br/>"
+            "3. 过滤 <code>api.elevenlabs.io</code>，点开任意成功请求<br/>"
+            "4. Request Headers 里复制（任选其一，推荐从上到下）：<br/>"
+            "　• <b>xi-api-key</b>（最稳，贴到下方「xi-api-key」框）<br/>"
+            "　• <b>Authorization: Bearer …</b>（贴到 Authorization 框）<br/>"
+            "　• 整行 <b>Cookie:</b>（需含 <code>fern_token</code>，贴到 Cookie 框）<br/>"
+            "5. 也可把整段 Request Headers 文本直接贴进 Cookie 大框，软件会自动识别。<br/>"
+            "6. <b>更简单</b>：用仓库 <code>tools/elevenlabs_capture.user.js</code> "
+            "（Tampermonkey 或 F12 控制台粘贴），登录后右下角一键复制。"
+        )
+        tip.setWordWrap(True)
+        tip.setOpenExternalLinks(True)
+        tip.setStyleSheet("color:#cbd5e1;background:#0b1830;padding:10px;border-radius:6px;")
+        box.addWidget(tip)
+
+        form = QFormLayout()
+        label_edit = QLineEdit()
+        label_edit.setPlaceholderText("例如：账号A / 工作号 / 1000点号1")
+        cookie_edit = QPlainTextEdit()
+        cookie_edit.setPlaceholderText(
+            "推荐：直接粘贴 Network 请求头整段，或 Cookie: 那一行\n"
+            "格式示例：fern_token=eyJ...; 其它=...\n"
+            "不要粘贴 Application 里导出的 {\"name\":\"_ga\",...} JSON 列表"
+        )
+        cookie_edit.setMinimumHeight(120)
+        auth_edit = QLineEdit()
+        auth_edit.setPlaceholderText("推荐：Bearer eyJ...（Network 里的 Authorization）")
+        xi_edit = QLineEdit()
+        xi_edit.setPlaceholderText("最推荐：Network 里的 xi-api-key: sk_… 或网页密钥")
+        form.addRow("账户备注", label_edit)
+        form.addRow("Cookie / 请求头", cookie_edit)
+        form.addRow("Authorization", auth_edit)
+        form.addRow("xi-api-key", xi_edit)
+        box.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            packed = el_web.pack_web_session(
+                cookie=cookie_edit.toPlainText(),
+                authorization=auth_edit.text(),
+                xi_api_key=xi_edit.text(),
+                label=label_edit.text().strip() or "网页会话",
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法保存", str(exc))
+            return
+        # 先检测
+        ok, message, quota = el_web.verify_session(packed)
+        if not ok:
+            reply = QMessageBox.question(
+                self, "验证失败",
+                f"当前会话验证未通过：\n{message}\n\n仍要保存吗？（可稍后「检测选中」）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            self.store.add_key(
+                "ElevenLabs", packed,
+                auth_kind="web",
+                label=label_edit.text().strip() or "网页会话",
+            )
+            # 写入检测状态
+            items = self.store.data["providers"]["ElevenLabs"]
+            if items:
+                last = items[-1]
+                if ok:
+                    detail = message
+                    if quota:
+                        rem = quota.get("remaining", "?")
+                        lim = quota.get("limit", "?")
+                        detail = f"剩余 {rem}/{lim} 点"
+                        if quota.get("tts_ok") is False:
+                            detail += "｜TTS被风控禁用(免费API)"
+                        elif quota.get("tts_ok") is True:
+                            detail += "｜TTS可用"
+                    self.store.mark_use("ElevenLabs", last["id"], "有效", detail)
+                else:
+                    self.store.mark_use("ElevenLabs", last["id"], "异常", message)
+        except Exception as exc:
+            QMessageBox.warning(self, "添加失败", str(exc))
+            return
+        self._refresh_keys()
+        extra = ""
+        if ok and quota and quota.get("tts_ok") is False:
+            extra = (
+                "\n\n⚠️ 余额查询成功，但 TTS 探测失败：该账号免费档 API 可能被风控"
+                "（网页仍显示 credits）。\n"
+                "请关 VPN、换网络重登后重新粘贴 xi-api-key，或升级付费/换号。"
+            )
+        elif ok and quota and quota.get("tts_ok") is True:
+            extra = "\n\n✓ 已通过极短文本 TTS 探测，可以试听/合成。"
+        QMessageBox.information(
+            self, "已添加网页会话",
+            (f"已保存：{label_edit.text().strip() or '网页会话'}\n{message}{extra}\n\n"
+             "Reels / 视频预设 选 ElevenLabs API + Voice ID 即可转语音。\n"
+             "可继续添加更多账户实现轮询。")
+        )
+        write_app_log(f"添加 ElevenLabs 网页会话：{label_edit.text().strip() or '网页会话'}", "INFO", "密钥")
+
     def _refresh_keys(self):
         if not hasattr(self, "key_table"):
             return
@@ -5570,7 +5669,15 @@ class MainWindow(QMainWindow):
                 row = self.key_table.rowCount(); self.key_table.insertRow(row)
                 reason = item.get("last_error", "") or "—"
                 compact_reason = " ".join(reason.split())
-                values = [provider, masked_key(item["key"]), item.get("status", "未检测"),
+                key_display = masked_key(item["key"])
+                if item.get("auth_kind") == "web" and item.get("label"):
+                    key_display = f"网页·{item['label']}"
+                elif el_web.is_web_secret(item.get("key") or ""):
+                    key_display = el_web.display_secret(item.get("key") or "")
+                svc = provider
+                if item.get("auth_kind") == "web" or el_web.is_web_secret(item.get("key") or ""):
+                    svc = f"{provider}·网页"
+                values = [svc, key_display, item.get("status", "未检测"),
                           item.get("last_checked", ""), str(item.get("uses", 0)), compact_reason, item["id"]]
                 for col, value in enumerate(values):
                     cell = QTableWidgetItem(value)
@@ -5586,9 +5693,13 @@ class MainWindow(QMainWindow):
         jobs = []
         for index in self.key_table.selectionModel().selectedRows():
             provider = self.key_table.item(index.row(), 0).text()
+            # 显示名可能是「ElevenLabs·网页」
+            provider = provider.split("·", 1)[0].strip()
             key_id = self.key_table.item(index.row(), 6).text()
-            item = next((x for x in self.store.data["providers"][provider] if x["id"] == key_id), None)
-            if item: jobs.append((provider, item.copy()))
+            item = next((x for x in self.store.data["providers"].get(provider, [])
+                         if x["id"] == key_id), None)
+            if item:
+                jobs.append((provider, item.copy()))
         return jobs
 
     def _check_selected_keys(self):

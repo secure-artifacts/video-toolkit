@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.33**
+当前版本：**v1.7.35**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,17 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.33.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.33/video-toolkit-windows-x64-v1.7.33.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.33/VideoToolkit_Setup_v1.7.33.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.33.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.33/video-toolkit-macos-arm64-v1.7.33.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.33.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.33/video-toolkit-macos-x64-v1.7.33.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.35.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/video-toolkit-windows-x64-v1.7.35.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/VideoToolkit_Setup_v1.7.35.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.35.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/video-toolkit-macos-arm64-v1.7.35.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.35.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/video-toolkit-macos-x64-v1.7.35.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.35 · 2026-08-06
+- 视频预设：独立「视频预设」模块，Reels 画布布局、固定字幕样式（标题/正文独立字体与颜色、描边/阴影）、蒙版、BGM（文件/文件夹随机）、TTS、预设导入导出、批量渲染与多语言（含阿拉伯语与欧洲语系）。
+- 字幕布局：按参考片自适应位置与字号，非简单左中右。
+- ElevenLabs：支持官方 API Key + 多账户「网页会话」（Cookie / Authorization / xi-api-key）；密钥页可添加与验证；附 `tools/elevenlabs_capture.user.js` 抓取浏览器会话。
+- 图片工具：批量截图与图片格式转换拆为独立标签（含 v1.7.34）。
 
 ### v1.7.33 · 2026-08-03
 - 多开：密钥 vault 合并保存，避免多窗口互相覆盖。

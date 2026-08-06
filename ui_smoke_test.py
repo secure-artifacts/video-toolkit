@@ -44,9 +44,59 @@ qt.setStyleSheet(toolkit.STYLE)
 window = toolkit.MainWindow()
 window.resize(1600, 920)
 
-assert window.pages.count() == 11
-assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 7
+assert window.pages.count() == 12
+assert len(window.pages.widget(0).findChildren(toolkit.ToolCard)) == 8
 assert window.nav_buttons[-1].text() == "帮助"
+assert any(button.text() == "视频预设" for button in window.nav_buttons)
+assert hasattr(window, "video_preset_page")
+assert window.pages.widget(11) is window.video_preset_page
+assert window.video_preset_page.title_size.value() == 90
+assert window.video_preset_page.body_auto.isChecked() is True
+assert hasattr(window.video_preset_page, "video_widget")
+assert hasattr(window.video_preset_page, "live_preview")
+assert window.video_preset_page.live_preview.isChecked() is True
+assert hasattr(window.video_preset_page, "timeline")
+assert hasattr(window.video_preset_page, "source_stack")
+assert window.video_preset_page.source_stack.count() == 4
+assert hasattr(window.video_preset_page, "right_settings_stack")
+assert window.video_preset_page.right_settings_stack.count() >= 2
+assert [b.text() for b in window.video_preset_page.source_tool_buttons] == [
+    "素材", "文案/TTS", "背景音乐", "输出/日志",
+]
+assert "字幕样式" in [b.text() for b in window.video_preset_page.right_setting_buttons]
+assert "蒙版" in [b.text() for b in window.video_preset_page.right_setting_buttons]
+# 字幕样式：系统字体列表 + 标题/正文独立字体颜色 + 效果（与 Reels 对齐）
+assert hasattr(window.video_preset_page, "title_font_family")
+assert hasattr(window.video_preset_page, "body_font_family")
+assert window.video_preset_page.title_font_family.count() >= 5
+assert window.video_preset_page.body_font_family.count() >= 5
+assert hasattr(window.video_preset_page, "effect")
+assert window.video_preset_page.effect.count() >= 4
+assert hasattr(window.video_preset_page, "outline_width")
+assert hasattr(window.video_preset_page, "shadow")
+assert hasattr(window.video_preset_page, "margin_v")
+assert hasattr(window.video_preset_page, "position")
+assert "底部" in [window.video_preset_page.position.itemText(i)
+                 for i in range(window.video_preset_page.position.count())]
+assert hasattr(window.video_preset_page, "highlight_color_btn")
+assert hasattr(window.video_preset_page, "style_quick")
+s = window.video_preset_page.current_settings()
+assert "effect" in s and "outline_width" in s and "margin_v" in s
+assert "title_font" in s and "body_font" in s
+assert "title_color" in s and "body_color" in s
+from modules.video_preset_page import resolve_caption_layout, STYLE_QUICK_PRESETS
+_ref = dict(STYLE_QUICK_PRESETS["参考1 · 山景祷告白卡"])
+_short = resolve_caption_layout(_ref, "عنوان", "نص قصير")
+_long = resolve_caption_layout(_ref, "عنوان طويل", "نص " * 80)
+assert _long["body_size"] <= _short["body_size"]
+assert len(_long["lines"]) > len(_short["lines"])
+from modules.video_preset_page import body_font_size_for_chars
+assert body_font_size_for_chars(30) >= 60
+assert body_font_size_for_chars(80) == 55
+assert body_font_size_for_chars(250) == 44
+assert body_font_size_for_chars(380) == 40
+assert body_font_size_for_chars(520) == 33
+assert body_font_size_for_chars(800) >= 20
 assert hasattr(window, "update_btn") and window.update_btn.text() == "检查更新"
 assert hasattr(window, "log_nav_btn") and window.log_nav_btn.text() == "查看软件日志"
 assert not any(button.text() == "密钥管理" for button in window.nav_buttons)
@@ -469,4 +519,7 @@ window.grab().save("reels_layout_preview.png")
 window.pages.setCurrentWidget(window.rename_page)
 qt.processEvents()
 window.grab().save("rename_layout_preview.png")
-print("OK pages=11 auto=enabled fallback=local key_diagnostics=passed")
+window._show_page(11)
+qt.processEvents()
+window.grab().save("video_preset_layout_preview.png")
+print("OK pages=12 auto=enabled fallback=local key_diagnostics=passed video_preset=on")
