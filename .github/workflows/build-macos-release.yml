@@ -9,6 +9,15 @@ on:
         required: true
         default: "v1.7.35"
         type: string
+      arches:
+        description: "Which macOS packages to build"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - arm64
+          - x64
 
 permissions:
   contents: write
@@ -21,10 +30,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Apple Silicon（M1/M2/M3…）
           - os: macos-latest
             arch: arm64
+          # Intel Mac
           - os: macos-15-intel
             arch: x64
+    # 允许只打 arm64，先保证 M 系列有包
+    if: >-
+      (inputs.arches == 'both') ||
+      (inputs.arches == 'arm64' && matrix.arch == 'arm64') ||
+      (inputs.arches == 'x64' && matrix.arch == 'x64')
     runs-on: ${{ matrix.os }}
 
     steps:
