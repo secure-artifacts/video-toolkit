@@ -1,0 +1,146 @@
+# 单独补打 macOS 包并上传到已有 GitHub Release（Windows 本机无法打 macOS）。
+name: Build macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.7.35)"
+        required: true
+        default: "v1.7.35"
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Install media components
+        run: |
+          brew install ffmpeg
+          echo "VIDEO_TOOLKIT_MEDIA_BIN=$(dirname "$(command -v ffmpeg)")" >> "$GITHUB_ENV"
+
+      - name: Create macOS application icon
+        run: |
+          mkdir -p logo.iconset
+          sips -z 16 16 logo.png --out logo.iconset/icon_16x16.png
+          sips -z 32 32 logo.png --out logo.iconset/icon_16x16@2x.png
+          sips -z 32 32 logo.png --out logo.iconset/icon_32x32.png
+          sips -z 64 64 logo.png --out logo.iconset/icon_32x32@2x.png
+          sips -z 128 128 logo.png --out logo.iconset/icon_128x128.png
+          sips -z 256 256 logo.png --out logo.iconset/icon_128x128@2x.png
+          sips -z 256 256 logo.png --out logo.iconset/icon_256x256.png
+          sips -z 512 512 logo.png --out logo.iconset/icon_256x256@2x.png
+          sips -z 512 512 logo.png --out logo.iconset/icon_512x512.png
+          sips -z 1024 1024 logo.png --out logo.iconset/icon_512x512@2x.png
+          iconutil -c icns logo.iconset -o logo.icns
+
+      - name: Embed version from tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "VIDEO_TOOLKIT_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "$VERSION" > VERSION
+          echo "Building macOS ${{ matrix.arch }} for $TAG ($VERSION)"
+
+      - name: Build macOS application
+        run: |
+          chmod +x build_macos.sh
+          ./build_macos.sh
+
+      - name: Set application metadata and sign locally
+        run: |
+          APP="dist_macos/VideoToolkit.app"
+          VERSION="${VIDEO_TOOLKIT_VERSION}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName 视频工具合集" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 视频工具合集" "$APP/Contents/Info.plist" || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 视频工具合集" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist" || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist" || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+          mv "$APP" "dist_macos/视频工具合集.app"
+          codesign --force --deep --sign - "dist_macos/视频工具合集.app"
+          codesign --verify --deep --strict --verbose=2 "dist_macos/视频工具合集.app"
+
+      - name: Verify bundled FFmpeg and FFprobe
+        run: |
+          APP="dist_macos/视频工具合集.app"
+          FFMPEG="$(find "$APP" -type f -name ffmpeg | head -1)"
+          FFPROBE="$(find "$APP" -type f -name ffprobe | head -1)"
+          test -n "$FFMPEG" && test -n "$FFPROBE"
+          "$FFMPEG" -version
+          "$FFPROBE" -version
+
+      - name: Verify local Whisper VAD runtime
+        run: |
+          APP="dist_macos/视频工具合集.app"
+          ONNX_RUNTIME="$(find "$APP" -iname '*onnxruntime*' | head -1)"
+          test -n "$ONNX_RUNTIME"
+          echo "Bundled ONNX Runtime: $ONNX_RUNTIME"
+
+      - name: Package final artifact
+        run: |
+          mkdir -p dist_final
+          TAG="${{ inputs.tag }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist_macos/视频工具合集.app" \
+            "dist_final/video-toolkit-macos-${{ matrix.arch }}-${TAG}.zip"
+          ls -lh dist_final/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-toolkit-macos-${{ matrix.arch }}
+          path: dist_final/*.zip
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          for f in dist_final/*.zip; do
+            echo "Uploading $f to release $TAG"
+            gh release upload "$TAG" "$f" --clobber
+          done
+
+  summarize:
+    needs: [build-macos]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: List release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ inputs.tag }}" --repo "${{ github.repository }}" --json assets --jq '.assets[].name'
