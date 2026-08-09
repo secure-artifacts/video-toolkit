@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.35**
+当前版本：**v1.7.36**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,18 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.35.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/video-toolkit-windows-x64-v1.7.35.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/VideoToolkit_Setup_v1.7.35.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.35.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/video-toolkit-macos-arm64-v1.7.35.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.35.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.35/video-toolkit-macos-x64-v1.7.35.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.36.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/video-toolkit-windows-x64-v1.7.36.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/VideoToolkit_Setup_v1.7.36.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.36.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/video-toolkit-macos-arm64-v1.7.36.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.36.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/video-toolkit-macos-x64-v1.7.36.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.36 · 2026-08-09
+- TTS：修复「第一句听不见」——微软 edge-tts 分段重编码拼接、短首句合并；配音轨淡入上限 120ms；视频预设标题+正文安全拼接。
+- 分组合成：xfade 前统一 fps/时间基；去口气音片头保护加强，减少静音检测吞首句。
+- 元数据清理：可选「水印合成」（Logo 角标/全屏，与清理同批输出）。
+- ElevenLabs：明确「网页有点数但免费 API 被风控」说明；重复启动时提示并尝试激活已有窗口。
+- 启动：单实例冲突时控制台/弹窗说明，不再静默退出。
 
 ### v1.7.35 · 2026-08-06
 - 视频预设：独立「视频预设」模块，Reels 画布布局、固定字幕样式（标题/正文独立字体与颜色、描边/阴影）、蒙版、BGM（文件/文件夹随机）、TTS、预设导入导出、批量渲染与多语言（含阿拉伯语与欧洲语系）。

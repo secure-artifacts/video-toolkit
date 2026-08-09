@@ -624,11 +624,14 @@ def tts_request(
     if unusual:
         raise RuntimeError(
             (last_err or "免费档 API 被风控")
-            + "\n\n说明：开源 VideoKit 也是调同一套官方 TTS API 扣点数，"
-            "并不是「不用 Key、只靠网页点数」的另一条通道。"
-            "它同样需要 Cookie/Authorization/网页 xi-api-key。"
-            "若同一账号在 VideoKit 能转、这里不能：请把 VideoKit 或浏览器"
-            "成功 TTS 那次请求的 xi-api-key 原样贴进本软件（删掉旧会话后重加）。"
-            "若两边都 401 unusual_activity：只能换号/升级/关 VPN 后重新注册绑定。"
+            + "\n\n【为什么网页有点数却不能用】\n"
+            "1. 网页 Balance 显示的 credits ≠ TTS API 一定可用；\n"
+            "2. ElevenLabs 对免费档有「异常活动」账号级封禁，订阅/点数界面仍可能显示 10000；\n"
+            "3. 本软件与 VideoKit 一样走官方 /v1/text-to-speech，会扣账号点数，"
+            "但没有「只靠网页、不调 API」的第二条通道；\n"
+            "4. 处理建议：升级付费 · 换干净网络/新账号 · 或改用微软 edge-tts / Gemini。\n"
+            "5. 若 Authorization JWT 过期（约 1 小时），请重新抓取网页会话后重试。\n"
+            "6. 若同一账号在 VideoKit 能转、这里不能：请把成功 TTS 请求的 xi-api-key 原样贴进本软件。\n"
+            "7. 若两边都 401 unusual_activity：只能换号 / 升级 / 换网络后重新注册。"
         )
     raise RuntimeError(last_err or "TTS 请求失败（所有区域主机/模型均不可用）")

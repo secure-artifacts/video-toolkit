@@ -956,7 +956,17 @@ class VideoPresetRenderWorker(QObject):
                     if job.get("generate_tts") and not (tts_path and tts_path.is_file()):
                         if not callable(self.text_to_speech_fn):
                             raise RuntimeError("已选择文案转语音，但当前没有可用的 TTS 服务。")
-                        speech_text = (title.strip() + "。\n" + body.strip()).strip("。\n ")
+                        # 标题+正文都要读；勿用 strip("。\n") 吃掉句首/句尾内容
+                        _t = title.strip()
+                        _b = body.strip()
+                        if _t and _b:
+                            joiner = "。" if re.search(r"[\u3400-\u9fff]", _t + _b) else ". "
+                            if _t[-1:] in "。.!！?？;；":
+                                speech_text = f"{_t} {_b}".strip()
+                            else:
+                                speech_text = f"{_t}{joiner}{_b}".strip()
+                        else:
+                            speech_text = _t or _b
                         if speech_text:
                             target = work / "batch_tts.mp3"
                             self.log.emit(f"生成配音：{media.name}")

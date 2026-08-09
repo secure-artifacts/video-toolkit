@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.35").strip().lstrip("v") or "1.7.35"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.36").strip().lstrip("v") or "1.7.36"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -5075,33 +5075,66 @@ class MainWindow(QMainWindow):
 
             # Edge 的免费接口在长段落或网络短暂波动时偶尔只返回元数据、不返回音频。
             # 按句拆成适中的请求，并对当前音色及同语种备用音色自动重试。
+            # 注意：不要用 strip("。！？…") 之类会吃掉首尾标点/句子的写法。
             pieces = []
             pending = ""
-            for sentence in re.split(r"(?<=[。！？.!?；;：:\n])\s*", clean_text):
+            # 保留首句：用换行/句末标点切分，但不过滤无标点的开头段落
+            raw_parts = re.split(r"(?<=[。！？.!?；;])\s+|\n+", clean_text)
+            for sentence in raw_parts:
                 sentence = sentence.strip()
                 if not sentence:
                     continue
                 if pending and len(pending) + len(sentence) + 1 > 1400:
-                    pieces.append(pending); pending = sentence
+                    pieces.append(pending)
+                    pending = sentence
                 else:
-                    pending = f"{pending} {sentence}".strip()
+                    pending = f"{pending} {sentence}".strip() if pending else sentence
             if pending:
                 pieces.append(pending)
             if not pieces:
                 pieces = [clean_text]
+            # 保险：若首段过短（纯标点/序号），合并到下一段，避免「第一句没声」
+            if len(pieces) >= 2 and len(re.sub(r"[\s\W_]+", "", pieces[0], flags=re.UNICODE)) < 2:
+                pieces[1] = f"{pieces[0]} {pieces[1]}".strip()
+                pieces = pieces[1:]
 
             async def generate_part(part_text, part_path, part_voice):
                 boundaries = []
+                wrote = 0
                 with part_path.open("wb") as audio_handle:
-                    async for chunk in edge_tts.Communicate(part_text, part_voice).stream():
+                    communicate = edge_tts.Communicate(part_text, part_voice)
+                    async for chunk in communicate.stream():
                         if chunk.get("type") == "audio" and chunk.get("data"):
                             audio_handle.write(chunk["data"])
+                            wrote += len(chunk["data"])
                         elif chunk.get("type") == "WordBoundary":
                             start = float(chunk.get("offset", 0)) / 10_000_000
                             duration = float(chunk.get("duration", 0)) / 10_000_000
                             boundaries.append({"start": start, "end": start + max(.08, duration),
                                                "text": str(chunk.get("text", "")).strip()})
+                if wrote < 256:
+                    raise RuntimeError("流式接口未写入有效音频数据")
                 return boundaries
+
+            def _probe_audio_seconds(path: Path) -> float:
+                try:
+                    ffprobe = self._find_ffmpeg().replace("ffmpeg", "ffprobe")
+                    if not Path(ffprobe).is_file():
+                        ffprobe = self._find_ffmpeg()
+                    # prefer sibling ffprobe next to ffmpeg
+                    ffmpeg_bin = Path(self._find_ffmpeg())
+                    candidate = ffmpeg_bin.with_name(
+                        "ffprobe.exe" if os.name == "nt" else "ffprobe")
+                    if candidate.is_file():
+                        ffprobe = str(candidate)
+                    result = subprocess.run(
+                        [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        encoding="utf-8", errors="replace", **hidden_kwargs())
+                    return max(0.0, float((result.stdout or "").strip() or 0))
+                except Exception:
+                    return 0.0
 
             last_error = "服务没有返回音频"
             with tempfile.TemporaryDirectory(prefix="video_toolkit_tts_") as temp_name:
@@ -5112,36 +5145,69 @@ class MainWindow(QMainWindow):
                         try:
                             for index, piece in enumerate(pieces):
                                 part_path = temp_dir / f"part_{index:03d}.mp3"
-                                if part_path.exists(): part_path.unlink()
+                                if part_path.exists():
+                                    part_path.unlink()
                                 boundaries = asyncio.run(generate_part(piece, part_path, selected))
                                 if not part_path.exists() or part_path.stat().st_size < 256:
-                                    raise RuntimeError(f"第 {index + 1} 段没有收到音频")
+                                    raise RuntimeError(f"第 {index + 1} 段没有收到音频（可能是首句被跳过）")
                                 part_paths.append(part_path)
+                                part_dur = _probe_audio_seconds(part_path)
                                 for entry in boundaries:
                                     all_boundaries.append({**entry,
                                                            "start": entry["start"] + time_offset,
                                                            "end": entry["end"] + time_offset})
+                                # 无 WordBoundary 时也必须推进时间轴，避免后段字幕盖住首句
                                 if boundaries:
-                                    time_offset += max(item["end"] for item in boundaries) + .08
+                                    time_offset += max(item["end"] for item in boundaries) + .06
+                                elif part_dur > 0.05:
+                                    time_offset += part_dur + .06
+                                else:
+                                    # 粗估：每 4 字约 0.35s（中文）/ 每词 0.28s
+                                    est = max(0.4, len(piece) * 0.08)
+                                    time_offset += est
 
-                            if target.exists(): target.unlink()
+                            if target.exists():
+                                target.unlink()
+                            ffmpeg = self._find_ffmpeg()
                             if len(part_paths) == 1:
-                                shutil.copyfile(part_paths[0], target)
-                            else:
-                                concat_file = temp_dir / "concat.txt"
-                                concat_file.write_text("".join(
-                                    f"file '{str(path).replace(chr(39), chr(39) + '\\\'' + chr(39))}'\n"
-                                    for path in part_paths), encoding="utf-8")
+                                # 重编码一次，消除部分 edge-tts MP3 片头丢帧导致「第一句听不见」
                                 result = subprocess.run(
-                                    [self._find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
-                                     "-f", "concat", "-safe", "0", "-i", str(concat_file),
-                                     "-c", "copy", str(target)], stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                                    **hidden_kwargs())
+                                    [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                                     "-i", str(part_paths[0]),
+                                     "-af", "aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS",
+                                     "-c:a", "libmp3lame", "-b:a", "192k", str(target)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace", **hidden_kwargs())
+                                if result.returncode or not target.exists() or target.stat().st_size < 256:
+                                    shutil.copyfile(part_paths[0], target)
+                            else:
+                                # 禁止 -c copy 拼接 MP3：常见丢首包/首句
+                                filter_inputs = "".join(f"[{i}:a:0]" for i in range(len(part_paths)))
+                                filter_complex = (
+                                    f"{filter_inputs}concat=n={len(part_paths)}:v=0:a=1,"
+                                    f"aresample=48000,aformat=channel_layouts=stereo,"
+                                    f"asetpts=PTS-STARTPTS[aout]"
+                                )
+                                cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+                                for path in part_paths:
+                                    cmd += ["-i", str(path)]
+                                cmd += [
+                                    "-filter_complex", filter_complex, "-map", "[aout]",
+                                    "-c:a", "libmp3lame", "-b:a", "192k", str(target),
+                                ]
+                                result = subprocess.run(
+                                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace", **hidden_kwargs())
                                 if result.returncode:
                                     raise RuntimeError(result.stderr.strip() or "分段音频合并失败")
                             if not target.exists() or target.stat().st_size < 256:
                                 raise RuntimeError("合并后音频为空")
+                            # 时长异常偏短时视为首句丢失，触发重试
+                            total_dur = _probe_audio_seconds(target)
+                            min_expect = max(0.35, min(8.0, len(clean_text) * 0.035))
+                            if total_dur > 0 and total_dur < min_expect * 0.45:
+                                raise RuntimeError(
+                                    f"生成音频过短（{total_dur:.2f}s），疑似首句未写入，将重试")
                             if all_boundaries:
                                 target.with_suffix(".srt").write_text(
                                     segments_to_srt(all_boundaries), encoding="utf-8-sig")
@@ -5149,8 +5215,10 @@ class MainWindow(QMainWindow):
                         except Exception as exc:
                             last_error = f"{selected}（第 {attempt} 次）：{exc}"
                             for part_path in part_paths:
-                                try: part_path.unlink()
-                                except OSError: pass
+                                try:
+                                    part_path.unlink()
+                                except OSError:
+                                    pass
             raise RuntimeError(
                 "微软文字转语音连续重试后仍未收到音频。"
                 f"\n最后错误：{last_error}"
@@ -5272,8 +5340,11 @@ class MainWindow(QMainWindow):
                 self.store.mark_use("ElevenLabs", item["id"], "异常", last_error)
         raise RuntimeError(
             f"ElevenLabs 可用凭证均生成失败。最后错误：{last_error}\n"
-            "排查：① Voice ID ② sk_ 密钥或网页 Cookie 是否过期 "
-            "③ 账号是否还有字符点数 ④ 可添加多个账户轮询"
+            "排查：\n"
+            "① Voice ID 是否为 elevenlabs 音色库 ID（非微软 Neural 名称）\n"
+            "② sk_ 密钥或网页会话 Authorization/Cookie 是否过期（JWT 约 1 小时）\n"
+            "③ 免费档是否被 unusual_activity 关掉 API（网页仍可能显示点数）\n"
+            "④ 可添加多个网页会话/密钥轮询；或改用「微软文字转语音」"
         )
 
     def _find_ffmpeg(self):
@@ -5559,7 +5630,11 @@ class MainWindow(QMainWindow):
             "　• 整行 <b>Cookie:</b>（需含 <code>fern_token</code>，贴到 Cookie 框）<br/>"
             "5. 也可把整段 Request Headers 文本直接贴进 Cookie 大框，软件会自动识别。<br/>"
             "6. <b>更简单</b>：用仓库 <code>tools/elevenlabs_capture.user.js</code> "
-            "（Tampermonkey 或 F12 控制台粘贴），登录后右下角一键复制。"
+            "（Tampermonkey 或 F12 控制台粘贴），登录后右下角一键复制。<br/><br/>"
+            "<b style='color:#f87171'>为何网页有点数却 TTS 失败？</b><br/>"
+            "官方会把「异常活动」账号的<strong>免费档 API</strong>关掉；"
+            "Balance 仍可能显示 10000，但本软件与 VideoKit 一样调官方 TTS 接口，会被 401。"
+            "请升级付费、换号，或改用微软/Gemini 语音。"
         )
         tip.setWordWrap(True)
         tip.setOpenExternalLinks(True)
@@ -6100,13 +6175,69 @@ def _acquire_single_instance() -> bool:
     return True
 
 
+def _focus_existing_instance() -> None:
+    """Best-effort: bring an already-running VideoToolkit window to the front."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value or ""
+            if "视频工具合集" in title or "VideoToolkit" in title:
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        if not found:
+            return
+        hwnd = found[0]
+        # Restore if minimized, then foreground
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
 def main():
     # A damaged macOS bundle once resolved "ffmpeg" to the app bootloader.
     # Media probes must never construct a second application window.
     if os.environ.get("VIDEO_TOOLKIT_MEDIA_PROBE") == "1":
         return
     if not _acquire_single_instance():
+        msg = (
+            "VideoToolkit 已在运行（单实例），本次启动已退出。\n"
+            "请到任务栏点「视频工具合集」窗口；若看不到，可在任务管理器结束 "
+            "VideoToolkit.exe / python.exe 后再启动。\n"
+            "开发时若要多开，可先关掉已安装版或旧进程。"
+        )
         write_app_log("程序已在运行，本次重复启动已退出。", "INFO", "应用")
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+        _focus_existing_instance()
+        # 尽量弹窗提醒（无事件循环时 MessageBox 仍可用）
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, msg, "VideoToolkit 已在运行", 0x40,
+            )
+        except Exception:
+            pass
         return
     _startup_trace("main entered")
     write_app_log(

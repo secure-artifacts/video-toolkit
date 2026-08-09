@@ -1182,9 +1182,20 @@ def render_timeline_audio(ffmpeg, source, clips, cache_dir, label="audio"):
     if output.is_file() and output.stat().st_size>512:
         return output
     filters=[]; outputs=[]
+    # 探测源时长，避免 source_end 缺失时只剩 80ms 把整段配音切没
+    try:
+        media_dur = max(0.1, float(media_duration(ffmpeg, source, fallback=0) or 0))
+    except Exception:
+        media_dur = 0.0
     for index,item in enumerate(clips):
         source_start=max(0,float(item.get("source_start",0))/1000)
-        source_end=max(source_start+.08,float(item.get("source_end",0))/1000)
+        raw_end = item.get("source_end", None)
+        if raw_end in (None, "", 0, 0.0):
+            source_end = media_dur if media_dur > source_start + 0.08 else source_start + 3600
+        else:
+            source_end = max(source_start + 0.08, float(raw_end) / 1000)
+        if media_dur > 0:
+            source_end = min(source_end, media_dur)
         timeline_start=max(0,int(item.get("start",0) or 0))
         chain=(f"[0:a]atrim=start={source_start:.3f}:end={source_end:.3f},"
                "asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo")
@@ -1209,11 +1220,19 @@ def render_timeline_audio(ffmpeg, source, clips, cache_dir, label="audio"):
 
 
 def added_audio_fade_filters(mode="直接加入（无淡入淡出）", fade_in_ms=500,
-                             fade_out_ms=500, duration=0):
-    """Return FFmpeg filters for the matched external track only."""
+                             fade_out_ms=500, duration=0, *, speech_track=False):
+    """Return FFmpeg filters for the matched external track only.
+
+    speech_track=True 时限制淡入时长（默认 UI 500ms 会把短「第一句」压到几乎听不见）。
+    """
     filters=[]; duration=max(0.0,float(duration or 0))
-    fade_in=max(0.0,int(fade_in_ms or 0)/1000)
-    fade_out=max(0.0,int(fade_out_ms or 0)/1000)
+    fade_in_ms = int(fade_in_ms or 0)
+    fade_out_ms = int(fade_out_ms or 0)
+    if speech_track and fade_in_ms > 120:
+        # 配音/TTS：最多 120ms 淡入，避免首句被吃掉
+        fade_in_ms = 120
+    fade_in=max(0.0,fade_in_ms/1000)
+    fade_out=max(0.0,fade_out_ms/1000)
     if mode in ("仅淡入","淡入＋淡出") and fade_in > 0:
         filters.append(f"afade=t=in:st=0:d={min(fade_in,duration or fade_in):.3f}")
     if mode in ("仅淡出","淡入＋淡出") and fade_out > 0 and duration > 0:
@@ -1244,10 +1263,11 @@ def mixed_audio_filter(original_volume=100, background_volume=25,
 def replacement_audio_filter(fade_mode="直接加入（无淡入淡出）", fade_in_ms=500,
                              fade_out_ms=500, duration=0, delay_ms=0):
     """Pad a replacement track with silence; -shortest then keeps video length."""
-    filters=["aresample=48000","aformat=channel_layouts=stereo"]
+    filters=["aresample=48000","aformat=channel_layouts=stereo","asetpts=PTS-STARTPTS"]
     if int(delay_ms or 0)>0:
         filters.append(f"adelay={int(delay_ms)}|{int(delay_ms)}")
-    filters.extend(added_audio_fade_filters(fade_mode,fade_in_ms,fade_out_ms,duration))
+    filters.extend(added_audio_fade_filters(
+        fade_mode, fade_in_ms, fade_out_ms, duration, speech_track=True))
     filters.append("apad=pad_dur=86400")
     filters.append("asetpts=PTS-STARTPTS")
     return f"[1:a:0]{','.join(filters)}[aout]"
@@ -1261,10 +1281,14 @@ def bgm_mix_audio_filter(dialogue_input, bgm_input, original_volume=100, backgro
     bgm_filters = ["aresample=48000", "aformat=channel_layouts=stereo", f"volume={bgm_vol:.3f}"]
     if int(bgm_delay_ms or 0)>0:
         bgm_filters.append(f"adelay={int(bgm_delay_ms)}|{int(bgm_delay_ms)}")
+    # BGM 可正常淡入；旁白/TTS 淡入单独收紧，避免第一句听不见
     bgm_filters.extend(added_audio_fade_filters(fade_mode, fade_in_ms, fade_out_ms, duration))
-    dialogue_filters=["aresample=48000","aformat=channel_layouts=stereo",f"volume={dialogue_vol:.3f}"]
+    dialogue_filters=["aresample=48000","aformat=channel_layouts=stereo",
+                      "asetpts=PTS-STARTPTS", f"volume={dialogue_vol:.3f}"]
     if int(dialogue_delay_ms or 0)>0:
         dialogue_filters.append(f"adelay={int(dialogue_delay_ms)}|{int(dialogue_delay_ms)}")
+    dialogue_filters.extend(added_audio_fade_filters(
+        fade_mode, fade_in_ms, fade_out_ms, duration, speech_track=True))
     return (
         f"{dialogue_input}{','.join(dialogue_filters)}[dialogue_audio];"
         f"{bgm_input}{','.join(bgm_filters)}[bgm_audio];"

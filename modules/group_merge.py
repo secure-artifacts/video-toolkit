@@ -313,18 +313,26 @@ def _speech_spans(srt):
     return spans
 
 
-def speech_trim_bounds(srt, duration, head_padding_ms=80, tail_padding_ms=280,
+def speech_trim_bounds(srt, duration, head_padding_ms=220, tail_padding_ms=280,
                        tail_safety_ms=280):
     """ASR 词界：从首词前 padding 到末词后 padding。
 
     尾部额外 +tail_safety_ms：ASR 词尾时间常偏早，防止吞掉尾音/气声。
     若末词后剩余不足 ~0.8s，直接保留到片尾。
+    片头 padding 默认 220ms：避免首句辅音/轻声被当成静音切掉。
     """
     spans = _speech_spans(srt)
     duration = max(0.05, float(duration or 0.05))
     if not spans:
         return 0.0, duration, False
-    start = max(0.0, spans[0][0] - max(0, head_padding_ms) / 1000.0)
+    # ASR 首词常晚于真实开口；padding 至少 200ms，首词特别晚时宁可不裁片头
+    head_pad = max(200, int(head_padding_ms or 0)) / 1000.0
+    first_word = float(spans[0][0])
+    if first_word > 1.2:
+        # 首词过晚：多半漏识别了第一句，整段从头保留
+        start = 0.0
+    else:
+        start = max(0.0, first_word - head_pad)
     # 用户尾保护至少 280ms；再加 safety（ASR 常切在音节中间）
     tail = max(280, int(tail_padding_ms or 0)) + max(0, int(tail_safety_ms))
     end = min(duration, spans[-1][1] + tail / 1000.0)
@@ -471,12 +479,12 @@ def pair_silence_events(events):
     return intervals
 
 
-def safe_silence_bounds(duration, events, head_padding_ms=80, tail_padding_ms=120):
+def safe_silence_bounds(duration, events, head_padding_ms=200, tail_padding_ms=120):
     """只裁「真·片头静音」和「真·片尾静音」。
 
     核心原则（高于 v1.7.17 旧逻辑）：
     - 中间停顿绝不当成片尾（旧逻辑会把 last silence_start 当 end，后半句全没）。
-    - 片头 silence_end 若过晚（轻声被当成静音），宁可不裁。
+    - 片头 silence_end 若过晚（轻声/第一句被当成静音），宁可不裁。
     - 不确定 → (0, duration, False) 保留完整片段。
     """
     duration = max(0.05, float(duration or 0.05))
@@ -485,10 +493,10 @@ def safe_silence_bounds(duration, events, head_padding_ms=80, tail_padding_ms=12
     end = duration
     detected = False
 
-    # —— 片头：第一条从 ~0 开始的静音，且结束点不能太靠后 ——
-    max_head = min(2.8, duration * 0.40)
+    # —— 片头：只裁很短的真静音；超过 ~0.7s 易吞第一句 ——
+    max_head = min(0.70, duration * 0.18)
     for s0, s1 in intervals:
-        if s0 > 0.15:
+        if s0 > 0.12:
             break
         if s1 is None:
             break
@@ -1428,10 +1436,21 @@ class GroupMergeWorker(QObject):
                         reason = f"{reason}+能量续尾"
                 except Exception as exc:
                     self.log.emit(f"提醒：能量续尾跳过 {clip.name}：{exc}")
-            # 片头：start 不得晚于「首词前 120ms」，避免切掉词头辅音
+            # 片头：start 不得晚于「首词前 250ms」；首词很晚则强制从 0 起
             if spans and trim_mode != "none":
-                first = spans[0][0]
-                start = min(start, max(0.0, first - 0.12))
+                first = float(spans[0][0])
+                if first > 1.2:
+                    start = 0.0
+                    reason = f"{reason}+首句保护(ASR首词过晚)"
+                else:
+                    start = min(start, max(0.0, first - 0.25))
+            # 硬顶：自动裁剪片头最多 0.65s，防止静音检测吞掉第一句
+            if trim_mode != "none" and start > 0.65 and reason != "手动切片":
+                self.log.emit(
+                    f"片头保护：{clip.name} 自动片头 {start:.2f}s 过大，限制为 0.15s 以防吞首句"
+                )
+                start = min(start, 0.15)
+                reason = f"{reason}+片头上限"
             self.log.emit(
                 f"去口气音：{clip.name} 保留 {start:.2f}s - {end:.2f}s"
                 f"（{reason}｜首保护{head_ms}ms 尾保护{tail_ms}ms）"
@@ -2079,13 +2098,22 @@ class GroupMergeWorker(QObject):
                             f"合并转场画面/声音同步 {actual_transition_duration:.2f}s；"
                             f"三角淡化，依赖尾保护气口而非垫静音。"
                         )
-                        v_in = "[0:v]"
-                        a_in = "[0:a]"
-                        current_offset = segment_infos[0]["duration"] - actual_transition_duration
+                        # 统一时间基/帧率，避免 xfade 报 timebase 不一致（如 1/12288 vs 1/15360）
                         filter_parts = []
+                        for i in range(len(normalized)):
+                            filter_parts.append(
+                                f"[{i}:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v{i}]"
+                            )
+                            filter_parts.append(
+                                f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,"
+                                f"asetpts=PTS-STARTPTS[a{i}]"
+                            )
+                        v_in = "[v0]"
+                        a_in = "[a0]"
+                        current_offset = segment_infos[0]["duration"] - actual_transition_duration
                         for i in range(1, len(normalized)):
-                            next_v = f"[{i}:v]"
-                            next_a = f"[{i}:a]"
+                            next_v = f"[v{i}]"
+                            next_a = f"[a{i}]"
                             out_v = f"[v_out_{i}]"
                             out_a = f"[a_out_{i}]"
                             filter_parts.append(
