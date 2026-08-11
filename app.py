@@ -51,7 +51,7 @@ from modules.settings_page import SettingsPage, component_bin, hidden_kwargs
 from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
-from modules.video_preset_page import VideoPresetPage
+from modules.tts_page import TtsPage
 from modules.text_rules import normalize_required_capitalization, normalize_subtitle_text
 from modules.metadata_page import MetadataPage
 from modules.platform_utils import (
@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.36").strip().lstrip("v") or "1.7.36"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.37").strip().lstrip("v") or "1.7.37"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -436,42 +436,63 @@ def normalize_api_key(key: str) -> str:
     return value
 
 
+def _looks_like_elevenlabs_key_id(value: str) -> bool:
+    """ElevenLabs 控制台里的「Key ID」是 32/64 位 hex，不是可调用的 secret。
+
+    官方错误：API key ID used as API key — only the full secret (sk_…) works.
+    """
+    v = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", v):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{64}", v):
+        return True
+    return False
+
+
 def detect_api_provider(key: str) -> str | None:
     """根据密钥前缀/形态猜测所属服务；无法判断时返回 None。
 
-    规则按「强特征优先」，避免把 OpenAI 的 sk- 误判成 ElevenLabs 的 sk_。
+    规则按「强特征优先」：
+    - Gladia 新版 sk_gla… 必须先于通用 sk_
+    - ElevenLabs 真密钥是 sk_…（不是 sk-，也不是 Key ID 的 hex）
     """
     value = normalize_api_key(key)
     if not value:
         return None
+    # 网页会话包
+    try:
+        if el_web.is_web_secret(value) or value.startswith(el_web.WEB_KEY_PREFIX):
+            return "ElevenLabs"
+    except Exception:
+        pass
     lower = value.casefold()
 
     # —— 强前缀（几乎可确定）——
     if value.startswith("gsk_") or lower.startswith("gsk-"):
         return "Groq"
-    # Google AI Studio / Gemini API Key（https://aistudio.google.com/api-keys）
-    # 1) 旧版常见：AIzaSy...（约 39 字符）
-    # 2) 新版常见：AQ.xxxxxxxx...（点号后跟一串 urlsafe 字符）
-    # 界面脱敏只显示前几位时，可能看到 “AI…” / “AQ…” —— 都归 Gemini。
+    # Gladia 新版密钥：sk_gla… / sk_gladia…（必须在通用 sk_ 之前）
+    if lower.startswith("sk_gla") or lower.startswith("sk_gladia"):
+        return "Gladia"
+    # Google AI Studio / Gemini
     if lower.startswith("aiza") or value.startswith(("AIza", "AIZa", "aiza", "AIZA")):
         return "Gemini"
     if lower.startswith("aq.") and len(value) >= 20:
         return "Gemini"
     if re.match(r"^aq\.[A-Za-z0-9_\-]{16,}$", value, flags=re.IGNORECASE):
         return "Gemini"
-    # 少数导出/复制时只剩 AI 开头的 Google 密钥（长度足够时才认，避免误伤）
     if lower.startswith("ai") and 35 <= len(value) <= 64 and re.fullmatch(r"[A-Za-z0-9_\-]+", value):
-        # 排除明显不是 Google 的
         if not lower.startswith(("airtable", "aidrive")):
             return "Gemini"
-    # ElevenLabs：下划线 sk_（注意不是 OpenAI 的 sk-）
+    # ElevenLabs 真·API secret（下划线 sk_，且不是 sk_gla）
     if value.startswith("sk_") and len(value) >= 20:
         return "ElevenLabs"
-    # ElevenLabs 偶尔下发 xi- 风格 / 长 hex
     if value.startswith("xi_") and len(value) >= 16:
         return "ElevenLabs"
+    # JWT / Firebase idToken（网页会话用）→ ElevenLabs，勿当 API Key
+    if value.count(".") >= 2 and len(value) > 80 and value.startswith("eyJ"):
+        return "ElevenLabs"
 
-    # 名称写在密钥里（自建备注或部分面板导出）
+    # 名称写在密钥里
     if "gladia" in lower:
         return "Gladia"
     if "groq" in lower and ("gsk" in lower or len(value) > 20):
@@ -485,25 +506,18 @@ def detect_api_provider(key: str) -> str | None:
     if "kling" in lower:
         return "Kling"
 
-    # Gladia：标准 UUID
+    # Gladia：标准 UUID（带连字符）
     if re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
         value,
     ):
         return "Gladia"
-    # Gladia：无连字符 32 位 hex（部分后台导出）
+    # 32 位 hex：更像 Gladia 旧 key / 通用 id；64 位 hex 多为 ElevenLabs「Key ID」误贴
+    # → 不在纯规则里强判，交给联网探测
     if re.fullmatch(r"[0-9a-fA-F]{32}", value):
         return "Gladia"
-    # Gladia：较长随机 token（40–80 的 urlsafe 字符），且不像其它家前缀
-    if (
-        40 <= len(value) <= 96
-        and re.fullmatch(r"[A-Za-z0-9_\-]+", value)
-        and not lower.startswith(("sk-", "sk_", "gsk_", "aiza", "pk_", "rk_"))
-    ):
-        # 更像 Gladia/通用 token；优先 Gladia（本软件常用）
-        return "Gladia"
 
-    # OpenAI 风格 sk- / sk-proj- 明确不是本软件 ASR 服务
+    # OpenAI 风格 sk- 不是本软件 ASR 服务
     if value.startswith("sk-"):
         return None
 
@@ -511,24 +525,45 @@ def detect_api_provider(key: str) -> str | None:
 
 
 def detect_api_provider_with_probe(key: str, timeout: float = 8.0) -> tuple[str | None, str]:
-    """先规则识别；失败则对常见 ASR 服务做短超时探测，返回 (provider, 说明)。"""
+    """先规则识别；失败则对常见服务短超时探测，返回 (provider, 说明)。"""
     value = normalize_api_key(key)
     if not value:
         return None, "空密钥"
+
+    # 明确误贴了 ElevenLabs 的 Key ID（不是 sk_ secret）
+    if _looks_like_elevenlabs_key_id(value) and not value.startswith("sk_"):
+        # 先试 Gladia（32 hex 可能是 Gladia）；64 hex 几乎一定是 EL Key ID
+        if len(value) == 64:
+            return None, (
+                "这是 ElevenLabs 的「Key ID」（64 位十六进制），不是可调用的密钥。"
+                "请到 elevenlabs.io → API Keys 复制完整 secret（以 sk_ 开头），"
+                "或使用「添加网页会话」粘贴 Authorization Bearer。"
+            )
+        ok_g, msg_g = check_api_key("Gladia", value, timeout=timeout)
+        if ok_g:
+            return "Gladia", "联网探测确认为 Gladia"
+        return None, (
+            "无法确认：若是 ElevenLabs，请粘贴 sk_ 开头的完整密钥（不是 Key ID）；"
+            f"若是 Gladia：{msg_g[:80]}"
+        )
+
     guessed = detect_api_provider(value)
     if guessed:
+        # 对 sk_ 可能仍歧义：sk_gla 已归 Gladia；纯 sk_ 再弱探测一次 Gladia？不必
         return guessed, f"按格式识别为 {guessed}"
 
-    # 探测顺序：特征冲突少、响应快的优先
-    probe_order = ["Groq", "Gemini", "ElevenLabs", "Gladia"]
+    # 探测顺序：特征冲突少、响应快的优先；Gladia 放 Eleven 前以免 64hex 误走 EL
+    probe_order = ["Groq", "Gemini", "Gladia", "ElevenLabs"]
     errors = []
     for provider in probe_order:
         ok, message = check_api_key(provider, value, timeout=timeout)
         if ok:
             return provider, f"联网探测确认为 {provider}"
-        # 401/403 说明服务认得出这是「密钥形态」但无效；401 可作弱线索
+        if "key ID" in message or "Key ID" in message:
+            errors.append(f"{provider}:{message[:100]}")
+            continue
         if "HTTP 401" in message or "HTTP 403" in message:
-            errors.append(f"{provider}:密钥形态匹配但未通过({message[:80]})")
+            errors.append(f"{provider}:密钥形态匹配但未通过")
         else:
             errors.append(f"{provider}:{message[:60]}")
     detail = "；".join(errors[:4])
@@ -542,6 +577,11 @@ def check_api_key(provider: str, key: str, timeout: float = 20.0) -> tuple[bool,
     try:
         if not key or any(ord(char) < 33 or ord(char) > 126 for char in key):
             return False, "密钥格式异常：含有空格、中文、全角字符或其他非法字符"
+        if provider == "ElevenLabs" and _looks_like_elevenlabs_key_id(key) and not key.startswith("sk_"):
+            return False, (
+                "格式错误：粘贴的是 ElevenLabs「Key ID」而不是密钥。"
+                "请复制以 sk_ 开头的完整 API secret，或改用「添加网页会话」。"
+            )
         if provider == "Groq":
             resp = requests.get("https://api.groq.com/openai/v1/models",
                                 headers={**headers, "Authorization": f"Bearer {key}"}, timeout=timeout)
@@ -549,8 +589,24 @@ def check_api_key(provider: str, key: str, timeout: float = 20.0) -> tuple[bool,
             resp = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                                 headers={**headers, "x-goog-api-key": key}, timeout=timeout)
         elif provider == "ElevenLabs":
-            # API Key 与网页会话统一走 verify_session（含 US/国际域 + TTS 探测）
+            # 纯 JWT → 临时包成网页会话再验
+            if key.count(".") >= 2 and key.startswith("eyJ") and not el_web.is_web_secret(key):
+                try:
+                    packed = el_web.pack_web_session(
+                        cookie="", authorization=f"Bearer {key}", xi_api_key="", label="JWT",
+                    )
+                    ok, message, _q = el_web.verify_session(packed, timeout=max(timeout, 45.0))
+                    return ok, message
+                except Exception as exc:
+                    return False, f"JWT 会话验证失败：{exc}"
             ok, message, _quota = el_web.verify_session(key, timeout=max(timeout, 45.0))
+            # 把官方「key ID」错误翻译成人话
+            if (not ok) and ("invalid_api_key" in (message or "") or "API key ID" in (message or "")):
+                return False, (
+                    "ElevenLabs 拒绝：当前字符串不是有效 API secret（常见原因：只复制了 Key ID）。"
+                    "请到 https://elevenlabs.io/app/settings/api-keys 创建/复制 sk_… 密钥，"
+                    "或使用「添加 ElevenLabs 网页会话」。原文：" + message[:160]
+                )
             return ok, message
         elif provider == "Luma":
             return True, "密钥格式有效，免联机检测"
@@ -562,9 +618,52 @@ def check_api_key(provider: str, key: str, timeout: float = 20.0) -> tuple[bool,
                                 headers={**headers, "x-gladia-key": key}, timeout=timeout)
         if resp.status_code < 300:
             return True, "验证通过"
-        return False, f"HTTP {resp.status_code}: {response_error(resp)}"
+        body = response_error(resp)
+        if provider == "ElevenLabs" or "invalid_api_key" in body or "API key ID" in body:
+            return False, (
+                f"HTTP {resp.status_code}: {body}\n"
+                "提示：ElevenLabs 必须使用 sk_ 完整密钥，不能用控制台里的 Key ID。"
+            )
+        return False, f"HTTP {resp.status_code}: {body}"
     except Exception as exc:
         return False, f"网络检测失败：{exc}"
+
+
+def reclassify_misplaced_keys(store: "ConfigStore") -> list[str]:
+    """修正历史误归类：如 sk_gla 进了 ElevenLabs、纯 Key ID 标错等。返回操作说明。"""
+    notes = []
+    # 1) Gladia 的 sk_gla 若在 ElevenLabs → 挪回 Gladia
+    move_pairs = []
+    for provider in list(PROVIDERS):
+        for item in list(store.data["providers"].get(provider) or []):
+            key = item.get("key") or ""
+            if el_web.is_web_secret(key):
+                continue
+            right = detect_api_provider(key)
+            if not right or right == provider:
+                # 标出 Key ID 误用
+                if provider == "ElevenLabs" and _looks_like_elevenlabs_key_id(key) and not key.startswith("sk_"):
+                    store.update_key(
+                        provider, item["id"],
+                        status="格式错误",
+                        last_error=(
+                            "这是 ElevenLabs Key ID，不是 sk_ 密钥。请删除后重新添加 sk_… 或网页会话。"
+                        ),
+                    )
+                    notes.append(f"标记 {provider}/{masked_key(key)} 为格式错误（Key ID）")
+                continue
+            move_pairs.append((provider, right, item))
+    for src, dst, item in move_pairs:
+        key = item["key"]
+        # 目标是否已有相同 key
+        exists = any(x.get("key") == key for x in store.data["providers"].get(dst) or [])
+        store.remove_key(src, item["id"])
+        if not exists:
+            store.add_key(dst, key)
+            notes.append(f"已迁移 {masked_key(key)}：{src} → {dst}")
+        else:
+            notes.append(f"已从 {src} 删除重复 {masked_key(key)}（{dst} 已有）")
+    return notes
 
 
 class KeyCheckWorker(QObject):
@@ -2947,13 +3046,13 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(brand)
         nav_layout.addSpacing(16)
         self.nav_buttons = []
-        # 索引与 self.pages 顺序一致：0 首页 … 4 批量重命名 … 8 流水线 … 10 元数据 … 11 视频预设
+        # 索引与 self.pages 顺序一致：0 首页 … 10 元数据 … 11 文字转语音
         nav_items = (
             ("首页", 0),
             ("图片工具", 1),
             ("智能剪辑", 2),
             ("Reels 编辑器", 3),
-            ("视频预设", 11),
+            ("文字转语音", 11),
             ("批量重命名", 4),
             ("清除元数据", 10),
             ("字幕提取", 5),
@@ -3037,13 +3136,13 @@ class MainWindow(QMainWindow):
         self.metadata_page = MetadataPage()
         self.pages.addWidget(self.metadata_page)
         _startup_trace("metadata page ready")
-        self.video_preset_page = VideoPresetPage(
+        self.tts_page = TtsPage(
             text_to_speech_fn=self._text_to_speech,
-            find_ffmpeg_fn=self._find_ffmpeg,
+            store=self.store,
         )
-        self.video_preset_page.navigate_requested.connect(self._show_page)
-        self.pages.addWidget(self.video_preset_page)
-        _startup_trace("video preset page ready")
+        self.tts_page.navigate_requested.connect(self._show_page)
+        self.pages.addWidget(self.tts_page)
+        _startup_trace("tts page ready")
         outer.addWidget(self.pages, 1)
         self._show_page(0)
 
@@ -3284,8 +3383,8 @@ class MainWindow(QMainWindow):
             ("▶", "Reels 编辑器",
              "• 分组合成、批量配音与字幕智能识别\n• 字幕样式、字幕校对、视频预览和公司水印\n• 每个视频对应自己的音频与文案并批量生成\n• 可选生成后上传云端并按方案填写 Google Sheets",
              "#34d399", "page:3"),
-            ("◆", "视频预设",
-             "• 固定标题/正文样式与白蒙版字幕效果\n• 按字符数自动正文字号（最小 20）\n• 时间轴、BGM 固定/随机、文案转语音\n• 预设保存导入导出与批量渲染",
+            ("🎤", "文字转语音",
+             "• 独立批量配音（微软 / ElevenLabs / Gemini）\n• ElevenLabs 网页会话扣点数（同浏览器插件 stream API）\n• 多卡文案、Excel 粘贴、本地缓存避免重复扣点\n• 音色/模型、混响、试听与导出目录",
              "#f472b6", "page:11"),
             ("A↔", "视频 / 文件重命名",
              "• 文件自然排序及 Windows 安全名称处理\n• 标题、日期、前后缀和连续编号组合\n• 执行前完整预览新旧文件名\n• 多套前缀与后缀方案保存和快速切换",
@@ -4034,7 +4133,7 @@ class MainWindow(QMainWindow):
             self.settings_page.setCurrentWidget(self.key_settings_page)
         self.pages.setCurrentIndex(index)
         page_names={0:"首页",1:"图片工具",2:"智能剪辑",3:"Reels 编辑器",4:"批量重命名",5:"字幕提取",
-                    6:"密钥管理",7:"设置与组件",8:"自动流水线",9:"帮助",10:"清除元数据",11:"视频预设"}
+                    6:"密钥管理",7:"设置与组件",8:"自动流水线",9:"帮助",10:"清除元数据",11:"文字转语音"}
         write_app_log(f"切换页面：{page_names.get(requested_index,requested_index)}","INFO","界面")
         for btn in self.nav_buttons:
             btn.setChecked(int(btn.property("pageIndex")) == nav_index)
@@ -5288,7 +5387,7 @@ class MainWindow(QMainWindow):
                     self.store.mark_use("Gemini", item["id"], "异常", last_error)
             raise RuntimeError(f"Gemini 可用密钥均生成失败。最后错误：{last_error}")
 
-        voice_id = voice.strip()
+        voice_id = voice.strip().split("｜", 1)[0].strip()
         if not voice_id or voice_id.endswith("Neural"):
             raise RuntimeError(
                 "使用 ElevenLabs 时，请在音色框输入 ElevenLabs Voice ID"
@@ -5300,15 +5399,23 @@ class MainWindow(QMainWindow):
                 "没有可用的 ElevenLabs 凭证。\n"
                 "请到「设置与组件 → 密钥」任选其一：\n"
                 "• 添加 sk_ API Key；或\n"
-                "• 添加「网页会话（Cookie）」——用账号免费点数，支持多账户轮询。\n"
-                "粘贴一次 Cookie 后即可在本软件内转语音，无需每次开浏览器。"
+                "• 添加「网页会话（Cookie）」——与浏览器插件相同，用 Bearer 调官方 TTS 扣点数。\n"
+                "也可在「文字转语音」独立板块批量生成。"
             )
+        el_model = (
+            os.environ.get("VIDEO_TOOLKIT_EL_MODEL")
+            or "eleven_flash_v2_5"
+        ).strip() or "eleven_flash_v2_5"
+        # Reels/字幕需要时间轴时用 timestamps；独立批量板块默认 stream（与插件一致）
+        want_ts = os.environ.get("VIDEO_TOOLKIT_EL_TIMESTAMPS", "").strip() in ("1", "true", "yes")
         last_error = ""
         for item in candidates:
             secret = item.get("key") or ""
             try:
                 audio_bytes, alignment = el_web.tts_request(
                     secret, voice_id, text, timeout=180,
+                    model_id=el_model,
+                    want_timestamps=want_ts,
                 )
                 if alignment:
                     try:
@@ -5728,7 +5835,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "已添加网页会话",
             (f"已保存：{label_edit.text().strip() or '网页会话'}\n{message}{extra}\n\n"
-             "Reels / 视频预设 选 ElevenLabs API + Voice ID 即可转语音。\n"
+             "到「文字转语音」板块选 ElevenLabs + Voice ID 即可批量转语音。\n"
              "可继续添加更多账户实现轮询。")
         )
         write_app_log(f"添加 ElevenLabs 网页会话：{label_edit.text().strip() or '网页会话'}", "INFO", "密钥")
@@ -5736,6 +5843,15 @@ class MainWindow(QMainWindow):
     def _refresh_keys(self):
         if not hasattr(self, "key_table"):
             return
+        # 启动/刷新时修正历史误归类（sk_gla→Gladia、Key ID 标错等）
+        if not getattr(self, "_keys_reclassified", False):
+            try:
+                notes = reclassify_misplaced_keys(self.store)
+                self._keys_reclassified = True
+                if notes:
+                    write_app_log("密钥归类修正：" + "；".join(notes[:8]), "INFO", "密钥")
+            except Exception as exc:
+                write_app_log(f"密钥归类修正跳过：{exc}", "WARN", "密钥")
         self.key_table.setRowCount(0)
         status_colors = {"有效": "#22c55e", "失效": "#ef4444", "格式错误": "#ef4444",
                          "额度受限": "#f59e0b", "异常": "#f97316"}

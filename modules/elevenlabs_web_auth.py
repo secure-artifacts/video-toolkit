@@ -32,11 +32,20 @@ API_HOSTS = (
     "https://api.elevenlabs.io",
 )
 
-# VideoKit 默认模型；免费档探测时也会尝试更轻量模型
+# 与浏览器插件 / 网页一致：Flash 优先（省点、快）；探测时多模型回退
 DEFAULT_TTS_MODELS = (
-    "eleven_multilingual_v2",
-    "eleven_turbo_v2_5",
     "eleven_flash_v2_5",
+    "eleven_turbo_v2_5",
+    "eleven_multilingual_v2",
+    "eleven_v3",
+)
+
+# UI 下拉用（id → 显示名）
+TTS_MODEL_CHOICES = (
+    ("eleven_flash_v2_5", "Flash v2.5（默认·快）"),
+    ("eleven_turbo_v2_5", "Turbo v2.5（极速）"),
+    ("eleven_multilingual_v2", "Multilingual v2（经典）"),
+    ("eleven_v3", "Eleven v3（情绪/笑声标签）"),
 )
 
 
@@ -501,15 +510,25 @@ def probe_tts_allowed(secret: str, timeout: float = 40.0) -> tuple[bool, str]:
 
 
 def list_voices(secret: str, timeout: float = 40.0) -> list[dict]:
-    """GET /v1/voices → [{voice_id, name, category, labels}, ...]"""
+    """GET /v2/voices 优先（与浏览器插件一致），回退 /v1/voices。"""
     headers = build_auth_headers(secret)
     headers["Accept"] = "application/json"
-    status, data, raw, host = _request_json(
-        "GET", "/v1/voices", headers, timeout=timeout,
-    )
-    if status >= 400 or not isinstance(data, dict):
+    data = None
+    raw = ""
+    host = API_HOSTS[0]
+    status = 0
+    # 插件用 v2 + page_size=100
+    for path in ("/v2/voices?page_size=100", "/v1/voices"):
+        status, data, raw, host = _request_json(
+            "GET", path, headers, timeout=timeout,
+        )
+        if status < 400 and isinstance(data, dict) and (data.get("voices") or []):
+            break
+    if not isinstance(data, dict):
         raise RuntimeError(_friendly_api_error(status, raw or f"host={host}"))
     voices = data.get("voices") or []
+    if not voices and status >= 400:
+        raise RuntimeError(_friendly_api_error(status, raw or f"host={host}"))
     result = []
     for item in voices:
         if not isinstance(item, dict):
@@ -543,62 +562,88 @@ def tts_request(
     voice_id: str,
     text: str,
     *,
-    model_id: str = "eleven_multilingual_v2",
+    model_id: str = "eleven_flash_v2_5",
     timeout: float = 180.0,
+    want_timestamps: bool = False,
 ) -> tuple[bytes, dict | None]:
     """发起 TTS；返回 (audio_bytes, alignment_or_None)。
 
-    与 VideoKit 相同：
-    - 网页会话 = Cookie + Authorization +（常有）网页注入的 xi-api-key
-    - 仍请求官方 /v1/text-to-speech（会扣账号 character credits）
-    - 并不是「绕过 Key、只在浏览器扣点数」的另一条通道
+    与浏览器插件「Eleven V3 Batch Pro」相同扣点方式：
+    - Authorization: Bearer <网页 Firebase/idToken> 或 xi-api-key
+    - POST api.us.elevenlabs.io/v1/text-to-speech/{id}/stream（优先）
+    - 扣账号 character credits；不是独立旁路
 
-    自动尝试 api.us / api 主机，以及多种 model。
+    want_timestamps=True 时优先 with-timestamps（方便字幕）。
     """
     headers = build_auth_headers(secret)
     models = [model_id] + [m for m in DEFAULT_TTS_MODELS if m != model_id]
     last_err = ""
     unusual = False
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        raise RuntimeError("文案为空")
 
     for host in API_HOSTS:
         for mid in models:
             payload = {
-                "text": text,
+                "text": clean_text,
                 "model_id": mid,
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
             }
-            # 1) with-timestamps（我们多这一步，方便字幕）
-            ts_headers = dict(headers)
-            ts_headers["Content-Type"] = "application/json"
-            ts_headers["Accept"] = "application/json"
+
+            # 0) 插件同款：/stream + Bearer（最常用于网页点数）
+            stream_headers = dict(headers)
+            stream_headers["Content-Type"] = "application/json"
+            stream_headers["Accept"] = "audio/mpeg"
             try:
-                resp = requests.post(
-                    _api_url(f"/v1/text-to-speech/{voice_id}/with-timestamps", host),
-                    headers=ts_headers, json=payload, timeout=timeout,
+                stream = requests.post(
+                    _api_url(f"/v1/text-to-speech/{voice_id}/stream", host),
+                    headers=stream_headers, json=payload, timeout=timeout,
                 )
             except requests.RequestException as exc:
                 last_err = str(exc)
-                continue
-            if resp.status_code < 400:
-                try:
-                    data = resp.json()
-                    b64 = data.get("audio_base64") or data.get("audio")
-                    if b64:
-                        import base64
-                        audio = base64.b64decode(b64)
-                        if len(audio) >= 256:
-                            alignment = data.get("alignment") or data.get("normalized_alignment")
-                            return audio, alignment if isinstance(alignment, dict) else None
-                except (ValueError, TypeError, KeyError):
-                    pass
-            body_text = resp.text or ""
-            if "detected_unusual_activity" in body_text or "Free Tier access has been disabled" in body_text:
-                unusual = True
-                last_err = _friendly_api_error(resp.status_code, body_text)
-                # 风控是账号级，换 host/model 通常无效，仍试一轮后统一抛出
-                continue
+                stream = None
+            if stream is not None:
+                if stream.status_code < 400 and len(stream.content) >= 256:
+                    return stream.content, None
+                body0 = stream.text or ""
+                last_err = _friendly_api_error(stream.status_code, body0)
+                if "detected_unusual_activity" in body0 or "Free Tier access has been disabled" in body0.lower():
+                    unusual = True
+                    continue
 
-            # 2) VideoKit 同款：plain TTS + output_format 查询参数
+            if want_timestamps:
+                # 1) with-timestamps（字幕用）
+                ts_headers = dict(headers)
+                ts_headers["Content-Type"] = "application/json"
+                ts_headers["Accept"] = "application/json"
+                try:
+                    resp = requests.post(
+                        _api_url(f"/v1/text-to-speech/{voice_id}/with-timestamps", host),
+                        headers=ts_headers, json=payload, timeout=timeout,
+                    )
+                except requests.RequestException as exc:
+                    last_err = str(exc)
+                    continue
+                if resp.status_code < 400:
+                    try:
+                        data = resp.json()
+                        b64 = data.get("audio_base64") or data.get("audio")
+                        if b64:
+                            import base64
+                            audio = base64.b64decode(b64)
+                            if len(audio) >= 256:
+                                alignment = data.get("alignment") or data.get("normalized_alignment")
+                                return audio, alignment if isinstance(alignment, dict) else None
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                body_text = resp.text or ""
+                if "detected_unusual_activity" in body_text or "Free Tier access has been disabled" in body_text:
+                    unusual = True
+                    last_err = _friendly_api_error(resp.status_code, body_text)
+                    continue
+
+            # 2) plain TTS + output_format
             plain_headers = dict(headers)
             plain_headers["Content-Type"] = "application/json"
             plain_headers["Accept"] = "audio/mpeg"

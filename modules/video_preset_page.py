@@ -217,6 +217,33 @@ STYLE_QUICK_PRESETS = {
         "highlight_color": "#A855F7", "outline_width": 5, "effect": "glow",
         "title_bold": True, "shadow": 0,
     },
+    # Facebook 参考（竖屏 9:16 居中大字）
+    "FB 卡车黄字跟读": {
+        "title_font": "Arial Black", "body_font": "Arial Black",
+        "title_color": "#F7FF1A", "body_color": "#F8FAFC",
+        "title_font_size": 92, "body_font_size": 78, "body_auto_size": True,
+        "adaptive_layout": True, "title_bold": True, "body_bold": True,
+        "outline_color": "#0A0A0A", "outline_width": 6, "effect": "outline",
+        "highlight_color": "#F7FF1A", "shadow": 2,
+        "mask_enabled": False, "mask_opacity": 0,
+        "position": "画面中间", "margin_v": 420, "line_spacing": 108,
+        "title_align": "居中", "title_x_pct": 50, "title_width_pct": 88,
+        "body_align": "居中", "body_x_pct": 50, "body_width_pct": 90,
+        "title_y_pct": 38, "body_y_pct": 48, "body_flow": [],
+    },
+    "FB 黄昏白字光晕": {
+        "title_font": "Arial Black", "body_font": "Arial Black",
+        "title_color": "#FFFFFF", "body_color": "#FFFFFF",
+        "title_font_size": 100, "body_font_size": 88, "body_auto_size": True,
+        "adaptive_layout": True, "title_bold": True, "body_bold": True,
+        "outline_color": "#FFFFFF", "outline_width": 3, "effect": "glow",
+        "highlight_color": "#FFFFFF", "shadow": 6,
+        "mask_enabled": False, "mask_opacity": 0,
+        "position": "画面中间", "margin_v": 400, "line_spacing": 112,
+        "title_align": "居中", "title_x_pct": 50, "title_width_pct": 86,
+        "body_align": "居中", "body_x_pct": 50, "body_width_pct": 88,
+        "title_y_pct": 40, "body_y_pct": 52, "body_flow": [],
+    },
 }
 
 DEFAULT_PRESET = {

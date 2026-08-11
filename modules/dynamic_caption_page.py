@@ -217,6 +217,40 @@ PRESETS = {
     # —— 逐词变色系列 ——
     "卡拉OK 青蓝跟读": {"text": "#FFFFFF", "outline": "#1A1A3A", "highlight": "#00E5FF", "outline_width": 4, "effect": "word_color", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
     "亮黄逐词变色": {"text": "#FFFFFF", "outline": "#222222", "highlight": "#FFEE00", "outline_width": 3, "effect": "word_color", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
+    # —— Facebook 参考（Downloads/视频批量下载/Facebook）——
+    # 参考1：夜间卡车 · 白字+当前词亮黄荧光 · 粗黑描边 · 居中偏上 · 逐词
+    "FB 卡车黄字跟读": {
+        "text": "#F8FAFC", "outline": "#0A0A0A", "highlight": "#F7FF1A",
+        "outline_width": 6, "effect": "word_color",
+        "font": "Arial Black", "font_size": 88, "line_length": 22,
+        "letter_spacing": -2, "line_spacing": 108,
+        "margin_v": 520, "max_words": 5, "max_lines": 2,
+        "highlight_padding": 8, "animation_speed": 85,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 86,
+    },
+    # 参考2：黄昏公路 · 纯白大字 + 柔和白光晕 · 居中 · 少词大字
+    "FB 黄昏白字光晕": {
+        "text": "#FFFFFF", "outline": "#FFFFFF", "highlight": "#FFFFFF",
+        "outline_width": 4, "effect": "glow",
+        "font": "Arial Black", "font_size": 96, "line_length": 18,
+        "letter_spacing": 1, "line_spacing": 112,
+        "margin_v": 480, "max_words": 4, "max_lines": 2,
+        "highlight_padding": 6, "animation_speed": 90,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 84, "shadow": 6,
+    },
+    # 参考2 变体：逐词亮起（当前词更亮，其余白）
+    "FB 黄昏逐词亮白": {
+        "text": "#E8E8E8", "outline": "#1A1A1A", "highlight": "#FFFFFF",
+        "outline_width": 5, "effect": "word_color",
+        "font": "Arial Black", "font_size": 94, "line_length": 18,
+        "letter_spacing": 0, "line_spacing": 110,
+        "margin_v": 480, "max_words": 4, "max_lines": 2,
+        "highlight_padding": 6, "animation_speed": 88,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 84,
+    },
     # —— 弹出缩放系列 ——
     "默认白字": {"text": "#FFFFFF", "outline": "#000000", "highlight": "#FFD700", "outline_width": 3, "effect": "pop", "font": "Arial", "font_size": 74, "line_length": 26, "margin_v": 500, "max_words": 7},
     "黄字黑边 (经典)": {"text": "#FFD700", "outline": "#000000", "highlight": "#FF4444", "outline_width": 5, "effect": "pop", "font": "Arial", "font_size": 74, "line_length": 26, "margin_v": 500, "max_words": 7},
@@ -728,6 +762,118 @@ def retime_word_srt_after_ripple(word_srt: str, start_ms: int, end_ms: int) -> s
             kept.append((s, max(s + 0.05, start), text))
         # 完全在删除区内或中点落在删除区内：丢弃
     return events_to_srt(kept)
+
+
+def _normalize_video_segments(segments):
+    """Normalize timeline video segments to sorted (tl_start, tl_end, src_start, src_end) seconds."""
+    result = []
+    for item in segments or []:
+        if not isinstance(item, dict):
+            continue
+        media_type = str(item.get("media_type", "video") or "video")
+        if media_type in ("image", "external_video"):
+            # 外插素材不在源片时间轴上，跳过（字幕仍按主片源映射）
+            continue
+        tl0 = max(0.0, float(item.get("start", 0) or 0) / 1000.0)
+        tl1 = max(tl0 + 0.04, float(item.get("end", 0) or 0) / 1000.0)
+        src0 = max(0.0, float(item.get("source_start", 0) or 0) / 1000.0)
+        src1 = float(item.get("source_end", 0) or 0) / 1000.0
+        if src1 <= src0 + 0.02:
+            src1 = src0 + (tl1 - tl0)
+        src1 = max(src0 + 0.04, src1)
+        result.append((tl0, tl1, src0, src1))
+    result.sort(key=lambda row: (row[0], row[1]))
+    return result
+
+
+def video_segments_need_caption_retime(segments) -> bool:
+    """True when timeline video cuts would move speech relative to a source-timed SRT."""
+    segs = _normalize_video_segments(segments)
+    if not segs:
+        return False
+    if len(segs) >= 2:
+        return True
+    tl0, tl1, src0, src1 = segs[0]
+    # 单段裁过片头/片尾：源起点非 0 或时长被裁短
+    if src0 > 0.04:
+        return True
+    if abs((tl1 - tl0) - (src1 - src0)) > 0.08:
+        return True
+    return False
+
+
+def retime_srt_for_video_segments(srt_content: str, segments) -> str:
+    """Map source-clock SRT onto the edited timeline after multi-segment video cuts.
+
+    Each video segment maps [source_start, source_end) → [timeline_start, timeline_end).
+    Cues fully inside a deleted gap are dropped; cues spanning a cut are clipped per segment.
+    This is the same model CapCut/Descript use when baking cuts before burn-in.
+    """
+    if not srt_content or "-->" not in str(srt_content):
+        return srt_content or ""
+    segs = _normalize_video_segments(segments)
+    if not segs or not video_segments_need_caption_retime(segments):
+        return srt_content
+    mapped = []
+    for start, end, text in parse_srt(srt_content):
+        if end <= start or not str(text or "").strip():
+            continue
+        for tl0, tl1, src0, src1 in segs:
+            # 与源段的交集
+            ov0 = max(start, src0)
+            ov1 = min(end, src1)
+            if ov1 - ov0 < 0.04:
+                continue
+            src_span = max(0.04, src1 - src0)
+            tl_span = max(0.04, tl1 - tl0)
+            # 线性映射源时刻 → 时间轴时刻
+            n0 = (ov0 - src0) / src_span
+            n1 = (ov1 - src0) / src_span
+            out0 = tl0 + n0 * tl_span
+            out1 = tl0 + n1 * tl_span
+            if out1 - out0 < 0.04:
+                out1 = out0 + 0.04
+            mapped.append((out0, out1, text))
+    if not mapped:
+        return ""
+    mapped.sort(key=lambda item: (item[0], item[1]))
+    return events_to_srt(mapped)
+
+
+def srt_max_end_seconds(srt_content: str) -> float:
+    try:
+        entries = parse_srt(srt_content or "")
+    except Exception:
+        return 0.0
+    if not entries:
+        return 0.0
+    return max(float(item[1]) for item in entries)
+
+
+def should_retime_captions_for_segments(phrase_srt, word_srt, segments, captions_timeline_aligned=False) -> bool:
+    """Decide whether SRT still lives on the source clock and needs segment mapping."""
+    if captions_timeline_aligned:
+        return False
+    if not video_segments_need_caption_retime(segments):
+        return False
+    segs = _normalize_video_segments(segments)
+    if not segs:
+        return False
+    timeline_dur = max(0.0, segs[-1][1] - segs[0][0]) if segs else 0.0
+    # 多段时以各段时间轴跨度之和近似（忽略转场重叠误差）
+    if len(segs) >= 2:
+        timeline_dur = sum(max(0.0, tl1 - tl0) for tl0, tl1, _s0, _s1 in segs)
+    cue_end = max(srt_max_end_seconds(phrase_srt), srt_max_end_seconds(word_srt))
+    # 字幕终点明显长于成片时间轴 → 仍是源时钟
+    if cue_end > timeline_dur + 0.35:
+        return True
+    # 单段裁片头：源起点 > 0 且字幕仍从接近 0 开始覆盖源片
+    if len(segs) == 1 and segs[0][2] > 0.04:
+        return True
+    # 多段切口：默认按源时钟映射（涟漪后会标 captions_timeline_aligned）
+    if len(segs) >= 2:
+        return True
+    return False
 
 
 def fix_srt_overlaps(srt, gap_ms=20, min_duration_ms=80):
@@ -1609,8 +1755,10 @@ def normalize_reverb_mode(mode) -> str:
 
 
 def ethereal_reverb_filter_chain(amount: int = 45, mode: str = "大厅") -> str:
-    """Dry/wet spatial reverb by mode; clean stereo, no electric hiss.
+    """Dry/wet spatial reverb by mode; speech-safe (no double-voice).
 
+    旧版用 stereowiden + 高 wet 会在左右耳形成 Haas 叠音，听起来像两个人。
+    现改为：单声道兼容 wet、压低湿声、去掉 stereowiden。
     modes: 小房间 / 大厅 / 教堂 / 板式混响 / 回声
     amount 10–100 控制湿声与衰减强度；干声始终可辨。
     """
@@ -1618,37 +1766,33 @@ def ethereal_reverb_filter_chain(amount: int = 45, mode: str = "大厅") -> str:
     t = amount / 100.0
     preset = REVERB_MODE_PRESETS[normalize_reverb_mode(mode)]
 
+    # 干声保持主导；湿声上限压低，避免「第二把声」
     dry = float(preset["dry_hi"]) - (float(preset["dry_hi"]) - float(preset["dry_lo"])) * t
+    dry = max(0.78, dry)
     wet = float(preset["wet_lo"]) + (float(preset["wet_hi"]) - float(preset["wet_lo"])) * t
+    wet = min(0.28, wet * 0.55)  # 明显降湿，仍有空间感
     decay_base = float(preset["decay_lo"]) + (float(preset["decay_hi"]) - float(preset["decay_lo"])) * t
-    cap = float(preset["decay_cap"])
+    cap = min(0.28, float(preset["decay_cap"]))
     factors = preset["decay_factors"]
-    decays = "|".join(f"{min(cap, decay_base * float(f)):.3f}" for f in factors)
+    decays = "|".join(f"{min(cap, decay_base * float(f) * 0.75):.3f}" for f in factors)
     delays = str(preset["delays"])
     in_g = float(preset["in_gain"])
     out_g = float(preset["out_gain"])
     lp = int(preset["lp"])
 
-    sw_delay = float(preset["sw_delay_lo"]) + (
-        float(preset["sw_delay_hi"]) - float(preset["sw_delay_lo"])
-    ) * t
-    sw_fb = float(preset["sw_fb_lo"]) + (float(preset["sw_fb_hi"]) - float(preset["sw_fb_lo"])) * t
-    sw_cross = 0.12 + 0.16 * t
-    sw_dry = 0.88 - 0.12 * t
-
     return (
         f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
-        f"highpass=f=100,"
+        f"highpass=f=90,"
         f"asplit=2[dry][wet];"
         f"[dry]volume={dry:.3f}[d];"
+        # pan=stereo|c0=c0|c1=c0：湿声左右同相，避免左右错时差造成「两个人」
         f"[wet]aecho={in_g:.2f}:{out_g:.2f}:{delays}:{decays},"
         f"lowpass=f={lp},"
+        f"pan=stereo|c0=c0|c1=c0,"
         f"volume={wet:.3f}[w];"
-        f"[d][w]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
-        f"stereowiden=delay={sw_delay:.1f}:feedback={sw_fb:.2f}:"
-        f"crossfeed={sw_cross:.2f}:drymix={sw_dry:.2f},"
-        f"alimiter=limit=0.93:attack=5:release=50,"
-        f"volume=0.96"
+        f"[d][w]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+        f"alimiter=limit=0.92:attack=5:release=50,"
+        f"volume=0.98"
     )
 
 
@@ -2870,10 +3014,27 @@ def watermark_filter_graph(
     切勿再按「全屏」二次拉伸，否则会把透明区域变成黑底盖住成片。
     video_logo_specs: optional list of (input_index, entry) for looping motion logos.
     """
-    ass_expression=ass_filter_expression(ass_filter,settings)
+    ass_expression = ass_filter_expression(
+        ass_filter,
+        settings,
+        video_size=(
+            settings.get("target_w"),
+            settings.get("target_h"),
+        ) if settings else None,
+    )
     opacity = max(5, min(100, int(settings.get("watermark_opacity", 90)))) / 100
     mode = str(settings.get("watermark_mode", "9:16 全屏覆盖") or "9:16 全屏覆盖")
-    video_prefix = f"[0:v]{v_filter_str + ',' if v_filter_str else ''}{ass_expression}[captioned]"
+    chain_parts = []
+    if v_filter_str:
+        chain_parts.append(str(v_filter_str).strip().strip(","))
+    if ass_expression:
+        chain_parts.append(ass_expression)
+    video_chain = ",".join(chain_parts)
+    if video_chain:
+        video_prefix = f"[0:v]{video_chain}[captioned]"
+    else:
+        # 无字幕、无前置滤镜时仍给水印链一个稳定入口标签
+        video_prefix = "[0:v]setpts=PTS-STARTPTS[captioned]"
     parts = [video_prefix]
     current = "captioned"
     # 预合成静态图 / 单图水印
@@ -2911,12 +3072,60 @@ def watermark_filter_graph(
     return ";".join(parts)
 
 
-def ass_filter_expression(ass_filter,settings):
-    expression=f"ass=filename='{escape_ffmpeg_filter_path(ass_filter)}'"
-    folder=render_font_dir()
+def ass_filter_expression(ass_filter, settings=None, video_size=None):
+    """Build a stable libass burn-in filter shared by preview and export.
+
+    Key consistency rules (aligned with common open-source burn-in paths):
+    - Always load fonts from our render font dir (same face as live Qt metrics).
+    - Author ASS at PlayRes 1080x1920; tell libass that canvas via original_size
+      when the video frame already matches that layout after scale/crop.
+    - Prefer complex shaping when FFmpeg/libass supports it (HarfBuzz), falling
+      back silently if the option is rejected by older builds.
+    - Never inject sample placeholder text here — empty ass_filter means no filter.
+    """
+    if not ass_filter:
+        return ""
+    settings = settings or {}
+    expression = f"ass=filename='{escape_ffmpeg_filter_path(ass_filter)}'"
+    folder = render_font_dir()
     if folder.is_dir():
-        expression+=f":fontsdir='{escape_ffmpeg_filter_path(folder)}'"
+        expression += f":fontsdir='{escape_ffmpeg_filter_path(folder)}'"
+    # write_ass always authors at PlayRes 1080x1920. original_size must be that
+    # authoring canvas — NOT the current frame size — so libass scales outlines
+    # and fonts the same way on 720p/1080p/export/preview frames.
+    try:
+        w = int(settings.get("ass_play_res_x") or 1080)
+        h = int(settings.get("ass_play_res_y") or 1920)
+    except (TypeError, ValueError):
+        w, h = 1080, 1920
+    if video_size and len(video_size) >= 2:
+        # Only override when caller explicitly authored ASS for another canvas.
+        pass
+    if w > 0 and h > 0:
+        expression += f":original_size={w}x{h}"
+    # FFmpeg ass filter option is "shaping" (auto/simple/complex), not "shaper".
+    # complex uses OpenType/HarfBuzz when libass is built with it — closer to
+    # desktop players and reduces preview vs export glyph drift.
+    if settings.get("ass_shaping", "complex") != "off":
+        shaping = str(settings.get("ass_shaping") or settings.get("ass_shaper") or "complex")
+        if shaping in ("complex", "simple", "auto"):
+            expression += f":shaping={shaping}"
     return expression
+
+
+def compose_caption_vf(v_filter_str, ass_path, settings=None, video_size=None):
+    """Join pre-ASS video chain + libass with identical order for preview/export.
+
+    Order (critical for WYSIWYG): scale/crop/fps/setpts → ass burn-in.
+    Applying ASS before scale causes font/outline size drift between paths.
+    """
+    ass_expr = ass_filter_expression(ass_path, settings, video_size=video_size)
+    parts = []
+    if v_filter_str:
+        parts.append(str(v_filter_str).strip().strip(","))
+    if ass_expr:
+        parts.append(ass_expr)
+    return ",".join(p for p in parts if p)
 
 
 def escape_ffmpeg_filter_path(path):
@@ -3735,19 +3944,50 @@ class CaptionWorker(QObject):
                     if match:
                         manual_bounds = (float(match.group(1)), float(match.group(2)))
 
+                # 未选转文案 / 明确跳过字幕：允许导出无字幕成品（预览样例文案不写入成品）
+                skip_captions = bool(
+                    self.settings.get("skip_captions")
+                    or self.settings.get("skip_post_transcript")
+                )
+                phrase_srt = ""
+                word_srt = ""
+                original = ""
+                chinese = ""
+                burn_captions = False
+
                 if self.settings.get("caption_mode") == "自由文案动画（不对口型）":
                     video_key = str(video.resolve())
                     copy_text = str(self.settings.get("free_texts", {}).get(video_key, "")).strip()
+                    if not copy_text:
+                        copy_text = str(self.settings.get("free_texts", {}).get(source_key, "")).strip()
+                    if not copy_text:
+                        copy_text = str(self.settings.get("free_default_text", "") or "").strip()
                     if manual_bounds is not None:
                         copy_text = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', copy_text).strip()
-                    if not copy_text:
-                        raise RuntimeError(f"自由文案模式下，视频尚未填写字幕：{video.name}")
-                    phrase_srt = free_caption_srt(copy_text, media_duration(self.ffmpeg, render_video), self.settings)
-                    word_srt = ""; original = copy_text; chinese = ""
-                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 使用自由文案动画，不执行语音识别：{video.name}")
+                    if skip_captions or not copy_text:
+                        if not skip_captions and not copy_text:
+                            # 自由文案模式且用户未勾「不转文案」时仍要求有文案
+                            raise RuntimeError(f"自由文案模式下，视频尚未填写字幕：{video.name}")
+                        burn_captions = False
+                        original = copy_text or video.stem
+                        chinese = ""
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 已勾选不转文案，"
+                            f"导出无字幕视频：{video.name}"
+                        )
+                    else:
+                        phrase_srt = free_caption_srt(copy_text, media_duration(self.ffmpeg, render_video), self.settings)
+                        word_srt = ""
+                        original = copy_text
+                        chinese = ""
+                        burn_captions = True
+                        self.log.emit(f"[{index + 1}/{len(self.videos)}] 使用自由文案动画，不执行语音识别：{video.name}")
                 else:
                     saved_word_srt = str(self.settings.get("word_timelines", {}).get(source_key, "")).strip()
+                    if not saved_word_srt:
+                        saved_word_srt = str(self.settings.get("word_timelines", {}).get(str(video.resolve()), "")).strip()
                     sidecar = caption_audio.with_suffix(".srt")
+                    srt = ""
                     if saved_word_srt:
                         srt = saved_word_srt
                         original = " ".join(text for _,_,text in parse_srt(srt))
@@ -3758,40 +3998,100 @@ class CaptionWorker(QObject):
                         original = " ".join(text for _, _, text in parse_srt(srt))
                         chinese = str(self.settings.get("timeline_chinese", {}).get(source_key, "")).strip()
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 使用配音的真实词级时间轴：{sidecar.name}")
-                    elif render_video==video and _load_timeline_cache(self.output,caption_audio):
+                    elif (not skip_captions) and render_video==video and _load_timeline_cache(self.output,caption_audio):
                         srt=_load_timeline_cache(self.output,caption_audio)
                         original=" ".join(text for _,_,text in parse_srt(srt))
                         chinese = str(self.settings.get("timeline_chinese", {}).get(source_key, "")).strip()
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 断点续接：复用已提取字幕 {caption_audio.name}")
-                    else:
+                    elif not skip_captions:
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 从对白音轨提取词级时间轴：{speech_media.name}")
                         original, chinese, srt = self.transcribe(str(speech_media))
                         if str(srt or "").strip() and render_video==video:
                             _save_timeline_cache(self.output,caption_audio,srt)
-                    if not srt.strip(): raise RuntimeError(f"未识别到有效字幕：{caption_audio.name}")
-                    word_srt = srt
-                    phrase_srt = group_word_srt(word_srt, self.settings["line_length"] * 2,
-                                                max_words=self.settings.get("max_words", 8))
-                    override = str(self.settings.get("timeline_overrides", {}).get(str(caption_audio.resolve()), "")).strip()
-                    if manual_bounds is not None:
-                        override = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', override).strip()
-                    if override:
-                        if "-->" in override:
-                            phrase_srt = override
-                            self.log.emit("已应用人工修订后的逐句 SRT，逐词时间轴继续驱动高亮。")
+                    else:
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 已勾选不转文案且无现成字幕，"
+                            f"跳过识别并导出无字幕：{video.name}"
+                        )
+                    if not str(srt or "").strip():
+                        # 无字幕：仍可导出画面/音轨；仅在「需要字幕」时才失败
+                        if skip_captions:
+                            burn_captions = False
+                            phrase_srt = ""
+                            word_srt = ""
+                            original = original or video.stem
+                            chinese = chinese or ""
                         else:
-                            phrase_srt = replace_srt_copy(phrase_srt, override)
-                            self.log.emit("已应用人工修订文案，并保留词级时间轴。")
-                if manual_bounds is not None:
+                            # 有人工修订句级 SRT 时仍可烧录
+                            override_try = str(
+                                self.settings.get("timeline_overrides", {}).get(str(caption_audio.resolve()), "")
+                                or self.settings.get("timeline_overrides", {}).get(str(video.resolve()), "")
+                                or ""
+                            ).strip()
+                            if override_try and "-->" in override_try:
+                                phrase_srt = override_try
+                                word_srt = ""
+                                burn_captions = True
+                                original = " ".join(t for _, _, t in parse_srt(phrase_srt)) or video.stem
+                                self.log.emit(
+                                    f"[{index + 1}/{len(self.videos)}] 无词级轴，使用人工逐句 SRT 烧录字幕。"
+                                )
+                            else:
+                                raise RuntimeError(f"未识别到有效字幕：{caption_audio.name}")
+                    else:
+                        word_srt = srt
+                        phrase_srt = group_word_srt(word_srt, self.settings["line_length"] * 2,
+                                                    max_words=self.settings.get("max_words", 8))
+                        override = str(self.settings.get("timeline_overrides", {}).get(str(caption_audio.resolve()), "")).strip()
+                        if not override:
+                            override = str(self.settings.get("timeline_overrides", {}).get(str(video.resolve()), "")).strip()
+                        if manual_bounds is not None:
+                            override = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', override).strip()
+                        if override:
+                            if "-->" in override:
+                                phrase_srt = override
+                                self.log.emit("已应用人工修订后的逐句 SRT，逐词时间轴继续驱动高亮。")
+                            else:
+                                phrase_srt = replace_srt_copy(phrase_srt, override)
+                                self.log.emit("已应用人工修订文案，并保留词级时间轴。")
+                        # 勾选「不转文案」：强制不烧录（预览临时字幕不进成品）
+                        burn_captions = (
+                            bool(str(phrase_srt or "").strip()) and not skip_captions
+                        )
+                        if skip_captions:
+                            self.log.emit(
+                                f"[{index + 1}/{len(self.videos)}] 已勾选不转文案：本条导出不带字幕"
+                                f"（时间轴/预览中的文案仅供临时查看）。"
+                            )
+                if burn_captions and manual_bounds is not None:
                     v_start = manual_bounds[0]
                     if v_start > 0.0:
                         phrase_srt = shift_srt_timestamps(phrase_srt, v_start)
                         word_srt = shift_srt_timestamps(word_srt, v_start)
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在将字幕时间轴向前平移 {v_start:.2f} 秒以适配切片视频。")
-                phrase_srt,overlap_fixes=fix_srt_overlaps(phrase_srt)
-                if overlap_fixes:
-                    self.log.emit(f"[{index + 1}/{len(self.videos)}] 渲染前自动修正 {overlap_fixes} 处逐句字幕时间重叠。")
-                self.timeline_ready.emit(source_key, word_srt, phrase_srt)
+                # 中间裁剪/多段时间轴：把源时钟 SRT 映射到成片时间轴，避免口型错位
+                if burn_captions and edit_tracks.get("video"):
+                    video_segs = list(edit_tracks.get("video") or [])
+                    aligned = bool(edit_state.get("captions_timeline_aligned"))
+                    if should_retime_captions_for_segments(
+                        phrase_srt, word_srt, video_segs, captions_timeline_aligned=aligned
+                    ):
+                        before_p, before_w = phrase_srt, word_srt
+                        phrase_srt = retime_srt_for_video_segments(phrase_srt, video_segs) or phrase_srt
+                        word_srt = retime_srt_for_video_segments(word_srt, video_segs) or word_srt
+                        if phrase_srt != before_p or word_srt != before_w:
+                            self.log.emit(
+                                f"[{index + 1}/{len(self.videos)}] 已按时间轴视频切片重映射字幕"
+                                f"（{len(video_segs)} 段），对齐裁剪后的口播。"
+                            )
+                if burn_captions and str(phrase_srt or "").strip():
+                    phrase_srt,overlap_fixes=fix_srt_overlaps(phrase_srt)
+                    if overlap_fixes:
+                        self.log.emit(f"[{index + 1}/{len(self.videos)}] 渲染前自动修正 {overlap_fixes} 处逐句字幕时间重叠。")
+                if burn_captions:
+                    self.timeline_ready.emit(source_key, word_srt, phrase_srt)
+                else:
+                    self.timeline_ready.emit(source_key, "", "")
                 already_renamed = {
                     str(Path(p).resolve()) for p in (self.settings.get("already_renamed_videos") or [])
                     if p
@@ -3875,7 +4175,8 @@ class CaptionWorker(QObject):
                     destination = bounded_output_path(self.output, video.stem, "_动态文案.mp4")
                 # Keep libass intermediate paths short. Long source titles can exceed
                 # the Windows/libass path limit even when the source video opens fine.
-                ass = temporary_ass_path(f"caption_{short_media_id(video)}")
+                ass = None
+                ass_filter = None
                 # 单视频独立样式优先，否则用批量共用样式
                 base_style = dict(self.settings or {})
                 overrides = base_style.get("video_style_overrides") or {}
@@ -3884,20 +4185,23 @@ class CaptionWorker(QObject):
                 if isinstance(per, dict) and per:
                     base_style.update(per)
                 video_settings = settings_with_timeline_overlays(base_style, edit_state)
-                write_ass(ass, phrase_srt, video_settings, word_srt)
+                if burn_captions and str(phrase_srt or "").strip():
+                    ass = temporary_ass_path(f"caption_{short_media_id(video)}")
+                    write_ass(ass, phrase_srt, video_settings, word_srt)
+                    ass_filter = ass
                 baked_watermarks={str(Path(path).resolve()) for path in self.settings.get("watermark_baked_videos",[]) }
                 watermark_already_baked=str(video.resolve()) in baked_watermarks
                 stages=[]
+                if burn_captions and ass_filter: stages.append("字幕")
                 if self.settings.get("watermark_path") and not watermark_already_baked: stages.append("公司水印")
                 if any(layer.get("type") in ("mask","text") for layer in self.settings.get("layers",[])): stages.append("图层/蒙版")
                 if any(t.get("mode") == "blur" and t.get("points") for t in (self.settings.get("motion_tracks") or []) if isinstance(t, dict)):
                     stages.append("追踪模糊")
-                stage_text="、".join(["字幕",*stages])
+                stage_text="、".join(stages) if stages else "画面"
                 if watermark_already_baked:
                     self.log.emit(f"[{index + 1}/{len(self.videos)}] 当前水印已在分组合成阶段烧录，本次跳过重复水印。")
-                self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在烧录{stage_text}并编码视频，请等待…")
+                self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在编码{stage_text}，请等待…")
                 self.progress.emit(round((index + .55) / max(1,len(self.videos)) * 100))
-                ass_filter = ass
                 is_image = render_video.suffix.lower() in IMAGE_EXTENSIONS
                 external = audio.resolve() != video.resolve()
                 if edit_state and "tts" in edit_tracks and not edit_tracks.get("tts"):
@@ -4321,6 +4625,15 @@ class CaptionWorker(QObject):
                     else:
                         # 无主音轨图时，环境音单独输出
                         audio_graph = f"{amb_in}{amb_chain}[aout]"
+                # 与预览统一：先 scale/fps/setpts，再 libass（PlayRes 1080x1920 + fontsdir + shaper）
+                render_settings["target_w"] = target_w if need_resize else (src_w or 1080)
+                render_settings["target_h"] = target_h if need_resize else (src_h or 1920)
+                render_settings["ass_play_res_x"] = 1080
+                render_settings["ass_play_res_y"] = 1920
+                burn_size = (
+                    int(render_settings["target_w"] or 1080),
+                    int(render_settings["target_h"] or 1920),
+                )
                 if watermark_enabled:
                     video_logo_specs = []
                     if image_wm_enabled:
@@ -4341,10 +4654,12 @@ class CaptionWorker(QObject):
                         graph += ";" + audio_graph
                     command += ["-filter_complex", graph, "-map", "[outv]"]
                 else:
-                    vf_expr = ass_filter_expression(ass_filter,self.settings)
-                    if v_filter_str:
-                        vf_expr = f"{v_filter_str},{vf_expr}"
-                    command += ["-vf", vf_expr, "-map", "0:v:0"]
+                    vf_expr = compose_caption_vf(
+                        v_filter_str, ass_filter, render_settings, video_size=burn_size
+                    )
+                    if vf_expr:
+                        command += ["-vf", vf_expr]
+                    command += ["-map", "0:v:0"]
                     if audio_graph: command += ["-filter_complex", audio_graph]
                 if audio_graph:
                     # shortest + 上方 -t：防止混音轨比画面长时拖成静帧
@@ -4400,8 +4715,9 @@ class CaptionWorker(QObject):
                 command += davinci_safe_mux_args(30)
                 command += [str(destination)]
                 returncode, render_log = self._run_render(command, video_duration, index, len(self.videos))
-                try: ass.unlink()
-                except OSError: pass
+                if ass is not None:
+                    try: Path(ass).unlink(missing_ok=True)
+                    except OSError: pass
                 if returncode: raise RuntimeError(render_log.strip() or "动态文案渲染失败")
                 # AAC 编码器仍可能写入 ~21ms 的 video start_time；轻量重封装归零
                 if remux_zero_start(self.ffmpeg, destination, fps=30):
@@ -4492,7 +4808,7 @@ class PreviewWorker(QObject):
         self.destination = Path(destination); self.text = text; self.settings = settings
 
     def run(self):
-        ass = temporary_ass_path("preview")
+        ass = None
         try:
             source = Path(self.source)
             # 先把多轨时间轴（切片/挪动/转场）物化成真实视频，再叠字幕/水印
@@ -4523,24 +4839,43 @@ class PreviewWorker(QObject):
                     f"轨道预览时长 {video_dur:.1f}s 过长，本次截取前 {max_preview:.0f}s 核对（完整长度仍在最终导出）。"
                 )
 
+            # 预览仅临时核对：无真实文案时不烧录占位中文样例
+            raw_text = str(self.text or "").strip()
+            sample = ""
+            word_srt = str(self.settings.get("preview_word_srt", "") or "")
             if self.settings.get("caption_mode") == "自由文案动画（不对口型）":
-                sample = free_caption_srt(self.text, preview_duration, self.settings)
-            elif "-->" in self.text:
-                sample = self.text
-            else:
+                if raw_text:
+                    sample = free_caption_srt(raw_text, preview_duration, self.settings)
+            elif "-->" in raw_text:
+                sample = raw_text
+            elif raw_text:
                 end_ms = int(max(0.5, preview_duration) * 1000)
                 h, rem = divmod(end_ms, 3600000)
                 m, rem = divmod(rem, 60000)
                 s, ms = divmod(rem, 1000)
                 sample = (
                     f"1\n00:00:00,000 --> {h:02d}:{m:02d}:{s:02d},{ms:03d}\n"
-                    f"{self.text}\n"
+                    f"{raw_text}\n"
                 )
+            # 与导出相同：源时钟 SRT 按视频切片映射到时间轴
+            video_segs = list((edit_state.get("tracks") or {}).get("video") or [])
+            aligned = bool(edit_state.get("captions_timeline_aligned"))
+            if sample and should_retime_captions_for_segments(
+                sample, word_srt, video_segs, captions_timeline_aligned=aligned
+            ):
+                sample = retime_srt_for_video_segments(sample, video_segs) or sample
+                word_srt = retime_srt_for_video_segments(word_srt, video_segs) or word_srt
+                self.log.emit("预览字幕已按时间轴切片重映射（与导出一致）。")
             preview_settings = settings_with_timeline_overlays(
-                self.settings, self.settings.get("timeline_edits") or {}
+                self.settings, edit_state
             )
-            write_ass(ass, sample, preview_settings, self.settings.get("preview_word_srt", ""))
-            ass_filter = ass
+            ass_filter = None
+            if sample and "-->" in sample:
+                ass = temporary_ass_path("preview")
+                write_ass(ass, sample, preview_settings, word_srt)
+                ass_filter = ass
+            else:
+                self.log.emit("轨道预览：当前无字幕文案，仅渲染画面/音轨（不插入样例字幕）。")
             preview_audio = Path(str(self.settings.get("preview_audio", "")))
             external = preview_audio.is_file() and preview_audio.resolve() != Path(self.source).resolve()
             # 若时间轴上 TTS 轨被切过，先渲染对齐后的配音
@@ -4661,11 +4996,25 @@ class PreviewWorker(QObject):
             _video_wm_start = next_input
 
             v_filters = []
+            # 与导出一致的滤镜顺序：像素格式 → 比例裁切 → 固定帧率 → 延长 → 时间戳归零 → ASS
+            src_ext = str(source).rsplit(".", 1)[-1].lower()
+            if src_ext in ("mov", "avi", "mxf", "mkv", "webm"):
+                v_filters.append("format=yuv420p")
             if need_resize:
                 v_filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1")
+            v_filters.append("fps=30")
             if extend_filters:
                 v_filters.extend(extend_filters)
-            v_filter_str = ",".join(v_filters) if v_filters else ""
+            v_filters.append(f"trim=duration={preview_duration:.3f}")
+            v_filters.append("setpts=PTS-STARTPTS")
+            v_filter_str = ",".join(v_filters) if v_filters else "setpts=PTS-STARTPTS"
+            burn_w = target_w if need_resize else (src_w or 1080)
+            burn_h = target_h if need_resize else (src_h or 1920)
+            burn_size = (int(burn_w or 1080), int(burn_h or 1920))
+            render_settings["target_w"] = burn_size[0]
+            render_settings["target_h"] = burn_size[1]
+            render_settings["ass_play_res_x"] = 1080
+            render_settings["ass_play_res_y"] = 1920
 
             # Build audio graph
             bgm_vol = int(self.settings.get("background_volume", 25) or 25)
@@ -4734,10 +5083,12 @@ class PreviewWorker(QObject):
                     graph += ";" + audio_graph
                 command += ["-filter_complex", graph, "-map", "[outv]"]
             else:
-                vf_expr = ass_filter_expression(ass_filter,self.settings)
-                if v_filter_str:
-                    vf_expr = f"{v_filter_str},{vf_expr}"
-                command += ["-vf", vf_expr, "-map", "0:v:0"]
+                vf_expr = compose_caption_vf(
+                    v_filter_str, ass_filter, render_settings, video_size=burn_size
+                )
+                if vf_expr:
+                    command += ["-vf", vf_expr]
+                command += ["-map", "0:v:0"]
                 if audio_graph: command += ["-filter_complex", audio_graph]
             if audio_graph:
                 command += ["-map", "[aout]"]
@@ -4762,8 +5113,9 @@ class PreviewWorker(QObject):
         except Exception as exc:
             self.finished.emit(False, str(exc))
         finally:
-            try: ass.unlink()
-            except OSError: pass
+            if ass is not None:
+                try: Path(ass).unlink(missing_ok=True)
+                except OSError: pass
 class ScrollRedirectFilter(QObject):
     """未聚焦的 Spin/Combo 上滚轮：滚动外层区域，不改控件值。
 
@@ -5626,26 +5978,27 @@ class DynamicCaptionPage(QWidget):
         self.tts_reverb_enabled = QCheckBox("混响")
         self.tts_reverb_enabled.setChecked(False)
         self.tts_reverb_enabled.setToolTip(
-            "生成配音后叠加空间混响（干湿混合，无电流噪）。\n"
-            "可选小房间 / 大厅 / 教堂 / 板式 / 回声；强度控制湿声比例。"
+            "生成配音后叠加空间感（单声道兼容，避免左右错时差「两个人」）。\n"
+            "若听起来像双重人声：请关掉混响，或把强度调到 25–40%。\n"
+            "另请确认声音合成不是「原声＋配音」同时开。"
         )
         self.tts_reverb_mode = QComboBox()
         self.tts_reverb_mode.addItems(list(REVERB_MODE_NAMES))
-        self.tts_reverb_mode.setCurrentText("大厅")
+        self.tts_reverb_mode.setCurrentText("小房间")
         self.tts_reverb_mode.setMinimumWidth(100)
         self.tts_reverb_mode.setEnabled(False)
         self.tts_reverb_mode.setToolTip(
-            "小房间：近场短反射\n"
-            "大厅：中等空间（推荐旁白）\n"
+            "小房间：近场短反射（旁白推荐，不易叠音）\n"
+            "大厅：中等空间\n"
             "教堂：长尾大空间\n"
             "板式混响：密集光泽尾音\n"
-            "回声：可辨听的延迟回声"
+            "回声：可辨听的延迟（强度过高会像两个人）"
         )
         self.tts_reverb_amount = QSpinBox()
         self.tts_reverb_amount.setRange(10, 100)
-        self.tts_reverb_amount.setValue(50)
+        self.tts_reverb_amount.setValue(30)
         self.tts_reverb_amount.setSuffix("%")
-        self.tts_reverb_amount.setToolTip("混响强度：干湿混合；50% 推荐")
+        self.tts_reverb_amount.setToolTip("混响强度：建议 25–40%；过高易像双重人声")
         self.tts_reverb_amount.setEnabled(False)
         self.tts_reverb_enabled.toggled.connect(self.tts_reverb_amount.setEnabled)
         self.tts_reverb_enabled.toggled.connect(self.tts_reverb_mode.setEnabled)
@@ -5713,8 +6066,9 @@ class DynamicCaptionPage(QWidget):
         self.group_skip_transcript.setToolTip(
             "勾选后：\n"
             "1）合成结束后不会自动提取字幕/转中文；\n"
-            "2）文件名自然排序时，合成阶段也不跑语音识别（强制用快速声音边界去口气）。\n"
-            "需要字幕请取消勾选，或合成后再点「批量提取」。\n"
+            "2）文件名自然排序时，合成阶段也不跑语音识别（强制用快速声音边界去口气）；\n"
+            "3）批量导出成品不烧录字幕（可直接导出无文案视频；轨道预览仅临时查看，不写入成品）。\n"
+            "需要字幕请取消勾选，或合成后再点「批量提取」再导出。\n"
             "仅当排序为「按分段文案匹配」时，合成中仍会识别语音用于排序。"
         )
         self.group_skip_transcript.setChecked(False)
@@ -6027,22 +6381,22 @@ class DynamicCaptionPage(QWidget):
         self.proj_tts_reverb = QCheckBox("启用混响")
         self.proj_tts_reverb.setChecked(False)
         self.proj_tts_reverb.setToolTip(
-            "生成配音后叠加空间混响（干湿混合，无电流噪）。\n"
-            "试听音色时若已勾选也会带上混响。\n"
-            "与「视频字幕 → 批量配音」页开关/模式同步。"
+            "生成配音后叠加空间感（已防「双重人声」）。\n"
+            "若仍像两个人：关混响，或强度 25–40%。\n"
+            "与「视频字幕 → 批量配音」页同步。"
         )
         self.proj_tts_reverb_mode = QComboBox()
         self.proj_tts_reverb_mode.addItems(list(REVERB_MODE_NAMES))
-        self.proj_tts_reverb_mode.setCurrentText("大厅")
+        self.proj_tts_reverb_mode.setCurrentText("小房间")
         self.proj_tts_reverb_mode.setMinimumWidth(110)
         self.proj_tts_reverb_mode.setMinimumHeight(30)
         self.proj_tts_reverb_mode.setEnabled(False)
         self.proj_tts_reverb_mode.setToolTip(
-            "小房间 / 大厅 / 教堂 / 板式混响 / 回声"
+            "小房间 / 大厅 / 教堂 / 板式混响 / 回声（旁白建议小房间）"
         )
         self.proj_tts_reverb_amount = QSpinBox()
         self.proj_tts_reverb_amount.setRange(10, 100)
-        self.proj_tts_reverb_amount.setValue(50)
+        self.proj_tts_reverb_amount.setValue(30)
         self.proj_tts_reverb_amount.setSuffix("%")
         self.proj_tts_reverb_amount.setMinimumWidth(88)
         self.proj_tts_reverb_amount.setMinimumHeight(30)
@@ -11586,6 +11940,19 @@ class DynamicCaptionPage(QWidget):
     def _live_caption_data(self, seconds):
         v_start = self._current_video_v_start()
         seconds = max(0.0, float(seconds) - v_start)
+        # 时间轴有切片且字幕仍在源时钟：把轨上时刻映射到源时刻再查词/句，避免裁中间后口型错位
+        # 涟漪删除后 captions_timeline_aligned=True，则字幕已是轨上时钟，不再映射。
+        if (
+            not getattr(self, "_precise_preview_active", False)
+            and self._timeline_edits_active()
+        ):
+            state = self._current_timeline_edit_state()
+            if not bool(state.get("captions_timeline_aligned")):
+                try:
+                    source_ms, _path = self._map_timeline_ms_to_source(int(seconds * 1000))
+                    seconds = max(0.0, float(source_ms) / 1000.0)
+                except Exception:
+                    pass
         phrase_srt = ""
         if hasattr(self, "override_text"):
             phrase_srt = self.override_text.toPlainText().strip()
@@ -13139,6 +13506,13 @@ class DynamicCaptionPage(QWidget):
                     getattr(self, "video_style_overrides", {}) or {}, ensure_ascii=False
                 )),
                 "motion_tracks": json.loads(json.dumps(self.motion_tracks, ensure_ascii=False)),
+                # 不转文案：批量导出不跑 ASR、不烧录字幕（预览样例不进成品）
+                "skip_captions": bool(
+                    hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked()
+                ),
+                "skip_post_transcript": bool(
+                    hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked()
+                ),
                 }
 
     def _refresh_motion_track_list(self):
@@ -13283,13 +13657,21 @@ class DynamicCaptionPage(QWidget):
         timeline_source=self._timeline_source()
         timeline_key=self._timeline_key(timeline_source)
         video_key=self._timeline_key(item.text())
-        # 轨道渲染预览：用当前选中视频自己的时间轴状态 + 字幕，不拿别的任务的文案串台
+        # 轨道渲染预览：仅用真实字幕/文案；禁止插入中文样例占位（预览临时查看，不进成品）
         text=(self.timeline_overrides.get(timeline_key, "").strip()
               or self.override_text.toPlainText().strip()
-              or self.tts_text.toPlainText().strip()
-              or "让每一句文案跟随朗读跳动")
-        if "-->" not in text and self.caption_mode.currentText() != "自由文案动画（不对口型）":
+              or (self.tts_text.toPlainText().strip() if hasattr(self, "tts_text") else "")
+              or self.free_texts.get(video_key, "").strip()
+              or self.free_texts.get(timeline_key, "").strip()
+              or "")
+        if text and "-->" not in text and self.caption_mode.currentText() != "自由文案动画（不对口型）":
             text=re.sub(r"\s+"," ",text)[:100]
+        # 词级轴：优先当前对白轨
+        word_preview = (
+            self.timeline_words.get(timeline_key, "")
+            or self.timeline_words.get(video_key, "")
+            or ""
+        )
         preview_dir=Path(self.output.text())/".preview"; preview_dir.mkdir(parents=True,exist_ok=True)
         # Never reuse a media URL in the same application session.
         preview_token=f"{time.time_ns():x}"
@@ -13301,6 +13683,8 @@ class DynamicCaptionPage(QWidget):
         # 带上当前时间轴拖动/切片结果（核心：不重跑分组合成）
         edit_state = dict(self.timeline_edit_states.get(video_key, {}) or {})
         settings["timeline_edits"] = edit_state
+        if word_preview:
+            settings["preview_word_srt"] = word_preview
         matched=self._matched_source_for_video(item.text())
         if (matched and Path(matched).is_file() and Path(matched).resolve()!=Path(item.text()).resolve()
                 and self._get_audio_mode_internal() in ("替换为添加的音频", "原声＋背景音混合")):
@@ -13675,8 +14059,14 @@ class DynamicCaptionPage(QWidget):
         key = self._current_video_key() or self._timeline_key(self._timeline_source())
         if not key:
             return
+        # 句级条已由 Canva 涟漪到时间轴时钟；词级在此同步，并标记「字幕已对齐时间轴」
+        state = dict(self.timeline_edit_states.get(key, {}) or {})
+        state["captions_timeline_aligned"] = True
+        self.timeline_edit_states[key] = state
         word_srt = self.timeline_words.get(key, "")
         if not word_srt or "-->" not in word_srt:
+            self._live_timeline_cache_key = None
+            self._invalidate_preview_caption_overlay()
             return
         updated = retime_word_srt_after_ripple(word_srt, int(start_ms), int(end_ms))
         if updated != word_srt:
@@ -14355,10 +14745,22 @@ class DynamicCaptionPage(QWidget):
         self.extract_all_btn.setText("正在识别中…")
         self._start_timeline_activity(f"[{index}/{total}] {Path(source).name}",base,cap)
 
+    def _mark_captions_source_timed(self, key: str):
+        """新提取的字幕在源片时钟上；导出/预览需按切片重映射，直到用户涟漪删除对齐。"""
+        if not key:
+            return
+        for candidate in (key, self._current_video_key() if hasattr(self, "_current_video_key") else ""):
+            if not candidate:
+                continue
+            state = dict(self.timeline_edit_states.get(candidate, {}) or {})
+            state["captions_timeline_aligned"] = False
+            self.timeline_edit_states[candidate] = state
+
     def _batch_timeline_item_done(self,source,srt,chinese,index,total):
         self._stop_timeline_activity(round(index/max(1,total)*100))
         key=self._timeline_key(source); phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
         self.timeline_words[key]=align_word_srt_to_phrase_srt(srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
+        self._mark_captions_source_timed(key)
         if chinese: self.timeline_chinese[key]=chinese
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             self.free_texts[key]=phrase_srt
@@ -14393,6 +14795,15 @@ class DynamicCaptionPage(QWidget):
         key=self._timeline_key(source)
         phrase_srt,fixes=fix_srt_overlaps(phrase_srt)
         self.timeline_words[key]=align_word_srt_to_phrase_srt(word_srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
+        # 导出路径写出的字幕已按切片映射到成片时钟
+        if word_srt or phrase_srt:
+            vkey = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+            for candidate in (vkey, key):
+                if not candidate:
+                    continue
+                state = dict(self.timeline_edit_states.get(candidate, {}) or {})
+                state["captions_timeline_aligned"] = True
+                self.timeline_edit_states[candidate] = state
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             self.free_texts[key]=phrase_srt
         if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠：{Path(source).name}")
@@ -14417,6 +14828,7 @@ class DynamicCaptionPage(QWidget):
             source=self._timeline_pending_source or self._timeline_source(); phrase_srt,fixes=self._group_words_for_current_layout(result,True)
             if source:
                 key=self._timeline_key(source); self.timeline_words[key]=align_word_srt_to_phrase_srt(result, phrase_srt); self.timeline_overrides[key]=phrase_srt
+                self._mark_captions_source_timed(key)
                 if chinese: self.timeline_chinese[key]=chinese
                 if self.caption_mode.currentText() == "自由文案动画（不对口型）":
                     self.free_texts[key]=phrase_srt
@@ -15859,7 +16271,7 @@ class DynamicCaptionPage(QWidget):
             )
             voice_id = voice.split("｜", 1)[0].strip()
             fp = hashlib.sha256(
-                f"{service}|{voice_id}|{sample}|{int(reverb_on)}|{reverb_amt}|{reverb_mode}|v5mode".encode("utf-8")
+                f"{service}|{voice_id}|{sample}|{int(reverb_on)}|{reverb_amt}|{reverb_mode}|v6mono".encode("utf-8")
             ).hexdigest()[:16]
             out = cache_dir / f"preview_{fp}.mp3"
             if not out.is_file() or out.stat().st_size < 256:
@@ -16592,7 +17004,7 @@ class ProjectGroupWorker(QObject):
             reverb_amt = int(self.settings.get("tts_reverb_amount", 45) or 45)
             reverb_mode = normalize_reverb_mode(self.settings.get("tts_reverb_mode", "大厅"))
             tts_fingerprint = hashlib.sha256(
-                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:{reverb_mode}:v5mode".encode("utf-8")
+                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:{reverb_mode}:v6mono".encode("utf-8")
             ).hexdigest()
                     
             reused_tts = False

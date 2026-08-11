@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from .path_picker import (AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS,
                           DropListWidget, collect_files, default_output_path)
 from .settings_page import find_media_tool, hidden_kwargs
+from .video_encoding import encoder_args, resolve_encoder
 
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS
 _META_STRIP = [
@@ -26,6 +27,19 @@ _META_STRIP = [
     "-metadata", "copyright=", "-metadata", "comment=", "-metadata", "description=",
     "-metadata", "encoder=",
 ]
+# 9:16 竖屏；表达式保证偶数宽高（yuv420p 兼容）
+_CROP_916_VF = (
+    "crop="
+    "trunc(min(iw\\,ih*9/16)/2)*2:"
+    "trunc(min(ih\\,iw*16/9)/2)*2:"
+    "(iw-ow)/2:(ih-oh)/2"
+)
+_CROP_916_MODES = {
+    "keep": None,  # 仅居中裁切，不缩放
+    "1080x1920": (1080, 1920),
+    "720x1280": (720, 1280),
+    "1440x2560": (1440, 2560),
+}
 
 
 def unique_path(path: Path) -> Path:
@@ -96,19 +110,120 @@ def _overlay_logo_on_image(base: Image.Image, logo_path: Path, cfg: dict) -> Ima
     return canvas
 
 
+def crop_image_to_916(image: Image.Image, target_size=None) -> Image.Image:
+    """Center-crop to 9:16 without stretching. Optional high-quality resize after crop."""
+    w, h = image.size
+    if w < 2 or h < 2:
+        return image
+    target_ratio = 9.0 / 16.0
+    current = w / float(h)
+    if abs(current - target_ratio) > 0.004:
+        if current > target_ratio:
+            new_w = max(2, int(round(h * target_ratio)))
+            left = max(0, (w - new_w) // 2)
+            image = image.crop((left, 0, min(w, left + new_w), h))
+        else:
+            new_h = max(2, int(round(w / target_ratio)))
+            top = max(0, (h - new_h) // 2)
+            image = image.crop((0, top, w, min(h, top + new_h)))
+    if target_size and len(target_size) == 2:
+        tw, th = int(target_size[0]), int(target_size[1])
+        if tw > 0 and th > 0 and (image.width != tw or image.height != th):
+            image = image.resize((tw, th), Image.Resampling.LANCZOS)
+    return image
+
+
+def _hq_video_encode_args(ffmpeg) -> list:
+    """High-quality H.264 for re-encode after crop/watermark (minimize quality loss)."""
+    encoder = resolve_encoder(ffmpeg, "auto")
+    args = list(encoder_args(encoder, cpu_preset="medium"))
+    # 元数据清理裁切是成品输出：比默认再抬一档画质
+    try:
+        if "-crf" in args:
+            i = args.index("-crf")
+            args[i + 1] = "16"
+        if "-cq" in args:
+            i = args.index("-cq")
+            args[i + 1] = "18"
+        if "-global_quality" in args:
+            i = args.index("-global_quality")
+            args[i + 1] = "18"
+        if "-quality" in args and "h264_mf" in args:
+            i = args.index("-quality")
+            args[i + 1] = "85"
+        if "-qp_i" in args:
+            i = args.index("-qp_i")
+            args[i + 1] = "18"
+        if "-qp_p" in args:
+            i = args.index("-qp_p")
+            args[i + 1] = "18"
+    except (ValueError, IndexError):
+        pass
+    return args
+
+
+def _probe_video_size(ffmpeg, path: Path):
+    ffprobe = find_media_tool("ffprobe")
+    if not ffprobe:
+        return 0, 0, 0.0
+    command = [
+        ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate",
+        "-of", "json", str(path),
+    ]
+    result = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+    if result.returncode:
+        return 0, 0, 0.0
+    try:
+        payload = json.loads(result.stdout or "{}")
+        stream = (payload.get("streams") or [{}])[0]
+        w = int(stream.get("width") or 0)
+        h = int(stream.get("height") or 0)
+        rate = str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1")
+        fps = 0.0
+        if "/" in rate:
+            num, den = rate.split("/", 1)
+            den_f = float(den) if float(den) else 1.0
+            fps = float(num) / den_f if den_f else 0.0
+        else:
+            fps = float(rate or 0)
+        return w, h, fps
+    except Exception:
+        return 0, 0, 0.0
+
+
+def _is_nearly_916(width: int, height: int, tol: float = 0.012) -> bool:
+    if width < 2 or height < 2:
+        return False
+    return abs((width / float(height)) - (9.0 / 16.0)) <= tol
+
+
 class MetadataWorker(QObject):
     log = Signal(str)
     progress = Signal(int)
     finished = Signal(bool, str)
     file_done = Signal(str, str)
 
-    def __init__(self, files, output, keep_structure=True, preserve_time=False, watermark=None):
+    def __init__(
+        self,
+        files,
+        output,
+        keep_structure=True,
+        preserve_time=False,
+        watermark=None,
+        crop_916=False,
+        crop_916_mode="keep",
+    ):
         super().__init__()
         self.files = [Path(value) for value in files]
         self.output = Path(output)
         self.keep_structure = keep_structure
         self.preserve_time = preserve_time
         self.watermark = watermark if isinstance(watermark, dict) else None
+        self.crop_916 = bool(crop_916)
+        self.crop_916_mode = str(crop_916_mode or "keep")
         self.cancelled = False
 
     def cancel(self):
@@ -120,10 +235,22 @@ class MetadataWorker(QObject):
         path = Path(str(self.watermark.get("path") or ""))
         return path.is_file()
 
+    def _crop_target_size(self):
+        if not self.crop_916:
+            return None
+        return _CROP_916_MODES.get(self.crop_916_mode)
+
     def _image(self, source: Path, destination: Path):
         with Image.open(source) as image:
             clean = Image.new(image.mode, image.size)
             clean.putdata(list(image.getdata()))
+            if self.crop_916:
+                before = (clean.width, clean.height)
+                clean = crop_image_to_916(clean, self._crop_target_size())
+                self.log.emit(
+                    f"  · 9:16 居中裁切：{before[0]}×{before[1]} → {clean.width}×{clean.height}"
+                    "（不拉伸）"
+                )
             if self._wm_enabled():
                 self.log.emit(f"  · 叠加水印：{Path(self.watermark['path']).name}")
                 composed = _overlay_logo_on_image(
@@ -148,10 +275,24 @@ class MetadataWorker(QObject):
         ffmpeg = find_media_tool("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("未找到 FFmpeg，请先到“设置与组件”一键安装。")
-        if source.suffix.lower() in AUDIO_EXTENSIONS or not self._wm_enabled():
+        # 纯音频：只清元数据
+        if source.suffix.lower() in AUDIO_EXTENSIONS:
             self._av_copy_clean(ffmpeg, source, destination)
             return
-        self._av_with_watermark(ffmpeg, source, destination)
+        need_reencode = self._wm_enabled() or self.crop_916
+        if not need_reencode:
+            self._av_copy_clean(ffmpeg, source, destination)
+            return
+        # 已是 9:16 且仅裁切、无水印：可走流复制
+        if self.crop_916 and not self._wm_enabled() and self.crop_916_mode == "keep":
+            w, h, _fps = _probe_video_size(ffmpeg, source)
+            if _is_nearly_916(w, h):
+                self.log.emit(
+                    f"  · 画面已是 9:16（{w}×{h}），跳过裁切，仅清除元数据（流复制、零画质损失）。"
+                )
+                self._av_copy_clean(ffmpeg, source, destination)
+                return
+        self._av_reencode(ffmpeg, source, destination)
 
     def _av_copy_clean(self, ffmpeg, source: Path, destination: Path):
         command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
@@ -179,68 +320,187 @@ class MetadataWorker(QObject):
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "FFmpeg 清除元数据失败")
 
-    def _av_with_watermark(self, ffmpeg, source: Path, destination: Path):
-        """重编码画面 + 烧录水印 + 清除元数据。"""
-        logo = Path(self.watermark["path"])
-        self.log.emit(f"  · 清理元数据并烧录水印（需重编码画面）：{logo.name}")
-        mode = str(self.watermark.get("mode") or "小 Logo 角标")
-        opacity = max(0.05, min(1.0, float(self.watermark.get("opacity", 100)) / 100.0))
-        width_pct = max(0.04, min(0.80, float(self.watermark.get("width_pct", 18)) / 100.0))
-        margin = max(0, int(self.watermark.get("margin", 28) or 28))
-        position = str(self.watermark.get("position") or "右下")
-        pos_map = {
-            "左上": (str(margin), str(margin)),
-            "顶部居中": ("(main_w-overlay_w)/2", str(margin)),
-            "右上": (f"main_w-overlay_w-{margin}", str(margin)),
-            "居中": ("(main_w-overlay_w)/2", "(main_h-overlay_h)/2"),
-            "左下": (str(margin), f"main_h-overlay_h-{margin}"),
-            "底部居中": ("(main_w-overlay_w)/2", f"main_h-overlay_h-{margin}"),
-            "右下": (f"main_w-overlay_w-{margin}", f"main_h-overlay_h-{margin}"),
-        }
-        ox, oy = pos_map.get(position, pos_map["右下"])
+    def _build_video_chain(self) -> str:
+        """Pre-watermark video processing: optional 9:16 crop + format.
 
-        cache = self.output / ".watermark_cache"
-        cache.mkdir(parents=True, exist_ok=True)
-        prepared = cache / f"{logo.stem}_o{int(opacity * 100)}.png"
-        try:
-            _prepare_logo_rgba(logo, opacity).save(prepared, "PNG")
-            logo_input = prepared
-        except Exception:
-            logo_input = logo
+        Center crop only (no stretch). Optional Lanczos resize after crop.
+        No fps filter — preserves source frame timing.
+        """
+        parts = ["setpts=PTS-STARTPTS", "format=yuv420p"]
+        if self.crop_916:
+            parts.append(_CROP_916_VF)
+            target = self._crop_target_size()
+            if target:
+                tw, th = int(target[0]), int(target[1])
+                # 裁成 9:16 后用 Lanczos 缩到目标分辨率（不拉伸）
+                parts.append(f"scale={tw}:{th}:flags=lanczos")
+                parts.append("setsar=1")
+        # yuv420p 偶数边
+        parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        return ",".join(parts)
 
-        if "全屏" in mode:
-            fc = (
-                f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[base];"
-                f"[1:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wmraw];"
-                f"[wmraw][base]scale2ref=w=iw:h=ih[wm][base2];"
-                f"[base2][wm]overlay=0:0:format=auto:eof_action=repeat[vout]"
-            )
-        else:
-            fc = (
-                f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[base];"
-                f"[1:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wmraw];"
-                f"[wmraw][base]scale2ref=w=main_w*{width_pct:.4f}:h=ow/mdar[wm][base2];"
-                f"[base2][wm]overlay={ox}:{oy}:format=auto:eof_action=repeat[vout]"
-            )
+    def _av_reencode(self, ffmpeg, source: Path, destination: Path):
+        """Re-encode with optional 9:16 crop and/or watermark; strip metadata.
 
+        Quality rules:
+        - Center crop only (no stretch)
+        - No fps filter (preserve source frame rate / no forced drop-dupe)
+        - High-quality H.264 + audio copy when possible
+        """
+        w, h, fps = _probe_video_size(ffmpeg, source)
+        notes = []
+        if self.crop_916:
+            target = self._crop_target_size()
+            if target:
+                notes.append(f"9:16 居中裁切→{target[0]}×{target[1]}")
+            else:
+                notes.append("9:16 居中裁切（不缩放）")
+            if w and h:
+                notes.append(f"源 {w}×{h}")
+        if self._wm_enabled():
+            notes.append(f"水印 {Path(self.watermark['path']).name}")
+        if fps > 0.1:
+            notes.append(f"保留约 {fps:.3g} fps")
+        self.log.emit("  · " + "；".join(notes) + "（高质量重编码，不变形）")
+
+        v_prep = self._build_video_chain()
+        encode = _hq_video_encode_args(ffmpeg)
+        # 不强制 -r，避免改帧率导致重复/丢帧；passthrough 尽量按源包时间戳
+        rate_args = ["-fps_mode", "passthrough"]
+
+        if self._wm_enabled():
+            logo = Path(self.watermark["path"])
+            mode = str(self.watermark.get("mode") or "小 Logo 角标")
+            opacity = max(0.05, min(1.0, float(self.watermark.get("opacity", 100)) / 100.0))
+            width_pct = max(0.04, min(0.80, float(self.watermark.get("width_pct", 18)) / 100.0))
+            margin = max(0, int(self.watermark.get("margin", 28) or 28))
+            position = str(self.watermark.get("position") or "右下")
+            pos_map = {
+                "左上": (str(margin), str(margin)),
+                "顶部居中": ("(main_w-overlay_w)/2", str(margin)),
+                "右上": (f"main_w-overlay_w-{margin}", str(margin)),
+                "居中": ("(main_w-overlay_w)/2", "(main_h-overlay_h)/2"),
+                "左下": (str(margin), f"main_h-overlay_h-{margin}"),
+                "底部居中": ("(main_w-overlay_w)/2", f"main_h-overlay_h-{margin}"),
+                "右下": (f"main_w-overlay_w-{margin}", f"main_h-overlay_h-{margin}"),
+            }
+            ox, oy = pos_map.get(position, pos_map["右下"])
+
+            cache = self.output / ".watermark_cache"
+            cache.mkdir(parents=True, exist_ok=True)
+            prepared = cache / f"{logo.stem}_o{int(opacity * 100)}.png"
+            try:
+                _prepare_logo_rgba(logo, opacity).save(prepared, "PNG")
+                logo_input = prepared
+            except Exception:
+                logo_input = logo
+
+            if "全屏" in mode:
+                fc = (
+                    f"[0:v]{v_prep}[base];"
+                    f"[1:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wmraw];"
+                    f"[wmraw][base]scale2ref=w=iw:h=ih[wm][base2];"
+                    f"[base2][wm]overlay=0:0:format=auto:eof_action=repeat[vout]"
+                )
+            else:
+                fc = (
+                    f"[0:v]{v_prep}[base];"
+                    f"[1:v]format=rgba,colorchannelmixer=aa={opacity:.3f}[wmraw];"
+                    f"[wmraw][base]scale2ref=w=main_w*{width_pct:.4f}:h=ow/mdar[wm][base2];"
+                    f"[base2][wm]overlay={ox}:{oy}:format=auto:eof_action=repeat[vout]"
+                )
+
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source),
+                "-loop", "1", "-i", str(logo_input),
+                "-filter_complex", fc,
+                "-map", "[vout]", "-map", "0:a?",
+                *encode,
+                "-c:a", "copy",
+                *rate_args,
+                *_META_STRIP,
+                "-shortest", "-movflags", "+faststart",
+                str(destination),
+            ]
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+            # 音频 copy 失败时回退 AAC
+            if result.returncode:
+                command = [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(source),
+                    "-loop", "1", "-i", str(logo_input),
+                    "-filter_complex", fc,
+                    "-map", "[vout]", "-map", "0:a?",
+                    *encode,
+                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                    *rate_args,
+                    *_META_STRIP,
+                    "-shortest", "-movflags", "+faststart",
+                    str(destination),
+                ]
+                result = subprocess.run(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+            if result.returncode or not destination.is_file() or destination.stat().st_size < 1024:
+                raise RuntimeError(
+                    (result.stderr or "").strip() or "FFmpeg 处理失败（9:16/水印）")
+            return
+
+        # 仅裁切 + 清元数据
         command = [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(source),
-            "-loop", "1", "-i", str(logo_input),
-            "-filter_complex", fc,
-            "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-vf", v_prep,
+            "-map", "0:v:0", "-map", "0:a?",
+            *encode,
+            "-c:a", "copy",
+            *rate_args,
             *_META_STRIP,
-            "-shortest", "-movflags", "+faststart",
+            "-movflags", "+faststart",
             str(destination),
         ]
         result = subprocess.run(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+        if result.returncode:
+            # 部分容器/编码无法 copy 音轨：重编码音频
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source),
+                "-vf", v_prep,
+                "-map", "0:v:0", "-map", "0:a?",
+                *encode,
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                *rate_args,
+                *_META_STRIP,
+                "-movflags", "+faststart",
+                str(destination),
+            ]
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+        # 旧版 FFmpeg 可能不认 fps_mode=passthrough
+        if result.returncode and "fps_mode" in (result.stderr or ""):
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source),
+                "-vf", v_prep,
+                "-map", "0:v:0", "-map", "0:a?",
+                *encode,
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                *_META_STRIP,
+                "-movflags", "+faststart",
+                str(destination),
+            ]
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
         if result.returncode or not destination.is_file() or destination.stat().st_size < 1024:
             raise RuntimeError(
-                (result.stderr or "").strip() or "FFmpeg 水印合成失败（请换透明 PNG Logo 重试）")
+                (result.stderr or "").strip() or "FFmpeg 9:16 裁切失败")
 
     def run(self):
         try:
@@ -252,7 +512,12 @@ class MetadataWorker(QObject):
                 except ValueError:
                     common = None
             completed = 0
-            wm_note = "（清理+水印）" if self._wm_enabled() else ""
+            extras = []
+            if self.crop_916:
+                extras.append("9:16裁切")
+            if self._wm_enabled():
+                extras.append("水印")
+            note = f"（清理+{'+'.join(extras)}）" if extras else "（清理元数据）"
             for source in self.files:
                 if self.cancelled:
                     raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
@@ -265,7 +530,7 @@ class MetadataWorker(QObject):
                 destination_dir = self.output / relative_parent
                 destination_dir.mkdir(parents=True, exist_ok=True)
                 destination = unique_path(destination_dir / source.name)
-                self.log.emit(f"正在处理{wm_note}：{source.name}")
+                self.log.emit(f"正在处理{note}：{source.name}")
                 if source.suffix.lower() in IMAGE_EXTENSIONS:
                     self._image(source, destination)
                 else:
@@ -278,6 +543,8 @@ class MetadataWorker(QObject):
                 self.log.emit(f"完成：{destination}")
                 self.file_done.emit(str(source), str(destination))
             msg = f"已处理 {completed} 个素材（清除元数据"
+            if self.crop_916:
+                msg += " + 9:16 居中裁切"
             if self._wm_enabled():
                 msg += " + 水印合成"
             msg += f"）。\n{self.output}"
@@ -305,6 +572,7 @@ class MetadataPage(QWidget):
         note = QLabel(
             "隐私清理会强制删除 GPS、拍摄时间、设备/序列号、作者版权、唯一标识、标题描述、软件来源、"
             "章节、附件和封面图；图片重建像素并清除 EXIF/XMP/IPTC。原文件不会被修改。"
+            "可选「9:16 裁切」：所有视频/图片居中裁成竖屏，不拉伸变形，不强制改帧率，高质量编码。"
             "可选「水印合成」：清理同时把 Logo 烧进画面（视频会重编码）。"
             "注意：文件名以及画面、声音中直接出现的隐私内容需要另行处理。"
         )
@@ -350,6 +618,36 @@ class MetadataPage(QWidget):
         form.addRow("目录结构", self.keep_structure)
         form.addRow("文件时间", self.preserve_time)
         options_layout.addLayout(form)
+
+        # —— 9:16 竖屏裁切（可选）——
+        crop_box = QGroupBox("9:16 竖屏裁切（可选）")
+        crop_layout = QFormLayout(crop_box)
+        self.crop_916 = QCheckBox("所有视频/图片裁剪为 9:16")
+        self.crop_916.setToolTip(
+            "居中裁切为竖屏 9:16：\n"
+            "· 不拉伸、不变形（只裁掉左右或上下多余部分）\n"
+            "· 不强制改帧率（尽量保留原 fps，避免丢帧/补帧）\n"
+            "· 高质量重编码；已是 9:16 且选「仅裁切」时走流复制，零画质损失\n"
+            "· 可与水印同时开启（先裁切再叠水印）"
+        )
+        self.crop_916_mode = QComboBox()
+        self.crop_916_mode.addItem("仅居中裁切（不放大，画质最佳）", "keep")
+        self.crop_916_mode.addItem("裁切后输出 1080×1920", "1080x1920")
+        self.crop_916_mode.addItem("裁切后输出 720×1280", "720x1280")
+        self.crop_916_mode.addItem("裁切后输出 1440×2560", "1440x2560")
+        self.crop_916_mode.setToolTip(
+            "「仅居中裁切」：只从源画面裁出最大 9:16 区域，不做缩放，像素质量最高。\n"
+            "「输出 xxx」：裁切后再用 Lanczos 缩到标准竖屏分辨率（适合统一发布尺寸）。"
+        )
+        crop_layout.addRow(self.crop_916)
+        crop_layout.addRow("输出尺寸", self.crop_916_mode)
+
+        def _sync_crop_enabled(on: bool):
+            self.crop_916_mode.setEnabled(bool(on))
+
+        self.crop_916.toggled.connect(_sync_crop_enabled)
+        _sync_crop_enabled(False)
+        options_layout.addWidget(crop_box)
 
         # —— 水印合成（可选）——
         wm_box = QGroupBox("水印合成（可选）")
@@ -621,6 +919,21 @@ class MetadataPage(QWidget):
             "margin": int(self.wm_margin.value()),
         }
 
+    def _crop_916_mode_key(self) -> str:
+        if not hasattr(self, "crop_916_mode"):
+            return "keep"
+        data = self.crop_916_mode.currentData()
+        if data:
+            return str(data)
+        text = self.crop_916_mode.currentText()
+        if "1080" in text:
+            return "1080x1920"
+        if "720" in text:
+            return "720x1280"
+        if "1440" in text:
+            return "1440x2560"
+        return "keep"
+
     def run(self):
         files = [self.list.item(i).text() for i in range(self.list.count())]
         if not files:
@@ -639,9 +952,14 @@ class MetadataPage(QWidget):
         self.log.clear()
         self.progress.setValue(0)
         self.thread = QThread(self)
+        crop_on = bool(getattr(self, "crop_916", None) and self.crop_916.isChecked())
         self.worker = MetadataWorker(
             files, self.output.text(), self.keep_structure.isChecked(),
-            self.preserve_time.isChecked(), watermark=self._watermark_cfg())
+            self.preserve_time.isChecked(),
+            watermark=self._watermark_cfg(),
+            crop_916=crop_on,
+            crop_916_mode=self._crop_916_mode_key() if crop_on else "keep",
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.log.appendPlainText)
@@ -653,6 +971,11 @@ class MetadataPage(QWidget):
         self.thread.finished.connect(self.thread.deleteLater)
         self.start.setEnabled(False)
         self.stop.setEnabled(True)
+        if crop_on:
+            self.log.appendPlainText(
+                f"已开启 9:16 居中裁切（模式：{self.crop_916_mode.currentText()}）；"
+                "不拉伸、不强制改帧率，使用高质量编码。"
+            )
         self.thread.start()
 
     def cancel(self):

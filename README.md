@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.36**
+当前版本：**v1.7.37**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,19 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.36.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/video-toolkit-windows-x64-v1.7.36.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/VideoToolkit_Setup_v1.7.36.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.36.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/video-toolkit-macos-arm64-v1.7.36.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.36.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.36/video-toolkit-macos-x64-v1.7.36.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.37.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/video-toolkit-windows-x64-v1.7.37.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/VideoToolkit_Setup_v1.7.37.exe) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.37.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/video-toolkit-macos-arm64-v1.7.37.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.37.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/video-toolkit-macos-x64-v1.7.37.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.37 · 2026-08-12
+- Reels 批量导出：勾选「不转文案」时可导出无字幕成品（预览样例不写入成片）。
+- 轨道预览：去掉自动中文样例文案；无真实字幕时只渲染画面/音轨。
+- 时间轴中间裁剪：字幕按视频切片重映射，修复口播与字幕错位；涟漪删除后标记已对齐，避免二次映射。
+- 字幕渲染：预览与导出统一 ASS（PlayRes 1080×1920、fontsdir、shaping、先 scale 再烧录），减少效果不一致与丢帧感。
+- 元数据清理：新增「所有视频/图片裁剪为 9:16」——居中裁切不变形、不强制改帧率、高质量编码；可与水印同开。
+- 独立「文字转语音」模块与相关修复一并打包。
 
 ### v1.7.36 · 2026-08-09
 - TTS：修复「第一句听不见」——微软 edge-tts 分段重编码拼接、短首句合并；配音轨淡入上限 120ms；视频预设标题+正文安全拼接。
