@@ -1,0 +1,72 @@
+# 单独补打 Linux 包并上传到已有 GitHub Release（本机 Windows 无法打 Linux 可执行文件）。
+name: Build Linux Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.7.38)"
+        required: true
+        default: "v1.7.38"
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system GUI / media libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libgl1 libglib2.0-0 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 \
+            libxcb-xinerama0 libegl1 libdbus-1-3 libfontconfig1 libfreetype6
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Embed version from tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "VIDEO_TOOLKIT_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "VIDEO_TOOLKIT_MEDIA_BIN=$(dirname "$(command -v ffmpeg)")" >> "$GITHUB_ENV"
+          echo "$VERSION" > VERSION
+          echo "Building Linux x64 for $TAG ($VERSION)"
+
+      - name: Build Linux application
+        run: |
+          chmod +x build_linux.sh
+          ./build_linux.sh
+
+      - name: Package and upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          mkdir -p dist_final
+          (
+            cd dist_linux
+            zip -r -q "../dist_final/video-toolkit-linux-x64-${TAG}.zip" VideoToolkit
+          )
+          ls -lh dist_final/
+          gh release upload "$TAG" dist_final/*.zip --clobber

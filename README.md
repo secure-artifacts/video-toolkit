@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.37**
+当前版本：**v1.7.38**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,11 +56,18 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.37.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/video-toolkit-windows-x64-v1.7.37.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/VideoToolkit_Setup_v1.7.37.exe) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.37.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/video-toolkit-macos-arm64-v1.7.37.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.37.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.37/video-toolkit-macos-x64-v1.7.37.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.38.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.38/video-toolkit-windows-x64-v1.7.38.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.38/VideoToolkit_Setup_v1.7.38.exe) |
+| Linux x64 | [video-toolkit-linux-x64-v1.7.38.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.38/video-toolkit-linux-x64-v1.7.38.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.38.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.38/video-toolkit-macos-arm64-v1.7.38.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.38.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.38/video-toolkit-macos-x64-v1.7.38.zip) |
 
-Windows 解压后运行 `VideoToolkit.exe`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+Windows 解压后运行 `VideoToolkit.exe`。Linux 解压后执行 `./run-videotoolkit.sh`（或 `./VideoToolkit`）；若 GUI 起不来可安装 `libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.38 · 2026-08-12
+- **Linux x64 正式支持**：CI 打包便携目录（含 FFmpeg/FFprobe），Release 提供 `video-toolkit-linux-x64-*.zip`。
+- 分组合成：MF/QSV 串行编码、ASR/编码心跳日志，减少「停在智能混合边界」假死感。
+- 组件管理：安装日志改为「安装成功，当前版本 x.x」（此前「未安装 → 版本」易误解）；安装后自动刷新检测。
+- 元数据清理 9:16 裁切、Reels 字幕导出/同步等 v1.7.37 修复一并收录。
 
 ### v1.7.37 · 2026-08-12
 - Reels 批量导出：勾选「不转文案」时可导出无字幕成品（预览样例不写入成片）。
@@ -400,22 +407,34 @@ python app.py
 本地打包还需要 FFmpeg 与 FFprobe：
 
 ```powershell
+# Windows
 $env:VIDEO_TOOLKIT_MEDIA_BIN = "C:\path\to\ffmpeg\bin"
-$env:VIDEO_TOOLKIT_VERSION = "1.7.33"
+$env:VIDEO_TOOLKIT_VERSION = "1.7.38"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+```bash
+# Linux x64
+export VIDEO_TOOLKIT_MEDIA_BIN="$(dirname "$(command -v ffmpeg)")"
+export VIDEO_TOOLKIT_VERSION="1.7.38"
+chmod +x build_linux.sh && ./build_linux.sh
+# 输出：dist_linux/VideoToolkit/  （运行 ./run-videotoolkit.sh）
 ```
 
 ## 自动构建与发布
 
 推送以 `v` 开头的 Tag 后，GitHub Actions 会自动：
 
-1. 构建 Windows x64 便携版。
-2. 构建 macOS Apple Silicon 和 Intel 版本。
-3. 验证 FFmpeg、FFprobe 与 ONNX Runtime。
-4. 为安装包生成 Build Provenance Attestation。
-5. 创建 GitHub Release，并上传三个 ZIP 与 Windows Setup 安装包。
+1. 构建 Windows x64 便携版 + Setup 安装包。
+2. 构建 Linux x64 便携版。
+3. 构建 macOS Apple Silicon 和 Intel 版本。
+4. 验证 FFmpeg、FFprobe 与 ONNX Runtime。
+5. 为安装包生成 Build Provenance Attestation。
+6. 创建 GitHub Release 并上传各平台产物。
+
+也可单独补打：`Build Linux Release` / `Build macOS Release` 工作流。
 
 ```bash
-git tag -a v1.7.33 -m "Release version 1.7.33"
-git push origin v1.7.33
+git tag -a v1.7.38 -m "Release version 1.7.38"
+git push origin v1.7.38
 ```

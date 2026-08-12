@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.37").strip().lstrip("v") or "1.7.37"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.38").strip().lstrip("v") or "1.7.38"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"

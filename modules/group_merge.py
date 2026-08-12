@@ -387,7 +387,8 @@ def energy_extend_end(ffmpeg, clip_path, end, duration, max_extend=1.5, threshol
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", **hidden_kwargs(),
+            text=True, encoding="utf-8", errors="replace",
+            timeout=25, **hidden_kwargs(),
         )
         text = result.stdout or ""
     except Exception:
@@ -1197,19 +1198,47 @@ class GroupMergeWorker(QObject):
                 and str(saved.get("srt") or "").strip()):
             self.log.emit(f"续接：复用语音边界 {clip.name}")
             return saved
-        self.log.emit(f"正在识别说话边界：{clip.name}（此阶段可能需要一些时间）")
+        self.log.emit(
+            f"正在识别说话边界：{clip.name}"
+            f"（智能混合需语音识别，可能较慢；已勾选「不转文案」时会改用快速声音边界）"
+        )
         # ASR 串行：本地 Whisper 同模型不可并发；API 亦避免瞬间打满配额
-        with self._asr_lock:
-            if self.cancelled:
-                raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
-            original, _translated, srt = self.transcribe(str(clip))
+        import threading
+        stop_beat = threading.Event()
+        started = time.monotonic()
+        original, srt = "", ""
+
+        def _asr_heartbeat():
+            while not stop_beat.wait(12.0):
+                if self.cancelled:
+                    return
+                try:
+                    self.log.emit(
+                        f"说话边界识别进行中：{clip.name}"
+                        f"（已 {time.monotonic() - started:.0f}s，请稍候…）"
+                    )
+                except Exception:
+                    return
+
+        beat = threading.Thread(target=_asr_heartbeat, name="asr-beat", daemon=True)
+        beat.start()
+        try:
+            with self._asr_lock:
+                if self.cancelled:
+                    raise RuntimeError("分组合成已停止；已经处理的片段会保留，下一次可断点续接。")
+                original, _translated, srt = self.transcribe(str(clip))
+        finally:
+            stop_beat.set()
         if not str(srt or "").strip():
             raise RuntimeError("没有识别到带时间轴的有效文案")
         with self._cache_lock:
             saved = dict(cache.get(key, {}) or {})
             info = {**saved, "signature": signature, "original": str(original or ""), "srt": str(srt or "")}
             cache[key] = info
-        self.log.emit(f"说话边界识别完成：{clip.name}")
+        self.log.emit(
+            f"说话边界识别完成：{clip.name}"
+            f"（耗时 {time.monotonic() - started:.1f}s）"
+        )
         return info
 
     def _silence_events_head_tail(self, clip, duration, threshold, minimum):
@@ -1365,6 +1394,10 @@ class GroupMergeWorker(QObject):
             raise
 
     def _normalize(self, clip, index, total_count, cache_dir, analysis, target_w, target_h, watermark=None, group_script=""):
+        self.log.emit(
+            f"[{index + 1}/{total_count}] 开始裁剪/编码片段：{clip.name}"
+            f"（编码器 {ENCODER_LABELS.get(self.encoder, self.encoder)}）"
+        )
         probe = self._probe(clip)
         # Prefer the group-level script (virtual groups like 2-1/2-2 live under parent dir,
         # so clip.parent is NOT the group key used when saving 分段文案).
@@ -1721,7 +1754,12 @@ class GroupMergeWorker(QObject):
             return cleaned
 
         def _run_encode(cmd, label):
-            self._run(cmd, timeout=encode_timeout, heartbeat_label=label, heartbeat_sec=6.0)
+            # Windows MF 多实例易卡死；串行拿锁后再编
+            if self.encoder == "mf":
+                with self._mf_encode_lock:
+                    self._run(cmd, timeout=encode_timeout, heartbeat_label=label, heartbeat_sec=6.0)
+            else:
+                self._run(cmd, timeout=encode_timeout, heartbeat_label=label, heartbeat_sec=6.0)
 
         def _accurate_ss_command(cmd):
             """把 -ss 移到 -i 之后（精确裁切，略慢；仅作空帧失败后的回退）。"""
@@ -1927,6 +1965,10 @@ class GroupMergeWorker(QObject):
                             completed_steps += 1
                             self.progress.emit(round(completed_steps / total_steps * 100))
                 self._persist_analysis_cache(cache_file, analysis_cache)
+                self.log.emit(
+                    f"边界分析完成：{folder.name} 共 {len(clips)} 段，"
+                    f"开始裁剪编码（进度不会停在「智能混合边界」）。"
+                )
                 if self.settings.get("sort_mode") == "script":
                     if not str(group_script or "").strip():
                         self.log.emit("提醒：本组未找到分段文案，自动回退为文件名自然排序。")
@@ -1972,13 +2014,15 @@ class GroupMergeWorker(QObject):
                         watermark = None
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 import os
-                # QSV 多开易死锁；MF/NVENC/AMF 双路（失败单段会 CPU 回退）；CPU 最多 4 路。
-                if self.encoder == "qsv":
+                # QSV / Windows MF 多开极易卡死或 “Could not open encoder”；一律串行。
+                # NVENC/AMF 最多双路；CPU 最多 4 路。
+                if self.encoder in ("qsv", "mf"):
                     max_workers = 1
                     self.log.emit(
-                        "编码策略：Intel Quick Sync 串行（避免多路会话互锁）。"
+                        f"编码策略：{ENCODER_LABELS.get(self.encoder, self.encoder)} 串行"
+                        f"（避免多路硬件会话卡死，看起来像停在智能混合边界之后）。"
                     )
-                elif self.encoder in ("nvenc", "mf", "amf"):
+                elif self.encoder in ("nvenc", "amf"):
                     max_workers = min(2, len(clips), os.cpu_count() or 2)
                     self.log.emit(
                         f"编码策略：硬件编码并行 {max_workers}"
@@ -1999,6 +2043,9 @@ class GroupMergeWorker(QObject):
                     )
                 tasks = [(clip, clip_index, len(clips)) for clip_index, clip in enumerate(clips)]
                 normalized = [None] * len(clips)
+                self.log.emit(
+                    f"开始编码 {len(tasks)} 个片段…（若长时间无新日志，请看是否出现「编码进行中」心跳）"
+                )
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {executor.submit(run_norm, task): i for i, task in enumerate(tasks)}
                     for future in as_completed(futures):
@@ -2006,12 +2053,16 @@ class GroupMergeWorker(QObject):
                         try:
                             normalized[i] = future.result()
                         except Exception as exc:
-                            # 取消其余任务，避免超时后仍占 QSV
+                            # 取消其余任务，避免超时后仍占 QSV/MF
                             for other in futures:
                                 other.cancel()
                             raise RuntimeError(
                                 f"片段编码失败：{tasks[i][0].name} — {exc}"
                             ) from exc
+                        done_n = sum(1 for p in normalized if p)
+                        self.log.emit(
+                            f"片段编码完成 [{done_n}/{len(tasks)}]：{tasks[i][0].name}"
+                        )
                         completed_steps += 1
                         self.progress.emit(round(completed_steps / total_steps * 100))
                 if any(path is None or not Path(path).is_file() for path in normalized):

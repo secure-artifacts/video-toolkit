@@ -63,15 +63,28 @@ def find_media_tool(name: str):
 
 
 def component_rows():
+    # 安装新包后必须清缓存，否则 find_spec 仍可能认为缺失
+    try:
+        importlib.invalidate_caches()
+    except Exception:
+        pass
     rows = []
     for label, module, package in PYTHON_COMPONENTS:
         ok = importlib.util.find_spec(module) is not None
         version = ""
         if ok:
             try:
-                version = importlib.metadata.version(package.split("[")[0])
+                # 多包时取第一个有版本的发行名
+                version = package_installed_version(package) or importlib.metadata.version(
+                    package.split()[0].split("[")[0]
+                )
             except Exception:
                 version = "已安装"
+        else:
+            # 模块 import 失败时，仍尝试用 metadata 判断 pip 是否装过（便于提示）
+            pip_ver = package_installed_version(package)
+            if pip_ver:
+                version = f"pip 有 {pip_ver}，但当前程序加载不到（若用安装版请重装软件包）"
         rows.append({"name": label, "type": "Python 依赖", "ok": ok,
                      "detail": version or f"缺少：{package}", "package": package})
     for name in ("ffmpeg", "ffprobe"):
@@ -105,6 +118,21 @@ def resolve_python_cmd() -> str:
     if not getattr(sys, "frozen", False):
         return sys.executable
     return shutil.which("python") or shutil.which("python3") or "python"
+
+
+def is_frozen_app() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _format_version_change(old_v: str, new_v: str) -> str:
+    """把安装前后版本写成用户可读中文（避免「未安装 → 7.2.8」被理解成失败）。"""
+    old = (old_v or "").strip() or "未安装"
+    new = (new_v or "").strip() or "未知"
+    if old in ("未安装", "") and new not in ("未知", ""):
+        return f"安装成功，当前版本 {new}（此前未安装）"
+    if old == new:
+        return f"已是最新 {new}"
+    return f"已升级：{old} → {new}"
 
 
 class CheckUpdatesWorker(QObject):
@@ -253,6 +281,13 @@ class InstallWorker(QObject):
             summary_bits = []
             if self.packages:
                 python_cmd = resolve_python_cmd()
+                if is_frozen_app():
+                    self.log.emit(
+                        "提示：当前是「安装包/绿色版」程序。"
+                        f" pip 将写入系统 Python（{python_cmd}），"
+                        "不会改动本软件已内置的依赖；"
+                        "若表格仍显示缺少，请以源码方式运行，或安装完整新版软件包。"
+                    )
                 # 更新前记录版本，便于日志对比
                 before_versions = {pkg: package_installed_version(pkg) for pkg in self.packages}
                 only_ytdlp = (
@@ -263,13 +298,13 @@ class InstallWorker(QObject):
                 if only_ytdlp:
                     old_v = before_versions.get(self.packages[0]) or "未安装"
                     self.log.emit("──────── yt-dlp 一键更新 ────────")
-                    self.log.emit(f"当前版本：{old_v}")
+                    self.log.emit(f"安装前版本：{old_v}")
                     self.log.emit("正在下载并升级 yt-dlp（实时进度见下方，请稍候）…")
                 else:
                     self.log.emit(f"──────── 安装/升级 Python 依赖（共 {total_pkgs} 个）────────")
                     for i, pkg in enumerate(self.packages, 1):
                         old_v = before_versions.get(pkg) or "未安装"
-                        self.log.emit(f"  [{i}/{total_pkgs}] {pkg}：更新前 {old_v}")
+                        self.log.emit(f"  [{i}/{total_pkgs}] {pkg}：安装前 {old_v}")
                     self.log.emit("开始下载（pip 进度会持续输出，请勿以为卡住）…")
 
                 # 逐包安装，便于显示进度；避免一次卡很久无输出
@@ -278,7 +313,7 @@ class InstallWorker(QObject):
                     if self.cancelled if hasattr(self, "cancelled") else False:
                         raise RuntimeError("用户已取消")
                     old_v = before_versions.get(pkg) or "未安装"
-                    self.log.emit(f"▶ [{i}/{total_pkgs}] 正在处理：{pkg}（当前 {old_v}）")
+                    self.log.emit(f"▶ [{i}/{total_pkgs}] 正在处理：{pkg}（安装前：{old_v}）")
                     self.progress.emit(max(1, round((i - 1) / max(1, steps) * 90)))
                     command = [
                         python_cmd, "-m", "pip", "install", "--upgrade",
@@ -288,7 +323,11 @@ class InstallWorker(QObject):
                     ]
                     # 实时读 pip 输出
                     rc = self._run_pip_streaming(command, pkg_index=i, pkg_total=total_pkgs)
-                    # 读新版本
+                    # 读新版本（先清缓存再查）
+                    try:
+                        importlib.invalidate_caches()
+                    except Exception:
+                        pass
                     dist_name = pkg.split("[")[0].strip()
                     new_v = package_installed_version(dist_name)
                     if not new_v:
@@ -306,10 +345,9 @@ class InstallWorker(QObject):
                         failed.append(pkg)
                         self.log.emit(f"  ✕ [{i}/{total_pkgs}] {pkg} 失败")
                         continue
-                    if old_v == new_v:
-                        line = f"  ✓ [{i}/{total_pkgs}] {pkg}：已是最新 {new_v}"
-                    else:
-                        line = f"  ✓ [{i}/{total_pkgs}] {pkg}：{old_v}  →  {new_v}"
+                    # 明确中文：未安装→版本号 = 安装成功，不是还没装
+                    change = _format_version_change(old_v, new_v)
+                    line = f"  ✓ [{i}/{total_pkgs}] {pkg}：{change}"
                     self.log.emit(line)
                     summary_bits.append(line.strip())
                     self.progress.emit(max(1, round(i / max(1, steps) * 90)))
@@ -324,10 +362,7 @@ class InstallWorker(QObject):
                     new_v = package_installed_version("yt-dlp") or "未知"
                     old_v = before_versions.get(self.packages[0]) or "未安装"
                     self.log.emit("──────── 更新结束 ────────")
-                    if old_v == new_v:
-                        self.log.emit(f"yt-dlp 当前版本：{new_v}（与更新前相同，已是最新）")
-                    else:
-                        self.log.emit(f"yt-dlp 更新完成：{old_v}  →  {new_v}")
+                    self.log.emit(f"yt-dlp：{_format_version_change(old_v, new_v)}")
 
                 completed += len(self.packages)
                 self.progress.emit(round(completed / steps * 100) if steps else 100)
@@ -336,10 +371,24 @@ class InstallWorker(QObject):
                 completed += 1
                 self.progress.emit(round(completed / steps * 100))
                 summary_bits.append("FFmpeg / FFprobe 已安装或恢复")
-            msg = "组件安装完成，请重新检测"
+            # 安装后自动说明：列表会刷新，不必误以为“没装上”
+            msg_lines = ["组件安装/更新已完成（上方表格会自动刷新）。"]
             if summary_bits:
-                msg = "组件安装完成：\n" + "\n".join(summary_bits) + "\n请重新检测"
-            self.finished.emit(True, msg)
+                msg_lines.append("")
+                msg_lines.extend(summary_bits)
+            msg_lines.append("")
+            msg_lines.append(
+                "说明：日志里「安装前：未安装 → 安装后：x.x.x」表示刚才成功装上了，"
+                "不是仍未安装。"
+            )
+            if is_frozen_app():
+                msg_lines.append(
+                    "若表格里仍显示「缺少」，因安装版内置依赖与系统 pip 环境分离；"
+                    "请用「重新检测全部」查看，或安装新版完整软件包。"
+                )
+            else:
+                msg_lines.append("请看上方表格状态列：✓ 正常即可使用。")
+            self.finished.emit(True, "\n".join(msg_lines))
         except Exception as exc:
             self.finished.emit(False, str(exc))
 
@@ -494,7 +543,8 @@ class SettingsPage(QWidget):
         layout.addWidget(title)
         sub = QLabel(
             "「重新检测」只看本机是否已安装；「检查更新」会联网对比全部 Python 依赖是否有新版。\n"
-            "安装/更新过程静默执行，不弹出命令窗口。"
+            "安装日志中「未安装 → 版本号」表示安装成功（从没有到有），不是失败。\n"
+            "安装结束后表格会自动刷新，一般不必再点重新检测。"
         )
         sub.setStyleSheet("color:#94a3b8;font-size:13px;")
         sub.setWordWrap(True)
@@ -740,7 +790,28 @@ class SettingsPage(QWidget):
         if ok:
             self._outdated_map = {}
         self.log.appendPlainText(message)
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
         self.refresh()
+        # 刷新后再写一行表格摘要，避免用户误以为“没装上”
+        if ok:
+            missing = [r["name"] for r in self.rows if not r.get("ok")]
+            ok_n = sum(1 for r in self.rows if r.get("ok"))
+            self.log.appendPlainText(
+                f"──────── 自动检测结果：正常 {ok_n} 项"
+                + (f"，仍缺少 {len(missing)} 项：{'、'.join(missing)}" if missing else "，全部齐全")
+                + " ────────"
+            )
+            if not missing:
+                # 缩短弹窗：全部成功时不必吓人
+                short = (
+                    "组件已安装完成，列表已自动刷新。\n"
+                    "日志里的「未安装 → 版本号」= 安装成功，不是还没装。"
+                )
+                QMessageBox.information(self, "组件管理", short)
+                return
         (QMessageBox.information if ok else QMessageBox.critical)(self, "组件管理", message)
 
     def _thread_ended(self):

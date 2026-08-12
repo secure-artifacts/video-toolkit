@@ -215,9 +215,103 @@ jobs:
           path: dist_final/*.zip
           if-no-files-found: error
 
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system GUI / media libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            libgl1 \
+            libglib2.0-0 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xfixes0 \
+            libxcb-xinerama0 \
+            libegl1 \
+            libdbus-1-3 \
+            libfontconfig1 \
+            libfreetype6
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Point media bin to system FFmpeg
+        run: |
+          echo "VIDEO_TOOLKIT_MEDIA_BIN=$(dirname "$(command -v ffmpeg)")" >> "$GITHUB_ENV"
+          echo "VIDEO_TOOLKIT_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "${GITHUB_REF_NAME#v}" > VERSION
+
+      - name: Build Linux application
+        run: |
+          chmod +x build_linux.sh
+          ./build_linux.sh
+
+      - name: Verify bundled FFmpeg and FFprobe
+        run: |
+          APP="dist_linux/VideoToolkit"
+          test -x "$APP/VideoToolkit"
+          FFMPEG="$(find "$APP" -type f -name ffmpeg | head -1)"
+          FFPROBE="$(find "$APP" -type f -name ffprobe | head -1)"
+          test -n "$FFMPEG" && test -n "$FFPROBE"
+          "$FFMPEG" -version | head -2
+          "$FFPROBE" -version | head -2
+
+      - name: Verify local Whisper VAD runtime
+        run: |
+          APP="dist_linux/VideoToolkit"
+          ONNX_RUNTIME="$(find "$APP" -iname '*onnxruntime*' | head -1)"
+          test -n "$ONNX_RUNTIME"
+          echo "Bundled ONNX Runtime: $ONNX_RUNTIME"
+
+      - name: Package final artifact
+        run: |
+          mkdir -p dist_final
+          TAG="${{ github.ref_name }}"
+          (
+            cd dist_linux
+            zip -r -q "../dist_final/video-toolkit-linux-x64-${TAG}.zip" VideoToolkit
+          )
+          ls -lh dist_final/
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist_final/*.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-toolkit-linux-x64
+          path: dist_final/*.zip
+          if-no-files-found: error
+
   release:
-    needs: [build-windows, build-macos]
+    needs: [build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
+    # 若某一平台失败仍尽量用已成功产物发版
+    if: ${{ always() && needs.build-windows.result == 'success' }}
 
     steps:
       - name: Download build artifact
@@ -225,6 +319,8 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          # 允许部分平台未产出
+          # (download-artifact v4 无 pattern 过滤失败 job；merge 成功的即可)
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -233,3 +329,4 @@ jobs:
             artifacts/*.zip
             artifacts/*.exe
           generate_release_notes: true
+          fail_on_unmatched_files: false
