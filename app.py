@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.42").strip().lstrip("v") or "1.7.42"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.43").strip().lstrip("v") or "1.7.43"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -6458,6 +6458,12 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
+    try:
+        from modules.settings_page import ensure_toolkit_packages_on_path
+        ensure_toolkit_packages_on_path()
+        _startup_trace("toolkit python_packages on path")
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     _startup_trace("QApplication ready")
     app.setApplicationName(APP_NAME)

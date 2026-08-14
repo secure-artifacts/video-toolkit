@@ -47,6 +47,26 @@ def component_bin() -> Path:
     return path
 
 
+def toolkit_python_packages_dir() -> Path:
+    """安装包/绿色版：一键安装写入的用户扩展包目录（不改动软件 internal）。"""
+    path = toolkit_dir() / "python_packages"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def ensure_toolkit_packages_on_path() -> str:
+    """把扩展包目录加入 sys.path，使 find_spec / import 能找到一键安装的依赖。"""
+    path = str(toolkit_python_packages_dir())
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    # 部分发行版也读 PYTHONPATH
+    prev = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in prev.split(os.pathsep) if p]
+    if path not in parts:
+        os.environ["PYTHONPATH"] = path + (os.pathsep + prev if prev else "")
+    return path
+
+
 def hidden_kwargs():
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -64,6 +84,7 @@ def find_media_tool(name: str):
 
 def component_rows():
     # 安装新包后必须清缓存，否则 find_spec 仍可能认为缺失
+    ensure_toolkit_packages_on_path()
     try:
         importlib.invalidate_caches()
     except Exception:
@@ -94,8 +115,8 @@ def component_rows():
             pip_ver = package_installed_version(package)
             if pip_ver:
                 version = f"pip 有 {pip_ver}，但当前程序加载不到（若用安装版请重装软件包）"
-            elif is_frozen_app():
-                version = f"缺少：{package}（安装版无法用 pip 补装，请重装完整软件包）"
+            else:
+                version = f"缺少：{package}"
         rows.append({"name": label, "type": "Python 依赖", "ok": ok,
                      "detail": version or f"缺少：{package}", "package": package})
     for name in ("ffmpeg", "ffprobe"):
@@ -357,184 +378,207 @@ class InstallWorker(QObject):
                     ytdlp_status,
                 )
 
-                ytdlp_pkgs = [p for p in self.packages if _is_ytdlp_package(p)]
-                other_pkgs = [p for p in self.packages if not _is_ytdlp_package(p)]
-                only_ytdlp = bool(ytdlp_pkgs) and not other_pkgs
+                ensure_toolkit_packages_on_path()
+                only_ytdlp = (
+                    len(self.packages) == 1 and _is_ytdlp_package(self.packages[0])
+                )
                 failed: list[str] = []
                 total_pkgs = len(self.packages)
-                before_ok, before_detail = ytdlp_status() if ytdlp_pkgs else (False, "未安装")
+                frozen = is_frozen_app()
+                target_dir = toolkit_python_packages_dir() if frozen else None
 
-                # ── 安装版：yt-dlp 走独立程序；其它 Python 包无法 pip 写入内置环境 ──
-                if is_frozen_app():
-                    self.log.emit(
-                        "提示：当前是「安装包/绿色版」。"
-                        " yt-dlp 将下载官方独立程序到本机数据目录；"
-                        "其它 Python 依赖无法通过 pip 写入安装包，缺少时请重装完整软件包。"
-                    )
-                    if ytdlp_pkgs:
-                        self.log.emit("──────── yt-dlp 一键更新（独立程序） ────────")
-                        self.log.emit(f"安装前：{before_detail if before_ok else '未安装'}")
-                        self.progress.emit(5)
-                        try:
-                            path = install_ytdlp_binary(
-                                log=self.log.emit,
-                                progress=lambda p: self.progress.emit(min(90, max(5, p))),
-                            )
-                            new_v = binary_version(path) or "已安装"
-                            line = f"  ✓ yt-dlp：{_format_version_change(before_detail if before_ok else '未安装', new_v)}"
-                            self.log.emit(line)
-                            summary_bits.append(line.strip())
-                        except Exception as exc:
-                            failed.append("yt-dlp")
-                            self.log.emit(f"  ✕ yt-dlp 失败：{exc}")
-                    if other_pkgs:
-                        self.log.emit(
-                            "──────── 以下组件在安装版中不能用「一键安装」补装 ────────"
-                        )
-                        for pkg in other_pkgs:
-                            self.log.emit(
-                                f"  · {pkg}：请重装完整 VideoToolkit 安装包/绿色版（内置依赖）"
-                            )
-                            failed.append(pkg)
-                        self.log.emit(
-                            "说明：以前走系统 pip 会写到 WindowsApps 假 Python，"
-                            "既装不上，也改不了本软件内置库。"
-                        )
-                    if failed:
-                        if ytdlp_pkgs and "yt-dlp" not in failed and other_pkgs:
-                            pending_error = (
-                                "yt-dlp 已更新为独立程序。"
-                                "其余缺少的组件（"
-                                + "、".join(other_pkgs)
-                                + "）安装版无法用 pip 补装，请重装完整软件包 v1.7.42+。"
-                            )
-                        else:
-                            pending_error = (
-                                "部分依赖安装失败：" + "、".join(failed)
-                                + "。请查看上方日志。"
-                            )
-                    if only_ytdlp and not failed:
-                        self.log.emit("──────── 更新结束 ────────")
-                        ok, detail = ytdlp_status()
-                        self.log.emit(f"yt-dlp：{'正常 ' + detail if ok else '仍缺少'}")
-                    completed += len(self.packages)
-                    self.progress.emit(round(completed / steps * 100) if steps else 100)
+                # 解析 pip 用的 Python（安装版写入扩展目录，不碰 internal）
+                python_cmd = resolve_python_cmd()
+                if frozen and only_ytdlp:
+                    # 单独「一键更新 yt-dlp」：只下官方独立程序，不要求系统 Python
+                    python_ok = False
                 else:
-                    # ── 源码/开发模式：pip 写入当前解释器 ──
-                    python_cmd = resolve_python_cmd()
                     if _is_windows_store_python(python_cmd):
                         raise RuntimeError(
                             "检测到的 Python 是微软商店占位程序（WindowsApps），没有可用的 pip。\n"
                             "请从 https://www.python.org/downloads/ 安装正式 Python，"
-                            "安装时勾选 “Add python.exe to PATH”，然后重试。"
+                            "安装时勾选 “Add python.exe to PATH”，然后重试。\n"
+                            "（仅「一键更新 yt-dlp」不需要系统 Python。）"
                         )
                     if not _python_can_run_pip(python_cmd):
                         raise RuntimeError(
                             f"当前 Python 无法运行 pip：{python_cmd}\n"
-                            "请安装正式 Python 或执行：python -m ensurepip --upgrade"
+                            "请安装正式 Python 或执行：python -m ensurepip --upgrade\n"
+                            "（仅「一键更新 yt-dlp」不需要系统 Python。）"
                         )
-                    self.log.emit(f"使用 Python：{python_cmd}")
-                    before_versions = {pkg: package_installed_version(pkg) for pkg in self.packages}
-                    if only_ytdlp:
-                        old_v = before_versions.get(self.packages[0]) or "未安装"
-                        self.log.emit("──────── yt-dlp 一键更新 ────────")
-                        self.log.emit(f"安装前版本：{old_v}")
-                        self.log.emit("正在下载并升级 yt-dlp（实时进度见下方，请稍候）…")
-                    else:
-                        self.log.emit(f"──────── 安装/升级 Python 依赖（共 {total_pkgs} 个）────────")
-                        for i, pkg in enumerate(self.packages, 1):
-                            old_v = before_versions.get(pkg) or "未安装"
-                            self.log.emit(f"  [{i}/{total_pkgs}] {pkg}：安装前 {old_v}")
-                        self.log.emit("开始下载（pip 进度会持续输出，请勿以为卡住）…")
+                    python_ok = True
 
+                before_versions: dict[str, str] = {}
+                try:
+                    _yok, _ydet = ytdlp_status()
+                except Exception:
+                    _yok, _ydet = False, ""
+                for pkg in self.packages:
+                    if _is_ytdlp_package(pkg):
+                        before_versions[pkg] = _ydet if _yok else "未安装"
+                    else:
+                        before_versions[pkg] = package_installed_version(pkg) or "未安装"
+
+                if only_ytdlp:
+                    self.log.emit("──────── yt-dlp 一键更新 ────────")
+                    self.log.emit(f"安装前版本：{before_versions.get(self.packages[0], '未安装')}")
+                else:
+                    self.log.emit(
+                        f"──────── 安装/升级全部 Python 依赖（共 {total_pkgs} 个）────────"
+                    )
+                    if frozen:
+                        self.log.emit(
+                            f"安装包模式：依赖写入扩展目录 {target_dir}；"
+                            "yt-dlp 使用官方独立程序。不会改动软件 internal 内置文件。"
+                        )
+                    else:
+                        self.log.emit(f"使用 Python：{python_cmd}")
                     for i, pkg in enumerate(self.packages, 1):
-                        if self.cancelled if hasattr(self, "cancelled") else False:
-                            raise RuntimeError("用户已取消")
-                        old_v = before_versions.get(pkg) or "未安装"
-                        self.log.emit(f"▶ [{i}/{total_pkgs}] 正在处理：{pkg}（安装前：{old_v}）")
-                        self.progress.emit(max(1, round((i - 1) / max(1, steps) * 90)))
-                        # yt-dlp 在源码模式优先 pip；失败再尝试独立程序
-                        if _is_ytdlp_package(pkg):
+                        self.log.emit(
+                            f"  [{i}/{total_pkgs}] {pkg}：安装前 {before_versions.get(pkg, '未安装')}"
+                        )
+                    self.log.emit("开始处理（pip 进度会持续输出，请勿以为卡住）…")
+
+                for i, pkg in enumerate(self.packages, 1):
+                    if getattr(self, "cancelled", False):
+                        raise RuntimeError("用户已取消")
+                    old_v = before_versions.get(pkg) or "未安装"
+                    self.log.emit(f"▶ [{i}/{total_pkgs}] 正在处理：{pkg}（安装前：{old_v}）")
+                    self.progress.emit(max(1, round((i - 1) / max(1, steps) * 90)))
+
+                    # —— yt-dlp：独立程序（安装版始终；源码 pip 失败时回退）——
+                    if _is_ytdlp_package(pkg):
+                        new_v = ""
+                        rc = 1
+                        if not frozen and python_ok:
                             command = [
                                 python_cmd, "-m", "pip", "install", "--upgrade",
                                 "--disable-pip-version-check",
                                 "--progress-bar", "off",
                                 pkg,
                             ]
-                            rc = self._run_pip_streaming(command, pkg_index=i, pkg_total=total_pkgs)
+                            rc = self._run_pip_streaming(
+                                command, pkg_index=i, pkg_total=total_pkgs
+                            )
                             try:
                                 importlib.invalidate_caches()
                             except Exception:
                                 pass
                             new_v = package_installed_version("yt-dlp") or module_version()
-                            if rc != 0 or not new_v:
+                        if frozen or rc != 0 or not new_v:
+                            if not frozen and rc != 0:
                                 self.log.emit("  pip 未成功，改为下载 yt-dlp 独立程序…")
-                                try:
-                                    path = install_ytdlp_binary(
-                                        log=self.log.emit,
-                                        progress=lambda p: self.progress.emit(min(90, max(5, p))),
-                                    )
-                                    new_v = binary_version(path) or "独立程序"
-                                    rc = 0
-                                except Exception as exc:
-                                    failed.append(pkg)
-                                    self.log.emit(f"  ✕ [{i}/{total_pkgs}] {pkg} 失败：{exc}")
-                                    continue
-                            change = _format_version_change(old_v, new_v or "未知")
-                            line = f"  ✓ [{i}/{total_pkgs}] {pkg}：{change}"
-                            self.log.emit(line)
-                            summary_bits.append(line.strip())
-                            self.progress.emit(max(1, round(i / max(1, steps) * 90)))
-                            continue
-
-                        command = [
-                            python_cmd, "-m", "pip", "install", "--upgrade",
-                            "--disable-pip-version-check",
-                            "--progress-bar", "off",
-                            pkg,
-                        ]
-                        rc = self._run_pip_streaming(command, pkg_index=i, pkg_total=total_pkgs)
-                        try:
-                            importlib.invalidate_caches()
-                        except Exception:
-                            pass
-                        dist_name = pkg.split("[")[0].strip()
-                        new_v = package_installed_version(dist_name)
-                        if not new_v:
-                            show = subprocess.run(
-                                [python_cmd, "-m", "pip", "show", dist_name],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, encoding="utf-8", errors="replace", **hidden_kwargs(),
-                            )
-                            for line in (show.stdout or "").splitlines():
-                                if line.lower().startswith("version:"):
-                                    new_v = line.split(":", 1)[1].strip()
-                                    break
-                        new_v = new_v or "未知"
-                        if rc != 0:
-                            failed.append(pkg)
-                            self.log.emit(f"  ✕ [{i}/{total_pkgs}] {pkg} 失败")
-                            continue
-                        change = _format_version_change(old_v, new_v)
+                            try:
+                                path = install_ytdlp_binary(
+                                    log=self.log.emit,
+                                    progress=lambda p: self.progress.emit(
+                                        min(90, max(5, p))
+                                    ),
+                                )
+                                new_v = binary_version(path) or "独立程序"
+                                rc = 0
+                            except Exception as exc:
+                                failed.append(pkg)
+                                self.log.emit(f"  ✕ [{i}/{total_pkgs}] {pkg} 失败：{exc}")
+                                continue
+                        change = _format_version_change(old_v, new_v or "未知")
                         line = f"  ✓ [{i}/{total_pkgs}] {pkg}：{change}"
                         self.log.emit(line)
                         summary_bits.append(line.strip())
                         self.progress.emit(max(1, round(i / max(1, steps) * 90)))
+                        continue
 
-                    if failed:
-                        pending_error = (
-                            "部分依赖安装失败：" + "、".join(failed)
-                            + "。请查看上方日志（网络/权限/代理）。"
+                    # —— 其它包：pip（安装版 --target 扩展目录）——
+                    if not python_ok:
+                        failed.append(pkg)
+                        self.log.emit(
+                            f"  ✕ [{i}/{total_pkgs}] {pkg} 失败：无可用 Python/pip"
                         )
+                        continue
+                    command = [
+                        python_cmd, "-m", "pip", "install", "--upgrade",
+                        "--disable-pip-version-check",
+                        "--progress-bar", "off",
+                    ]
+                    if frozen and target_dir is not None:
+                        command += ["--target", str(target_dir)]
+                    command.append(pkg)
+                    rc = self._run_pip_streaming(
+                        command, pkg_index=i, pkg_total=total_pkgs
+                    )
+                    ensure_toolkit_packages_on_path()
+                    try:
+                        importlib.invalidate_caches()
+                    except Exception:
+                        pass
+                    dist_name = pkg.split("[")[0].strip()
+                    new_v = package_installed_version(dist_name)
+                    if not new_v and not frozen:
+                        show = subprocess.run(
+                            [python_cmd, "-m", "pip", "show", dist_name],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8", errors="replace",
+                            **hidden_kwargs(),
+                        )
+                        for line in (show.stdout or "").splitlines():
+                            if line.lower().startswith("version:"):
+                                new_v = line.split(":", 1)[1].strip()
+                                break
+                    if not new_v and frozen and target_dir is not None:
+                        # 从 --target 目录读 dist-info
+                        try:
+                            for info in target_dir.glob(f"{dist_name.replace('-', '_')}*.dist-info"):
+                                meta = info / "METADATA"
+                                if meta.is_file():
+                                    for ml in meta.read_text(
+                                        encoding="utf-8", errors="replace"
+                                    ).splitlines():
+                                        if ml.lower().startswith("version:"):
+                                            new_v = ml.split(":", 1)[1].strip()
+                                            break
+                                if new_v:
+                                    break
+                            if not new_v:
+                                for info in target_dir.glob(f"{dist_name}*.dist-info"):
+                                    meta = info / "METADATA"
+                                    if meta.is_file():
+                                        for ml in meta.read_text(
+                                            encoding="utf-8", errors="replace"
+                                        ).splitlines():
+                                            if ml.lower().startswith("version:"):
+                                                new_v = ml.split(":", 1)[1].strip()
+                                                break
+                                    if new_v:
+                                        break
+                        except Exception:
+                            pass
+                    new_v = new_v or "未知"
+                    if rc != 0:
+                        failed.append(pkg)
+                        self.log.emit(f"  ✕ [{i}/{total_pkgs}] {pkg} 失败")
+                        continue
+                    change = _format_version_change(old_v, new_v)
+                    line = f"  ✓ [{i}/{total_pkgs}] {pkg}：{change}"
+                    self.log.emit(line)
+                    summary_bits.append(line.strip())
+                    self.progress.emit(max(1, round(i / max(1, steps) * 90)))
 
-                    if only_ytdlp and not failed:
-                        ok, detail = ytdlp_status()
-                        old_v = before_versions.get(self.packages[0]) or "未安装"
-                        self.log.emit("──────── 更新结束 ────────")
-                        self.log.emit(f"yt-dlp：{_format_version_change(old_v, detail if ok else '未知')}")
+                if failed:
+                    pending_error = (
+                        "部分依赖安装失败：" + "、".join(failed)
+                        + "。请查看上方日志（网络/权限/代理）。"
+                    )
 
-                    completed += len(self.packages)
-                    self.progress.emit(round(completed / steps * 100) if steps else 100)
+                if only_ytdlp and not failed:
+                    ok, detail = ytdlp_status()
+                    old_v = before_versions.get(self.packages[0]) or "未安装"
+                    self.log.emit("──────── 更新结束 ────────")
+                    self.log.emit(
+                        f"yt-dlp：{_format_version_change(old_v, detail if ok else '未知')}"
+                    )
+
+                completed += len(self.packages)
+                self.progress.emit(round(completed / steps * 100) if steps else 100)
             if self.install_media:
                 self._install_ffmpeg()
                 completed += 1
@@ -554,8 +598,8 @@ class InstallWorker(QObject):
             )
             if is_frozen_app():
                 msg_lines.append(
-                    "若表格里仍显示「缺少」，安装版无法用 pip 改内置库；"
-                    "yt-dlp / FFmpeg 可在本页安装，其它请重装完整软件包。"
+                    "安装包模式：Python 依赖装在本机扩展目录，yt-dlp 为独立程序；"
+                    "请看表格状态列 ✓ 正常即可。若仍缺少可再点「重新检测全部」。"
                 )
             else:
                 msg_lines.append("请看上方表格状态列：✓ 正常即可使用。")
@@ -723,9 +767,9 @@ class SettingsPage(QWidget):
         title = QLabel("🛠 组件检测与安装"); title.setObjectName("heading")
         layout.addWidget(title)
         sub = QLabel(
-            "「重新检测」只看本机是否已安装；「检查更新」会联网对比全部 Python 依赖是否有新版。\n"
-            "安装包/绿色版：yt-dlp 会下载官方独立程序（有效）；其它 Python 库需重装完整软件包，不能靠 pip。\n"
-            "安装日志中「未安装 → 版本号」表示安装成功（从没有到有），不是失败。"
+            "「一键安装缺少组件 / 一键更新全部」会处理清单内全部组件；「一键更新 yt-dlp」只更新 yt-dlp。\n"
+            "安装包模式：依赖装到本机扩展目录，yt-dlp 用官方独立程序；需本机有正式 Python（非商店占位）才能 pip。\n"
+            "安装日志中「未安装 → 版本号」表示安装成功，不是失败。"
         )
         sub.setStyleSheet("color:#94a3b8;font-size:13px;")
         sub.setWordWrap(True)
@@ -838,32 +882,19 @@ class SettingsPage(QWidget):
             )
 
     def install_missing(self):
+        """一键安装当前缺少的全部组件（含多个 Python 包 + 可选 FFmpeg）。"""
         packages = [x["package"] for x in self.rows if not x["ok"] and x["type"] == "Python 依赖"]
         media = any(not x["ok"] and x["type"] == "媒体组件" for x in self.rows)
         if not packages and not media:
-            QMessageBox.information(self, "无需安装", "没有缺少的组件。若要升级已有版本，请用「检查全部更新」/「一键更新全部」。")
+            QMessageBox.information(
+                self, "无需安装",
+                "没有缺少的组件。若要升级已有版本，请用「检查全部更新」/「一键更新全部」。",
+            )
             return
-        if is_frozen_app():
-            other = [
-                p for p in packages
-                if p.split()[0].split("[")[0].lower() not in ("yt-dlp", "yt_dlp")
-            ]
-            if other and not any(
-                p.split()[0].split("[")[0].lower() in ("yt-dlp", "yt_dlp") for p in packages
-            ) and not media:
-                QMessageBox.warning(
-                    self,
-                    "安装版限制",
-                    "当前是安装包/绿色版，下列组件无法通过「一键安装」写入软件内部：\n\n"
-                    + "、".join(other)
-                    + "\n\n请重装完整 VideoToolkit 软件包（Setup 或 zip）。\n"
-                    "仅 yt-dlp / FFmpeg 可在此页单独安装或更新。",
-                )
-                return
         self.start_install(packages, media)
 
     def update_ytdlp(self):
-        """强制升级 yt-dlp（网络截图 / 链接字幕提取）。"""
+        """仅强制升级 yt-dlp（与「一键更新全部」区分）。"""
         try:
             from .ytdlp_utils import ytdlp_status
             ok, detail = ytdlp_status()
@@ -872,26 +903,11 @@ class SettingsPage(QWidget):
             old = package_installed_version("yt-dlp") or "未安装"
         self.start_install(
             ["yt-dlp"], False,
-            force_title=f"正在更新 yt-dlp …（当前版本：{old}）",
+            force_title=f"正在单独更新 yt-dlp …（当前版本：{old}）",
         )
 
     def update_all_python(self):
-        """升级清单内全部 Python 依赖（pip --upgrade）。"""
-        if is_frozen_app():
-            reply = QMessageBox.question(
-                self,
-                "安装版说明",
-                "当前是安装包/绿色版：「一键更新全部 Python 依赖」无法改动内置库。\n\n"
-                "可以：\n"
-                "· 一键更新 yt-dlp（下载官方独立程序）\n"
-                "· 重新安装 FFmpeg\n"
-                "· 重装完整新版软件包以更新其它依赖\n\n"
-                "是否改为只更新 yt-dlp？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.update_ytdlp()
-            return
+        """升级清单内全部 Python 依赖（含 yt-dlp 及其它包）。"""
         packages = []
         for _label, _mod, package in PYTHON_COMPONENTS:
             # 整段 package 可能是 "a b" 或多个带 extras 的名
@@ -920,11 +936,16 @@ class SettingsPage(QWidget):
             if to_upgrade:
                 unique = to_upgrade
                 n = len(unique)
-                tip = f"将升级检查到的 {n} 个可更新组件。"
+                tip = f"将升级检查到的 {n} 个可更新组件（含清单内全部类型，不只 yt-dlp）。"
             else:
                 tip = f"未检测到可更新项，将仍对全部 {n} 个包执行 --upgrade（确认是否已最新）。"
         else:
-            tip = f"将升级约 {n} 个 Python 组件（pip install --upgrade）。"
+            tip = f"将升级约 {n} 个 Python 组件（全部依赖，不只 yt-dlp）。"
+        if is_frozen_app():
+            tip += (
+                "\n\n安装包模式：包写入本机扩展目录；yt-dlp 走官方独立程序。"
+                "需要本机已安装正式 Python（非 Windows 商店占位）。"
+            )
         reply = QMessageBox.question(
             self, "更新全部 Python 依赖",
             f"{tip}\n可能需要数分钟，并依赖网络。\n\n是否继续？",
@@ -934,7 +955,7 @@ class SettingsPage(QWidget):
             return
         self.start_install(
             unique, False,
-            force_title=f"正在一键更新 Python 依赖（共 {n} 个）…",
+            force_title=f"正在一键更新全部 Python 依赖（共 {n} 个）…",
         )
 
     def check_all_updates(self):
