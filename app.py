@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.41").strip().lstrip("v") or "1.7.41"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.42").strip().lstrip("v") or "1.7.42"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -805,6 +805,12 @@ class TranscribeWorker(QObject):
     result_ready = Signal(str, str, str, str)
     finished = Signal(bool, str)
 
+    # 图文成片/批量识别每次新建 Worker 时复用同一 Whisper，避免 12 条任务重复加载 medium 卡死感
+    _shared_local_lock = threading.Lock()
+    _shared_local_model = None
+    _shared_local_model_name = None
+    _shared_local_device = None
+
     def __init__(self, store: ConfigStore, provider: str, model: str, files: list[str],
                  output_dir: str, language: str, diarize: bool, ffmpeg_path: str,
                  resume_existing: bool = True, allow_provider_fallback: bool = True):
@@ -1111,35 +1117,60 @@ class TranscribeWorker(QObject):
                 break
         if model_name not in {code for code, _ in LOCAL_WHISPER_MODEL_OPTIONS}:
             self.log.emit(f"未知本地模型「{model_name}」，回退 medium")
+            write_app_log(f"未知本地模型「{model_name}」，回退 medium", "WARNING", "字幕识别")
             model_name = "medium"
-        self.log.emit(
-            f"正在加载本地 Whisper 模型：{model_name}"
-            f"（首次使用会下载；medium/large 更吃显存，语义更稳）…"
-        )
-        # 模型名变化时重新加载
-        if self._local_model is None or getattr(self, "_local_model_name", None) != model_name:
-            self._local_model = None
-            has_cuda = ctranslate2.get_cuda_device_count() > 0
+
+        def _emit(msg: str) -> None:
             try:
-                self._local_model = WhisperModel(
-                    model_name,
-                    device="cuda" if has_cuda else "cpu",
-                    compute_type="auto" if has_cuda else "int8",
-                    cpu_threads=max(1, min(8, os.cpu_count() or 4)),
-                )
-                self._local_device = "cuda" if has_cuda else "cpu"
+                self.log.emit(msg)
+            except Exception:
+                pass
+            write_app_log(msg, "INFO", "字幕识别")
+
+        # 复用跨 Worker 的共享模型（图文成片每条任务都会新建 Worker）
+        with TranscribeWorker._shared_local_lock:
+            shared_ok = (
+                TranscribeWorker._shared_local_model is not None
+                and TranscribeWorker._shared_local_model_name == model_name
+            )
+            if shared_ok:
+                self._local_model = TranscribeWorker._shared_local_model
+                self._local_device = TranscribeWorker._shared_local_device or "cpu"
                 self._local_model_name = model_name
-            except (ValueError, RuntimeError) as exc:
-                if not has_cuda:
-                    raise
-                self.log.emit(f"当前 GPU 模式不可用，自动切换 CPU INT8：{exc}")
-                self._local_model = WhisperModel(
-                    model_name, device="cpu", compute_type="int8",
-                    cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+                _emit(f"复用已加载的本地 Whisper 模型：{model_name}（{self._local_device}）")
+            else:
+                _emit(
+                    f"正在加载本地 Whisper 模型：{model_name}"
+                    f"（首次使用会下载；medium/large 在 CPU 上可能需数分钟，并非卡死）…"
                 )
-                self._local_device = "cpu"
-                self._local_model_name = model_name
+                has_cuda = ctranslate2.get_cuda_device_count() > 0
+                try:
+                    self._local_model = WhisperModel(
+                        model_name,
+                        device="cuda" if has_cuda else "cpu",
+                        compute_type="auto" if has_cuda else "int8",
+                        cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+                    )
+                    self._local_device = "cuda" if has_cuda else "cpu"
+                    self._local_model_name = model_name
+                except (ValueError, RuntimeError) as exc:
+                    if not has_cuda:
+                        raise
+                    _emit(f"当前 GPU 模式不可用，自动切换 CPU INT8：{exc}")
+                    self._local_model = WhisperModel(
+                        model_name, device="cpu", compute_type="int8",
+                        cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+                    )
+                    self._local_device = "cpu"
+                    self._local_model_name = model_name
+                TranscribeWorker._shared_local_model = self._local_model
+                TranscribeWorker._shared_local_model_name = model_name
+                TranscribeWorker._shared_local_device = self._local_device
+                _emit(f"本地 Whisper 模型已就绪：{model_name}（{self._local_device}）")
+
         language = None if not self.language or self.language == "auto" else self.language
+        _emit(f"开始本地识别：{audio.name} …")
+
         def collect_segments(stream, info):
             segments = []
             for item in stream:
@@ -1148,8 +1179,8 @@ class TranscribeWorker(QObject):
                 words = [{"start": word.start, "end": word.end, "text": word.word.strip()}
                          for word in (getattr(item, "words", None) or []) if word.word.strip()]
                 segments.append({"start": item.start, "end": item.end, "text": item.text.strip(), "words": words})
-                if len(segments) % 10 == 0:
-                    self.log.emit(f"本地识别中：已生成 {len(segments)} 条字幕 …")
+                if len(segments) % 5 == 0 or len(segments) == 1:
+                    _emit(f"本地识别中：已生成 {len(segments)} 条字幕 …")
             return segments, info
 
         def transcribe_with(model):
@@ -1158,7 +1189,7 @@ class TranscribeWorker(QObject):
                 use_vad = True
             except ImportError:
                 use_vad = False
-                self.log.emit("未检测到 ONNX Runtime，已自动关闭 VAD 静音过滤并继续识别。")
+                _emit("未检测到 ONNX Runtime，已自动关闭 VAD 静音过滤并继续识别。")
             try:
                 stream, info = model.transcribe(str(audio), language=language, beam_size=5,
                                                 vad_filter=use_vad, word_timestamps=True)
@@ -1166,7 +1197,7 @@ class TranscribeWorker(QObject):
             except RuntimeError as exc:
                 if not use_vad or "onnxruntime" not in str(exc).lower():
                     raise
-                self.log.emit("VAD 组件不可用，已关闭静音过滤并自动重试当前视频。")
+                _emit("VAD 组件不可用，已关闭静音过滤并自动重试当前视频。")
                 stream, info = model.transcribe(str(audio), language=language, beam_size=5,
                                                 vad_filter=False, word_timestamps=True)
                 return collect_segments(stream, info)
@@ -1175,13 +1206,17 @@ class TranscribeWorker(QObject):
         except RuntimeError as exc:
             if self._local_device != "cuda" or self.cancelled:
                 raise
-            self.log.emit(f"GPU 长视频识别中断，自动改用 CPU INT8 从当前视频重试：{exc}")
-            self._local_model = WhisperModel(
-                model_name, device="cpu", compute_type="int8",
-                cpu_threads=max(1, min(8, os.cpu_count() or 4)),
-            )
-            self._local_device = "cpu"
-            self._local_model_name = model_name
+            _emit(f"GPU 长视频识别中断，自动改用 CPU INT8 从当前视频重试：{exc}")
+            with TranscribeWorker._shared_local_lock:
+                self._local_model = WhisperModel(
+                    model_name, device="cpu", compute_type="int8",
+                    cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+                )
+                self._local_device = "cpu"
+                self._local_model_name = model_name
+                TranscribeWorker._shared_local_model = self._local_model
+                TranscribeWorker._shared_local_model_name = model_name
+                TranscribeWorker._shared_local_device = "cpu"
             segments, info = transcribe_with(self._local_model)
         detected = getattr(info, "language", None) or language
         plain = "\n".join(
@@ -1189,6 +1224,7 @@ class TranscribeWorker(QObject):
         raw = {"provider": "Local Whisper", "model": self.model,
                "language": detected, "segments": segments,
                "words": [word for segment in segments for word in segment.get("words", [])]}
+        _emit(f"本地识别完成：{audio.name}（{len(segments)} 段）")
         return segments_to_srt(segments, language=detected), plain, raw
 
     def _groq_payload_is_suspicious(self, payload: dict, duration: float) -> str:
@@ -5000,33 +5036,79 @@ class MainWindow(QMainWindow):
             pass
         return "auto"
 
-    def _caption_transcribe(self, media_path, selected_provider):
-        """在动态文案工作线程中复用同一套识别、翻译和密钥轮询逻辑。"""
+    def _caption_transcribe(self, media_path, selected_provider, cancel_flag=None, prefer_fast=False):
+        """在动态文案工作线程中复用同一套识别、翻译和密钥轮询逻辑。
+
+        cancel_flag: 可选 callable() -> bool，为 True 时尽快中止（图文成片点停止）。
+        prefer_fast: 图文成片场景优先用更轻的本地模型，避免 medium 卡死感。
+        """
         priority = list(self.store.data.get("provider_priority") or PROVIDERS + [LOCAL_PROVIDER])
+        # 界面旧文案 / 别名 → 正式 provider 名
+        alias = {
+            "Whisper (本地/较慢)": LOCAL_PROVIDER,
+            "Whisper": LOCAL_PROVIDER,
+            "本地 Whisper": LOCAL_PROVIDER,
+            "Local Whisper": LOCAL_PROVIDER,
+        }
+        selected_provider = alias.get(str(selected_provider or "").strip(), selected_provider)
         candidates = ([selected_provider] if selected_provider != AUTO_PROVIDER else []) + priority + [LOCAL_PROVIDER]
         ordered = []
         for provider in candidates:
+            provider = alias.get(str(provider or "").strip(), provider)
             if provider in TRANSCRIPTION_PROVIDERS and provider != AUTO_PROVIDER and provider not in ordered:
                 ordered.append(provider)
         errors = []
         asr_language = self._caption_asr_language()
+        write_app_log(
+            f"图文/字幕识别排队：{Path(media_path).name}｜首选={selected_provider}｜候选={','.join(ordered)}"
+            f"{'｜prefer_fast' if prefer_fast else ''}",
+            "INFO", "字幕识别",
+        )
         for provider in ordered:
+            if cancel_flag and cancel_flag():
+                raise RuntimeError("任务已取消")
             if provider != LOCAL_PROVIDER and not self.store.has_candidates(provider):
                 message = f"{provider} 没有可用密钥，自动尝试下一种识别服务"
                 errors.append(message); write_app_log(message, "WARNING", "字幕识别")
                 continue
             model = self.store.data["models"].get(provider, DEFAULT_MODELS[provider])
+            if prefer_fast and provider == LOCAL_PROVIDER:
+                # 图文成片只需时间轴，small 足够且远快于 medium
+                cur = str(model or "").strip().lower()
+                if cur in ("", "medium", "large-v3", "large-v2", "large"):
+                    model = "small"
             try:
                 # resume_existing=False：避免误复用 subtitle_tasks 断点里的坏结果
                 worker = TranscribeWorker(
                     self.store, provider, model, [media_path], "", asr_language, False,
                     self._find_ffmpeg(), False,
                 )
+                # 同步调用时 Signal 可能无接收端：双写到软件日志
+                worker.log.connect(lambda m: write_app_log(m, "INFO", "字幕识别"))
+                # 轮询取消标志，写入 TranscribeWorker.cancelled（Whisper 段落间会检查）
+                stop_poll = threading.Event()
+                poller = None
+                if cancel_flag:
+                    def _poll_cancel(w=worker, flag=cancel_flag, stop=stop_poll):
+                        while not stop.wait(0.2):
+                            try:
+                                if flag():
+                                    w.cancel()
+                                    return
+                            except Exception:
+                                return
+                    poller = threading.Thread(target=_poll_cancel, name="asr-cancel-poll", daemon=True)
+                    poller.start()
                 write_app_log(
                     f"字幕识别：{Path(media_path).name}｜服务={provider}｜模型={model}｜语言={asr_language or 'auto'}",
                     "INFO", "字幕识别",
                 )
-                result = worker._process_one(media_path)
+                try:
+                    if cancel_flag and cancel_flag():
+                        raise RuntimeError("任务已取消")
+                    result = worker._process_one(media_path)
+                finally:
+                    stop_poll.set()
                 raw = result.get("raw") or {}
                 words = raw.get("words") or (raw.get("response") or {}).get("words") or []
                 timed_words = []
@@ -5056,8 +5138,12 @@ class MainWindow(QMainWindow):
                 }
                 return result["original"], result["chinese"], precise_srt
             except Exception as exc:
+                if (cancel_flag and cancel_flag()) or "取消" in str(exc):
+                    raise RuntimeError("任务已取消") from exc
                 message = f"{provider} 调用失败（可能是配额、密钥或网络问题）：{exc}；自动切换下一方案"
                 errors.append(message); write_app_log(message, "WARNING", "字幕识别")
+        if cancel_flag and cancel_flag():
+            raise RuntimeError("任务已取消")
         final = "所有字幕识别方案均不可用：" + "｜".join(errors[-5:])
         write_app_log(final, "ERROR", "字幕识别")
         raise RuntimeError(final)

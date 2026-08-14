@@ -8483,16 +8483,54 @@ class DynamicCaptionPage(QWidget):
             self.run_status.setText("当前状态：正在合成…")
 
     def _stop_context_synthesis(self):
-        mode=getattr(self,"_last_work_source_mode",0)
-        if mode==2:
+        """停止当前实际在跑的任务（不单看左侧页签，避免切到水印/BGM 后停止无效）。"""
+        # 1) 图文成片
+        try:
+            thr = getattr(self, "_project_thread", None)
+            if thr is not None and thr.isRunning():
+                self.stop_project_synthesis()
+                if hasattr(self, "group_merge_start"):
+                    self.group_merge_start.setText("合成")
+                return
+        except RuntimeError:
+            pass
+        # 2) 批量动态文案
+        try:
+            thr = getattr(self, "thread", None)
+            if thr is not None and thr.isRunning():
+                self.cancel()
+                if hasattr(self, "group_merge_start"):
+                    self.group_merge_start.setEnabled(True)
+                    self.group_merge_start.setText("合成")
+                if hasattr(self, "group_merge_stop"):
+                    self.group_merge_stop.setEnabled(False)
+                return
+        except RuntimeError:
+            pass
+        # 3) 分组合成
+        try:
+            thr = getattr(self, "group_merge_thread", None)
+            if thr is not None and thr.isRunning():
+                self.stop_group_merge()
+                if hasattr(self, "group_merge_start"):
+                    self.group_merge_start.setText("合成")
+                return
+        except RuntimeError:
+            pass
+        # 回退：按页签
+        mode = getattr(self, "_last_work_source_mode", 0)
+        if mode == 2:
             self.stop_project_synthesis()
-        elif mode==1:
+        elif mode == 1:
             self.cancel()
-            self.group_merge_start.setEnabled(True)
-            self.group_merge_stop.setEnabled(False)
+            if hasattr(self, "group_merge_start"):
+                self.group_merge_start.setEnabled(True)
+            if hasattr(self, "group_merge_stop"):
+                self.group_merge_stop.setEnabled(False)
         else:
             self.stop_group_merge()
-        self.group_merge_start.setText("合成")
+        if hasattr(self, "group_merge_start"):
+            self.group_merge_start.setText("合成")
 
     def _choose_bgm_source(self):
         from PySide6.QtGui import QCursor
@@ -16556,9 +16594,16 @@ class DynamicCaptionPage(QWidget):
         self._project_thread.start()
 
     def stop_project_synthesis(self):
+        self._append_run_log("正在停止图文成片…（若卡在字幕识别，会尽快中断；最长约数秒）")
         if hasattr(self, "_project_worker") and self._project_worker:
-            self._project_worker.cancel()
+            try:
+                self._project_worker.cancel()
+            except Exception:
+                pass
+        # 立即恢复按钮，避免用户以为“点了没反应”；后台线程会自行收尾
         self.stop_project_synthesis_btn()
+        if hasattr(self, "run_status"):
+            self.run_status.setText("当前状态：正在停止…")
 
     def stop_project_synthesis_btn(self):
         self.project_start_btn.setEnabled(True)
@@ -16915,10 +16960,139 @@ class ProjectGroupWorker(QObject):
 
     def cancel(self):
         self.cancelled = True
+        try:
+            self.log.emit("已收到停止请求，正在中断当前识别/合成…")
+        except Exception:
+            pass
 
     def _apply_project_tts_reverb(self, audio_path, amount: int = 45, mode: str = "大厅"):
         """图文成片配音后处理：按模式混响（与批量配音同一套算法）。"""
         apply_ethereal_reverb_file(self.ffmpeg, audio_path, amount, mode=mode)
+
+    @staticmethod
+    def _stamp_srt(seconds: float) -> str:
+        ms = max(0, round(float(seconds) * 1000))
+        h, rem = divmod(ms, 3_600_000)
+        m, rem = divmod(rem, 60_000)
+        s, milli = divmod(rem, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
+
+    def _fallback_word_srt(self, script: str, duration: float) -> str:
+        """识别超时/失败时：按文案均分时间轴，保证成片能继续。"""
+        text = str(script or "").strip()
+        if text.startswith("[已指定外部音频") or text.startswith("[已指定"):
+            text = ""
+        srt = free_caption_srt(text, duration, self.settings) if text else ""
+        if str(srt or "").strip():
+            return srt
+        end = max(0.5, float(duration or 1.0))
+        return f"1\n00:00:00,000 --> {self._stamp_srt(end)}\n配音\n"
+
+    @staticmethod
+    def _clear_shared_whisper_model():
+        """超时/放弃识别时清掉共享 Whisper，避免下一任务踩到半死状态。"""
+        try:
+            import sys
+            for mod_name in ("app", "__main__"):
+                mod = sys.modules.get(mod_name)
+                tw = getattr(mod, "TranscribeWorker", None) if mod else None
+                if tw is None:
+                    continue
+                lock = getattr(tw, "_shared_local_lock", None)
+                if lock is not None:
+                    with lock:
+                        tw._shared_local_model = None
+                        tw._shared_local_model_name = None
+                        tw._shared_local_device = None
+                else:
+                    tw._shared_local_model = None
+                return
+        except Exception:
+            pass
+
+    def _call_transcribe(self, path: str, provider: str):
+        """兼容 2 参 / 3 参 / prefer_fast 关键字。"""
+        cancel_flag = lambda: self.cancelled
+        try:
+            return self.transcribe_callable(
+                path, provider, cancel_flag=cancel_flag, prefer_fast=True
+            )
+        except TypeError:
+            pass
+        try:
+            return self.transcribe_callable(path, provider, cancel_flag)
+        except TypeError:
+            return self.transcribe_callable(path, provider)
+
+    def _extract_word_srt(self, tts_path, provider, tts_duration, script) -> str:
+        """可取消 + 超时回退的字幕时间轴提取。"""
+        import threading
+        timeout = min(480.0, max(75.0, float(tts_duration) * 5.0 + 45.0))
+        self.log.emit(
+            f"正在从配音中提取精确字幕时间轴…（识别服务：{provider}；"
+            f"音频约 {tts_duration:.0f}s；超时 {timeout:.0f}s 后改用文案均分；"
+            f"本地 Whisper 可能较慢，可点停止）"
+        )
+        box: dict = {"result": None, "error": None, "done": False}
+
+        def target():
+            try:
+                box["result"] = self._call_transcribe(str(tts_path), provider)
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                box["done"] = True
+
+        th = threading.Thread(target=target, name="proj-asr", daemon=True)
+        th.start()
+        started = time.monotonic()
+        last_beat = started
+        while not box["done"]:
+            if self.cancelled:
+                # 给识别线程一点时间响应 cancel_flag
+                th.join(10.0)
+                if not box["done"]:
+                    self.log.emit("识别线程未能及时退出，已放弃当前识别。")
+                    self._clear_shared_whisper_model()
+                raise RuntimeError("任务已取消")
+            now = time.monotonic()
+            if now - last_beat >= 12.0:
+                last_beat = now
+                self.log.emit(
+                    f"…字幕时间轴识别进行中（已等待 {now - started:.0f}s / 上限 {timeout:.0f}s）"
+                )
+            if now - started >= timeout:
+                self.log.emit(
+                    f"字幕识别超过 {timeout:.0f}s，改用文案均分时间轴继续合成（不中断整批）…"
+                )
+                th.join(2.0)
+                if not box["done"]:
+                    self._clear_shared_whisper_model()
+                return self._fallback_word_srt(script, tts_duration)
+            th.join(0.35)
+
+        if box["error"] is not None:
+            err = box["error"]
+            msg = str(err)
+            if self.cancelled or "取消" in msg:
+                raise RuntimeError("任务已取消")
+            self.log.emit(f"识别失败（{msg}），改用文案均分时间轴继续…")
+            return self._fallback_word_srt(script, tts_duration)
+
+        result = box["result"]
+        if isinstance(result, tuple) and len(result) >= 3:
+            word_srt = result[2]
+        else:
+            word_srt = result
+        word_srt = str(word_srt or "").strip()
+        if not word_srt:
+            self.log.emit("未识别到有效字幕，改用文案均分时间轴…")
+            return self._fallback_word_srt(script, tts_duration)
+        cue_n = max(0, word_srt.count("-->"))
+        self.log.emit(
+            f"字幕时间轴提取完成（约 {cue_n} 条，用时 {time.monotonic() - started:.0f}s），继续合成画面…"
+        )
+        return word_srt
 
     def run(self):
         import subprocess, shutil, hashlib, json, time, os, random
@@ -16949,22 +17123,34 @@ class ProjectGroupWorker(QObject):
                         encoder, outputs, failures,
                     )
                 except Exception as proj_exc:
+                    if self.cancelled or "取消" in str(proj_exc):
+                        self.log.emit(f"已停止。已完成 {len(outputs)} 项。")
+                        self.finished.emit(False, f"任务已取消（已完成 {len(outputs)} 项）。")
+                        return
                     failures.append(f"项目 {name}：{proj_exc}")
                     self.item_failed.emit(name, str(proj_exc))
                     self.log.emit(f"项目 {name} 失败：{proj_exc}")
                 
             self.progress.emit(100)
-            if failures:
+            if self.cancelled:
+                self.finished.emit(False, f"任务已取消（已完成 {len(outputs)} 项）。")
+            elif failures:
                 self.finished.emit(True, f"批量制作完成（有部分失败）：\n" + "\n".join(failures))
             else:
                 self.finished.emit(True, f"批量制作成功！共处理 {len(self.projects)} 个项目，已载入视频列表（仍可改需求后重合成）。")
         except Exception as exc:
-            self.finished.emit(False, str(exc))
+            if self.cancelled or "取消" in str(exc):
+                self.finished.emit(False, f"任务已取消（已完成 {len(outputs)} 项）。")
+            else:
+                self.finished.emit(False, str(exc))
 
     def _process_one_project(self, idx, name, script, materials, bgm_choice, dim, encoder, outputs, failures):
         import subprocess, shutil, hashlib, json, time, os, random
         from pathlib import Path
         from .video_encoding import encoder_args
+
+        if self.cancelled:
+            raise RuntimeError("任务已取消")
                 
         res_map = {
             "9:16": (1080, 1920),
@@ -17048,12 +17234,13 @@ class ProjectGroupWorker(QObject):
             tts_duration = 5.0
                 
         self.log.emit(f"语音配音时长为: {tts_duration:.2f} 秒")
-                
-        self.log.emit(f"正在从配音中提取精确字幕时间轴...")
-        provider = self.settings.get("provider", "Whisper (本地/较慢)")
-        _, _, word_srt = self.transcribe_callable(str(tts_path), provider)
-        if not word_srt.strip():
-            raise RuntimeError("未识别到有效字幕时间轴")
+        if self.cancelled:
+            raise RuntimeError("任务已取消")
+
+        provider = self.settings.get("provider", "本地 Whisper（无需密钥）")
+        word_srt = self._extract_word_srt(tts_path, provider, tts_duration, script)
+        if self.cancelled:
+            raise RuntimeError("任务已取消")
                 
         if not materials:
             failures.append(f"项目 {name}：未添加素材")

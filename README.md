@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.41**
+当前版本：**v1.7.42**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,12 +56,17 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.41.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.41/video-toolkit-windows-x64-v1.7.41.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.41/VideoToolkit_Setup_v1.7.41.exe) |
-| Linux x64 | [video-toolkit-linux-x64-v1.7.41.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.41/video-toolkit-linux-x64-v1.7.41.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.41.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.41/video-toolkit-macos-arm64-v1.7.41.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.41.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.41/video-toolkit-macos-x64-v1.7.41.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.42.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.42/video-toolkit-windows-x64-v1.7.42.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.42/VideoToolkit_Setup_v1.7.42.exe) |
+| Linux x64 | [video-toolkit-linux-x64-v1.7.42.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.42/video-toolkit-linux-x64-v1.7.42.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.42.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.42/video-toolkit-macos-arm64-v1.7.42.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.42.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.42/video-toolkit-macos-x64-v1.7.42.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。Linux 解压后执行 `./run-videotoolkit.sh`（或 `./VideoToolkit`）；若 GUI 起不来可安装 `libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.42 · 2026-08-14
+- 图文成片：字幕时间轴识别可**停止**、有**心跳与超时**；超时改用文案均分时间轴继续，避免卡在「提取精确字幕时间轴」。
+- 图文成片本地 Whisper 优先 **small**；共享模型复用；停止按钮按实际运行任务中断。
+- 含 v1.7.41：安装版 yt-dlp 独立程序、组件管理说明等。
 
 ### v1.7.41 · 2026-08-14
 - 组件管理（安装包/绿色版）：**yt-dlp 改为下载官方独立程序**到本机数据目录，不再误用 WindowsApps 假 Python 的 pip。

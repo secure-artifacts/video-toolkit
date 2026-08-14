@@ -406,7 +406,7 @@ class InstallWorker(QObject):
                                 "yt-dlp 已更新为独立程序。"
                                 "其余缺少的组件（"
                                 + "、".join(other_pkgs)
-                                + "）安装版无法用 pip 补装，请重装完整软件包 v1.7.41+。"
+                                + "）安装版无法用 pip 补装，请重装完整软件包 v1.7.42+。"
                             )
                         else:
                             pending_error = (
