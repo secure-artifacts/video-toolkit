@@ -132,6 +132,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ inputs.tag }}"
+          # 与 tag 的 Build and Release 并行时，Release 可能尚未创建
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG not found yet; creating release shell..."
+            gh release create "$TAG" --title "$TAG" --notes "Release $TAG" --verify-tag || true
+            for i in $(seq 1 36); do
+              if gh release view "$TAG" >/dev/null 2>&1; then
+                echo "Release $TAG is ready."
+                break
+              fi
+              echo "Waiting for release $TAG ($i/36)..."
+              sleep 10
+            done
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG still missing after wait; upload aborted."
+            exit 1
+          fi
           for f in dist_final/*.zip; do
             echo "Uploading $f to release $TAG"
             gh release upload "$TAG" "$f" --clobber
@@ -244,6 +261,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ inputs.tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG not found yet; creating release shell..."
+            gh release create "$TAG" --title "$TAG" --notes "Release $TAG" --verify-tag || true
+            for i in $(seq 1 36); do
+              if gh release view "$TAG" >/dev/null 2>&1; then
+                echo "Release $TAG is ready."
+                break
+              fi
+              echo "Waiting for release $TAG ($i/36)..."
+              sleep 10
+            done
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG still missing after wait; upload aborted."
+            exit 1
+          fi
           for f in dist_final/*.zip; do
             echo "Uploading $f to release $TAG"
             gh release upload "$TAG" "$f" --clobber
