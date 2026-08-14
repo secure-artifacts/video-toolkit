@@ -762,8 +762,8 @@ class MetadataPage(QWidget):
         self.preserve_time = QCheckBox("保留文件系统修改时间（隐私清理模式下禁用）")
         self.preserve_time.setChecked(False)
         self.preserve_time.setEnabled(False)
+        # QCheckBox 无 setWordWrap；长说明放 tooltip 即可
         self.preserve_time.setToolTip("拍摄/修改时间可能用于推断活动轨迹，因此隐私清理固定使用新的输出时间。")
-        self.preserve_time.setWordWrap(True)
         self.preserve_time.setMinimumHeight(28)
         out_box_layout.addWidget(self.keep_structure)
         out_box_layout.addWidget(self.preserve_time)
