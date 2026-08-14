@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.40").strip().lstrip("v") or "1.7.40"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.41").strip().lstrip("v") or "1.7.41"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -906,13 +906,15 @@ class TranscribeWorker(QObject):
             shutil.rmtree(work, ignore_errors=True)
 
     def _download_online_media(self, url: str, temp: Path):
-        try:
-            from yt_dlp import YoutubeDL
-        except ImportError as exc:
-            raise RuntimeError("缺少网络视频解析组件 yt-dlp，请到“组件管理”点击一键安装。") from exc
+        from modules.ytdlp_utils import download_media, ytdlp_status
 
-        self.log.emit("正在解析并静默下载网络视频音轨 …")
+        ok, detail = ytdlp_status()
+        if not ok:
+            raise RuntimeError("缺少网络视频解析组件 yt-dlp，请到“组件管理”点击「一键更新 yt-dlp」。")
+
+        self.log.emit(f"正在解析并静默下载网络视频音轨 …（{detail}）")
         last_percent = {"value": ""}
+
         def download_hook(data):
             if self.cancelled:
                 raise RuntimeError("任务已取消")
@@ -922,20 +924,16 @@ class TranscribeWorker(QObject):
                     last_percent["value"] = percent
                     self.log.emit(f"网络视频下载中：{percent}")
 
-        options = {
-            "format": "bestaudio/best",
-            "outtmpl": str(temp / "online_source.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            "overwrites": True,
-            "progress_hooks": [download_hook],
-        }
         try:
-            with YoutubeDL(options) as downloader:
-                info = downloader.extract_info(url, download=True)
-                prepared = Path(downloader.prepare_filename(info))
+            prepared_str, info = download_media(
+                url,
+                str(temp / "online_source.%(ext)s"),
+                format_spec="bestaudio/best",
+                progress_hooks=[download_hook],
+                extra_opts={"restrictfilenames": True},
+                log=self.log.emit,
+            )
+            prepared = Path(prepared_str)
         except Exception as exc:
             raise RuntimeError(f"网络视频下载失败：{exc}") from exc
         candidates = [prepared] if prepared.exists() else []
@@ -943,7 +941,7 @@ class TranscribeWorker(QObject):
         source = next((p for p in candidates if p.exists() and p.is_file()), None)
         if not source:
             raise RuntimeError("网络视频下载完成，但没有找到可处理的媒体文件。")
-        title = re.sub(r"[\\/:*?\"<>|]+", "_", str(info.get("title") or "网络视频")).strip()
+        title = re.sub(r"[\\/:*?\"<>|]+", "_", str((info or {}).get("title") or "网络视频")).strip()
         return source, (title[:100] or "网络视频")
 
     def _process_one(self, source_value: str):

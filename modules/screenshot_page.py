@@ -99,23 +99,17 @@ class ProcessThread(QThread):
         if proxy:
             self.log_signal.emit(f"系统代理：{proxy}")
 
-        YoutubeDL = None
         need_ytdlp = any(not os.path.isfile(item.strip()) for item in self.urls if item.strip())
         if need_ytdlp:
-            try:
-                from yt_dlp import YoutubeDL
-                try:
-                    import importlib.metadata as _md
-                    ytdlp_ver = _md.version("yt-dlp")
-                except Exception:
-                    ytdlp_ver = "未知"
-                self.log_signal.emit(f"yt-dlp 版本：{ytdlp_ver}（网络链接解析依赖此版本）")
-            except ImportError:
+            from .ytdlp_utils import ytdlp_status
+            ok, detail = ytdlp_status()
+            if not ok:
                 msg = "环境错误：未安装 yt-dlp，网络链接无法解析。请到「设置与组件」一键更新 yt-dlp。"
                 self.log_signal.emit(f"❌ {msg}")
                 logging.error(msg)
                 self.finished_signal.emit()
                 return
+            self.log_signal.emit(f"yt-dlp：{detail}（网络链接解析依赖此组件）")
 
         ok_n, skip_n, fail_n = 0, 0, 0
         for index, url in enumerate(self.urls):
@@ -146,24 +140,22 @@ class ProcessThread(QThread):
                     self.log_signal.emit(f"  路径：{url}")
                 else:
                     self.log_signal.emit("  正在用 yt-dlp 解析并下载…")
-                    ydl_opts = {
-                        'outtmpl': f'temp_{int(time.time())}_{task_no}.%(ext)s',
-                        'format': 'mp4/best',
-                        'quiet': True,
-                        'no_warnings': True,
-                        'proxy': proxy,
-                        'nocheckcertificate': True,
-                    }
-                    with YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        temp_video = ydl.prepare_filename(info)
-                        title = (info or {}).get("title") or ""
-                        duration = (info or {}).get("duration")
-                        if title:
-                            self.log_signal.emit(f"  标题：{title}")
-                        if duration:
-                            self.log_signal.emit(f"  时长：{float(duration):.1f}s")
-                        self.log_signal.emit(f"  已下载临时文件：{os.path.basename(temp_video)}")
+                    from .ytdlp_utils import download_media
+                    outtmpl = f'temp_{int(time.time())}_{task_no}.%(ext)s'
+                    temp_video, info = download_media(
+                        url,
+                        outtmpl,
+                        format_spec="mp4/best",
+                        proxy=proxy,
+                        log=self.log_signal.emit,
+                    )
+                    title = (info or {}).get("title") or ""
+                    duration = (info or {}).get("duration")
+                    if title:
+                        self.log_signal.emit(f"  标题：{title}")
+                    if duration:
+                        self.log_signal.emit(f"  时长：{float(duration):.1f}s")
+                    self.log_signal.emit(f"  已下载临时文件：{os.path.basename(temp_video)}")
 
                 # 截图目录
                 f_idx = 1
