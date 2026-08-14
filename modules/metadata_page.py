@@ -6,11 +6,11 @@ import subprocess
 from pathlib import Path
 
 from PIL import ExifTags, Image
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from .path_picker import (AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS,
@@ -133,52 +133,26 @@ def crop_image_to_916(image: Image.Image, target_size=None) -> Image.Image:
     return image
 
 
-def _hq_video_encode_args(ffmpeg) -> list:
-    """High-quality H.264 for re-encode after crop/watermark (minimize quality loss)."""
-    encoder = resolve_encoder(ffmpeg, "auto")
-    args = list(encoder_args(encoder, cpu_preset="medium"))
-    # 元数据清理裁切是成品输出：比默认再抬一档画质
-    try:
-        if "-crf" in args:
-            i = args.index("-crf")
-            args[i + 1] = "16"
-        if "-cq" in args:
-            i = args.index("-cq")
-            args[i + 1] = "18"
-        if "-global_quality" in args:
-            i = args.index("-global_quality")
-            args[i + 1] = "18"
-        if "-quality" in args and "h264_mf" in args:
-            i = args.index("-quality")
-            args[i + 1] = "85"
-        if "-qp_i" in args:
-            i = args.index("-qp_i")
-            args[i + 1] = "18"
-        if "-qp_p" in args:
-            i = args.index("-qp_p")
-            args[i + 1] = "18"
-    except (ValueError, IndexError):
-        pass
-    return args
-
-
-def _probe_video_size(ffmpeg, path: Path):
+def _probe_video_meta(ffmpeg, path: Path):
+    """Return width, height, fps, video_bit_rate (bps, 0 if unknown)."""
     ffprobe = find_media_tool("ffprobe")
     if not ffprobe:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, 0
     command = [
         ffprobe, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate",
+        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,bit_rate",
+        "-show_entries", "format=bit_rate",
         "-of", "json", str(path),
     ]
     result = subprocess.run(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
     if result.returncode:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, 0
     try:
         payload = json.loads(result.stdout or "{}")
         stream = (payload.get("streams") or [{}])[0]
+        fmt = payload.get("format") or {}
         w = int(stream.get("width") or 0)
         h = int(stream.get("height") or 0)
         rate = str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1")
@@ -189,9 +163,118 @@ def _probe_video_size(ffmpeg, path: Path):
             fps = float(num) / den_f if den_f else 0.0
         else:
             fps = float(rate or 0)
-        return w, h, fps
+        br = 0
+        try:
+            br = int(stream.get("bit_rate") or 0)
+        except (TypeError, ValueError):
+            br = 0
+        if br <= 0:
+            try:
+                br = int(fmt.get("bit_rate") or 0)
+            except (TypeError, ValueError):
+                br = 0
+        return w, h, fps, max(0, br)
     except Exception:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, 0
+
+
+def _probe_video_size(ffmpeg, path: Path):
+    w, h, fps, _br = _probe_video_meta(ffmpeg, path)
+    return w, h, fps
+
+
+def _bitrate_floor_for_size(width: int, height: int) -> int:
+    """Minimum video bitrate (bps) for clean 9:16 delivery at given pixels."""
+    pixels = max(1, int(width) * int(height))
+    # ~0.12 bit/pixel/frame @ 30fps ≈ 3.6 bpp-ish overall; clamp to sensible range
+    # 1080x1920 → ~8 Mbps floor; 720x1280 → ~4.5; tiny 270x480 → ~1.2
+    floor = int(pixels * 30 * 0.12)
+    return max(1_200_000, min(16_000_000, floor))
+
+
+def _hq_video_encode_args(ffmpeg, width: int = 0, height: int = 0, source_bitrate: int = 0) -> list:
+    """成品级 H.264：优先画质，不用 intermediate/预览档。
+
+    - 不用 encoder_args 的 medium→faster 改写（那是中间缓存用的）
+    - 硬编给更高 CQ/质量；CPU 用 slow + 低 CRF
+    - 按分辨率设码率下限，避免小分辨率被压糊、大分辨率码率不够
+    """
+    encoder = resolve_encoder(ffmpeg, "auto")
+    w = max(0, int(width or 0))
+    h = max(0, int(height or 0))
+    floor = _bitrate_floor_for_size(w or 1080, h or 1920)
+    # 源码率更高时尽量贴近源，减少二次压缩损失
+    target_br = max(floor, int(source_bitrate * 0.95) if source_bitrate > 500_000 else floor)
+    maxrate = int(target_br * 1.5)
+    bufsize = int(target_br * 2)
+
+    if encoder == "nvenc":
+        return [
+            "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+            "-rc", "vbr", "-cq", "15", "-b:v", str(target_br),
+            "-maxrate", str(maxrate), "-bufsize", str(bufsize),
+            "-profile:v", "high", "-bf", "0", "-pix_fmt", "yuv420p",
+        ]
+    if encoder == "qsv":
+        return [
+            "-c:v", "h264_qsv", "-preset", "slow", "-global_quality", "16",
+            "-look_ahead", "1", "-b:v", str(target_br),
+            "-maxrate", str(maxrate), "-bufsize", str(bufsize),
+            "-bf", "0", "-pix_fmt", "nv12",
+        ]
+    if encoder == "mf":
+        # Windows MF：质量档尽量拉满，并给码率下限
+        return [
+            "-c:v", "h264_mf", "-rate_control", "quality", "-quality", "100",
+            "-b:v", str(target_br), "-maxrate", str(maxrate),
+            "-pix_fmt", "yuv420p",
+        ]
+    if encoder == "amf":
+        return [
+            "-c:v", "h264_amf", "-quality", "quality",
+            "-rc", "vbr_peak", "-b:v", str(target_br),
+            "-maxrate", str(maxrate),
+            "-qp_i", "15", "-qp_p", "17", "-bf_delta_qp", "0",
+            "-pix_fmt", "yuv420p",
+        ]
+    # CPU libx264：成品 slow + CRF 14（明显优于原先 faster/CRF20）
+    return [
+        "-c:v", "libx264", "-preset", "slow", "-crf", "14",
+        "-profile:v", "high", "-level", "4.2",
+        "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0",
+        # 防止极低码率场景：仍给一个温和上限参考
+        "-maxrate", str(maxrate), "-bufsize", str(bufsize),
+    ]
+
+
+def _effective_crop_target(source_w: int, source_h: int, mode_key: str):
+    """计算裁切后是否缩放，以及目标尺寸。
+
+    规则（避免糊）：
+    - keep：只居中裁 9:16，绝不缩放
+    - 指定 720/1080/1440：仅当裁后像素 **大于** 目标时缩小；源更小则保持源像素（绝不放大）
+    返回 (target_wh_or_None, note)
+    """
+    mode = str(mode_key or "keep")
+    wanted = _CROP_916_MODES.get(mode)
+    if not wanted:
+        return None, "仅居中裁切（不缩放，画质最佳）"
+    tw, th = int(wanted[0]), int(wanted[1])
+    # 裁后近似尺寸（与 FFmpeg crop 表达式一致）
+    if source_w > 0 and source_h > 0:
+        crop_w = min(source_w, int(source_h * 9 / 16))
+        crop_h = min(source_h, int(source_w * 16 / 9))
+        crop_w = max(2, (crop_w // 2) * 2)
+        crop_h = max(2, (crop_h // 2) * 2)
+    else:
+        crop_w, crop_h = tw, th
+    # 源/裁后任一边小于目标 → 放大会糊，跳过缩放
+    if crop_w < tw or crop_h < th:
+        return None, (
+            f"目标 {tw}×{th} 大于裁后约 {crop_w}×{crop_h}，"
+            f"已禁止放大（保持源像素，避免发糊）"
+        )
+    return (tw, th), f"缩小到 {tw}×{th}（Lanczos，不变形）"
 
 
 def _is_nearly_916(width: int, height: int, tol: float = 0.012) -> bool:
@@ -235,10 +318,12 @@ class MetadataWorker(QObject):
         path = Path(str(self.watermark.get("path") or ""))
         return path.is_file()
 
-    def _crop_target_size(self):
+    def _crop_target_size(self, source_w: int = 0, source_h: int = 0):
+        """兼容旧调用；真正策略见 _effective_crop_target。"""
         if not self.crop_916:
             return None
-        return _CROP_916_MODES.get(self.crop_916_mode)
+        target, _note = _effective_crop_target(source_w, source_h, self.crop_916_mode)
+        return target
 
     def _image(self, source: Path, destination: Path):
         with Image.open(source) as image:
@@ -246,10 +331,11 @@ class MetadataWorker(QObject):
             clean.putdata(list(image.getdata()))
             if self.crop_916:
                 before = (clean.width, clean.height)
-                clean = crop_image_to_916(clean, self._crop_target_size())
+                target, note = _effective_crop_target(before[0], before[1], self.crop_916_mode)
+                clean = crop_image_to_916(clean, target)
                 self.log.emit(
                     f"  · 9:16 居中裁切：{before[0]}×{before[1]} → {clean.width}×{clean.height}"
-                    "（不拉伸）"
+                    f"（不拉伸；{note}）"
                 )
             if self._wm_enabled():
                 self.log.emit(f"  · 叠加水印：{Path(self.watermark['path']).name}")
@@ -320,51 +406,69 @@ class MetadataWorker(QObject):
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "FFmpeg 清除元数据失败")
 
-    def _build_video_chain(self) -> str:
-        """Pre-watermark video processing: optional 9:16 crop + format.
+    def _build_video_chain(self, source_w: int = 0, source_h: int = 0) -> tuple[str, tuple | None, str]:
+        """Build video filter chain. Returns (vf, out_size_or_None, scale_note).
 
-        Center crop only (no stretch). Optional Lanczos resize after crop.
-        No fps filter — preserves source frame timing.
+        - 居中裁 9:16，不拉伸
+        - 目标分辨率仅允许缩小，禁止放大（小图强制 1080p 会发糊）
+        - 不改 fps
         """
         parts = ["setpts=PTS-STARTPTS", "format=yuv420p"]
+        out_w, out_h = int(source_w or 0), int(source_h or 0)
+        scale_note = ""
         if self.crop_916:
             parts.append(_CROP_916_VF)
-            target = self._crop_target_size()
+            # 估算裁后尺寸
+            if source_w > 0 and source_h > 0:
+                out_w = min(source_w, int(source_h * 9 / 16))
+                out_h = min(source_h, int(source_w * 16 / 9))
+                out_w = max(2, (out_w // 2) * 2)
+                out_h = max(2, (out_h // 2) * 2)
+            target, scale_note = _effective_crop_target(source_w, source_h, self.crop_916_mode)
             if target:
                 tw, th = int(target[0]), int(target[1])
-                # 裁成 9:16 后用 Lanczos 缩到目标分辨率（不拉伸）
-                parts.append(f"scale={tw}:{th}:flags=lanczos")
+                # Lanczos 缩小；accurate_rnd + full_chroma 更锐利
+                parts.append(
+                    f"scale={tw}:{th}:flags=lanczos+accurate_rnd+full_chroma_int"
+                )
                 parts.append("setsar=1")
-        # yuv420p 偶数边
+                out_w, out_h = tw, th
+        # yuv420p 偶数边（裁切表达式已保证偶数，这里兜底）
         parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-        return ",".join(parts)
+        return ",".join(parts), ((out_w, out_h) if out_w and out_h else None), scale_note
 
     def _av_reencode(self, ffmpeg, source: Path, destination: Path):
         """Re-encode with optional 9:16 crop and/or watermark; strip metadata.
 
         Quality rules:
         - Center crop only (no stretch)
-        - No fps filter (preserve source frame rate / no forced drop-dupe)
-        - High-quality H.264 + audio copy when possible
+        - Never upscale to “1080×1920” when source is smaller (that causes blur)
+        - No fps filter (preserve source frame rate)
+        - Delivery-grade H.264 (slow/CRF14 or HW high quality + bitrate floor)
         """
-        w, h, fps = _probe_video_size(ffmpeg, source)
+        w, h, fps, src_br = _probe_video_meta(ffmpeg, source)
         notes = []
+        v_prep, out_size, scale_note = self._build_video_chain(w, h)
         if self.crop_916:
-            target = self._crop_target_size()
-            if target:
-                notes.append(f"9:16 居中裁切→{target[0]}×{target[1]}")
-            else:
-                notes.append("9:16 居中裁切（不缩放）")
             if w and h:
                 notes.append(f"源 {w}×{h}")
+            if scale_note:
+                notes.append(scale_note)
+            else:
+                notes.append("9:16 居中裁切（不缩放）")
+            if out_size:
+                notes.append(f"输出约 {out_size[0]}×{out_size[1]}")
         if self._wm_enabled():
             notes.append(f"水印 {Path(self.watermark['path']).name}")
         if fps > 0.1:
             notes.append(f"保留约 {fps:.3g} fps")
-        self.log.emit("  · " + "；".join(notes) + "（高质量重编码，不变形）")
+        if src_br > 0:
+            notes.append(f"源码率约 {src_br / 1_000_000:.2f} Mbps")
+        self.log.emit("  · " + "；".join(notes) + "（高质量重编码，不变形、不放大）")
 
-        v_prep = self._build_video_chain()
-        encode = _hq_video_encode_args(ffmpeg)
+        ow = int(out_size[0]) if out_size else w
+        oh = int(out_size[1]) if out_size else h
+        encode = _hq_video_encode_args(ffmpeg, ow, oh, src_br)
         # 不强制 -r，避免改帧率导致重复/丢帧；passthrough 尽量按源包时间戳
         rate_args = ["-fps_mode", "passthrough"]
 
@@ -599,48 +703,100 @@ class MetadataPage(QWidget):
             buttons.addWidget(button)
         source_layout.addLayout(buttons)
 
-        options = QGroupBox("输出与执行")
-        options_layout = QVBoxLayout(options)
-        form = QFormLayout()
+        # 右侧：内容固定最小宽度 + 纵向滚动。
+        # 禁止把表单压成「一字竖排」（窄宽度时 QGrid 双列会把中文挤成竖排乱码）。
+        LABEL_W = 88
+        CTRL_H = 34
+        CONTENT_MIN_W = 400
+
+        def _row_label(text: str) -> QLabel:
+            lab = QLabel(text)
+            lab.setFixedWidth(LABEL_W)
+            lab.setMinimumHeight(CTRL_H)
+            lab.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+            lab.setStyleSheet(
+                "QLabel{font-size:13px;font-weight:600;color:#e2e8f0;"
+                "padding-right:8px;background:transparent;}"
+            )
+            # 禁止在极窄宽度下自动换行成竖排
+            lab.setWordWrap(False)
+            lab.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            return lab
+
+        def _labeled_row(label: str, *widgets) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(_row_label(label), 0)
+            for i, w in enumerate(widgets):
+                if hasattr(w, "setMinimumHeight"):
+                    w.setMinimumHeight(CTRL_H)
+                stretch = 1 if i == 0 and len(widgets) == 1 else (1 if i == 0 else 0)
+                row.addWidget(w, stretch)
+            return row
+
+        options_host = QWidget()
+        options_host.setMinimumWidth(CONTENT_MIN_W)
+        options_host.setSizePolicy(
+            QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Preferred
+        )
+        options_layout = QVBoxLayout(options_host)
+        options_layout.setContentsMargins(10, 8, 14, 12)
+        options_layout.setSpacing(12)
+
+        out_box = QGroupBox("输出与执行")
+        out_box_layout = QVBoxLayout(out_box)
+        out_box_layout.setSpacing(10)
         self.output = QLineEdit(str(default_output_path("metadata_clean_outputs")))
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output)
+        self.output.setMinimumHeight(CTRL_H)
+        self.output.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         choose = QPushButton("选择…")
+        choose.setFixedWidth(84)
+        choose.setMinimumHeight(CTRL_H)
         choose.clicked.connect(self.choose_output)
-        out_row.addWidget(choose)
-        form.addRow("输出目录", out_row)
+        out_dir_row = _labeled_row("输出目录", self.output, choose)
+        out_box_layout.addLayout(out_dir_row)
         self.keep_structure = QCheckBox("保留输入文件夹层级")
         self.keep_structure.setChecked(True)
+        self.keep_structure.setMinimumHeight(28)
         self.preserve_time = QCheckBox("保留文件系统修改时间（隐私清理模式下禁用）")
         self.preserve_time.setChecked(False)
         self.preserve_time.setEnabled(False)
         self.preserve_time.setToolTip("拍摄/修改时间可能用于推断活动轨迹，因此隐私清理固定使用新的输出时间。")
-        form.addRow("目录结构", self.keep_structure)
-        form.addRow("文件时间", self.preserve_time)
-        options_layout.addLayout(form)
+        self.preserve_time.setWordWrap(True)
+        self.preserve_time.setMinimumHeight(28)
+        out_box_layout.addWidget(self.keep_structure)
+        out_box_layout.addWidget(self.preserve_time)
+        options_layout.addWidget(out_box)
 
         # —— 9:16 竖屏裁切（可选）——
         crop_box = QGroupBox("9:16 竖屏裁切（可选）")
-        crop_layout = QFormLayout(crop_box)
+        crop_layout = QVBoxLayout(crop_box)
+        crop_layout.setSpacing(10)
         self.crop_916 = QCheckBox("所有视频/图片裁剪为 9:16")
+        self.crop_916.setMinimumHeight(28)
         self.crop_916.setToolTip(
             "居中裁切为竖屏 9:16：\n"
             "· 不拉伸、不变形（只裁掉左右或上下多余部分）\n"
-            "· 不强制改帧率（尽量保留原 fps，避免丢帧/补帧）\n"
-            "· 高质量重编码；已是 9:16 且选「仅裁切」时走流复制，零画质损失\n"
+            "· 绝不把小分辨率强行放大到 1080p（会发糊）\n"
+            "· 不强制改帧率；高质量重编码（slow/低 CRF 或硬编高画质）\n"
+            "· 已是 9:16 且选「仅裁切」时走流复制\n"
             "· 可与水印同时开启（先裁切再叠水印）"
         )
         self.crop_916_mode = QComboBox()
-        self.crop_916_mode.addItem("仅居中裁切（不放大，画质最佳）", "keep")
-        self.crop_916_mode.addItem("裁切后输出 1080×1920", "1080x1920")
-        self.crop_916_mode.addItem("裁切后输出 720×1280", "720x1280")
-        self.crop_916_mode.addItem("裁切后输出 1440×2560", "1440x2560")
+        self.crop_916_mode.addItem("仅居中裁切（推荐，不缩放）", "keep")
+        self.crop_916_mode.addItem("裁切后缩小到 1080×1920（不放大）", "1080x1920")
+        self.crop_916_mode.addItem("裁切后缩小到 720×1280（不放大）", "720x1280")
+        self.crop_916_mode.addItem("裁切后缩小到 1440×2560（不放大）", "1440x2560")
+        self.crop_916_mode.setMinimumHeight(CTRL_H)
+        self.crop_916_mode.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.crop_916_mode.setToolTip(
-            "「仅居中裁切」：只从源画面裁出最大 9:16 区域，不做缩放，像素质量最高。\n"
-            "「输出 xxx」：裁切后再用 Lanczos 缩到标准竖屏分辨率（适合统一发布尺寸）。"
+            "「仅居中裁切」：只裁 9:16，不做缩放，画质最佳。\n"
+            "「缩小到 xxx」：源比目标大时才缩小；源更小则保持源像素，"
+            "绝不上采样放大（例如 270×480 不会被拉成 1080×1920 变糊）。"
         )
-        crop_layout.addRow(self.crop_916)
-        crop_layout.addRow("输出尺寸", self.crop_916_mode)
+        crop_layout.addWidget(self.crop_916)
+        crop_layout.addLayout(_labeled_row("输出尺寸", self.crop_916_mode))
 
         def _sync_crop_enabled(on: bool):
             self.crop_916_mode.setEnabled(bool(on))
@@ -649,50 +805,77 @@ class MetadataPage(QWidget):
         _sync_crop_enabled(False)
         options_layout.addWidget(crop_box)
 
-        # —— 水印合成（可选）——
+        # —— 水印合成：严格单列（标签在左固定宽，控件在右），永不挤成竖排 ——
         wm_box = QGroupBox("水印合成（可选）")
-        wm_layout = QFormLayout(wm_box)
+        wm_outer = QVBoxLayout(wm_box)
+        wm_outer.setSpacing(10)
         self.wm_enable = QCheckBox("清理时同时烧录水印")
         self.wm_enable.setToolTip("开启后图片用 PIL 叠图；视频重编码并 overlay Logo，同时清除元数据。")
+        self.wm_enable.setMinimumHeight(28)
+        wm_outer.addWidget(self.wm_enable)
+
         self.wm_path = QLineEdit()
         self.wm_path.setPlaceholderText("选择 PNG / JPG Logo（推荐透明 PNG）")
-        wm_path_row = QHBoxLayout()
-        wm_path_row.addWidget(self.wm_path)
+        self.wm_path.setMinimumHeight(CTRL_H)
+        self.wm_path.setMinimumWidth(160)
+        self.wm_path.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.wm_path.textChanged.connect(
+            lambda t: self.wm_path.setToolTip(
+                t if t.strip() else "选择 PNG / JPG Logo（推荐透明 PNG）"
+            )
+        )
         wm_browse = QPushButton("选择…")
+        wm_browse.setFixedWidth(84)
+        wm_browse.setMinimumHeight(CTRL_H)
         wm_browse.clicked.connect(self.choose_watermark)
-        wm_path_row.addWidget(wm_browse)
+        wm_outer.addLayout(_labeled_row("Logo 文件", self.wm_path, wm_browse))
+
         self.wm_mode = QComboBox()
         self.wm_mode.addItems(["小 Logo 角标", "9:16 全屏覆盖"])
+        self.wm_mode.setMinimumHeight(CTRL_H)
+        self.wm_mode.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.wm_position = QComboBox()
         self.wm_position.addItems(["右下", "右上", "左下", "左上", "顶部居中", "底部居中", "居中"])
+        self.wm_position.setMinimumHeight(CTRL_H)
+        self.wm_position.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.wm_width = QSpinBox()
         self.wm_width.setRange(4, 80)
         self.wm_width.setValue(18)
         self.wm_width.setSuffix(" %")
+        self.wm_width.setMinimumHeight(CTRL_H)
+        self.wm_width.setMinimumWidth(100)
         self.wm_width.setToolTip("角标模式：相对画面宽度的 Logo 宽度")
         self.wm_opacity = QSpinBox()
         self.wm_opacity.setRange(5, 100)
         self.wm_opacity.setValue(90)
         self.wm_opacity.setSuffix(" %")
+        self.wm_opacity.setMinimumHeight(CTRL_H)
+        self.wm_opacity.setMinimumWidth(100)
         self.wm_margin = QSpinBox()
         self.wm_margin.setRange(0, 200)
         self.wm_margin.setValue(28)
         self.wm_margin.setSuffix(" px")
-        wm_layout.addRow(self.wm_enable)
-        wm_layout.addRow("Logo 文件", wm_path_row)
-        wm_layout.addRow("模式", self.wm_mode)
-        wm_layout.addRow("位置", self.wm_position)
-        wm_layout.addRow("宽度", self.wm_width)
-        wm_layout.addRow("不透明度", self.wm_opacity)
-        wm_layout.addRow("边距", self.wm_margin)
+        self.wm_margin.setMinimumHeight(CTRL_H)
+        self.wm_margin.setMinimumWidth(100)
+
+        # 每一项独占一行 → 小屏也不会把「模式/位置」挤成竖排
+        wm_outer.addLayout(_labeled_row("模式", self.wm_mode))
+        wm_outer.addLayout(_labeled_row("位置", self.wm_position))
+        wm_outer.addLayout(_labeled_row("宽度", self.wm_width))
+        wm_outer.addLayout(_labeled_row("不透明度", self.wm_opacity))
+        wm_outer.addLayout(_labeled_row("边距", self.wm_margin))
+
+        wm_hint = QLabel("角标模式可调位置 / 宽度 / 边距；全屏覆盖只使用不透明度。")
+        wm_hint.setWordWrap(True)
+        wm_hint.setStyleSheet("color:#94a3b8;font-size:12px;padding:2px 0 0 0;")
+        wm_outer.addWidget(wm_hint)
 
         def _sync_wm_enabled(on: bool):
-            for w in (self.wm_path, wm_browse, self.wm_mode, self.wm_position,
-                      self.wm_width, self.wm_opacity, self.wm_margin):
+            corner = bool(on) and "全屏" not in self.wm_mode.currentText()
+            for w in (self.wm_path, wm_browse, self.wm_mode, self.wm_opacity):
                 w.setEnabled(bool(on))
-            self.wm_position.setEnabled(bool(on) and "全屏" not in self.wm_mode.currentText())
-            self.wm_width.setEnabled(bool(on) and "全屏" not in self.wm_mode.currentText())
-            self.wm_margin.setEnabled(bool(on) and "全屏" not in self.wm_mode.currentText())
+            for w in (self.wm_position, self.wm_width, self.wm_margin):
+                w.setEnabled(corner)
 
         self.wm_enable.toggled.connect(_sync_wm_enabled)
         self.wm_mode.currentTextChanged.connect(
@@ -702,21 +885,25 @@ class MetadataPage(QWidget):
 
         inspection = QGroupBox("元数据检查（选中左侧素材自动读取）")
         inspection_layout = QVBoxLayout(inspection)
-        self.inspect_status = QLabel("请选择一个素材查看清理前信息；完成清理后会自动显示前后对比。")
+        inspection_layout.setSpacing(8)
+        self.inspect_status = QLabel(
+            "请选择一个素材查看清理前信息；完成清理后会自动显示前后对比。"
+        )
         self.inspect_status.setWordWrap(True)
-        self.inspect_status.setStyleSheet("color:#7dd3fc;")
+        self.inspect_status.setStyleSheet("color:#7dd3fc;font-size:13px;")
         inspection_layout.addWidget(self.inspect_status)
         compare = QHBoxLayout()
+        compare.setSpacing(10)
         before_box = QVBoxLayout()
         after_box = QVBoxLayout()
         before_box.addWidget(QLabel("清理前 · 原素材"))
         after_box.addWidget(QLabel("清理后 · 输出成品"))
         self.before_metadata = QPlainTextEdit()
         self.before_metadata.setReadOnly(True)
-        self.before_metadata.setMinimumHeight(190)
+        self.before_metadata.setMinimumHeight(140)
         self.after_metadata = QPlainTextEdit()
         self.after_metadata.setReadOnly(True)
-        self.after_metadata.setMinimumHeight(190)
+        self.after_metadata.setMinimumHeight(140)
         metadata_style = "font-family:Consolas,'Microsoft YaHei UI';font-size:12px;"
         self.before_metadata.setStyleSheet(metadata_style)
         self.after_metadata.setStyleSheet(metadata_style)
@@ -727,24 +914,50 @@ class MetadataPage(QWidget):
         inspection_layout.addLayout(compare)
         options_layout.addWidget(inspection)
         self.progress = QProgressBar()
+        self.progress.setMinimumHeight(18)
         options_layout.addWidget(self.progress)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMinimumHeight(100)
         options_layout.addWidget(self.log, 1)
         actions = QHBoxLayout()
         actions.addStretch()
         self.stop = QPushButton("停止")
         self.stop.setEnabled(False)
+        self.stop.setMinimumHeight(36)
+        self.stop.setMinimumWidth(88)
         self.stop.clicked.connect(self.cancel)
         self.start = QPushButton("开始批量清除")
         self.start.setObjectName("primary")
+        self.start.setMinimumHeight(36)
+        self.start.setMinimumWidth(120)
         self.start.clicked.connect(self.run)
         actions.addWidget(self.stop)
         actions.addWidget(self.start)
         options_layout.addLayout(actions)
+        options_layout.addStretch(0)
+
+        options_scroll = QScrollArea()
+        options_scroll.setWidgetResizable(True)
+        options_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        options_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        options_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        options_scroll.setWidget(options_host)
+        options_scroll.setMinimumWidth(360)
+        options_scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:vertical{width:12px;background:#0f172a;margin:0;}"
+            "QScrollBar::handle:vertical{background:#334155;border-radius:5px;min-height:28px;}"
+            "QScrollBar:horizontal{height:12px;background:#0f172a;margin:0;}"
+            "QScrollBar::handle:horizontal{background:#334155;border-radius:5px;min-width:28px;}"
+        )
+
         split.addWidget(source)
-        split.addWidget(options)
-        split.setSizes([560, 720])
+        split.addWidget(options_scroll)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        split.setSizes([320, 680])
+        split.setChildrenCollapsible(False)
         root.addWidget(split, 1)
 
     def add_paths(self, paths):

@@ -7,7 +7,7 @@ on:
       tag:
         description: "Release tag (e.g. v1.7.38)"
         required: true
-        default: "v1.7.38"
+        default: "v1.7.39"
         type: string
 
 permissions:
