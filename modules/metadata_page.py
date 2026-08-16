@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from PIL import ExifTags, Image
@@ -192,12 +194,14 @@ def _bitrate_floor_for_size(width: int, height: int) -> int:
     return max(1_200_000, min(16_000_000, floor))
 
 
-def _hq_video_encode_args(ffmpeg, width: int = 0, height: int = 0, source_bitrate: int = 0) -> list:
-    """成品级 H.264：优先画质，不用 intermediate/预览档。
+def _hq_video_encode_args(ffmpeg, width: int = 0, height: int = 0, source_bitrate: int = 0) -> tuple[list, str]:
+    """成品级 H.264：在肉眼难辨的前提下优先速度。
 
-    - 不用 encoder_args 的 medium→faster 改写（那是中间缓存用的）
-    - 硬编给更高 CQ/质量；CPU 用 slow + 低 CRF
-    - 按分辨率设码率下限，避免小分辨率被压糊、大分辨率码率不够
+    策略（相对旧版 slow/CRF14）：
+    - CPU：medium + CRF15（通常比 slow 快约 2～4 倍，观感几乎相同）
+    - NVENC：p4 + CQ16（比 p5 更快，成片仍清晰）
+    - QSV/AMF：平衡档 + 码率下限
+    返回 (ffmpeg_args, 简短说明)
     """
     encoder = resolve_encoder(ffmpeg, "auto")
     w = max(0, int(width or 0))
@@ -210,41 +214,41 @@ def _hq_video_encode_args(ffmpeg, width: int = 0, height: int = 0, source_bitrat
 
     if encoder == "nvenc":
         return [
-            "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-            "-rc", "vbr", "-cq", "15", "-b:v", str(target_br),
+            "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+            "-rc", "vbr", "-cq", "16", "-b:v", str(target_br),
             "-maxrate", str(maxrate), "-bufsize", str(bufsize),
+            "-spatial-aq", "1", "-temporal-aq", "1",
             "-profile:v", "high", "-bf", "0", "-pix_fmt", "yuv420p",
-        ]
+        ], "NVIDIA 硬编 p4/CQ16（快且清晰）"
     if encoder == "qsv":
         return [
-            "-c:v", "h264_qsv", "-preset", "slow", "-global_quality", "16",
+            "-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "17",
             "-look_ahead", "1", "-b:v", str(target_br),
             "-maxrate", str(maxrate), "-bufsize", str(bufsize),
             "-bf", "0", "-pix_fmt", "nv12",
-        ]
+        ], "Intel QSV medium（硬编加速）"
     if encoder == "mf":
-        # Windows MF：质量档尽量拉满，并给码率下限
+        # Windows MF：质量档拉高 + 码率下限（比 CPU slow 快很多）
         return [
-            "-c:v", "h264_mf", "-rate_control", "quality", "-quality", "100",
+            "-c:v", "h264_mf", "-rate_control", "quality", "-quality", "90",
             "-b:v", str(target_br), "-maxrate", str(maxrate),
             "-pix_fmt", "yuv420p",
-        ]
+        ], "Windows 硬编 h264_mf"
     if encoder == "amf":
         return [
-            "-c:v", "h264_amf", "-quality", "quality",
+            "-c:v", "h264_amf", "-quality", "balanced",
             "-rc", "vbr_peak", "-b:v", str(target_br),
             "-maxrate", str(maxrate),
-            "-qp_i", "15", "-qp_p", "17", "-bf_delta_qp", "0",
+            "-qp_i", "16", "-qp_p", "18", "-bf_delta_qp", "0",
             "-pix_fmt", "yuv420p",
-        ]
-    # CPU libx264：成品 slow + CRF 14（明显优于原先 faster/CRF20）
+        ], "AMD AMF balanced（硬编加速）"
+    # CPU libx264：medium+15 是速度/画质甜点（slow+14 慢很多、肉眼几乎无差）
     return [
-        "-c:v", "libx264", "-preset", "slow", "-crf", "14",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "15",
         "-profile:v", "high", "-level", "4.2",
-        "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0",
-        # 防止极低码率场景：仍给一个温和上限参考
+        "-aq-mode", "1", "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0",
         "-maxrate", str(maxrate), "-bufsize", str(bufsize),
-    ]
+    ], "CPU libx264 medium/CRF15（快且接近 slow 画质）"
 
 
 def _effective_crop_target(source_w: int, source_h: int, mode_key: str):
@@ -308,9 +312,161 @@ class MetadataWorker(QObject):
         self.crop_916 = bool(crop_916)
         self.crop_916_mode = str(crop_916_mode or "keep")
         self.cancelled = False
+        self._proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
 
     def cancel(self):
         self.cancelled = True
+        with self._proc_lock:
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _probe_duration_sec(self, ffmpeg: str, source: Path) -> float:
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe" + Path(ffmpeg).suffix))
+        if not Path(ffprobe).is_file():
+            ffprobe = find_media_tool("ffprobe") or "ffprobe"
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(source),
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30, **hidden_kwargs(),
+            )
+            return max(0.0, float((result.stdout or "").strip() or 0))
+        except Exception:
+            return 0.0
+
+    def _run_ffmpeg(
+        self,
+        command: list,
+        *,
+        source: Path | None = None,
+        label: str = "FFmpeg",
+        duration_hint: float = 0.0,
+    ) -> subprocess.CompletedProcess:
+        """运行 FFmpeg：实时读进度、心跳日志、可停止；避免 PIPE 死锁。"""
+        if self.cancelled:
+            raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
+
+        duration = duration_hint
+        if duration <= 0.1 and source is not None:
+            duration = self._probe_duration_sec(command[0], source)
+
+        # -progress pipe:1 输出 key=value；-nostats 减少 stderr 噪音
+        cmd = list(command)
+        # 在输出路径前插入 progress（最后一个非 flag 参数前）
+        insert_at = len(cmd) - 1
+        cmd[insert_at:insert_at] = ["-progress", "pipe:1", "-nostats"]
+
+        creation = hidden_kwargs()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **creation,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"无法启动 FFmpeg：{exc}") from exc
+
+        with self._proc_lock:
+            self._proc = proc
+
+        err_chunks: list[str] = []
+        last_out_ms = 0
+        last_beat = time.monotonic()
+        started = last_beat
+
+        def _drain_stderr():
+            try:
+                assert proc.stderr is not None
+                for line in proc.stderr:
+                    if line:
+                        err_chunks.append(line)
+                        if len(err_chunks) > 200:
+                            del err_chunks[:50]
+            except Exception:
+                pass
+
+        err_thread = threading.Thread(target=_drain_stderr, name="meta-ff-err", daemon=True)
+        err_thread.start()
+
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                if self.cancelled:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
+                line = (raw or "").strip()
+                if not line or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if key == "out_time_ms":
+                    try:
+                        last_out_ms = int(float(val))
+                    except ValueError:
+                        pass
+                elif key == "out_time":
+                    # 00:00:12.345678
+                    try:
+                        parts = val.split(":")
+                        if len(parts) == 3:
+                            last_out_ms = int(
+                                (float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2]))
+                                * 1000
+                            )
+                    except ValueError:
+                        pass
+                now = time.monotonic()
+                if now - last_beat >= 8.0:
+                    last_beat = now
+                    elapsed = now - started
+                    if duration > 0.5 and last_out_ms > 0:
+                        pct = min(99.0, last_out_ms / (duration * 1000.0) * 100.0)
+                        self.log.emit(
+                            f"  · {label}进行中：约 {pct:.0f}% "
+                            f"（已编码 {last_out_ms / 1000:.1f}s / 片长 {duration:.1f}s，"
+                            f"耗时 {elapsed:.0f}s）"
+                        )
+                    else:
+                        self.log.emit(
+                            f"  · {label}进行中：已运行 {elapsed:.0f}s"
+                            f"{f'，已输出约 {last_out_ms / 1000:.1f}s' if last_out_ms else ''}"
+                        )
+            rc = proc.wait(timeout=6 * 3600)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError(f"{label}超时（超过 6 小时），已终止")
+        finally:
+            with self._proc_lock:
+                if self._proc is proc:
+                    self._proc = None
+            err_thread.join(timeout=2.0)
+
+        stderr = "".join(err_chunks)
+        return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=stderr)
 
     def _wm_enabled(self) -> bool:
         if not self.watermark or not self.watermark.get("enabled"):
@@ -444,7 +600,7 @@ class MetadataWorker(QObject):
         - Center crop only (no stretch)
         - Never upscale to “1080×1920” when source is smaller (that causes blur)
         - No fps filter (preserve source frame rate)
-        - Delivery-grade H.264 (slow/CRF14 or HW high quality + bitrate floor)
+        - Delivery-grade H.264（medium/CRF15 或硬编高画质，兼顾速度）
         """
         w, h, fps, src_br = _probe_video_meta(ffmpeg, source)
         notes = []
@@ -464,13 +620,17 @@ class MetadataWorker(QObject):
             notes.append(f"保留约 {fps:.3g} fps")
         if src_br > 0:
             notes.append(f"源码率约 {src_br / 1_000_000:.2f} Mbps")
-        self.log.emit("  · " + "；".join(notes) + "（高质量重编码，不变形、不放大）")
+        self.log.emit("  · " + "；".join(notes) + "（高画质重编码，不变形、不放大）")
 
         ow = int(out_size[0]) if out_size else w
         oh = int(out_size[1]) if out_size else h
-        encode = _hq_video_encode_args(ffmpeg, ow, oh, src_br)
+        encode, enc_note = _hq_video_encode_args(ffmpeg, ow, oh, src_br)
+        self.log.emit(
+            f"  · 编码器：{enc_note}；进度会周期性更新，可点「停止」"
+        )
         # 不强制 -r，避免改帧率导致重复/丢帧；passthrough 尽量按源包时间戳
         rate_args = ["-fps_mode", "passthrough"]
+        duration = self._probe_duration_sec(ffmpeg, source)
 
         if self._wm_enabled():
             logo = Path(self.watermark["path"])
@@ -494,7 +654,13 @@ class MetadataWorker(QObject):
             cache.mkdir(parents=True, exist_ok=True)
             prepared = cache / f"{logo.stem}_o{int(opacity * 100)}.png"
             try:
-                _prepare_logo_rgba(logo, opacity).save(prepared, "PNG")
+                prepared_im = _prepare_logo_rgba(logo, opacity)
+                # 角标模式：先缩小到合理像素，避免每帧 scale2ref 超大 PNG
+                if "全屏" not in mode and prepared_im.width > 1200:
+                    tw = 1200
+                    th = max(16, int(prepared_im.height * (tw / prepared_im.width)))
+                    prepared_im = prepared_im.resize((tw, th), Image.Resampling.LANCZOS)
+                prepared_im.save(prepared, "PNG")
                 logo_input = prepared
             except Exception:
                 logo_input = logo
@@ -514,10 +680,12 @@ class MetadataWorker(QObject):
                     f"[base2][wm]overlay={ox}:{oy}:format=auto:eof_action=repeat[vout]"
                 )
 
+            # -t 限制片长，防止 loop 水印在个别环境下拖成无限编码
+            t_args = ["-t", f"{duration:.3f}"] if duration > 0.1 else []
             command = [
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(source),
-                "-loop", "1", "-i", str(logo_input),
+                "-loop", "1", *t_args, "-i", str(logo_input),
                 "-filter_complex", fc,
                 "-map", "[vout]", "-map", "0:a?",
                 *encode,
@@ -527,15 +695,18 @@ class MetadataWorker(QObject):
                 "-shortest", "-movflags", "+faststart",
                 str(destination),
             ]
-            result = subprocess.run(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+            result = self._run_ffmpeg(
+                command, source=source, label="9:16/水印重编码", duration_hint=duration,
+            )
             # 音频 copy 失败时回退 AAC
             if result.returncode:
+                if self.cancelled:
+                    raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
+                self.log.emit("  · 音轨复制失败，改为 AAC 重试…")
                 command = [
                     ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                     "-i", str(source),
-                    "-loop", "1", "-i", str(logo_input),
+                    "-loop", "1", *t_args, "-i", str(logo_input),
                     "-filter_complex", fc,
                     "-map", "[vout]", "-map", "0:a?",
                     *encode,
@@ -545,9 +716,9 @@ class MetadataWorker(QObject):
                     "-shortest", "-movflags", "+faststart",
                     str(destination),
                 ]
-                result = subprocess.run(
-                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+                result = self._run_ffmpeg(
+                    command, source=source, label="9:16/水印重编码(AAC)", duration_hint=duration,
+                )
             if result.returncode or not destination.is_file() or destination.stat().st_size < 1024:
                 raise RuntimeError(
                     (result.stderr or "").strip() or "FFmpeg 处理失败（9:16/水印）")
@@ -566,10 +737,12 @@ class MetadataWorker(QObject):
             "-movflags", "+faststart",
             str(destination),
         ]
-        result = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+        result = self._run_ffmpeg(
+            command, source=source, label="9:16 裁切重编码", duration_hint=duration,
+        )
         if result.returncode:
+            if self.cancelled:
+                raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
             # 部分容器/编码无法 copy 音轨：重编码音频
             command = [
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -583,11 +756,13 @@ class MetadataWorker(QObject):
                 "-movflags", "+faststart",
                 str(destination),
             ]
-            result = subprocess.run(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+            result = self._run_ffmpeg(
+                command, source=source, label="9:16 裁切重编码(AAC)", duration_hint=duration,
+            )
         # 旧版 FFmpeg 可能不认 fps_mode=passthrough
         if result.returncode and "fps_mode" in (result.stderr or ""):
+            if self.cancelled:
+                raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
             command = [
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(source),
@@ -599,9 +774,9 @@ class MetadataWorker(QObject):
                 "-movflags", "+faststart",
                 str(destination),
             ]
-            result = subprocess.run(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
+            result = self._run_ffmpeg(
+                command, source=source, label="9:16 裁切重编码(兼容)", duration_hint=duration,
+            )
         if result.returncode or not destination.is_file() or destination.stat().st_size < 1024:
             raise RuntimeError(
                 (result.stderr or "").strip() or "FFmpeg 9:16 裁切失败")
@@ -779,7 +954,7 @@ class MetadataPage(QWidget):
             "居中裁切为竖屏 9:16：\n"
             "· 不拉伸、不变形（只裁掉左右或上下多余部分）\n"
             "· 绝不把小分辨率强行放大到 1080p（会发糊）\n"
-            "· 不强制改帧率；高质量重编码（slow/低 CRF 或硬编高画质）\n"
+            "· 不强制改帧率；高画质重编码（medium/CRF15 或硬编，兼顾速度）\n"
             "· 已是 9:16 且选「仅裁切」时走流复制\n"
             "· 可与水印同时开启（先裁切再叠水印）"
         )
