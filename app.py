@@ -74,7 +74,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.46").strip().lstrip("v") or "1.7.46"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.47").strip().lstrip("v") or "1.7.47"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -911,6 +911,35 @@ class TranscribeWorker(QObject):
         if work.exists():
             shutil.rmtree(work, ignore_errors=True)
 
+    def _media_has_audio(self, media_path: Path) -> bool:
+        """探测文件是否含音轨（TikTok 等有时只下到静音画面）。"""
+        ffprobe = str(Path(self.ffmpeg_path).with_name(
+            "ffprobe.exe" if os.name == "nt" else "ffprobe"))
+        if not Path(ffprobe).is_file():
+            ffprobe = self.ffmpeg_path.replace("ffmpeg", "ffprobe")
+        run_kw: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 30,
+        }
+        if os.name == "nt":
+            run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-select_streams", "a",
+                    "-show_entries", "stream=index",
+                    "-of", "csv=p=0", str(media_path),
+                ],
+                **run_kw,
+            )
+            return bool((result.stdout or "").strip())
+        except Exception:
+            return False
+
     def _download_online_media(self, url: str, temp: Path):
         from modules.ytdlp_utils import download_media, ytdlp_status
 
@@ -930,23 +959,75 @@ class TranscribeWorker(QObject):
                     last_percent["value"] = percent
                     self.log.emit(f"网络视频下载中：{percent}")
 
-        try:
-            prepared_str, info = download_media(
-                url,
-                str(temp / "online_source.%(ext)s"),
-                format_spec="bestaudio/best",
-                progress_hooks=[download_hook],
-                extra_opts={"restrictfilenames": True},
-                log=self.log.emit,
-            )
-            prepared = Path(prepared_str)
-        except Exception as exc:
-            raise RuntimeError(f"网络视频下载失败：{exc}") from exc
-        candidates = [prepared] if prepared.exists() else []
-        candidates += [p for p in temp.glob("online_source.*") if p.suffix not in (".part", ".ytdl")]
-        source = next((p for p in candidates if p.exists() and p.is_file()), None)
+        # TikTok 等：bestaudio 不可用时 best 可能是「仅画面」；优先带音轨的组合
+        format_attempts = [
+            (
+                "bestaudio/bestvideo*+bestaudio/best",
+                {"restrictfilenames": True, "merge_output_format": "mp4"},
+            ),
+            (
+                "bv*+ba/b",
+                {"restrictfilenames": True, "merge_output_format": "mp4"},
+            ),
+            (
+                "bestaudio/best",
+                {"restrictfilenames": True},
+            ),
+        ]
+        source = None
+        info = None
+        last_exc: Exception | None = None
+        for fmt, extra in format_attempts:
+            try:
+                # 清掉上一轮无音轨的残片，避免误复用
+                for old in temp.glob("online_source.*"):
+                    if old.suffix.lower() in (".part", ".ytdl", ".json"):
+                        continue
+                    try:
+                        if not self._media_has_audio(old):
+                            old.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                prepared_str, info = download_media(
+                    url,
+                    str(temp / "online_source.%(ext)s"),
+                    format_spec=fmt,
+                    progress_hooks=[download_hook],
+                    extra_opts=extra,
+                    log=self.log.emit,
+                )
+                prepared = Path(prepared_str)
+                candidates = [prepared] if prepared.exists() else []
+                candidates += [
+                    p for p in temp.glob("online_source.*")
+                    if p.suffix.lower() not in (".part", ".ytdl", ".json")
+                ]
+                candidate = next((p for p in candidates if p.exists() and p.is_file()), None)
+                if not candidate:
+                    continue
+                if self._media_has_audio(candidate):
+                    source = candidate
+                    self.log.emit(f"已下载含音轨媒体：{candidate.name}（格式 {fmt}）")
+                    break
+                self.log.emit(
+                    f"下载文件无音轨（{candidate.name}，格式 {fmt}），尝试其它格式…"
+                )
+                last_exc = RuntimeError("下载结果无音轨")
+            except Exception as exc:
+                last_exc = exc
+                self.log.emit(f"下载尝试失败（{fmt}）：{exc}")
+                continue
+
         if not source:
-            raise RuntimeError("网络视频下载完成，但没有找到可处理的媒体文件。")
+            hint = (
+                "网络视频下载完成，但没有可用音轨。"
+                "TikTok/抖音等有时只下到静音画面。"
+                "请：① 组件管理更新 yt-dlp；② 换浏览器可播的完整链接；"
+                "③ 或先本地下载含声音的 mp4 再识别。"
+            )
+            if last_exc:
+                raise RuntimeError(f"{hint}\n技术详情：{last_exc}") from last_exc
+            raise RuntimeError(hint)
         title = re.sub(r"[\\/:*?\"<>|]+", "_", str((info or {}).get("title") or "网络视频")).strip()
         return source, (title[:100] or "网络视频")
 
@@ -965,16 +1046,28 @@ class TranscribeWorker(QObject):
             metadata_path = temp / "online_source.json"
             metadata = read_json_file(metadata_path, {})
             saved_path = Path(metadata.get("path", "")) if metadata.get("path") else None
-            if saved_path and saved_path.exists():
+            if saved_path and saved_path.exists() and self._media_has_audio(saved_path):
                 source = saved_path
                 result_name = metadata.get("title") or source.name
                 self.log.emit("断点续接：复用已下载的网络媒体。")
             else:
+                if saved_path and saved_path.exists() and not self._media_has_audio(saved_path):
+                    self.log.emit("缓存媒体无音轨，重新下载…")
+                    try:
+                        saved_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 source, result_name = self._download_online_media(source_value, temp)
                 atomic_write_json(metadata_path, {"path": str(source), "title": result_name})
         else:
             source = Path(source_value)
             result_name = source.name
+
+        if not self._media_has_audio(source):
+            raise RuntimeError(
+                f"媒体没有音轨，无法识别字幕：{result_name}。"
+                "（TikTok/抖音链接有时只下到静音画面；请更新 yt-dlp 或改用含声音的本地文件。）"
+            )
 
         if self.provider == LOCAL_PROVIDER:
             recognition_input = source
@@ -992,7 +1085,9 @@ class TranscribeWorker(QObject):
                 proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                       creationflags=creation, text=True, encoding="utf-8", errors="replace")
                 if proc.returncode != 0 or not audio.exists():
-                    raise RuntimeError("无法提取音频，请确认视频包含音轨。\n" + proc.stderr[-800:])
+                    raise RuntimeError(
+                        "无法提取音频，请确认视频包含音轨。\n" + (proc.stderr or "")[-800:]
+                    )
             else:
                 self.log.emit("断点续接：复用已提取的识别音频。")
             recognition_input = audio
@@ -1273,28 +1368,41 @@ class TranscribeWorker(QObject):
         creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         segment_seconds = 90
         # 统一抽 mono 16k 再分段，体积更小、Groq 更稳
+        # 注意：不要用 0:a:0?（可选映射）——无音轨时会生成 0 流输出却仍 return 0，导致「无 stream」
         prepared = temp / "groq_source.wav"
         if not prepared.exists() or prepared.stat().st_size < 1000:
             prep = subprocess.run(
-                [self.ffmpeg_path, "-y", "-i", str(audio), "-map", "0:a:0?", "-vn",
+                [self.ffmpeg_path, "-y", "-i", str(audio), "-map", "0:a:0", "-vn",
                  "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(prepared)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 creationflags=creation, text=True, encoding="utf-8", errors="replace",
             )
-            if prep.returncode != 0 or not prepared.exists():
-                # 回退：直接对源文件分段
+            if prep.returncode != 0 or not prepared.exists() or prepared.stat().st_size < 1000:
+                err = (prep.stderr or "")[-600:]
+                if "Stream map" in err or "does not contain" in err or "matches no streams" in err:
+                    raise RuntimeError(
+                        "媒体没有可识别的音轨（常见于 TikTok/抖音只下到静音画面）。"
+                        "请更新 yt-dlp 后重试链接，或改用含声音的本地视频。\n" + err
+                    )
+                # 其它错误：回退对源文件分段（仍要求有音轨）
                 prepared = audio
         chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda path: rename_natural_key(path.name))
         if not chunks:
             self.log.emit("正在把长音频切成 90 秒无损识别分段 …")
-            cmd = [self.ffmpeg_path, "-y", "-i", str(prepared), "-map", "0:a:0?", "-vn", "-f", "segment",
+            cmd = [self.ffmpeg_path, "-y", "-i", str(prepared), "-map", "0:a:0", "-vn", "-f", "segment",
                    "-segment_time", str(segment_seconds), "-reset_timestamps", "1",
                    "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(pattern)]
             result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                     creationflags=creation, text=True, encoding="utf-8", errors="replace")
             chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda path: rename_natural_key(path.name))
             if result.returncode != 0 or not chunks:
-                raise RuntimeError("Groq 长音频分段失败。\n" + (result.stderr or "")[-800:])
+                err = (result.stderr or "")[-800:]
+                if "does not contain any stream" in err or "matches no streams" in err:
+                    raise RuntimeError(
+                        "无法切分识别音频：文件没有音轨。"
+                        "TikTok 等链接请确保下载含声音的版本，或使用本地 mp4。\n" + err
+                    )
+                raise RuntimeError("Groq 长音频分段失败。\n" + err)
         else:
             self.log.emit(f"断点续接：复用 {len(chunks)} 个长音频分段。")
         cache_path = temp / "groq_chunk_results.json"
