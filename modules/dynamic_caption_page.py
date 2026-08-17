@@ -4069,20 +4069,35 @@ class CaptionWorker(QObject):
                         phrase_srt = shift_srt_timestamps(phrase_srt, v_start)
                         word_srt = shift_srt_timestamps(word_srt, v_start)
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在将字幕时间轴向前平移 {v_start:.2f} 秒以适配切片视频。")
-                # 中间裁剪/多段时间轴：把源时钟 SRT 映射到成片时间轴，避免口型错位
+                # 中间裁剪/多段时间轴：优先用「源时钟」SRT 映射到成片，避免二次映射或漏映射导致口型错位
                 if burn_captions and edit_tracks.get("video"):
                     video_segs = list(edit_tracks.get("video") or [])
+                    vkey = str(video.resolve())
+                    word_src = str(
+                        self.settings.get("word_timelines_source", {}).get(source_key, "")
+                        or self.settings.get("word_timelines_source", {}).get(vkey, "")
+                        or ""
+                    ).strip()
+                    phrase_src = str(
+                        self.settings.get("timeline_overrides_source", {}).get(source_key, "")
+                        or self.settings.get("timeline_overrides_source", {}).get(vkey, "")
+                        or ""
+                    ).strip()
                     aligned = bool(edit_state.get("captions_timeline_aligned"))
-                    if should_retime_captions_for_segments(
-                        phrase_srt, word_srt, video_segs, captions_timeline_aligned=aligned
-                    ):
+                    need = video_segments_need_caption_retime(video_segs)
+                    # 有源轴快照时一律从源重映射；无快照时沿用旧启发式（未对齐才映射）
+                    if need and (word_src or phrase_src or not aligned):
+                        base_p = phrase_src or phrase_srt
+                        base_w = word_src or word_srt
                         before_p, before_w = phrase_srt, word_srt
-                        phrase_srt = retime_srt_for_video_segments(phrase_srt, video_segs) or phrase_srt
-                        word_srt = retime_srt_for_video_segments(word_srt, video_segs) or word_srt
+                        if base_p and "-->" in base_p:
+                            phrase_srt = retime_srt_for_video_segments(base_p, video_segs) or phrase_srt
+                        if base_w and "-->" in base_w:
+                            word_srt = retime_srt_for_video_segments(base_w, video_segs) or word_srt
                         if phrase_srt != before_p or word_srt != before_w:
                             self.log.emit(
                                 f"[{index + 1}/{len(self.videos)}] 已按时间轴视频切片重映射字幕"
-                                f"（{len(video_segs)} 段），对齐裁剪后的口播。"
+                                f"（{len(video_segs)} 段，源时钟→成片），对齐裁剪后的口播。"
                             )
                 if burn_captions and str(phrase_srt or "").strip():
                     phrase_srt,overlap_fixes=fix_srt_overlaps(phrase_srt)
@@ -5770,6 +5785,9 @@ class DynamicCaptionPage(QWidget):
         self.video_style_overrides = {}
         self._loading_video_style = False  # 切换视频加载独立样式时不写回 override
         self._batch_style_snapshot = None  # 最近一次批量样式快照
+        # 字幕源时钟（ASR 原始时间）：裁剪后始终从此重映射，避免口型错位
+        self.timeline_words_source = {}
+        self.timeline_overrides_source = {}
         self._timeline_activity_started=0.0; self._timeline_activity_label=""
         self._timeline_activity_base=0; self._timeline_activity_cap=90
         self._timeline_activity_timer=QTimer(self); self._timeline_activity_timer.setInterval(800)
@@ -6965,7 +6983,7 @@ class DynamicCaptionPage(QWidget):
         layer_layout.addWidget(overlay_hint)
         overlay_timing=QGridLayout(); overlay_timing.setHorizontalSpacing(5); overlay_timing.setVerticalSpacing(4)
         self.overlay_start=QDoubleSpinBox(); self.overlay_start.setRange(0,86400); self.overlay_start.setDecimals(2); self.overlay_start.setSuffix(" s")
-        self.overlay_end=QDoubleSpinBox(); self.overlay_end.setRange(.08,86400); self.overlay_end.setDecimals(2); self.overlay_end.setValue(3); self.overlay_end.setSuffix(" s")
+        self.overlay_end=QDoubleSpinBox(); self.overlay_end.setRange(.08,86400); self.overlay_end.setDecimals(2); self.overlay_end.setValue(5); self.overlay_end.setSuffix(" s")
         self.overlay_fade_in=QSpinBox(); self.overlay_fade_in.setRange(0,5000); self.overlay_fade_in.setValue(250); self.overlay_fade_in.setSuffix(" ms")
         self.overlay_fade_out=QSpinBox(); self.overlay_fade_out.setRange(0,5000); self.overlay_fade_out.setValue(250); self.overlay_fade_out.setSuffix(" ms")
         for control in (self.overlay_start,self.overlay_end):
@@ -6980,16 +6998,25 @@ class DynamicCaptionPage(QWidget):
         self.overlay_from_playhead=QPushButton("取播放头")
         self.overlay_from_playhead.setToolTip("把当前播放器位置设为开始时间，并保留当前区间长度")
         self.overlay_from_playhead.clicked.connect(self._overlay_time_from_playhead)
-        self.add_layer_to_timeline=QPushButton("加入轨道")
+        self.add_layer_to_timeline=QPushButton("加入当前视频")
         self.add_layer_to_timeline.setObjectName("primary")
-        self.add_layer_to_timeline.setToolTip("把选中的文字或蒙版加入声明叠加轨，仅在指定时间段显示")
+        self.add_layer_to_timeline.setToolTip(
+            "把选中的文字/蒙版/PNG 加入【当前视频】的声明叠加轨，仅在设定时间段显示（类似字幕独立样式的「当前」）。"
+        )
         self.add_layer_to_timeline.clicked.connect(self._add_selected_layer_to_timeline)
+        self.add_layer_to_all_videos=QPushButton("批量全部视频")
+        self.add_layer_to_all_videos.setToolTip(
+            "用当前选中图层 + 开始/结束/淡入淡出，批量加入列表中【每一条视频】的声明轨。"
+            "时长超过片长的会自动截断。与字幕「批量共用样式」同类。"
+        )
+        self.add_layer_to_all_videos.clicked.connect(self._add_selected_layer_to_all_videos)
         overlay_timing.addWidget(QLabel("开始"),0,0); overlay_timing.addWidget(self.overlay_start,0,1)
         overlay_timing.addWidget(QLabel("结束"),0,2); overlay_timing.addWidget(self.overlay_end,0,3)
         overlay_timing.addWidget(self.overlay_from_playhead,1,0,1,2)
         overlay_timing.addWidget(self.add_layer_to_timeline,1,2,1,2)
-        overlay_timing.addWidget(QLabel("淡入"),2,0); overlay_timing.addWidget(self.overlay_fade_in,2,1)
-        overlay_timing.addWidget(QLabel("淡出"),2,2); overlay_timing.addWidget(self.overlay_fade_out,2,3)
+        overlay_timing.addWidget(self.add_layer_to_all_videos,2,0,1,4)
+        overlay_timing.addWidget(QLabel("淡入"),3,0); overlay_timing.addWidget(self.overlay_fade_in,3,1)
+        overlay_timing.addWidget(QLabel("淡出"),3,2); overlay_timing.addWidget(self.overlay_fade_out,3,3)
         layer_layout.addLayout(overlay_timing)
 
         legacy_mask_editor=QWidget()
@@ -7863,9 +7890,12 @@ class DynamicCaptionPage(QWidget):
         mask_actions.addWidget(add_image,1,0); mask_actions.addWidget(delete_layer,1,1)
         mask_actions.addWidget(move_up,2,0); mask_actions.addWidget(move_down,2,1)
         mask_group_layout.addLayout(mask_actions)
-        timeline_insert_hint=QLabel("选图层 → 设时间 → 加入轨道")
-        timeline_insert_hint.setToolTip("拖动轨道块中间改变位置；拖动左右白色边缘调整开始和结束时间。")
-        timeline_insert_hint.setWordWrap(False)
+        timeline_insert_hint=QLabel("选图层 → 设时间 → 加入当前 / 批量全部（同字幕样式）")
+        timeline_insert_hint.setToolTip(
+            "加入当前：只写当前视频声明轨。批量全部：同一图层与时间写到所有视频。"
+            "轨道上仍可拖动调整。"
+        )
+        timeline_insert_hint.setWordWrap(True)
         timeline_insert_hint.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:4px 6px;border-radius:4px;")
         mask_group_layout.addWidget(timeline_insert_hint)
         final_overlay_timing=QGridLayout(); final_overlay_timing.setHorizontalSpacing(5); final_overlay_timing.setVerticalSpacing(4)
@@ -7873,8 +7903,9 @@ class DynamicCaptionPage(QWidget):
         final_overlay_timing.addWidget(QLabel("结束"),0,2); final_overlay_timing.addWidget(self.overlay_end,0,3)
         final_overlay_timing.addWidget(self.overlay_from_playhead,1,0,1,2)
         final_overlay_timing.addWidget(self.add_layer_to_timeline,1,2,1,2)
-        final_overlay_timing.addWidget(QLabel("淡入"),2,0); final_overlay_timing.addWidget(self.overlay_fade_in,2,1)
-        final_overlay_timing.addWidget(QLabel("淡出"),2,2); final_overlay_timing.addWidget(self.overlay_fade_out,2,3)
+        final_overlay_timing.addWidget(self.add_layer_to_all_videos,2,0,1,4)
+        final_overlay_timing.addWidget(QLabel("淡入"),3,0); final_overlay_timing.addWidget(self.overlay_fade_in,3,1)
+        final_overlay_timing.addWidget(QLabel("淡出"),3,2); final_overlay_timing.addWidget(self.overlay_fade_out,3,3)
         mask_group_layout.addLayout(final_overlay_timing)
         self.mask_editor=QWidget()
         compact_mask_layout=QVBoxLayout(self.mask_editor)
@@ -11978,23 +12009,27 @@ class DynamicCaptionPage(QWidget):
     def _live_caption_data(self, seconds):
         v_start = self._current_video_v_start()
         seconds = max(0.0, float(seconds) - v_start)
-        # 时间轴有切片且字幕仍在源时钟：把轨上时刻映射到源时刻再查词/句，避免裁中间后口型错位
-        # 涟漪删除后 captions_timeline_aligned=True，则字幕已是轨上时钟，不再映射。
-        if (
+        # 有切片时：优先用「源时钟」词/句轴，并把轨上时刻映射到源时刻再查，避免裁剪后口型错位
+        state = self._current_timeline_edit_state() if self._timeline_edits_active() else {}
+        segs = list((state.get("tracks") or {}).get("video") or [])
+        need_map = (
             not getattr(self, "_precise_preview_active", False)
             and self._timeline_edits_active()
-        ):
-            state = self._current_timeline_edit_state()
-            if not bool(state.get("captions_timeline_aligned")):
-                try:
-                    source_ms, _path = self._map_timeline_ms_to_source(int(seconds * 1000))
-                    seconds = max(0.0, float(source_ms) / 1000.0)
-                except Exception:
-                    pass
+            and (
+                video_segments_need_caption_retime(segs)
+                or not bool(state.get("captions_timeline_aligned"))
+            )
+        )
+        if need_map:
+            try:
+                source_ms, _path = self._map_timeline_ms_to_source(int(seconds * 1000))
+                seconds = max(0.0, float(source_ms) / 1000.0)
+            except Exception:
+                pass
         phrase_srt = ""
-        if hasattr(self, "override_text"):
+        if hasattr(self, "override_text") and not need_map:
             phrase_srt = self.override_text.toPlainText().strip()
-        if (not phrase_srt or "-->" not in phrase_srt) and hasattr(self, "timeline_timestamp_view"):
+        if (not phrase_srt or "-->" not in phrase_srt) and hasattr(self, "timeline_timestamp_view") and not need_map:
             phrase_srt = self.timeline_timestamp_view.toPlainText().strip()
         source = self._timeline_source() if hasattr(self, "audios") else ""
         video_item = self.videos.currentItem() if hasattr(self, "videos") else None
@@ -12008,14 +12043,22 @@ class DynamicCaptionPage(QWidget):
                 preview_key = self._timeline_key(loaded)
         except Exception:
             preview_key = ""
-        # 图文成品：词级轴常挂在视频路径；配音路径可能不一致，多处都查
+        # 需要映射时优先源轴；否则用工作副本
+        word_map = (
+            getattr(self, "timeline_words_source", {}) or {}
+            if need_map else self.timeline_words
+        )
+        phrase_map = (
+            getattr(self, "timeline_overrides_source", {}) or {}
+            if need_map else self.timeline_overrides
+        )
         word_srt = ""
         for key in (source_key, video_key, preview_key):
             if key and not word_srt:
-                word_srt = self.timeline_words.get(key, "") or ""
+                word_srt = word_map.get(key, "") or self.timeline_words.get(key, "") or ""
         for key in (source_key, video_key, preview_key):
             if key and (not phrase_srt or "-->" not in phrase_srt):
-                phrase_srt = self.timeline_overrides.get(key, "") or phrase_srt
+                phrase_srt = phrase_map.get(key, "") or self.timeline_overrides.get(key, "") or phrase_srt
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             duration=max(8.0,(self.player.duration() or 0)/1000)
             settings=(self._live_caption_style_cache or {}).get("settings") or self._current_settings()
@@ -12595,50 +12638,168 @@ class DynamicCaptionPage(QWidget):
         self.overlay_start.setValue(start)
         self.overlay_end.setValue(start + duration)
 
-    def _add_selected_layer_to_timeline(self):
+    def _prepare_overlay_layer_payload(self):
+        """校验选中图层与时间，返回 (source_layer, layer_dict, start_ms, end_ms) 或 (None, msg)。"""
         row = self.layer_list.currentRow()
         if not (0 <= row < len(self.layers)):
-            QMessageBox.information(self, "选择图层", "请先选择文字、蒙版或 PNG 模板。")
-            return
+            return None, "请先选择文字、蒙版或 PNG 模板。"
         source_layer = self.layers[row]
         if source_layer.get("type") not in ("text", "mask", "image"):
-            QMessageBox.information(self, "选择图层", "字幕主层不能加入声明轨，请选择文字、蒙版或 PNG 模板。")
-            return
+            return None, "字幕主层不能加入声明轨，请选择文字、蒙版或 PNG 模板。"
         start_ms = int(round(self.overlay_start.value() * 1000))
         end_ms = int(round(self.overlay_end.value() * 1000))
         if end_ms <= start_ms + 79:
-            QMessageBox.information(self, "时间无效", "结束时间必须晚于开始时间。")
-            return
-        layer = dict(source_layer)
+            return None, "结束时间必须晚于开始时间。"
         source_layer.setdefault(
             "template_id",
             hashlib.sha1(
                 f"{source_layer.get('type')}|{source_layer.get('name')}|{time.time_ns()}".encode()
             ).hexdigest()[:12],
         )
-        layer["template_id"]=source_layer["template_id"]
+        layer = dict(source_layer)
+        layer["template_id"] = source_layer["template_id"]
         layer.pop("timeline_template_only", None)
-        clip_duration=max(80,end_ms-start_ms)
-        layer["fade_in_ms"]=min(int(self.overlay_fade_in.value()),clip_duration//2)
-        layer["fade_out_ms"]=min(int(self.overlay_fade_out.value()),clip_duration//2)
+        clip_duration = max(80, end_ms - start_ms)
+        layer["fade_in_ms"] = min(int(self.overlay_fade_in.value()), clip_duration // 2)
+        layer["fade_out_ms"] = min(int(self.overlay_fade_out.value()), clip_duration // 2)
+        layer["enabled"] = True
+        return (source_layer, layer, start_ms, end_ms), ""
+
+    def _append_overlay_to_edit_state(self, video_path: str, layer: dict, start_ms: int, end_ms: int) -> bool:
+        """把声明叠加写入指定视频的 timeline_edit_states（不依赖当前画布）。"""
+        if not video_path or not Path(str(video_path)).is_file():
+            return False
+        key = self._timeline_key(video_path)
+        if not key:
+            return False
+        try:
+            duration_ms = int(self._resolve_timeline_duration_ms(str(video_path)) or 0)
+        except Exception:
+            duration_ms = 0
+        if duration_ms <= 80:
+            try:
+                duration_ms = int(media_duration(self.find_ffmpeg(), video_path) * 1000)
+            except Exception:
+                duration_ms = max(end_ms + 80, 5000)
+        start = max(0, min(int(start_ms), max(0, duration_ms - 80)))
+        end = max(start + 80, min(int(end_ms), duration_ms if duration_ms > 80 else int(end_ms)))
+        state = dict(self.timeline_edit_states.get(key, {}) or {})
+        overlays = [dict(item) for item in (state.get("overlays") or [])]
+        payload = dict(layer)
+        payload["enabled"] = True
+        overlays.append({
+            "start": start,
+            "end": end,
+            "name": str(payload.get("name") or {
+                "text": "声明文字",
+                "mask": "声明蒙版",
+                "image": "PNG 声明图",
+            }.get(payload.get("type"), "声明叠加")),
+            "layer": payload,
+        })
+        overlays.sort(key=lambda item: (int(item.get("start", 0)), int(item.get("end", 0))))
+        state["overlays"] = overlays
+        # 保留已有 tracks 等
+        if "tracks" not in state and key == self._current_video_key() and hasattr(self, "canva_timeline"):
+            try:
+                cur = self.canva_timeline.current_state()
+                for field in ("tracks", "transitions", "original_audio_enabled", "captions_timeline_aligned"):
+                    if field in cur and field not in state:
+                        state[field] = cur[field]
+            except Exception:
+                pass
+        self.timeline_edit_states[key] = state
+        return True
+
+    def _add_selected_layer_to_timeline(self):
+        prepared, err = self._prepare_overlay_layer_payload()
+        if not prepared:
+            QMessageBox.information(self, "无法加入", err)
+            return
+        source_layer, layer, start_ms, end_ms = prepared
         if not self.canva_timeline.add_overlay(layer, start_ms, end_ms):
             QMessageBox.warning(self, "加入失败", "请先选择视频并等待时间轴载入。")
             return
         # 该图层以后只作为轨道模板，不再全片常驻；轨道副本由当前视频独立保存。
         source_layer["timeline_template_only"] = True
-        key=self._current_video_key()
-        if key and hasattr(self.canva_timeline,"current_state"):
-            self.timeline_edit_states[key]=self.canva_timeline.current_state()
-        if hasattr(self.canva_timeline,"ensure_time_visible"):
+        key = self._current_video_key()
+        if key and hasattr(self.canva_timeline, "current_state"):
+            self.timeline_edit_states[key] = self.canva_timeline.current_state()
+        if hasattr(self.canva_timeline, "ensure_time_visible"):
             self.canva_timeline.ensure_time_visible(start_ms)
-        self._refresh_layer_list(row)
+        self._refresh_layer_list(self.layer_list.currentRow())
         self._save_style_preferences()
-        original_text=self.add_layer_to_timeline.text()
-        self.add_layer_to_timeline.setText("✓ 已加入轨道")
-        QTimer.singleShot(1200,lambda:self.add_layer_to_timeline.setText(original_text))
+        original_text = self.add_layer_to_timeline.text()
+        self.add_layer_to_timeline.setText("✓ 已加入当前")
+        QTimer.singleShot(1200, lambda: self.add_layer_to_timeline.setText(original_text))
         self._append_run_log(
-            f"已加入声明叠加轨：{layer.get('name','图层')}，"
-            f"{start_ms/1000:.2f}s–{end_ms/1000:.2f}s。可在轨道上拖动或修改两端。"
+            f"已加入【当前视频】声明轨：{layer.get('name', '图层')}，"
+            f"{start_ms/1000:.2f}s–{end_ms/1000:.2f}s。可在轨道上拖动或改两端。"
+        )
+
+    def _add_selected_layer_to_all_videos(self):
+        """批量：同一图层+时间段写到视频列表每一项（类似字幕批量样式）。"""
+        prepared, err = self._prepare_overlay_layer_payload()
+        if not prepared:
+            QMessageBox.information(self, "无法批量加入", err)
+            return
+        source_layer, layer, start_ms, end_ms = prepared
+        if not hasattr(self, "videos") or self.videos.count() <= 0:
+            QMessageBox.information(self, "无视频", "请先在视频列表中添加视频。")
+            return
+        paths = []
+        for i in range(self.videos.count()):
+            item = self.videos.item(i)
+            if not item:
+                continue
+            p = item.text().strip()
+            if p and Path(p).is_file():
+                paths.append(p)
+        if not paths:
+            QMessageBox.information(self, "无有效视频", "列表中没有可用的视频文件。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "批量应用到全部视频",
+            f"将「{layer.get('name', '图层')}」以 "
+            f"{start_ms/1000:.2f}s–{end_ms/1000:.2f}s 加入全部 {len(paths)} 条视频的声明轨。\n"
+            "超过片长的片段会自动截断。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        source_layer["timeline_template_only"] = True
+        ok_n = 0
+        current_path = ""
+        try:
+            cur = self.videos.currentItem()
+            current_path = cur.text().strip() if cur else ""
+        except Exception:
+            current_path = ""
+        for path in paths:
+            payload = dict(layer)
+            if self._append_overlay_to_edit_state(path, payload, start_ms, end_ms):
+                ok_n += 1
+                # 当前正在看的视频：同步画布
+                if current_path and self._timeline_key(path) == self._timeline_key(current_path):
+                    try:
+                        self.canva_timeline.add_overlay(dict(payload), start_ms, end_ms)
+                        if hasattr(self.canva_timeline, "current_state"):
+                            self.timeline_edit_states[self._timeline_key(path)] = (
+                                self.canva_timeline.current_state()
+                            )
+                    except Exception:
+                        pass
+        self._refresh_layer_list(self.layer_list.currentRow())
+        self._save_style_preferences()
+        self._append_run_log(
+            f"已批量加入声明轨：{layer.get('name', '图层')} → {ok_n}/{len(paths)} 条视频，"
+            f"{start_ms/1000:.2f}s–{end_ms/1000:.2f}s。"
+        )
+        QMessageBox.information(
+            self,
+            "批量完成",
+            f"已应用到 {ok_n} 条视频。\n切换到其它视频时可在声明叠加轨上看到/调整该图层。",
         )
 
     def _delete_layer(self):
@@ -12664,6 +12825,8 @@ class DynamicCaptionPage(QWidget):
         if hasattr(self,"image_editor"): self.image_editor.setVisible(image_enabled)
         if hasattr(self,"add_layer_to_timeline"):
             self.add_layer_to_timeline.setEnabled(mask_enabled or text_enabled or image_enabled)
+        if hasattr(self,"add_layer_to_all_videos"):
+            self.add_layer_to_all_videos.setEnabled(mask_enabled or text_enabled or image_enabled)
         if hasattr(self,"mask_quick_combo"):
             self.mask_quick_combo.setEnabled(mask_enabled)
         for control in (self.mask_color,self.mask_opacity,self.mask_x,self.mask_y,self.mask_w,self.mask_h,self.mask_radius,*self.mask_quick_buttons): control.setEnabled(mask_enabled)
@@ -13506,6 +13669,8 @@ class DynamicCaptionPage(QWidget):
                     self.ambient_volume.value() if hasattr(self, "ambient_volume") else 20
                 ),
                 "word_timelines":dict(self.timeline_words),
+                "word_timelines_source": dict(getattr(self, "timeline_words_source", {}) or {}),
+                "timeline_overrides_source": dict(getattr(self, "timeline_overrides_source", {}) or {}),
                 "free_texts":dict(self.free_texts),
                 "free_default_text":self.override_text.toPlainText().strip(),
                 "preview_word_srt":self.timeline_words.get(self._timeline_key(self._timeline_source()),""),
@@ -14093,12 +14258,29 @@ class DynamicCaptionPage(QWidget):
         self._append_run_log("已从多轨时间轴更新字幕起止时间，并同步到 SRT 编辑器。")
 
     def _timeline_range_rippled(self, start_ms: int, end_ms: int):
-        """删除区间后同步词级时间轴，保证预览高亮与导出 ASS 跟读不错位。"""
+        """删除区间后：优先从源时钟按当前视频段重映射字幕（句+词），避免口型错位。"""
         key = self._current_video_key() or self._timeline_key(self._timeline_source())
         if not key:
             return
-        # 句级条已由 Canva 涟漪到时间轴时钟；词级在此同步，并标记「字幕已对齐时间轴」
-        state = dict(self.timeline_edit_states.get(key, {}) or {})
+        # 涟漪后画布 tracks 已更新；从 edit state 重映射更准确
+        state = {}
+        if hasattr(self, "canva_timeline") and hasattr(self.canva_timeline, "current_state"):
+            try:
+                state = dict(self.canva_timeline.current_state() or {})
+            except Exception:
+                state = dict(self.timeline_edit_states.get(key, {}) or {})
+        else:
+            state = dict(self.timeline_edit_states.get(key, {}) or {})
+        self.timeline_edit_states[key] = state
+        segs = list((state.get("tracks") or {}).get("video") or [])
+        if video_segments_need_caption_retime(segs):
+            self._sync_captions_after_video_edit(key, state)
+            self._refresh_live_preview()
+            self._append_run_log(
+                f"已按切片重映射字幕（删除 {start_ms/1000:.2f}–{end_ms/1000:.2f}s），对齐口播。"
+            )
+            return
+        # 无有效切片信息时回退旧涟漪算法
         state["captions_timeline_aligned"] = True
         self.timeline_edit_states[key] = state
         word_srt = self.timeline_words.get(key, "")
@@ -14270,7 +14452,27 @@ class DynamicCaptionPage(QWidget):
         key = self._current_video_key()
         state = dict(state or {})
         if key:
+            prev = dict(self.timeline_edit_states.get(key, {}) or {})
+            prev_video = list((prev.get("tracks") or {}).get("video") or [])
+            new_video = list((state.get("tracks") or {}).get("video") or [])
             self.timeline_edit_states[key] = state
+            # 仅当视频轨片段（源入出点/段数）变化时重映射字幕，避免拖动字幕条时被冲掉
+            def _video_sig(segs):
+                rows = []
+                for s in segs:
+                    rows.append((
+                        int(s.get("start", 0) or 0),
+                        int(s.get("end", 0) or 0),
+                        int(s.get("source_start", 0) or 0),
+                        int(s.get("source_end", 0) or 0),
+                        str(s.get("media_type", "video") or "video"),
+                    ))
+                return tuple(rows)
+            if _video_sig(prev_video) != _video_sig(new_video):
+                try:
+                    self._sync_captions_after_video_edit(key, state)
+                except Exception:
+                    pass
         # 旧的「轨道预览」成品已过时
         if getattr(self, "_precise_preview_active", False):
             self._precise_preview_active = False
@@ -14784,15 +14986,79 @@ class DynamicCaptionPage(QWidget):
         self._start_timeline_activity(f"[{index}/{total}] {Path(source).name}",base,cap)
 
     def _mark_captions_source_timed(self, key: str):
-        """新提取的字幕在源片时钟上；导出/预览需按切片重映射，直到用户涟漪删除对齐。"""
+        """新提取的字幕在源片时钟上；同时快照源轴，裁剪后始终从此重映射。"""
         if not key:
             return
+        # 保存 ASR 原始时间轴（与后续工作副本分离）
+        if not hasattr(self, "timeline_words_source"):
+            self.timeline_words_source = {}
+        if not hasattr(self, "timeline_overrides_source"):
+            self.timeline_overrides_source = {}
+        if key in self.timeline_words and self.timeline_words.get(key):
+            self.timeline_words_source[key] = self.timeline_words[key]
+        if key in self.timeline_overrides and self.timeline_overrides.get(key):
+            self.timeline_overrides_source[key] = self.timeline_overrides[key]
         for candidate in (key, self._current_video_key() if hasattr(self, "_current_video_key") else ""):
             if not candidate:
                 continue
             state = dict(self.timeline_edit_states.get(candidate, {}) or {})
             state["captions_timeline_aligned"] = False
             self.timeline_edit_states[candidate] = state
+
+    def _ensure_caption_source_snapshot(self, key: str):
+        """若尚无源轴快照且当前仍是源时钟，则补快照（兼容旧工程）。"""
+        if not key:
+            return
+        if not hasattr(self, "timeline_words_source"):
+            self.timeline_words_source = {}
+        if not hasattr(self, "timeline_overrides_source"):
+            self.timeline_overrides_source = {}
+        state = dict(self.timeline_edit_states.get(key, {}) or {})
+        if state.get("captions_timeline_aligned"):
+            return
+        if key not in self.timeline_words_source and self.timeline_words.get(key):
+            self.timeline_words_source[key] = self.timeline_words[key]
+        if key not in self.timeline_overrides_source and self.timeline_overrides.get(key):
+            self.timeline_overrides_source[key] = self.timeline_overrides[key]
+
+    def _sync_captions_after_video_edit(self, key: str, state: dict | None = None):
+        """视频轨裁剪/切片后：从源时钟 SRT 按片段重映射句级+词级，保证口型对齐。"""
+        if not key:
+            return
+        state = dict(state if state is not None else self.timeline_edit_states.get(key, {}) or {})
+        segs = list((state.get("tracks") or {}).get("video") or [])
+        if not video_segments_need_caption_retime(segs):
+            return
+        self._ensure_caption_source_snapshot(key)
+        word_src = (getattr(self, "timeline_words_source", {}) or {}).get(key) or self.timeline_words.get(key, "")
+        phrase_src = (getattr(self, "timeline_overrides_source", {}) or {}).get(key) or self.timeline_overrides.get(key, "")
+        if not (str(word_src or "").strip() or str(phrase_src or "").strip()):
+            # 无源轴：标记未对齐，导出时仍会尝试重映射当前 SRT
+            state["captions_timeline_aligned"] = False
+            self.timeline_edit_states[key] = state
+            return
+        phrase_new = retime_srt_for_video_segments(phrase_src, segs) if phrase_src else ""
+        word_new = retime_srt_for_video_segments(word_src, segs) if word_src else ""
+        if phrase_new:
+            self.timeline_overrides[key] = phrase_new
+            if self._timeline_key(self._timeline_source()) == key or self._current_video_key() == key:
+                if hasattr(self, "override_text") and not getattr(self, "_loading_timeline", False):
+                    self._loading_timeline = True
+                    try:
+                        self.override_text.setPlainText(phrase_new)
+                    finally:
+                        self._loading_timeline = False
+                if hasattr(self, "canva_timeline") and hasattr(self.canva_timeline, "set_srt"):
+                    try:
+                        self.canva_timeline.set_srt(phrase_new)
+                    except Exception:
+                        pass
+        if word_new:
+            self.timeline_words[key] = word_new
+        state["captions_timeline_aligned"] = True
+        self.timeline_edit_states[key] = state
+        self._live_timeline_cache_key = None
+        self._invalidate_preview_caption_overlay()
 
     def _batch_timeline_item_done(self,source,srt,chinese,index,total):
         self._stop_timeline_activity(round(index/max(1,total)*100))
@@ -14832,16 +15098,10 @@ class DynamicCaptionPage(QWidget):
     def _worker_timeline_ready(self,source,word_srt,phrase_srt):
         key=self._timeline_key(source)
         phrase_srt,fixes=fix_srt_overlaps(phrase_srt)
-        self.timeline_words[key]=align_word_srt_to_phrase_srt(word_srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
-        # 导出路径写出的字幕已按切片映射到成片时钟
-        if word_srt or phrase_srt:
-            vkey = self._current_video_key() if hasattr(self, "_current_video_key") else ""
-            for candidate in (vkey, key):
-                if not candidate:
-                    continue
-                state = dict(self.timeline_edit_states.get(candidate, {}) or {})
-                state["captions_timeline_aligned"] = True
-                self.timeline_edit_states[candidate] = state
+        # 导出回写的是成片时钟字幕，只更新工作副本/界面，不覆盖源时钟快照、不强制 aligned
+        # （源轴由识别时 _mark_captions_source_timed 保存，裁剪始终从源重映射）
+        self.timeline_words[key]=align_word_srt_to_phrase_srt(word_srt, phrase_srt)
+        self.timeline_overrides[key]=phrase_srt
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             self.free_texts[key]=phrase_srt
         if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠：{Path(source).name}")
