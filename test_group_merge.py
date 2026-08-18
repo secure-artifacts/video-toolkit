@@ -65,15 +65,50 @@ def main():
         g_ordered, g_reason, _g_details = match_clips_to_script(g_clips, g_transcripts, g_script)
         assert g_ordered == [g_clips[1], g_clips[0]], g_reason
 
+        # Optimal assignment beats greedy near-ties (similar openings).
+        from modules.group_merge import _max_weight_assignment
+        # Greedy would take A→seg0 (0.90) then B→seg1 (0.50); optimal is A→seg1, B→seg0.
+        assert _max_weight_assignment([[0.90, 0.88], [0.89, 0.50]]) == [1, 0]
+
+        # Numbered script with wrapped lines must stay 3 segments for 3 clips.
+        numbered = (
+            "1. 今天第一段很长\n继续写在第一段里\n"
+            "2. 今天第二段内容\n"
+            "3. 今天第三段收尾"
+        )
+        assert split_group_script(numbered, 3) == [
+            "今天第一段很长 继续写在第一段里",
+            "今天第二段内容",
+            "今天第三段收尾",
+        ]
+        assert split_group_script("1、甲\n2、乙\n3、丙", 3) == ["甲", "乙", "丙"]
+
+        # Reorder by script content vs filename 1/2/3.
+        r_clips = [group_2 / "1.mp4", group_2 / "2.mp4", group_2 / "3.mp4"]
+        for p in r_clips:
+            p.touch()
+        r_transcripts = {
+            str(r_clips[0].resolve()): "欢迎来到频道今天分享护肤第二步保湿",
+            str(r_clips[1].resolve()): "欢迎来到频道今天分享护肤第一步清洁",
+            str(r_clips[2].resolve()): "感谢收看下期再见",
+        }
+        r_script = (
+            "欢迎来到频道今天分享护肤第一步清洁\n\n"
+            "欢迎来到频道今天分享护肤第二步保湿\n\n"
+            "感谢收看下期再见"
+        )
+        r_ordered, r_reason, _ = match_clips_to_script(r_clips, r_transcripts, r_script)
+        assert r_ordered == [r_clips[1], r_clips[0], r_clips[2]], r_reason
+
         srt = "1\n00:00:00,300 --> 00:00:01,200\nOlá\n\n2\n00:00:01,300 --> 00:00:02,400\nmundo"
         start, end, detected = speech_trim_bounds(srt, 3.0, 80, 120)
-        # 末词后剩余 ≤0.85s 时保留到片尾，避免吞尾音（start 仍为首词前 padding）
-        assert detected and abs(start - 0.22) < 0.001 and abs(end - 3.0) < 0.001
+        # 片头 padding 至少 200ms：0.30 - 0.20 = 0.10；末词后剩余 ≤0.85s 保留到片尾
+        assert detected and abs(start - 0.10) < 0.001 and abs(end - 3.0) < 0.001
         assert speech_trim_bounds("", 3.0) == (0.0, 3.0, False)
         # 末词后留白充足时：尾 = max(280, pad) + safety，不拉满到片尾
         long_srt = "1\n00:00:00,300 --> 00:00:01,200\nOlá\n\n2\n00:00:01,300 --> 00:00:02,400\nmundo"
         start2, end2, det2 = speech_trim_bounds(long_srt, 5.0, 80, 120, tail_safety_ms=280)
-        assert det2 and abs(start2 - 0.22) < 0.001
+        assert det2 and abs(start2 - 0.10) < 0.001
         # max(280,120)+280 = 560ms → 2.4+0.56 = 2.96
         assert abs(end2 - 2.96) < 0.001
 
@@ -92,17 +127,18 @@ def main():
         assert calls == [str(smart_clip)] and analysis["srt"] == smart_srt
         # 6.0 - 4.2 = 1.8 > 0.85 → 不强制到片尾；尾 = 4.2 + max(280,120)/1000 + safety280 = 4.76
         start, end, detected = speech_trim_bounds(analysis["srt"], 6.0, 80, 120, tail_safety_ms=280)
-        assert detected and abs(start - 1.42) < .001 and abs(end - 4.76) < .001
+        # 首词 1.5s > 1.2s：疑似漏识别第一句，片头不裁（start=0）；尾 4.2+0.56=4.76
+        assert detected and abs(start - 0.0) < .001 and abs(end - 4.76) < .001
         # Audio may tighten padding, but must never cross into the first/last word.
         start, end, detected = hybrid_trim_bounds(
             analysis["srt"], 6.0, (1.47, 4.23, True), 80, 120, 40,
         )
-        assert detected and abs(start - 1.46) < .001
+        assert detected and abs(start - 1.46) < .02
         # hybrid 取 speech 与静音外沿：尾扩展后约 4.76
         assert abs(end - 4.76) < .02
         # Internal silence is intentionally irrelevant: only the outer bounds are combined.
         h_start, h_end, h_det = hybrid_trim_bounds(analysis["srt"], 6.0, (0.0, 6.0, False), 80, 120)
-        assert h_det and abs(h_start - 1.42) < .001 and abs(h_end - 4.76) < .02
+        assert h_det and abs(h_start - 0.0) < .001 and abs(h_end - 4.76) < .02
     print("group merge helpers: OK")
 
 

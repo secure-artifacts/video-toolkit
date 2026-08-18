@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
 from .path_picker import (
     AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, DropFolderLineEdit, DropListWidget, DropButton, DropTableWidget, collect_files, default_output_path, natural_key,
 )
+from .text_rules import filter_asr_junk_srt
 
 ALLOWED_VIDEO_INPUTS = VIDEO_EXTENSIONS.union(IMAGE_EXTENSIONS)
 
@@ -4063,13 +4064,10 @@ class CaptionWorker(QObject):
                                 f"[{index + 1}/{len(self.videos)}] 已勾选不转文案：本条导出不带字幕"
                                 f"（时间轴/预览中的文案仅供临时查看）。"
                             )
-                if burn_captions and manual_bounds is not None:
-                    v_start = manual_bounds[0]
-                    if v_start > 0.0:
-                        phrase_srt = shift_srt_timestamps(phrase_srt, v_start)
-                        word_srt = shift_srt_timestamps(word_srt, v_start)
-                        self.log.emit(f"[{index + 1}/{len(self.videos)}] 正在将字幕时间轴向前平移 {v_start:.2f} 秒以适配切片视频。")
-                # 中间裁剪/多段时间轴：优先用「源时钟」SRT 映射到成片，避免二次映射或漏映射导致口型错位
+                # 字幕时钟处理（二选一，禁止「先平移再切片映射」造成双重偏移）：
+                # 1) 有视频轨切片 → 从源时钟（或未对齐工作副本）按片段映射到成片
+                # 2) 仅有文案里的手动起止 → 简单平移
+                caption_retiming_done = False
                 if burn_captions and edit_tracks.get("video"):
                     video_segs = list(edit_tracks.get("video") or [])
                     vkey = str(video.resolve())
@@ -4085,8 +4083,11 @@ class CaptionWorker(QObject):
                     ).strip()
                     aligned = bool(edit_state.get("captions_timeline_aligned"))
                     need = video_segments_need_caption_retime(video_segs)
-                    # 有源轴快照时一律从源重映射；无快照时沿用旧启发式（未对齐才映射）
-                    if need and (word_src or phrase_src or not aligned):
+                    if need and aligned and not (word_src or phrase_src):
+                        # 工作副本已是成片时钟且无源轴：直接用，勿再映射
+                        caption_retiming_done = True
+                    elif need and (word_src or phrase_src or not aligned):
+                        # 有源轴 → 必须从源映射；无源且未对齐 → 映射当前工作副本一次
                         base_p = phrase_src or phrase_srt
                         base_w = word_src or word_srt
                         before_p, before_w = phrase_srt, word_srt
@@ -4094,11 +4095,21 @@ class CaptionWorker(QObject):
                             phrase_srt = retime_srt_for_video_segments(base_p, video_segs) or phrase_srt
                         if base_w and "-->" in base_w:
                             word_srt = retime_srt_for_video_segments(base_w, video_segs) or word_srt
+                        caption_retiming_done = True
                         if phrase_srt != before_p or word_srt != before_w:
                             self.log.emit(
                                 f"[{index + 1}/{len(self.videos)}] 已按时间轴视频切片重映射字幕"
                                 f"（{len(video_segs)} 段，源时钟→成片），对齐裁剪后的口播。"
                             )
+                if burn_captions and (not caption_retiming_done) and manual_bounds is not None:
+                    v_start = manual_bounds[0]
+                    if v_start > 0.0:
+                        phrase_srt = shift_srt_timestamps(phrase_srt, v_start)
+                        word_srt = shift_srt_timestamps(word_srt, v_start)
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 正在将字幕时间轴向前平移 "
+                            f"{v_start:.2f} 秒以适配切片视频。"
+                        )
                 if burn_captions and str(phrase_srt or "").strip():
                     phrase_srt,overlap_fixes=fix_srt_overlaps(phrase_srt)
                     if overlap_fixes:
@@ -6765,9 +6776,12 @@ class DynamicCaptionPage(QWidget):
             "Alienware 等游戏本优先 NVIDIA NVENC。"
         )
         self.encode_preset=QComboBox()
-        self.encode_preset.addItems(["ultrafast", "veryfast", "faster", "fast", "medium"])
-        self.encode_preset.setCurrentText("veryfast")
-        self.encode_preset.setToolTip("仅 CPU 模式生效。越快画质略降；口播成片用 veryfast/ultrafast 即可。")
+        self.encode_preset.addItems(["ultrafast", "veryfast", "faster", "fast", "medium", "slow"])
+        self.encode_preset.setCurrentText("fast")
+        self.encode_preset.setToolTip(
+            "仅 CPU 模式生效。越慢画质越好：fast/medium 适合成片；"
+            "veryfast/ultrafast 仅适合赶时间。硬件编码时此项忽略。"
+        )
         self.writing_language = QComboBox()
         fill_writing_language_combo(self.writing_language, "")
         self.writing_language.setToolTip(
@@ -12009,16 +12023,17 @@ class DynamicCaptionPage(QWidget):
     def _live_caption_data(self, seconds):
         v_start = self._current_video_v_start()
         seconds = max(0.0, float(seconds) - v_start)
-        # 有切片时：优先用「源时钟」词/句轴，并把轨上时刻映射到源时刻再查，避免裁剪后口型错位
+        # 切片后的两种时钟：
+        # - 已对齐（captions_timeline_aligned）：工作副本已是成片时钟，直接用播放头查
+        # - 未对齐：用源时钟轴，并把播放头映射回源时刻再查（禁止拿成片轴配源时刻）
         state = self._current_timeline_edit_state() if self._timeline_edits_active() else {}
         segs = list((state.get("tracks") or {}).get("video") or [])
+        aligned = bool(state.get("captions_timeline_aligned"))
         need_map = (
             not getattr(self, "_precise_preview_active", False)
             and self._timeline_edits_active()
-            and (
-                video_segments_need_caption_retime(segs)
-                or not bool(state.get("captions_timeline_aligned"))
-            )
+            and video_segments_need_caption_retime(segs)
+            and not aligned
         )
         if need_map:
             try:
@@ -12043,7 +12058,7 @@ class DynamicCaptionPage(QWidget):
                 preview_key = self._timeline_key(loaded)
         except Exception:
             preview_key = ""
-        # 需要映射时优先源轴；否则用工作副本
+        # 未对齐：只用源轴；已对齐/无切片：用工作副本（成片时钟）
         word_map = (
             getattr(self, "timeline_words_source", {}) or {}
             if need_map else self.timeline_words
@@ -12055,10 +12070,15 @@ class DynamicCaptionPage(QWidget):
         word_srt = ""
         for key in (source_key, video_key, preview_key):
             if key and not word_srt:
-                word_srt = word_map.get(key, "") or self.timeline_words.get(key, "") or ""
+                word_srt = word_map.get(key, "") or ""
+                # 仅在「成片时钟」模式下允许回退到工作副本；源时刻模式禁止混用
+                if not word_srt and not need_map:
+                    word_srt = self.timeline_words.get(key, "") or ""
         for key in (source_key, video_key, preview_key):
             if key and (not phrase_srt or "-->" not in phrase_srt):
-                phrase_srt = phrase_map.get(key, "") or self.timeline_overrides.get(key, "") or phrase_srt
+                phrase_srt = phrase_map.get(key, "") or ""
+                if (not phrase_srt or "-->" not in phrase_srt) and not need_map:
+                    phrase_srt = self.timeline_overrides.get(key, "") or phrase_srt
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             duration=max(8.0,(self.player.duration() or 0)/1000)
             settings=(self._live_caption_style_cache or {}).get("settings") or self._current_settings()
@@ -12069,8 +12089,8 @@ class DynamicCaptionPage(QWidget):
         if not phrase_srt and word_srt:
             phrase_srt = group_word_srt(word_srt, max_chars=max(18, self.line_length.value() * 2),
                                         max_words=self.max_words.value())
-        # 时间轴紫色字幕条是最可靠的实时来源（用户能看见条就一定有文案）
-        if hasattr(self, "canva_timeline"):
+        # 时间轴紫色字幕条是成片时钟；仅在已对齐/无需源映射时覆盖，避免「源时刻 + 成片轴」错位
+        if not need_map and hasattr(self, "canva_timeline"):
             try:
                 from .canva_timeline import write_srt
                 canvas = getattr(self.canva_timeline, "canvas", None) or self.canva_timeline
@@ -12083,17 +12103,18 @@ class DynamicCaptionPage(QWidget):
                     clips = getattr(canvas, "clips", None) or []
                     if clips:
                         canva_srt = (write_srt(clips) or "").strip()
-                # 优先用时间轴条：与下方字幕带一致
                 if canva_srt and "-->" in canva_srt:
                     phrase_srt = canva_srt
             except Exception:
                 pass
-        cache_key=(phrase_srt,word_srt)
+        cache_key = (phrase_srt, word_srt, bool(need_map))
         if cache_key != self._live_timeline_cache_key:
-            self._live_timeline_cache_key=cache_key
-            self._live_timeline_cache=(parse_srt(phrase_srt) if phrase_srt else [],
-                                       parse_srt(word_srt) if word_srt else [])
-        phrase_events,word_events_all=self._live_timeline_cache
+            self._live_timeline_cache_key = cache_key
+            self._live_timeline_cache = (
+                parse_srt(phrase_srt) if phrase_srt else [],
+                parse_srt(word_srt) if word_srt else [],
+            )
+        phrase_events, word_events_all = self._live_timeline_cache
         event = next((item for item in phrase_events if item[0] <= seconds <= item[1]), None)
         if event is None and phrase_events:
             # 在两条字幕间隙：仍显示刚结束的那条（更符合预览预期）
@@ -15062,7 +15083,10 @@ class DynamicCaptionPage(QWidget):
 
     def _batch_timeline_item_done(self,source,srt,chinese,index,total):
         self._stop_timeline_activity(round(index/max(1,total)*100))
+        # 去掉 Whisper 幻觉水印（如「Υπότιτλοι AUTHORWAVE」），视频里并无此声
+        srt = filter_asr_junk_srt(srt)
         key=self._timeline_key(source); phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
+        phrase_srt = filter_asr_junk_srt(phrase_srt)
         self.timeline_words[key]=align_word_srt_to_phrase_srt(srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
         self._mark_captions_source_timed(key)
         if chinese: self.timeline_chinese[key]=chinese
@@ -15097,6 +15121,8 @@ class DynamicCaptionPage(QWidget):
 
     def _worker_timeline_ready(self,source,word_srt,phrase_srt):
         key=self._timeline_key(source)
+        word_srt = filter_asr_junk_srt(word_srt)
+        phrase_srt = filter_asr_junk_srt(phrase_srt)
         phrase_srt,fixes=fix_srt_overlaps(phrase_srt)
         # 导出回写的是成片时钟字幕，只更新工作副本/界面，不覆盖源时钟快照、不强制 aligned
         # （源轴由识别时 _mark_captions_source_timed 保存，裁剪始终从源重映射）
@@ -15123,7 +15149,9 @@ class DynamicCaptionPage(QWidget):
         self._stop_timeline_activity(100 if ok else self.progress.value())
         self.extract_timeline_btn.setEnabled(True); self.extract_timeline_btn.setText("重新提取")
         if ok:
+            result = filter_asr_junk_srt(result)
             source=self._timeline_pending_source or self._timeline_source(); phrase_srt,fixes=self._group_words_for_current_layout(result,True)
+            phrase_srt = filter_asr_junk_srt(phrase_srt)
             if source:
                 key=self._timeline_key(source); self.timeline_words[key]=align_word_srt_to_phrase_srt(result, phrase_srt); self.timeline_overrides[key]=phrase_srt
                 self._mark_captions_source_timed(key)
@@ -16912,9 +16940,19 @@ class DynamicCaptionPage(QWidget):
         # 清掉旧人工字幕覆盖，避免重合成后仍用上一版文案
         self.timeline_overrides.pop(key, None)
         
-        # Default audio mode to keep original sound (since TTS + BGM are already mixed in project synthesis)
+        # 成品里已混好「配音 + BGM」。必须切到真实存在的「视频原声」，
+        # 否则若仍是「视频配音＋背景音乐」会再叠一路外部配音 → 听成两个朗诵。
         try:
-            self.audio_mode.setCurrentText("仅保留视频原音（无配音/无BGM）")
+            if hasattr(self, "audio_mode") and self.audio_mode is not None:
+                self.audio_mode.blockSignals(True)
+                self.audio_mode.setCurrentText("视频原声")
+                self.audio_mode.blockSignals(False)
+            if hasattr(self, "bgm_enabled") and self.bgm_enabled is not None:
+                self.bgm_enabled.blockSignals(True)
+                self.bgm_enabled.setChecked(False)
+                self.bgm_enabled.blockSignals(False)
+            if hasattr(self, "_audio_mode_changed"):
+                self._audio_mode_changed("视频原声")
         except Exception:
             pass
         
@@ -17122,7 +17160,7 @@ class SlideshowWorker(QObject):
                 ]
                 
                 encoder = resolve_encoder(self.ffmpeg, self.settings.get("encoder_backend", "auto"))
-                concat_command += encoder_args(encoder, self.settings.get("encode_preset", "veryfast"))
+                concat_command += encoder_args(encoder, self.settings.get("encode_preset", "fast"))
                 concat_command += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
                 concat_command += ["-movflags", "+faststart", str(self.destination)]
             else:
@@ -17228,6 +17266,13 @@ class ProjectGroupWorker(QObject):
     def _apply_project_tts_reverb(self, audio_path, amount: int = 45, mode: str = "大厅"):
         """图文成片配音后处理：按模式混响（与批量配音同一套算法）。"""
         apply_ethereal_reverb_file(self.ffmpeg, audio_path, amount, mode=mode)
+
+    def _project_clip_encode_args(self, encoder):
+        """图文成片中间画面片段：比默认 libx264 更清晰（避免 CRF23/无 preset 发糊）。"""
+        from .video_encoding import encoder_args
+        preset = str(self.settings.get("encode_preset") or "fast")
+        # 中间段也走成品档质量；不再强制 veryfast
+        return list(encoder_args(encoder, preset))
 
     @staticmethod
     def _stamp_srt(seconds: float) -> str:
@@ -17411,6 +17456,8 @@ class ProjectGroupWorker(QObject):
 
         if self.cancelled:
             raise RuntimeError("任务已取消")
+
+        creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 
         res_map = {
             "9:16": (1080, 1920),
@@ -17422,7 +17469,9 @@ class ProjectGroupWorker(QObject):
                 
         is_audio_file = False
         try:
-            if Path(script).is_file() and Path(script).suffix.lower() in [".mp3", ".wav", ".aac", ".ogg", ".m4a"]:
+            if Path(script).is_file() and Path(script).suffix.lower() in [
+                ".mp3", ".wav", ".aac", ".ogg", ".m4a", ".flac", ".opus", ".wma"
+            ]:
                 is_audio_file = True
         except Exception:
             pass
@@ -17433,11 +17482,25 @@ class ProjectGroupWorker(QObject):
         temp_dir = output_dir / f"temp_proj_{name}_{time.time_ns()}"
         temp_dir.mkdir(parents=True, exist_ok=True)
                 
-        tts_path = temp_dir / "tts.mp3"
+        tts_path = temp_dir / "tts.wav"
                 
         if is_audio_file:
-            self.log.emit(f"项目 {name} 正在使用指定的外部配音音频文件...")
-            shutil.copy(script, tts_path)
+            self.log.emit(f"项目 {name} 正在使用指定的外部配音音频文件（规范为单声道）...")
+            # 强制单声道下混，避免立体声左右各一路人声听成「两个朗诵」
+            norm_cmd = [
+                self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(script),
+                "-vn",
+                "-af", "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono",
+                "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
+                str(tts_path),
+            ]
+            res = subprocess.run(
+                norm_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation
+            )
+            if res.returncode != 0 or not tts_path.is_file() or tts_path.stat().st_size < 256:
+                err = (res.stdout or b"").decode("utf-8", errors="replace")
+                raise RuntimeError(f"外部配音无法读取：{err[-500:]}")
         else:
             if not script:
                 failures.append(f"项目 {name}：文案为空")
@@ -17464,13 +17527,31 @@ class ProjectGroupWorker(QObject):
                     
             if not reused_tts:
                 self.log.emit(f"正在为项目 {name} 生成语音配音...")
-                self.tts_callable(script, self.tts_service, self.tts_voice, str(tts_path))
-                if reverb_on and Path(tts_path).is_file():
+                # TTS 服务常写 mp3；生成后统一转单声道 wav，避免双声道「两个人」
+                tts_raw = temp_dir / "tts_raw.mp3"
+                self.tts_callable(script, self.tts_service, self.tts_voice, str(tts_raw))
+                src_for_norm = tts_raw if tts_raw.is_file() else tts_path
+                if reverb_on and Path(src_for_norm).is_file():
                     try:
-                        self._apply_project_tts_reverb(tts_path, reverb_amt, reverb_mode)
+                        self._apply_project_tts_reverb(src_for_norm, reverb_amt, reverb_mode)
                         self.log.emit(f"已为项目 {name} 叠加混响（{reverb_mode} · {reverb_amt}%）。")
                     except Exception as rv_exc:
                         self.log.emit(f"混响失败（保留原配音）：{rv_exc}")
+                norm_cmd = [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(src_for_norm),
+                    "-vn",
+                    "-af", "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono",
+                    "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
+                    str(tts_path),
+                ]
+                res = subprocess.run(
+                    norm_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    creationflags=creation,
+                )
+                if res.returncode != 0 or not tts_path.is_file():
+                    err = (res.stdout or b"").decode("utf-8", errors="replace")
+                    raise RuntimeError(f"配音规范化失败：{err[-500:]}")
                 tts_state.write_text(json.dumps({
                     "fingerprint": tts_fingerprint,
                     "service": self.tts_service,
@@ -17486,7 +17567,6 @@ class ProjectGroupWorker(QObject):
             self.ffprobe, "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", str(tts_path)
         ]
-        creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         res = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=creation)
         try:
             tts_duration = float(res.stdout.strip())
@@ -17507,6 +17587,22 @@ class ProjectGroupWorker(QObject):
             self.item_failed.emit(name, "未添加素材")
             shutil.rmtree(temp_dir, ignore_errors=True)
             return
+
+        # 素材列里的音频不要当画面编进去（否则会与配音叠成两路人声）
+        voice_src = Path(script).resolve() if is_audio_file else None
+        visual_materials = []
+        for m in materials:
+            suf = m.suffix.lower()
+            if suf in AUDIO_EXTENSIONS:
+                self.log.emit(f"  · 跳过素材中的音频（不作画面）：{m.name}")
+                continue
+            if voice_src and m.resolve() == voice_src:
+                self.log.emit(f"  · 跳过与配音相同的文件：{m.name}")
+                continue
+            visual_materials.append(m)
+        materials = visual_materials
+        if not materials:
+            raise RuntimeError("没有可用的图片/视频素材（音频请放在「外部配音」而不是素材列）")
                 
         images = [m for m in materials if m.suffix.lower() in IMAGE_EXTENSIONS]
         videos = [m for m in materials if m.suffix.lower() in VIDEO_EXTENSIONS]
@@ -17531,19 +17627,20 @@ class ProjectGroupWorker(QObject):
                 else:
                     v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
                             
+                clip_enc = self._project_clip_encode_args(encoder)
                 if anim_name == "智能慢速变焦（Ken Burns）":
                     cmd = [
                         self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                         "-i", str(img),
-                        "-vf", v_filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-                        str(scaled_dest)
+                        "-vf", v_filter, *clip_enc, "-r", "30",
+                        "-an", str(scaled_dest)
                     ]
                 else:
                     cmd = [
                         self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                         "-loop", "1", "-t", f"{single_dur:.3f}", "-i", str(img),
-                        "-vf", v_filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-                        str(scaled_dest)
+                        "-vf", v_filter, *clip_enc, "-r", "30",
+                        "-an", str(scaled_dest)
                     ]
                         
                 res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
@@ -17576,10 +17673,11 @@ class ProjectGroupWorker(QObject):
                         
                 concat_cmd += [
                     "-filter_complex", ";".join(filter_parts),
-                    "-map", v_in
+                    "-map", v_in,
+                    "-an",
                 ]
-                concat_cmd += encoder_args(encoder, "veryfast")
-                concat_cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(slideshow_temp)]
+                concat_cmd += self._project_clip_encode_args(encoder)
+                concat_cmd += ["-movflags", "+faststart", str(slideshow_temp)]
             else:
                 list_file = temp_dir / "list.txt"
                 with open(list_file, "w", encoding="utf-8") as f:
@@ -17588,7 +17686,7 @@ class ProjectGroupWorker(QObject):
                 concat_cmd = [
                     self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "concat", "-safe", "0", "-i", str(list_file),
-                    "-c:v", "copy", "-movflags", "+faststart", str(slideshow_temp)
+                    "-c:v", "copy", "-an", "-movflags", "+faststart", str(slideshow_temp)
                 ]
                     
             res = subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
@@ -17600,6 +17698,7 @@ class ProjectGroupWorker(QObject):
         else:
             self.log.emit("正在处理视频/混合素材的分辨率对齐与裁剪...")
             scaled_clips = []
+            clip_enc = self._project_clip_encode_args(encoder)
             for idx_m, mat in enumerate(materials):
                 scaled_dest = temp_dir / f"scaled_{idx_m:03d}.mp4"
                         
@@ -17611,23 +17710,24 @@ class ProjectGroupWorker(QObject):
                         cmd = [
                             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                             "-i", str(mat),
-                            "-vf", v_filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-                            str(scaled_dest)
+                            "-vf", v_filter, *clip_enc, "-r", "30",
+                            "-an", str(scaled_dest)
                         ]
                     else:
                         v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
                         cmd = [
                             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                             "-loop", "1", "-t", "5.000", "-i", str(mat),
-                            "-vf", v_filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-                            str(scaled_dest)
+                            "-vf", v_filter, *clip_enc, "-r", "30",
+                            "-an", str(scaled_dest)
                         ]
                 else:
+                    # 图文成片：画面素材只保留画面，音轨一律用外部配音/TTS，避免双声
                     v_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
                     cmd = [
                         self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                         "-i", str(mat),
-                        "-vf", v_filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                        "-vf", v_filter, *clip_enc, "-r", "30",
                         "-an", str(scaled_dest)
                     ]
                         
@@ -17646,7 +17746,7 @@ class ProjectGroupWorker(QObject):
             concat_cmd = [
                 self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "concat", "-safe", "0", "-i", str(list_file),
-                "-c:v", "copy", "-movflags", "+faststart", str(merged_temp)
+                "-c:v", "copy", "-an", "-movflags", "+faststart", str(merged_temp)
             ]
             res = subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
             if res.returncode != 0:
@@ -17660,18 +17760,19 @@ class ProjectGroupWorker(QObject):
             res = subprocess.run(ffprobe_cmd, stdout=subprocess.PIPE, text=True, creationflags=creation)
             try:
                 v_dur = float(res.stdout.strip())
-            except:
+            except Exception:
                 v_dur = 0
                     
             if v_dur < tts_duration:
                 self.log.emit(f"素材总长 ({v_dur:.2f}s) 短于配音时长 ({tts_duration:.2f}s)，自动循环素材以对齐音频...")
-                loop_count = int(tts_duration // v_dur) + 1
+                loop_count = int(tts_duration // max(0.1, v_dur)) + 1
                 looped_temp = temp_dir / "looped_temp.mp4"
                         
                 loop_cmd = [
                     self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                     "-stream_loop", str(loop_count), "-i", str(merged_temp),
-                    "-t", f"{tts_duration:.3f}", "-c", "copy", str(looped_temp)
+                    "-t", f"{tts_duration:.3f}",
+                    "-map", "0:v:0", "-an", "-c:v", "copy", str(looped_temp)
                 ]
                 res = subprocess.run(loop_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
                 if res.returncode != 0:
@@ -17683,7 +17784,7 @@ class ProjectGroupWorker(QObject):
                 crop_cmd = [
                     self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                     "-i", str(merged_temp), "-t", f"{tts_duration:.3f}",
-                    "-c", "copy", str(cropped_temp)
+                    "-map", "0:v:0", "-an", "-c:v", "copy", str(cropped_temp)
                 ]
                 res = subprocess.run(crop_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
                 if res.returncode == 0:
@@ -17691,23 +17792,81 @@ class ProjectGroupWorker(QObject):
                 else:
                     main_video = merged_temp
                 
-        self.log.emit("正在合成配音音频 and 背景音乐，进行最终音频混缩...")
+        self.log.emit("正在合成最终音轨：1 路配音 + 可选 BGM（画面素材原声一律丢弃）…")
         bgm_file = None
-        if bgm_choice == "无背景音":
+        bgm_label = "无"
+        if bgm_choice == "无背景音" or not str(bgm_choice or "").strip():
             pass
         elif bgm_choice.startswith("随机分配") and self.bgm_dir and self.bgm_dir.is_dir():
             bgm_file = find_bgm_file(str(self.bgm_dir), idx, randomize=True)
+            if bgm_file:
+                bgm_label = f"随机BGM {Path(bgm_file).name}"
         elif Path(bgm_choice).is_file():
             bgm_file = Path(bgm_choice)
-                
+            bgm_label = bgm_file.name
+
+        # BGM 与配音不能是同一文件（否则等于两路朗诵）。随机模式则换一首，仍尽量保留 BGM。
+        def _same_audio_file(a, b) -> bool:
+            try:
+                return Path(a).resolve() == Path(b).resolve()
+            except Exception:
+                return False
+
+        voice_src_path = Path(script).resolve() if is_audio_file else None
+        if bgm_file and (
+            _same_audio_file(bgm_file, tts_path)
+            or (voice_src_path and _same_audio_file(bgm_file, voice_src_path))
+        ):
+            replaced = False
+            if bgm_choice.startswith("随机分配") and self.bgm_dir and self.bgm_dir.is_dir():
+                # 再抽几次，避开与配音相同的文件
+                for attempt in range(8):
+                    cand = find_bgm_file(str(self.bgm_dir), idx * 17 + attempt + 3, randomize=True)
+                    if not cand:
+                        break
+                    if _same_audio_file(cand, tts_path):
+                        continue
+                    if voice_src_path and _same_audio_file(cand, voice_src_path):
+                        continue
+                    bgm_file = cand
+                    bgm_label = f"随机BGM {Path(bgm_file).name}"
+                    replaced = True
+                    self.log.emit(f"  · BGM 与配音重复，已改抽：{bgm_label}")
+                    break
+            if not replaced:
+                self.log.emit("  · BGM 与配音是同一文件，已跳过该 BGM（请另选背景音乐，配音不会重复）")
+                bgm_file = None
+                bgm_label = "无（与配音重复已跳过）"
+
+        # 先去掉 main_video 上可能残留的音轨，避免与配音叠成「两个朗诵」
+        main_vonly = temp_dir / "main_vonly.mp4"
+        strip_cmd = [
+            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(main_video),
+            "-map", "0:v:0", "-an", "-c:v", "copy",
+            str(main_vonly),
+        ]
+        res = subprocess.run(strip_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
+        if res.returncode == 0 and main_vonly.is_file() and main_vonly.stat().st_size > 1024:
+            main_video = main_vonly
+        else:
+            self.log.emit("  · 画面去音失败，将在混音阶段强制只映射配音轨（仍不保留素材原声）")
+
         mix_inputs = [
             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(main_video),
-            "-i", str(tts_path)
+            "-i", str(tts_path),
         ]
-                
+
+        # 配音：aformat 下混为单声道 → 左右同相立体声（杜绝双声道左右各一路人声）
+        # 只 map 配音(+BGM)，绝不 map 画面轨 0:a
+        tts_af = (
+            "[1:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono,"
+            "pan=stereo|c0=c0|c1=c0,volume=1.0[tts]"
+        )
+        bgm_offset_s = 0
+
         if bgm_file:
-            bgm_offset_s = 0
             if bgm_choice.startswith("随机分配"):
                 res = subprocess.run([
                     self.ffprobe, "-v", "error", "-show_entries", "format=duration",
@@ -17719,31 +17878,37 @@ class ProjectGroupWorker(QObject):
                         bgm_offset_s = random.randint(0, int(bgm_dur - tts_duration - 2))
                 except Exception:
                     pass
-                    
+
             if bgm_offset_s > 0:
                 mix_inputs += ["-ss", f"{bgm_offset_s:.3f}", "-i", str(bgm_file)]
             else:
                 mix_inputs += ["-i", str(bgm_file)]
-                        
+
             bgm_vol = float(self.settings.get("background_volume", 15)) / 100.0
+            # BGM 保留（立体声）；配音单路居中 → 听感 = 1 个朗诵 + 背景乐
             filter_complex = (
-                f"[1:a]volume=1.0[tts];"
-                f"[2:a]volume={bgm_vol:.3f},aloop=loop=-1:size=2e9[bgm];"
-                f"[tts][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+                f"{tts_af};"
+                f"[2:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"volume={bgm_vol:.3f},aloop=loop=-1:size=2e+09,apad[bgm];"
+                f"[tts][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
             )
-            mix_inputs += [
-                "-filter_complex", filter_complex,
-                "-map", "0:v:0",
-                "-map", "[aout]"
-            ]
+            self.log.emit(f"  · 音轨：1 路配音 + BGM「{bgm_label}」（BGM 保留）")
         else:
-            mix_inputs += [
-                "-map", "0:v:0",
-                "-map", "1:a:0"
-            ]
-                
+            filter_complex = f"{tts_af};[tts]anull[aout]"
+            self.log.emit("  · 音轨：仅 1 路配音（未配置 BGM）")
+
+        mix_inputs += [
+            "-filter_complex", filter_complex,
+            "-map", "0:v:0",
+            "-map", "[aout]",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+            "-shortest",
+            "-movflags", "+faststart",
+            "-map_metadata", "-1",
+        ]
         mix_tmp = temp_dir / "mix_out.mp4"
-        mix_inputs += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(mix_tmp)]
+        mix_inputs.append(str(mix_tmp))
         res = subprocess.run(mix_inputs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)
         if res.returncode != 0:
             err = (res.stdout or b"").decode("utf-8", errors="replace")
@@ -17773,8 +17938,9 @@ class ProjectGroupWorker(QObject):
                 self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(dest_file), "-i", str(watermark_img),
                 "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
-                "-map", "[v]", "-map", "0:a:0",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy",
+                "-map", "[v]", "-map", "0:a:0?",
+                *self._project_clip_encode_args(encoder),
+                "-c:a", "copy",
                 str(watermarked_file)
             ]
             res = subprocess.run(wm_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=creation)

@@ -52,7 +52,12 @@ from modules.smartcut_page import SmartCutPage, video_duration
 from modules.watermark_page import MainWindow as WatermarkPage
 from modules.dynamic_caption_page import DynamicCaptionPage, group_word_srt, write_ass
 from modules.tts_page import TtsPage
-from modules.text_rules import normalize_required_capitalization, normalize_subtitle_text
+from modules.text_rules import (
+    filter_asr_junk_srt,
+    is_asr_junk_caption,
+    normalize_required_capitalization,
+    normalize_subtitle_text,
+)
 from modules.metadata_page import MetadataPage
 from modules.platform_utils import (
     app_data_dir,
@@ -74,7 +79,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.47").strip().lstrip("v") or "1.7.47"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.48").strip().lstrip("v") or "1.7.48"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -694,7 +699,7 @@ def segments_to_srt(segments, language=None) -> str:
     for i, seg in enumerate(segments, 1):
         text = normalize_subtitle_text(
             re.sub(r"\s+", " ", str(seg.get("text", ""))).strip(), language=language)
-        if not text:
+        if not text or is_asr_junk_caption(text):
             continue
         start = seg.get("start", 0)
         end = max(float(seg.get("end", start + 2)), float(start) + 0.2)
@@ -733,8 +738,11 @@ def clean_model_srt(text: str, language=None) -> str:
     text = normalize_subtitle_text(text, language=language)
     if "-->" not in text:
         body = normalize_subtitle_text(text.strip(), language=language)
+        if is_asr_junk_caption(body):
+            return ""
         return f"1\n00:00:00,000 --> 99:59:59,000\n{body}\n"
-    return text.strip() + "\n"
+    # 去掉 Whisper 幻觉水印行（如「Υπότιτλοι AUTHORWAVE」）
+    return filter_asr_junk_srt(text.strip() + "\n")
 
 
 SUPPORTED_VIDEO_DOMAINS = (

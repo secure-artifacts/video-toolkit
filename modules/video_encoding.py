@@ -184,25 +184,34 @@ def encoder_args(key, cpu_preset="veryfast", preview=False, intermediate=False):
         return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0"]
     if key == "qsv":
-        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "21",
-                "-look_ahead", "0", "-bf", "0", "-pix_fmt", "nv12"]
+        return ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "19",
+                "-look_ahead", "1", "-bf", "0", "-pix_fmt", "nv12"]
     if key == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
-                "-rc", "vbr", "-cq", "21", "-b:v", "0", "-bf", "0", "-pix_fmt", "yuv420p"]
+                "-rc", "vbr", "-cq", "19", "-b:v", "0", "-bf", "0", "-pix_fmt", "yuv420p"]
     if key == "mf":
-        return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "75",
+        return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "85",
                 "-pix_fmt", "yuv420p"]
     if key == "amf":
-        return ["-c:v", "h264_amf", "-quality", "balanced",
-                "-rc", "cqp", "-qp_i", "21", "-qp_p", "21", "-bf_delta_qp", "0",
+        return ["-c:v", "h264_amf", "-quality", "quality",
+                "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-bf_delta_qp", "0",
                 "-pix_fmt", "yuv420p"]
-    preset = str(cpu_preset or "veryfast")
-    if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
-        preset = "veryfast"
-    if preset == "medium":
-        preset = "faster"
+    preset = str(cpu_preset or "fast")
+    if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"):
+        preset = "fast"
+    # 越慢 CRF 略降：成品更清晰。不再把 medium 偷偷降成 faster。
+    crf_by_preset = {
+        "ultrafast": 22,
+        "superfast": 21,
+        "veryfast": 20,
+        "faster": 19,
+        "fast": 18,
+        "medium": 17,
+        "slow": 16,
+    }
+    crf = crf_by_preset.get(preset, 18)
     return ["-c:v", "libx264", "-preset", preset,
-            "-crf", "20", "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0"]
+            "-crf", str(crf), "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0"]
 
 
 def davinci_safe_mux_args(fps=30):

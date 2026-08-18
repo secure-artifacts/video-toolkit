@@ -197,10 +197,10 @@ def _bitrate_floor_for_size(width: int, height: int) -> int:
 def _hq_video_encode_args(ffmpeg, width: int = 0, height: int = 0, source_bitrate: int = 0) -> tuple[list, str]:
     """成品级 H.264：在肉眼难辨的前提下优先速度。
 
-    策略（相对旧版 slow/CRF14）：
-    - CPU：medium + CRF15（通常比 slow 快约 2～4 倍，观感几乎相同）
-    - NVENC：p4 + CQ16（比 p5 更快，成片仍清晰）
-    - QSV/AMF：平衡档 + 码率下限
+    策略（相对 1.7.45 偏快档略回调画质）：
+    - CPU：medium + CRF14（接近旧 slow/CRF14 观感，仍比 slow 快）
+    - NVENC：p5 + CQ15
+    - QSV/AMF：质量档 + 码率下限
     返回 (ffmpeg_args, 简短说明)
     """
     encoder = resolve_encoder(ffmpeg, "auto")
@@ -214,41 +214,41 @@ def _hq_video_encode_args(ffmpeg, width: int = 0, height: int = 0, source_bitrat
 
     if encoder == "nvenc":
         return [
-            "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
-            "-rc", "vbr", "-cq", "16", "-b:v", str(target_br),
+            "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+            "-rc", "vbr", "-cq", "15", "-b:v", str(target_br),
             "-maxrate", str(maxrate), "-bufsize", str(bufsize),
             "-spatial-aq", "1", "-temporal-aq", "1",
             "-profile:v", "high", "-bf", "0", "-pix_fmt", "yuv420p",
-        ], "NVIDIA 硬编 p4/CQ16（快且清晰）"
+        ], "NVIDIA 硬编 p5/CQ15（高画质）"
     if encoder == "qsv":
         return [
-            "-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "17",
+            "-c:v", "h264_qsv", "-preset", "slow", "-global_quality", "16",
             "-look_ahead", "1", "-b:v", str(target_br),
             "-maxrate", str(maxrate), "-bufsize", str(bufsize),
             "-bf", "0", "-pix_fmt", "nv12",
-        ], "Intel QSV medium（硬编加速）"
+        ], "Intel QSV slow（高画质硬编）"
     if encoder == "mf":
-        # Windows MF：质量档拉高 + 码率下限（比 CPU slow 快很多）
+        # Windows MF：质量档拉满 + 码率下限
         return [
-            "-c:v", "h264_mf", "-rate_control", "quality", "-quality", "90",
+            "-c:v", "h264_mf", "-rate_control", "quality", "-quality", "100",
             "-b:v", str(target_br), "-maxrate", str(maxrate),
             "-pix_fmt", "yuv420p",
-        ], "Windows 硬编 h264_mf"
+        ], "Windows 硬编 h264_mf（最高质量档）"
     if encoder == "amf":
         return [
-            "-c:v", "h264_amf", "-quality", "balanced",
+            "-c:v", "h264_amf", "-quality", "quality",
             "-rc", "vbr_peak", "-b:v", str(target_br),
             "-maxrate", str(maxrate),
-            "-qp_i", "16", "-qp_p", "18", "-bf_delta_qp", "0",
+            "-qp_i", "15", "-qp_p", "17", "-bf_delta_qp", "0",
             "-pix_fmt", "yuv420p",
-        ], "AMD AMF balanced（硬编加速）"
-    # CPU libx264：medium+15 是速度/画质甜点（slow+14 慢很多、肉眼几乎无差）
+        ], "AMD AMF quality（高画质硬编）"
+    # CPU libx264：medium+14 兼顾速度与接近旧版 slow/14 的清晰度
     return [
-        "-c:v", "libx264", "-preset", "medium", "-crf", "15",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "14",
         "-profile:v", "high", "-level", "4.2",
         "-aq-mode", "1", "-bf", "0", "-pix_fmt", "yuv420p", "-threads", "0",
         "-maxrate", str(maxrate), "-bufsize", str(bufsize),
-    ], "CPU libx264 medium/CRF15（快且接近 slow 画质）"
+    ], "CPU libx264 medium/CRF14（高画质）"
 
 
 def _effective_crop_target(source_w: int, source_h: int, mode_key: str):

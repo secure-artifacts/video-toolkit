@@ -96,17 +96,89 @@ def discover_groups(parent):
     return groups
 
 
-def split_group_script(text, expected_count=None):
+# 分段文案常见序号：1. / 1、 / 1) / （1） / (1) / 第1段
+_SEGMENT_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"\d{1,3}\s*[.\u3001\uff0e\)\）:：]\s*"
+    r"|\(\s*\d{1,3}\s*\)\s*"
+    r"|（\s*\d{1,3}\s*）\s*"
+    r"|第\s*\d{1,3}\s*[段章节条款]\s*"
+    r")"
+)
+_NUMBERED_SPLIT_RE = re.compile(
+    # 中文常写「1、甲」无空格，故序号后用 \s* 而非 \s+
+    r"(?:^|\n)\s*(?:"
+    r"\d{1,3}\s*[.\u3001\uff0e\)\）:：]\s*"
+    r"|\(\s*\d{1,3}\s*\)\s*"
+    r"|（\s*\d{1,3}\s*）\s*"
+    r"|第\s*\d{1,3}\s*[段章节条款]\s*"
+    r")"
+)
+
+
+def _strip_segment_prefix(text: str) -> str:
+    """去掉段首序号，避免「1.」「2.」干扰相似度匹配。"""
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    return _SEGMENT_PREFIX_RE.sub("", value, count=1).strip() or value
+
+
+def _split_numbered_script(text: str) -> list[str]:
+    """按段首序号切开（允许同一序号段内换行）。"""
     value = str(text or "").strip()
     if not value:
         return []
-    if expected_count is not None:
-        lines = [line.strip() for line in value.splitlines() if line.strip() and line.strip() != "---"]
-        if len(lines) == expected_count:
-            return lines
+    parts = _NUMBERED_SPLIT_RE.split(value)
+    # split 会留下空首段；过滤后规范化空白
+    segments = []
+    for part in parts:
+        cleaned = re.sub(r"\s+", " ", str(part or "").strip())
+        if cleaned and cleaned != "---":
+            segments.append(cleaned)
+    # 若正文本身不以序号开头，第一段可能吃进标题；仅当切开 ≥2 段才采信
+    if len(segments) < 2:
+        return []
+    return segments
+
+
+def split_group_script(text, expected_count=None):
+    """Split pasted group script into per-clip segments.
+
+    Priority when expected_count is known:
+      1) numbered markers (1. / 1、 / （1） / 第1段…) matching count
+      2) non-empty lines matching count
+      3) blank-line / --- blocks matching count
+      4) best-effort numbered or blocks (even if count differs — caller validates)
+    """
+    value = str(text or "").strip()
+    if not value:
+        return []
     value = re.sub(r"(?m)^\s*---+\s*$", "\n\n", value)
-    blocks = re.split(r"\r?\n\s*\r?\n", value)
-    return [re.sub(r"\s+", " ", block).strip() for block in blocks if block.strip()]
+    numbered = _split_numbered_script(value)
+    lines = [line.strip() for line in value.splitlines() if line.strip() and line.strip() != "---"]
+    blocks = [
+        re.sub(r"\s+", " ", block).strip()
+        for block in re.split(r"\r?\n\s*\r?\n", value)
+        if block.strip()
+    ]
+    if expected_count is not None:
+        expected = int(expected_count)
+        if len(numbered) == expected:
+            return numbered
+        if len(lines) == expected:
+            return lines
+        if len(blocks) == expected:
+            return blocks
+        # 序号切开数量接近期望时优先（常见：多一行标题被丢掉）
+        if numbered and abs(len(numbered) - expected) <= abs(len(blocks) - expected):
+            return numbered
+        if blocks:
+            return blocks
+        return lines
+    if numbered and (not blocks or len(numbered) >= len(blocks)):
+        return numbered
+    return blocks if blocks else lines
 
 
 def _script_key(folder):
@@ -238,56 +310,167 @@ def _resolve_transcript(transcripts, clip):
     return ""
 
 
+def _max_weight_assignment(score_matrix):
+    """Maximize sum of scores for one-to-one clip→segment assignment.
+
+    score_matrix[clip_i][seg_j] → float. Returns list seg_index → clip_index.
+    Uses DP bitmask for n≤12 (exact); larger n uses Hungarian-style O(n³).
+    """
+    n = len(score_matrix)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    if n <= 12:
+        # dp[mask] = (best_sum, prev_clip_for_this_popcount_step as packed path via parent)
+        size = 1 << n
+        dp = [-1e100] * size
+        parent = [(-1, -1)] * size  # mask → (prev_mask, clip_used)
+        dp[0] = 0.0
+        for mask in range(size):
+            seg = mask.bit_count()
+            if seg >= n:
+                continue
+            base = dp[mask]
+            if base < -1e99:
+                continue
+            for clip in range(n):
+                bit = 1 << clip
+                if mask & bit:
+                    continue
+                nxt = mask | bit
+                # Tiny order prior: prefer clip index near seg index when scores tie
+                # (helps when ASR of neighboring takes are similar).
+                prior = 0.002 * (1.0 - abs(clip - seg) / max(1, n - 1))
+                val = base + float(score_matrix[clip][seg]) + prior
+                if val > dp[nxt]:
+                    dp[nxt] = val
+                    parent[nxt] = (mask, clip)
+        full = (1 << n) - 1
+        if dp[full] < -1e99:
+            return list(range(n))
+        seg_to_clip = [-1] * n
+        mask = full
+        for seg in range(n - 1, -1, -1):
+            prev, clip = parent[mask]
+            seg_to_clip[seg] = clip
+            mask = prev
+        return seg_to_clip
+
+    # Hungarian (Kuhn-Munkres) maximizing weight via cost = M - score
+    max_score = max(max(row) for row in score_matrix) if score_matrix else 0.0
+    cost = [[max_score - float(score_matrix[i][j]) + 0.002 * abs(i - j) for j in range(n)] for i in range(n)]
+    u = [0.0] * (n + 1)
+    v = [0.0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [1e100] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = 1e100
+            j1 = 0
+            for j in range(1, n + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    # p[j] = clip+1 assigned to segment j
+    seg_to_clip = [-1] * n
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            seg_to_clip[j - 1] = p[j] - 1
+    for i, c in enumerate(seg_to_clip):
+        if c < 0:
+            seg_to_clip[i] = i
+    return seg_to_clip
+
+
 def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
     """One-to-one match clips to script segments; return clips in script-segment order.
 
     Final list order follows the pasted script segments (line/block 1 → first clip,
     line 2 → second, …), not the original filename order.
+
+    Uses global optimal assignment (not greedy) so similar openings / near-ties
+    don't steal the wrong segment.
     """
     segments = split_group_script(script_text, len(clips))
     clips = list(clips)
     if len(segments) != len(clips) or not clips:
-        return None, "分段文案数量与视频片段数量不一致", []
-    candidates = []
+        got = len(segments)
+        need = len(clips)
+        return (
+            None,
+            f"分段文案数量与视频片段数量不一致（文案 {got} 段 / 视频 {need} 段；"
+            f"请用空行或 1. 2. 3. 序号分隔，段数须一致）",
+            [],
+        )
+    # 匹配用去序号正文；预览仍显示原文前缀
+    match_segments = [_strip_segment_prefix(seg) or seg for seg in segments]
     empty_sources = 0
     source_previews = {}
+    score_matrix = []
     for clip_index, clip in enumerate(clips):
         raw = _resolve_transcript(transcripts, clip)
         variants = _transcript_variants(raw)
+        row = []
         if not variants:
             empty_sources += 1
             source_previews[clip_index] = ""
-            for segment_index, _segment in enumerate(segments):
-                candidates.append((0.0, clip_index, segment_index))
-            continue
-        source_previews[clip_index] = variants[0][:80]
-        for segment_index, segment in enumerate(segments):
-            score = max(_text_similarity(variant, segment) for variant in variants)
-            candidates.append((score, clip_index, segment_index))
+            row = [0.0] * len(match_segments)
+        else:
+            source_previews[clip_index] = variants[0][:80]
+            for segment in match_segments:
+                score = max(_text_similarity(variant, segment) for variant in variants)
+                row.append(float(score))
+        score_matrix.append(row)
     if empty_sources == len(clips):
         return None, "片段识别文案为空，无法按分段文案匹配排序", []
-    assigned_clips = set()
-    assigned_segments = set()
+
+    seg_to_clip = _max_weight_assignment(score_matrix)
     mapping = {}
-    for score, clip_index, segment_index in sorted(candidates, reverse=True):
-        if clip_index in assigned_clips or segment_index in assigned_segments:
-            continue
-        assigned_clips.add(clip_index)
-        assigned_segments.add(segment_index)
-        mapping[segment_index] = (clips[clip_index], score, source_previews.get(clip_index, ""))
     details = []
-    for index in range(len(segments)):
-        if index not in mapping:
+    for seg_index, clip_index in enumerate(seg_to_clip):
+        if clip_index < 0 or clip_index >= len(clips):
             continue
-        clip, score, preview = mapping[index]
+        score = score_matrix[clip_index][seg_index]
+        clip = clips[clip_index]
+        mapping[seg_index] = (clip, score, source_previews.get(clip_index, ""))
         details.append({
-            "segment_index": index,
+            "segment_index": seg_index,
             "clip": clip,
             "score": score,
-            "script_preview": segments[index][:60],
-            "transcript_preview": preview,
+            "script_preview": segments[seg_index][:60],
+            "transcript_preview": source_previews.get(clip_index, ""),
         })
-    if len(mapping) != len(clips):
+
+    if len(mapping) != len(clips) or len(set(seg_to_clip)) != len(clips):
         return None, "文案匹配未能建立一一对应", details
     scores = [item["score"] for item in details]
     if min(scores) < minimum_score:
@@ -297,7 +480,11 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
         )
         return None, f"文案匹配可信度不足（{weak}）", details
     ordered = [mapping[index][0] for index in range(len(segments))]
-    return ordered, "已按分段文案自动匹配排序", details
+    # 若与文件名自然序不同，提示更清晰
+    natural = list(clips)
+    if [str(p) for p in ordered] != [str(p) for p in natural]:
+        return ordered, "已按分段文案自动匹配排序（已重排，与文件名顺序不同）", details
+    return ordered, "已按分段文案自动匹配排序（与文件名顺序一致）", details
 
 
 def _speech_spans(srt):
