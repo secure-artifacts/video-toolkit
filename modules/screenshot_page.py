@@ -290,6 +290,23 @@ class ImageConvertThread(QThread):
                 return candidate
             index += 1
 
+    @staticmethod
+    def _clean_error(exc) -> str:
+        """去掉 Qt QPainter 刷屏警告，只保留可读原因。"""
+        text = str(exc or "").strip() or "未知错误"
+        # 偶发：其它线程/预览的 QPainter 警告被拼进异常文本
+        lines = [
+            ln.strip() for ln in text.replace("\r", "\n").split("\n")
+            if ln.strip() and "QPainter::" not in ln
+        ]
+        cleaned = " ".join(lines) if lines else text
+        if "QPainter" in cleaned and not lines:
+            return (
+                "内部绘图冲突（通常可重试）。若持续失败，请关掉预览窗口后再转换，"
+                "或改导出为 PNG。"
+            )
+        return cleaned[:500]
+
     def run(self):
         try:
             from PIL import Image, ImageOps
@@ -311,14 +328,19 @@ class ImageConvertThread(QThread):
             return
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         ok = fail = 0
+        first_error = ""
         self.log_signal.emit("════════ 图片格式转换开始 ════════")
         self.log_signal.emit(f"输入 {len(self.paths)} 张 → {self.format_label} → {self.output_dir}")
         for index, path_text in enumerate(self.paths, 1):
             src = Path(path_text)
             try:
+                # 仅用 Pillow 读写，不经 QImage/QPainter，避免与主界面预览抢画笔
                 with Image.open(src) as opened:
                     opened.load()
                     image = ImageOps.exif_transpose(opened)
+                    # 部分 HEIC/CMYK 需先转标准模式
+                    if image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                        image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
                     metadata = {}
                     if self.preserve_metadata:
                         exif = opened.info.get("exif")
@@ -329,8 +351,12 @@ class ImageConvertThread(QThread):
                             metadata["icc_profile"] = icc
                     save_options = dict(metadata)
                     if fmt == "PNG":
+                        if image.mode == "P":
+                            image = image.convert("RGBA")
                         save_options.update(optimize=True, compress_level=9)
                     elif fmt == "WEBP":
+                        if image.mode == "P":
+                            image = image.convert("RGBA")
                         save_options.update(lossless=True, quality=100, method=6)
                     elif fmt == "TIFF":
                         save_options.update(compression="tiff_lzw")
@@ -340,18 +366,41 @@ class ImageConvertThread(QThread):
                     elif fmt == "BMP":
                         image = self._flatten_alpha(image)
                     elif fmt in {"HEIF", "AVIF"}:
+                        if image.mode not in ("RGB", "RGBA"):
+                            image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
                         save_options.update(quality=100, lossless=True, chroma="444")
                     destination = self._destination(src, extension)
-                    image.save(str(destination), format=fmt, **save_options)
+                    try:
+                        image.save(str(destination), format=fmt, **save_options)
+                    except Exception:
+                        # 元数据不兼容时去掉 EXIF/ICC 再试；仍失败则回退 PNG
+                        bare = {k: v for k, v in save_options.items() if k not in ("exif", "icc_profile")}
+                        try:
+                            image.save(str(destination), format=fmt, **bare)
+                        except Exception:
+                            if fmt != "PNG":
+                                destination = self._destination(src, ".png")
+                                rgb = image if image.mode in ("RGB", "RGBA") else image.convert("RGBA")
+                                rgb.save(str(destination), format="PNG", optimize=True, compress_level=9)
+                                self.log_signal.emit(
+                                    f"⚠️ [{index}/{len(self.paths)}] {src.name} 目标格式失败，已回退 PNG"
+                                )
+                            else:
+                                raise
                 ok += 1
                 self.log_signal.emit(
                     f"✓ [{index}/{len(self.paths)}] {src.name} → {destination.name}"
                 )
             except Exception as exc:
                 fail += 1
-                self.log_signal.emit(f"❌ [{index}/{len(self.paths)}] {src.name}：{exc}")
+                reason = self._clean_error(exc)
+                if not first_error:
+                    first_error = f"{src.name}：{reason}"
+                self.log_signal.emit(f"❌ [{index}/{len(self.paths)}] {src.name}：{reason}")
             self.progress_signal.emit(int(index / max(1, len(self.paths)) * 100))
         self.log_signal.emit(f"════════ 转换完成：成功 {ok}｜失败 {fail} ════════")
+        if first_error:
+            self.log_signal.emit(f"首个失败原因：{first_error}")
         self.finished_signal.emit(ok, fail, self.output_dir)
 
 # --- 主界面 ---
@@ -678,8 +727,21 @@ class VideoTool(QMainWindow):
         if ok:
             self.last_folder = folder
             self.btn_open.setEnabled(True)
-        if fail:
-            QMessageBox.warning(self, "图片转换完成", f"成功 {ok} 张，失败 {fail} 张。详情请查看右侧日志。")
+        if fail and ok == 0:
+            QMessageBox.warning(
+                self,
+                "图片格式转换失败",
+                f"全部 {fail} 张都未转换成功。\n\n"
+                "请查看右侧日志中的「首个失败原因」。\n"
+                "常见处理：安装/更新 pillow-heif；或改导出 PNG 再试；"
+                "若提示绘图冲突，请先关掉其它页面的视频预览。",
+            )
+        elif fail:
+            QMessageBox.warning(
+                self,
+                "图片转换完成",
+                f"成功 {ok} 张，失败 {fail} 张。\n详情请查看右侧日志。",
+            )
         else:
             QMessageBox.information(self, "图片转换完成", f"已成功转换 {ok} 张图片。")
 

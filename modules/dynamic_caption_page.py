@@ -651,7 +651,12 @@ class PresetPreviewButton(QPushButton):
 
 
 def ass_color(hex_color, alpha="00"):
-    value = QColor(hex_color)
+    """ASS &HAABBGGRR. Invalid/空值回退，避免 QColor(None) 变成纯黑底框。"""
+    raw = str(hex_color or "").strip()
+    match = re.search(r"#[0-9A-Fa-f]{6}", raw)
+    value = QColor(match.group(0) if match else raw)
+    if not value.isValid():
+        value = QColor("#168AAD")
     return f"&H{alpha}{value.blue():02X}{value.green():02X}{value.red():02X}"
 
 
@@ -3335,11 +3340,12 @@ def render_timed_image_overlays(ffmpeg, source, edit_state, cache_dir):
 
 def write_ass(path, srt, settings, word_srt=""):
     preset = PRESETS[settings["preset"]]
-    text_color = ass_color(settings["text_color"])
-    outline_color = ass_color(settings["outline_color"])
-    highlight = ass_color(settings["highlight_color"])
-    background_color = ass_color(settings.get("background_color", "#168AAD"))
-    active_text_color = ass_color(settings.get("active_text_color", "#FFFFFF"))
+    text_color = ass_color(settings.get("text_color") or "#FFFFFF")
+    outline_color = ass_color(settings.get("outline_color") or "#111827")
+    highlight = ass_color(settings.get("highlight_color") or "#2563EB")
+    # 勿用 dict.get 默认值：key 存在但为 None/"" 时仍会得到空 → 黑框
+    background_color = ass_color(settings.get("background_color") or "#168AAD")
+    active_text_color = ass_color(settings.get("active_text_color") or "#FFFFFF")
     # Use the face Qt actually selected for live preview.  If a requested font
     # is missing or has a different internal family name, libass now receives
     # the same resolved family instead of choosing an unrelated fallback.
@@ -3640,7 +3646,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         box_height=max(font_size*1.12,metrics.height())+padding_y*2
                         box_x=x-box_width/2; box_y=y-box_height/2
                         box=rounded_rect_path(box_width,box_height,min(14,box_height*.20))
-                        base_box_override=fr"{{\an7\pos({box_x:.1f},{box_y:.1f})\p1}}"
+                        # 矢量框必须在 tags 里写死填充色，避免样式表/旧独立样式落成黑底
+                        base_box_override=(
+                            fr"{{\an7\pos({box_x:.1f},{box_y:.1f})\p1"
+                            fr"\1c{background_color}\3c{background_color}\bord0\shad0}}"
+                        )
                         events.append(
                             f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},"
                             f"BaseBox,,0,0,0,,{base_box_override}{box}"
@@ -3650,8 +3660,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             f"Base,,0,0,0,,{intro}{draw}"
                         )
                         active_box_override=(
-                            fr"{{\an7\pos({box_x:.1f},{box_y:.1f})\p1\fscx94\fscy94"
-                            fr"\t(0,{animation_ms},\fscx100\fscy100)}}"
+                            fr"{{\an7\pos({box_x:.1f},{box_y:.1f})\p1"
+                            fr"\1c{highlight}\3c{highlight}\bord0\shad0"
+                            fr"\fscx94\fscy94\t(0,{animation_ms},\fscx100\fscy100)}}"
                         )
                         events.append(
                             f"Dialogue: {caption_layer + 2},{ass_time(token_start)},{ass_time(token_end)},"
@@ -4210,11 +4221,26 @@ class CaptionWorker(QObject):
                 per = overrides.get(vkey) or overrides.get(str(video)) or overrides.get(video.name)
                 if isinstance(per, dict) and per:
                     base_style.update(per)
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 使用该视频独立样式"
+                        f"（普通背景 {base_style.get('background_color') or '—'}，"
+                        f"预设 {base_style.get('preset') or '—'}）"
+                    )
                 video_settings = settings_with_timeline_overlays(base_style, edit_state)
                 if burn_captions and str(phrase_srt or "").strip():
                     ass = temporary_ass_path(f"caption_{short_media_id(video)}")
                     write_ass(ass, phrase_srt, video_settings, word_srt)
                     ass_filter = ass
+                    try:
+                        bg = video_settings.get("background_color") or "#168AAD"
+                        preset_n = video_settings.get("preset") or ""
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 字幕样式："
+                            f"普通背景 {bg}"
+                            + (f"｜预设 {preset_n}" if preset_n else "")
+                        )
+                    except Exception:
+                        pass
                 baked_watermarks={str(Path(path).resolve()) for path in self.settings.get("watermark_baked_videos",[]) }
                 watermark_already_baked=str(video.resolve()) in baked_watermarks
                 stages=[]
@@ -10583,9 +10609,11 @@ class DynamicCaptionPage(QWidget):
             # 当前视频帧 + 字幕效果层
             composed = display.copy()
             painter = QPainter(composed)
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            painter.drawImage(0, 0, caption_layer)
-            painter.end()
+            try:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                painter.drawImage(0, 0, caption_layer)
+            finally:
+                painter.end()
             display = composed
         pm = QPixmap.fromImage(display)
         if pm.isNull():
@@ -15729,7 +15757,29 @@ class DynamicCaptionPage(QWidget):
     def pick_color(self, button):
         current = re.search(r"#[0-9A-Fa-f]{6}", button.text()); color = QColorDialog.getColor(QColor(current.group() if current else "#ffffff"), self)
         if color.isValid():
-            button.setText(re.sub(r"#[0-9A-Fa-f]{6}", color.name().upper(), button.text())); self.update_style_preview(); self._refresh_live_preview(); self._save_style_preferences()
+            button.setText(re.sub(r"#[0-9A-Fa-f]{6}", color.name().upper(), button.text()))
+            self.update_style_preview()
+            self._refresh_live_preview()
+            try:
+                video_only = bool(
+                    getattr(self, "style_scope_video_only", None)
+                    and self.style_scope_video_only.isChecked()
+                )
+                if video_only:
+                    self._mark_current_video_style_override()
+                else:
+                    # 批量改色：同步清掉独立样式里的旧底色，否则导出仍可能是黑框
+                    n = len(getattr(self, "video_style_overrides", {}) or {})
+                    if n:
+                        self.video_style_overrides = {}
+                        self._append_run_log(
+                            f"已改批量颜色，并清除 {n} 个视频独立样式，保证导出底色一致。"
+                        )
+                        self._update_batch_style_hint()
+                    self._remember_batch_style_snapshot()
+            except Exception:
+                pass
+            self._save_style_preferences()
 
     def apply_preset(self, name):
         preset = PRESETS[name]
@@ -15778,6 +15828,25 @@ class DynamicCaptionPage(QWidget):
         self.update_style_preview(); self._refresh_live_preview()
         try:
             self._remember_batch_style_snapshot()
+        except Exception:
+            pass
+        # 批量改预设时清掉各视频残留的「独立样式」，否则个别片仍用旧黑底导出
+        try:
+            video_only = bool(
+                getattr(self, "style_scope_video_only", None)
+                and self.style_scope_video_only.isChecked()
+            )
+            if video_only:
+                self._mark_current_video_style_override()
+            else:
+                n = len(getattr(self, "video_style_overrides", {}) or {})
+                if n:
+                    self.video_style_overrides = {}
+                    self._append_run_log(
+                        f"已应用批量预设「{name}」，并清除 {n} 个视频的独立样式"
+                        f"（避免个别片仍用旧底色/旧预设导出）。"
+                    )
+                    self._update_batch_style_hint()
         except Exception:
             pass
         self._save_style_preferences()
@@ -15856,7 +15925,9 @@ class DynamicCaptionPage(QWidget):
         profile = self.cloud_sync_profile.currentData() or "当前设置"
         self.cloud_sync_hint.setText(f"已开启：本地批量生成完成后，使用“{profile}”上传并按配置写入 Google Sheets")
 
-    def _hex(self, button): return re.search(r"#[0-9A-Fa-f]{6}", button.text()).group()
+    def _hex(self, button):
+        match = re.search(r"#[0-9A-Fa-f]{6}", button.text() if button is not None else "")
+        return match.group(0) if match else "#168AAD"
 
     def _clear_previews_and_releases(self):
         self._bump_preview_token()

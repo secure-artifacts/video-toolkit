@@ -2931,8 +2931,10 @@ class VideoPresetPage(QWidget):
         x = (w - scaled.width()) // 2
         y = (h - scaled.height()) // 2
         painter = QPainter(canvas)
-        painter.drawImage(x, y, scaled)
-        painter.end()
+        try:
+            painter.drawImage(x, y, scaled)
+        finally:
+            painter.end()
         self._preview_base = canvas
         self._preview_content_rect = (x, y, scaled.width(), scaled.height())
 
@@ -2970,6 +2972,12 @@ class VideoPresetPage(QWidget):
             return
         settings = self.current_settings()
         painter = QPainter(canvas)
+        try:
+            self._draw_overlay_with_painter(painter, canvas, cx, cy, cw, ch, settings)
+        finally:
+            painter.end()
+
+    def _draw_overlay_with_painter(self, painter, canvas, cx, cy, cw, ch, settings):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         sx = cw / CANVAS_W
