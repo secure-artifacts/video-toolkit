@@ -79,7 +79,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.49").strip().lstrip("v") or "1.7.49"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.50").strip().lstrip("v") or "1.7.50"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -3199,7 +3199,7 @@ class MainWindow(QMainWindow):
         # 索引与 self.pages 顺序一致：0 首页 … 10 元数据 … 11 文字转语音
         nav_items = (
             ("首页", 0),
-            ("图片工具", 1),
+            ("格式转换", 1),
             ("智能剪辑", 2),
             ("Reels 编辑器", 3),
             ("文字转语音", 11),
@@ -3248,6 +3248,10 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._home_page())
         _startup_trace("home page ready")
         self.screenshot_page = ScreenshotPage()
+        try:
+            self.screenshot_page.set_ffmpeg_finder(self._find_ffmpeg)
+        except Exception:
+            pass
         _startup_trace("screenshot page ready")
         self.smartcut_page = SmartCutPage()
         _startup_trace("smartcut page ready")
@@ -3524,8 +3528,8 @@ class MainWindow(QMainWindow):
     def _home_page(self):
         page, layout = self._page_shell("一站式视频工作台", "选择需要的业务功能；文件、文件夹和网络链接均可按模块批量处理。")
         tools = [
-            ("▣", "视频批量截图",
-             "• YouTube / FB / IG / TikTok 网络链接取帧\n• 本地视频、文件夹拖拽与父子目录选择\n• 自定义截图间隔、数量、画质和命名\n• 保存任务记录并自动进行历史查重",
+            ("▣", "格式转换",
+             "• 批量截图（网络/本地视频取帧）\n• 图片格式转换（含 HEIF/HEIC）\n• 视频压缩/转格式：优先转封装保画质（如 4K MOV→4K MP4）\n• 不兼容时自动高质量重编码减小体积",
              "#38bdf8", "page:1"),
             ("✂", "智能剪辑",
              "• 根据画面变化自动检测视频场景\n• 支持自定义片段时长和批量切分\n• 多视频、文件夹拖拽和任务队列\n• 输出成品并保留视频原有立体声音频",
@@ -4282,7 +4286,7 @@ class MainWindow(QMainWindow):
             nav_index = 7
             self.settings_page.setCurrentWidget(self.key_settings_page)
         self.pages.setCurrentIndex(index)
-        page_names={0:"首页",1:"图片工具",2:"智能剪辑",3:"Reels 编辑器",4:"批量重命名",5:"字幕提取",
+        page_names={0:"首页",1:"格式转换",2:"智能剪辑",3:"Reels 编辑器",4:"批量重命名",5:"字幕提取",
                     6:"密钥管理",7:"设置与组件",8:"自动流水线",9:"帮助",10:"清除元数据",11:"文字转语音"}
         write_app_log(f"切换页面：{page_names.get(requested_index,requested_index)}","INFO","界面")
         for btn in self.nav_buttons:

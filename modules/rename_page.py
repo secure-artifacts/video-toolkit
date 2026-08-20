@@ -258,10 +258,22 @@ class RenamePage(QWidget):
         self.copy = QCheckBox("复制到输出目录，保留原文件"); self.copy.setChecked(True); form.addRow("处理方式", self.copy)
         left_layout.addWidget(form_group)
 
-        title_group = QGroupBox("2. 标题列表（每行一个；留空使用原文件名）")
+        title_group = QGroupBox("2. 标题列表（每行一个；空行会被忽略，请用编号表核对对应关系）")
         title_layout = QVBoxLayout(title_group); title_layout.setContentsMargins(10, 10, 10, 10)
         self.titles = QPlainTextEdit(); self.titles.setMinimumHeight(150)
+        self.titles.setPlaceholderText(
+            "第1行 → 自然排序后的第1个文件\n"
+            "第2行 → 第2个文件\n"
+            "（空行不计入；首尾空格会清理，请看右侧编号表）"
+        )
+        self.titles.textChanged.connect(self.update_preview)
         title_layout.addWidget(self.titles)
+        self.title_match_hint = QLabel("有效标题 0 行 · 源文件 0 个")
+        self.title_match_hint.setWordWrap(True)
+        self.title_match_hint.setStyleSheet(
+            "color:#7dd3fc;background:#0b1830;padding:6px 8px;border-radius:5px;"
+        )
+        title_layout.addWidget(self.title_match_hint)
         buttons = QHBoxLayout()
         preview = QPushButton("刷新预览"); preview.clicked.connect(self.update_preview)
         load = QPushButton("读取文件名为标题"); load.clicked.connect(self.load_titles)
@@ -275,18 +287,19 @@ class RenamePage(QWidget):
         left_scroll.setWidget(left); content.addWidget(left_scroll)
 
         right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(10, 8, 10, 8); right_layout.setSpacing(8)
-        preview_group = QGroupBox("重命名结果预览")
+        preview_group = QGroupBox("编号核对表（序号 · 源视频 · 对应标题 · 新文件名）")
         preview_layout = QVBoxLayout(preview_group); preview_layout.setContentsMargins(10, 10, 10, 10)
         self.preview_title = QLabel("待处理文件总数：0 个")
         self.preview_title.setStyleSheet("font-weight: bold; color: #3b82f6;")
         preview_layout.addWidget(self.preview_title)
         
-        self.preview = QTableWidget(0, 3)
-        self.preview.setHorizontalHeaderLabels(["序号", "源文件名", "替换后的文件名"])
+        self.preview = QTableWidget(0, 4)
+        self.preview.setHorizontalHeaderLabels(["序号", "源文件名", "对应标题（第N行）", "新文件名"])
         self.preview.verticalHeader().setVisible(False)
         self.preview.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.preview.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.preview.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.preview.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.preview.setColumnWidth(0, 46)
         self.preview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -408,35 +421,84 @@ class RenamePage(QWidget):
         try:
             task = self.task_from_form()
             files = sorted((x for x in task.input_dir.iterdir() if x.is_file()), key=lambda x: natural_key(x.name))
-            
-            # Update file count label
-            self.preview_title.setText(f"待处理文件总数：{len(files)} 个")
-            
+            raw_lines = self.titles.toPlainText().splitlines()
+            blank_lines = sum(1 for line in raw_lines if not str(line).strip())
+            title_count = len(task.titles)
+            file_count = len(files)
+
+            # Update file count + match hint
+            self.preview_title.setText(
+                f"待处理文件：{file_count} 个｜有效标题：{title_count} 行"
+                + (f"（已忽略空行 {blank_lines}）" if blank_lines else "")
+            )
+            if hasattr(self, "title_match_hint"):
+                if file_count == 0:
+                    hint = "请先选择源文件夹。"
+                    style = "color:#94a3b8;background:#0b1424;padding:6px 8px;border-radius:5px;"
+                elif title_count == 0:
+                    hint = f"尚未填写标题：{file_count} 个文件将按规则使用原文件名。"
+                    style = "color:#fde68a;background:#422006;padding:6px 8px;border-radius:5px;"
+                elif title_count == file_count:
+                    hint = (
+                        f"✓ 一一对应：序号 01…{file_count:02d} 的源文件 ↔ 标题第 1…{title_count} 行。"
+                        "可在右侧表核对，避免空格/空行错位。"
+                    )
+                    style = "color:#86efac;background:#052e1a;padding:6px 8px;border-radius:5px;"
+                elif title_count < file_count:
+                    hint = (
+                        f"⚠ 标题只有 {title_count} 行，文件有 {file_count} 个："
+                        f"第 {title_count + 1:02d}…{file_count:02d} 将用原文件名。"
+                        + (f" 另有 {blank_lines} 个空行已被忽略。" if blank_lines else "")
+                    )
+                    style = "color:#fde68a;background:#422006;padding:6px 8px;border-radius:5px;"
+                else:
+                    hint = (
+                        f"⚠ 标题 {title_count} 行多于文件 {file_count} 个："
+                        f"多出的第 {file_count + 1}…{title_count} 行不会用到。"
+                    )
+                    style = "color:#fca5a5;background:#450a0a;padding:6px 8px;border-radius:5px;"
+                self.title_match_hint.setText(hint)
+                self.title_match_hint.setStyleSheet(style)
+
             self.preview.setRowCount(0)
-            self.preview.setRowCount(len(files))
-            
+            self.preview.setRowCount(file_count)
+
             for offset, item in enumerate(files):
                 name, adjusted = task.render_name_info(item.name, task.start_index + offset)
                 note = " (已自动清洗/截断)" if adjusted else ""
-                
-                # Column 0: Index
-                idx_item = QTableWidgetItem(f"{offset + 1:02d}")
+                seq = offset + 1
+                title_index = offset  # titles 已去掉空行后的第 N 条对应第 N 个文件
+                if 0 <= title_index < len(task.titles):
+                    title_text = task.titles[title_index]
+                    title_cell = f"#{title_index + 1} {title_text}"
+                else:
+                    title_cell = "（无标题 → 用原名）"
+
+                idx_item = QTableWidgetItem(f"{seq:02d}")
                 idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.preview.setItem(offset, 0, idx_item)
-                
-                # Column 1: Source filename
+
                 src_item = QTableWidgetItem(item.name)
                 src_item.setFlags(src_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.preview.setItem(offset, 1, src_item)
-                
-                # Column 2: Replaced filename
+
+                title_item = QTableWidgetItem(title_cell)
+                title_item.setFlags(title_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                title_item.setToolTip(
+                    "标题列表去掉空行后的第 N 行对应自然排序后的第 N 个文件。\n"
+                    "若文案里有多余空行/空格，请看本列是否对得上。"
+                )
+                self.preview.setItem(offset, 2, title_item)
+
                 dst_item = QTableWidgetItem(f"{name}{note}")
                 dst_item.setFlags(dst_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.preview.setItem(offset, 2, dst_item)
-                
+                self.preview.setItem(offset, 3, dst_item)
+
         except Exception as exc:
             self.preview_title.setText("待处理文件总数：0 个")
             self.preview.setRowCount(0)
+            if hasattr(self, "title_match_hint"):
+                self.title_match_hint.setText(f"预览无法刷新：{exc}")
             if hasattr(self, "log"):
                 self.log.appendPlainText(f"预览刷新错误: {exc}")
 

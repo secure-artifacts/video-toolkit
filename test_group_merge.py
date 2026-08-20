@@ -65,6 +65,24 @@ def main():
         g_ordered, g_reason, _g_details = match_clips_to_script(g_clips, g_transcripts, g_script)
         assert g_ordered == [g_clips[1], g_clips[0]], g_reason
 
+        # 低相似度必须拒绝重排（日志里 0.25～0.39 那种）
+        bad_clips = [group_2 / "a.mp4", group_2 / "b.mp4", group_2 / "c.mp4"]
+        for p in bad_clips:
+            p.touch()
+        bad_tr = {
+            str(bad_clips[0].resolve()): "19 Αυγούστου. Ο διάβολος θέλει να προσπεράσεις",
+            str(bad_clips[1].resolve()): "Βλέπεις τον πόνο της ψυχής μου τα δακρυά μου",
+            str(bad_clips[2].resolve()): "Το ότι βλέπεις αυτό το μήνυμα δεν είναι τυχαίο",
+        }
+        bad_script = (
+            "Σε καμία περίπτωση μην προσπεράσεις αυτό το βίντεο.\n\n"
+            "Εσύ και η οικογένειά σου θα λάβετε καλά νέα από τον Θεό.\n\n"
+            "από σήμερα. Αν έχεις την ευκαιρία, μοιράσου αυτό το μήνυμα."
+        )
+        bad_ordered, bad_reason, bad_details = match_clips_to_script(bad_clips, bad_tr, bad_script)
+        assert bad_ordered is None, (bad_reason, bad_details)
+        assert "可信度不足" in bad_reason
+
         # Optimal assignment beats greedy near-ties (similar openings).
         from modules.group_merge import _max_weight_assignment
         # Greedy would take A→seg0 (0.90) then B→seg1 (0.50); optimal is A→seg1, B→seg0.
@@ -82,6 +100,23 @@ def main():
             "今天第三段收尾",
         ]
         assert split_group_script("1、甲\n2、乙\n3、丙", 3) == ["甲", "乙", "丙"]
+
+        # 正文中间误出现「2.」时，不得抢走空行三分段（1.7.48 回归）
+        messy = (
+            "First paragraph says nothing special.\n\n"
+            "Second has\n2. this mid line that starts with number after newline\n\n"
+            "Third paragraph ends."
+        )
+        assert split_group_script(messy, 3) == [
+            "First paragraph says nothing special.",
+            "Second has 2. this mid line that starts with number after newline",
+            "Third paragraph ends.",
+        ]
+        # 段数碰巧=2 时也不能用错误序号切开
+        assert len(split_group_script(messy, 2)) != 2 or split_group_script(messy, 2)[0].startswith("First")
+        # 上面：期望 2 时最接近是空行 3 段，返回 3 段供上层报错；不得返回假序号 2 段
+        bad2 = split_group_script(messy, 2)
+        assert len(bad2) == 3, bad2
 
         # Reorder by script content vs filename 1/2/3.
         r_clips = [group_2 / "1.mp4", group_2 / "2.mp4", group_2 / "3.mp4"]

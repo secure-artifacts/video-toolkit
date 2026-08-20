@@ -2791,9 +2791,10 @@ def align_source_text_to_srt_cues(events, source_text):
 
     old_texts = [str(text or "").strip() for _s, _e, text in events]
     # 1) 句/行数恰好相等：一一对应
+    # 希腊语问号是 ';'；另含中文/英文句读与间隔号
     chunks = [
         value.strip()
-        for value in re.split(r"(?<=[。！？.!?…])\s*|\r?\n+", source_text)
+        for value in re.split(r"(?<=[。！？.!?…;；·])\s*|\r?\n+", source_text)
         if value.strip()
     ]
     if len(chunks) == len(events):
@@ -2911,6 +2912,11 @@ def proofread_srt_keep_timestamps(srt, source_text, language=None):
     cleaned = normalize_subtitle_text(str(source_text).strip(), language=language) if language else str(source_text).strip()
     cleaned = normalize_required_capitalization(cleaned)
     new_texts = align_source_text_to_srt_cues(events, cleaned)
+    # 粗检：若校对后大量「极短条」且与识别差很远，多半是合成顺序/文案组对不上
+    short_new = sum(1 for t in new_texts if 0 < len(re.sub(r"\s+", "", t or "")) <= 3)
+    if short_new >= max(5, len(events) // 4):
+        # 仍应用结果，但在 changes 里加标记供 UI 提示
+        pass
     changes = []
     blocks = []
     for index, ((start, end, old_text), new_text) in enumerate(zip(events, new_texts), 1):
@@ -7469,9 +7475,9 @@ class DynamicCaptionPage(QWidget):
         rename_layout.addLayout(rename_form)
 
         rename_titles_hint = QLabel(
-            "自定义标题列表（可选）：每行一个标题，按左侧队列顺序对应。"
-            "填写后导出时优先使用此处标题；序号 / 前缀 / 日期 / 后缀仍按上方规则拼接。"
-            "一批导出完成后会自动清空，下一批请重新粘贴文案（避免沿用上一批标题）。"
+            "自定义标题列表（可选）：每行一个标题，按左侧「视频队列」顺序对应。"
+            "空行会占位（该序号仍用自动标题）；末尾空行忽略。"
+            "下方编号表可核对是否错位。一批导出完成后会自动清空。"
         )
         rename_titles_hint.setWordWrap(True)
         rename_titles_hint.setStyleSheet("color:#94a3b8;font-size:11px;")
@@ -7485,8 +7491,45 @@ class DynamicCaptionPage(QWidget):
             "（留空则仍自动提取文案标题；本批导出成功后会自动清空）"
         )
         self.rename_custom_titles.setMinimumHeight(88)
-        self.rename_custom_titles.setMaximumHeight(160)
+        self.rename_custom_titles.setMaximumHeight(140)
         rename_layout.addWidget(self.rename_custom_titles)
+
+        self.rename_match_hint = QLabel("编号核对：队列 0 个 · 标题行 0")
+        self.rename_match_hint.setWordWrap(True)
+        self.rename_match_hint.setStyleSheet(
+            "color:#7dd3fc;background:#0b1830;padding:5px 8px;border-radius:5px;font-size:11px;"
+        )
+        rename_layout.addWidget(self.rename_match_hint)
+        self.rename_match_table = QTableWidget(0, 4)
+        self.rename_match_table.setHorizontalHeaderLabels(
+            ["序号", "队列视频", "标题第N行", "将用于命名"]
+        )
+        self.rename_match_table.verticalHeader().setVisible(False)
+        self.rename_match_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rename_match_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rename_match_table.setAlternatingRowColors(True)
+        self.rename_match_table.setMaximumHeight(180)
+        self.rename_match_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.rename_match_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.rename_match_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.rename_match_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.rename_match_table.setColumnWidth(0, 42)
+        self.rename_match_table.setStyleSheet(
+            "QTableWidget{background:#0b1424;alternate-background-color:#13223d;gridline-color:#1e293b;}"
+            "QTableWidget::item{background:transparent;color:#e5edf8;padding:3px;}"
+            "QTableWidget::item:selected{background:#2563eb;color:#ffffff;}"
+        )
+        rename_layout.addWidget(self.rename_match_table)
+        self.rename_custom_titles.textChanged.connect(self._refresh_rename_title_match_table)
+        if hasattr(self, "rename_start_index"):
+            self.rename_start_index.valueChanged.connect(self._refresh_rename_title_match_table)
+        if hasattr(self, "rename_padding"):
+            self.rename_padding.valueChanged.connect(self._refresh_rename_title_match_table)
+        refresh_rename_match = QPushButton("刷新编号核对")
+        refresh_rename_match.setToolTip("按当前左侧视频队列与标题列表重新编号对照")
+        refresh_rename_match.clicked.connect(self._refresh_rename_title_match_table)
+        rename_layout.addWidget(refresh_rename_match)
+        QTimer.singleShot(0, self._refresh_rename_title_match_table)
         
         # Add the jump button inside Section 7
         self.output_to_rename = QPushButton("👉 成品转批量重命名")
@@ -9660,10 +9703,14 @@ class DynamicCaptionPage(QWidget):
         if hasattr(self,"audios") and widget is self.audios and self.videos.currentItem():
             QTimer.singleShot(0,self._rematch_current_video)
         if hasattr(self,"task_queue"): QTimer.singleShot(0,self._refresh_task_queue)
+        if hasattr(self, "videos") and widget is self.videos:
+            QTimer.singleShot(0, self._refresh_rename_title_match_table)
 
     def _clear_media_queue(self, widget):
         widget.clear()
         self._refresh_task_queue()
+        if hasattr(self, "videos") and widget is self.videos:
+            self._refresh_rename_title_match_table()
 
     def _refresh_task_queue(self):
         if not hasattr(self,"task_queue") or not hasattr(self,"videos"): return
@@ -9686,6 +9733,8 @@ class DynamicCaptionPage(QWidget):
             values=(f"{row+1:02d}",video.name,f"{audio.name}（{reason}）",text_state)
             for column,value in enumerate(values):
                 item=QTableWidgetItem(value); item.setToolTip(value); self.task_queue.setItem(row,column,item)
+        if hasattr(self, "rename_match_table"):
+            QTimer.singleShot(0, self._refresh_rename_title_match_table)
 
     def _load_microsoft_voices(self):
         """微软 edge-tts 多语言 Neural 音色（无需密钥）。"""
@@ -13900,6 +13949,70 @@ class DynamicCaptionPage(QWidget):
             lines.pop()
         return lines
 
+    def _refresh_rename_title_match_table(self, *_args):
+        """Reels 导出重命名：编号核对「队列第 N 个视频 ↔ 标题第 N 行」。"""
+        if not hasattr(self, "rename_match_table"):
+            return
+        videos = []
+        if hasattr(self, "videos"):
+            for i in range(self.videos.count()):
+                try:
+                    videos.append(Path(self.videos.item(i).text()).name)
+                except Exception:
+                    videos.append(str(self.videos.item(i).text()))
+        titles = self._rename_titles_list() if hasattr(self, "rename_custom_titles") else []
+        n = max(len(videos), len(titles))
+        filled = sum(1 for t in titles if str(t).strip())
+        if hasattr(self, "rename_match_hint"):
+            if not videos and not titles:
+                hint = "编号核对：请先在左侧加入视频队列，再粘贴标题列表。"
+                style = "color:#94a3b8;background:#0b1424;padding:5px 8px;border-radius:5px;font-size:11px;"
+            elif len(videos) == len(titles) and filled == len(videos) and videos:
+                hint = (
+                    f"✓ 一一对应：队列 {len(videos)} 个 ↔ 标题 {len(titles)} 行"
+                    f"（序号 01…{len(videos):02d}）。导出/上传前请再扫一眼下表。"
+                )
+                style = "color:#86efac;background:#052e1a;padding:5px 8px;border-radius:5px;font-size:11px;"
+            elif len(titles) < len(videos):
+                hint = (
+                    f"⚠ 标题 {len(titles)} 行 < 队列 {len(videos)} 个："
+                    f"第 {len(titles) + 1:02d}…{len(videos):02d} 将用自动提取标题。"
+                    f"（有效非空标题 {filled} 行；中间空行仍占位）"
+                )
+                style = "color:#fde68a;background:#422006;padding:5px 8px;border-radius:5px;font-size:11px;"
+            elif len(titles) > len(videos):
+                hint = (
+                    f"⚠ 标题 {len(titles)} 行 > 队列 {len(videos)} 个："
+                    f"多出的第 {len(videos) + 1}…{len(titles)} 行不会用到。"
+                )
+                style = "color:#fca5a5;background:#450a0a;padding:5px 8px;border-radius:5px;font-size:11px;"
+            else:
+                hint = (
+                    f"队列 {len(videos)} · 标题行 {len(titles)}（非空 {filled}）。"
+                    "空行占位＝该序号仍走自动标题。"
+                )
+                style = "color:#7dd3fc;background:#0b1830;padding:5px 8px;border-radius:5px;font-size:11px;"
+            self.rename_match_hint.setText(hint)
+            self.rename_match_hint.setStyleSheet(style)
+
+        self.rename_match_table.setRowCount(n)
+        start = int(self.rename_start_index.value()) if hasattr(self, "rename_start_index") else 1
+        pad = int(self.rename_padding.value()) if hasattr(self, "rename_padding") else 3
+        for i in range(n):
+            seq = f"{start + i:0{pad}d}"
+            vid = videos[i] if i < len(videos) else "（无对应视频）"
+            if i < len(titles):
+                raw = titles[i]
+                title_cell = f"#{i + 1} {raw}" if raw else f"#{i + 1} （空行占位）"
+                used = raw if raw else "→ 自动提取标题"
+            else:
+                title_cell = "（无标题行）"
+                used = "→ 自动提取标题"
+            for col, text in enumerate((seq, vid, title_cell, used)):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.rename_match_table.setItem(i, col, item)
+
     def render_effect_preview(self):
         item=self.videos.currentItem()
         if not item:
@@ -14829,6 +14942,27 @@ class DynamicCaptionPage(QWidget):
         corrected, changes = proofread_srt_keep_timestamps(
             timeline, normalize_required_capitalization(source_copy), language=lang,
         )
+        # 校对后大量极短条：多半是合成顺序乱了，或粘贴文案与成片内容不一致
+        try:
+            cue_bodies = [
+                re.sub(r"\s+", "", ln)
+                for block in re.split(r"\n\s*\n", corrected)
+                for ln in block.splitlines()[2:]
+                if ln.strip() and "-->" not in ln and not ln.strip().isdigit()
+            ]
+            short_n = sum(1 for t in cue_bodies if 0 < len(t) <= 3)
+            if short_n >= max(8, len(cue_bodies) // 3):
+                QMessageBox.warning(
+                    self,
+                    "文案校对结果异常",
+                    f"校对后出现大量极短字幕（约 {short_n} 条）。\n\n"
+                    "常见原因：\n"
+                    "1）分组合成时「按文案排序」匹配错了，成片口播顺序与原文不一致；\n"
+                    "2）粘贴的原文不是这部成品对应的文案。\n\n"
+                    "建议：改用「文件名自然排序」重新合成，或粘贴与成片一致的原文后再校对。",
+                )
+        except Exception:
+            pass
         self._loading_timeline = True
         try:
             self.override_text.setPlainText(corrected)

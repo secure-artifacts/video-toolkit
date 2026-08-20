@@ -96,22 +96,22 @@ def discover_groups(parent):
     return groups
 
 
-# 分段文案常见序号：1. / 1、 / 1) / （1） / (1) / 第1段
+# 分段文案段首序号：1. / 1、 / 1) / （1） / (1) / 第1段
+# 捕获序号数字，便于校验是否为连续 1..N（避免正文里的「2.」误切开）
 _SEGMENT_PREFIX_RE = re.compile(
     r"^\s*(?:"
-    r"\d{1,3}\s*[.\u3001\uff0e\)\）:：]\s*"
-    r"|\(\s*\d{1,3}\s*\)\s*"
-    r"|（\s*\d{1,3}\s*）\s*"
-    r"|第\s*\d{1,3}\s*[段章节条款]\s*"
+    r"(\d{1,3})\s*[.\u3001\uff0e\)\）:：]\s*"
+    r"|\(\s*(\d{1,3})\s*\)\s*"
+    r"|（\s*(\d{1,3})\s*）\s*"
+    r"|第\s*(\d{1,3})\s*[段章节条款]\s*"
     r")"
 )
-_NUMBERED_SPLIT_RE = re.compile(
-    # 中文常写「1、甲」无空格，故序号后用 \s* 而非 \s+
+_NUMBERED_START_RE = re.compile(
     r"(?:^|\n)\s*(?:"
-    r"\d{1,3}\s*[.\u3001\uff0e\)\）:：]\s*"
-    r"|\(\s*\d{1,3}\s*\)\s*"
-    r"|（\s*\d{1,3}\s*）\s*"
-    r"|第\s*\d{1,3}\s*[段章节条款]\s*"
+    r"(\d{1,3})\s*[.\u3001\uff0e\)\）:：]\s*"
+    r"|\(\s*(\d{1,3})\s*\)\s*"
+    r"|（\s*(\d{1,3})\s*）\s*"
+    r"|第\s*(\d{1,3})\s*[段章节条款]\s*"
     r")"
 )
 
@@ -124,32 +124,57 @@ def _strip_segment_prefix(text: str) -> str:
     return _SEGMENT_PREFIX_RE.sub("", value, count=1).strip() or value
 
 
+def _extract_leading_number(prefix_match) -> int | None:
+    if not prefix_match:
+        return None
+    for g in prefix_match.groups():
+        if g is not None and str(g).isdigit():
+            return int(g)
+    return None
+
+
 def _split_numbered_script(text: str) -> list[str]:
-    """按段首序号切开（允许同一序号段内换行）。"""
+    """按「连续段首序号 1..N」切开；非连续/正文误匹配则返回空（勿用）。"""
     value = str(text or "").strip()
     if not value:
         return []
-    parts = _NUMBERED_SPLIT_RE.split(value)
-    # split 会留下空首段；过滤后规范化空白
+    matches = list(_NUMBERED_START_RE.finditer(value))
+    if len(matches) < 2:
+        return []
+    numbers = []
+    for match in matches:
+        num = _extract_leading_number(match)
+        if num is None:
+            return []
+        numbers.append(num)
+    # 必须是从 1 或 0 起的连续序号，防止正文里的「2. xxx」误分段
+    start_num = numbers[0]
+    if start_num not in (0, 1):
+        return []
+    expected = list(range(start_num, start_num + len(numbers)))
+    if numbers != expected:
+        return []
+    # 第一段必须紧贴全文开头（允许空白），避免标题后的「1.」才开始却丢掉标题误当段
+    if matches[0].start() > 0 and value[: matches[0].start()].strip():
+        # 允许很短标题行；超过 40 字则认为不是规范编号文案
+        if len(value[: matches[0].start()].strip()) > 40:
+            return []
     segments = []
-    for part in parts:
-        cleaned = re.sub(r"\s+", " ", str(part or "").strip())
+    for i, match in enumerate(matches):
+        body_start = match.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(value)
+        cleaned = re.sub(r"\s+", " ", value[body_start:body_end].strip())
         if cleaned and cleaned != "---":
             segments.append(cleaned)
-    # 若正文本身不以序号开头，第一段可能吃进标题；仅当切开 ≥2 段才采信
-    if len(segments) < 2:
-        return []
-    return segments
+    return segments if len(segments) >= 2 else []
 
 
 def split_group_script(text, expected_count=None):
     """Split pasted group script into per-clip segments.
 
-    Priority when expected_count is known:
-      1) numbered markers (1. / 1、 / （1） / 第1段…) matching count
-      2) non-empty lines matching count
-      3) blank-line / --- blocks matching count
-      4) best-effort numbered or blocks (even if count differs — caller validates)
+    When expected_count is known, **only** return a candidate whose length
+    exactly equals expected_count. Never return a near-miss numbered split
+    (that was scrambling trim/sort since v1.7.48).
     """
     value = str(text or "").strip()
     if not value:
@@ -164,21 +189,28 @@ def split_group_script(text, expected_count=None):
     ]
     if expected_count is not None:
         expected = int(expected_count)
-        if len(numbered) == expected:
-            return numbered
-        if len(lines) == expected:
-            return lines
-        if len(blocks) == expected:
-            return blocks
-        # 序号切开数量接近期望时优先（常见：多一行标题被丢掉）
-        if numbered and abs(len(numbered) - expected) <= abs(len(blocks) - expected):
-            return numbered
-        if blocks:
-            return blocks
-        return lines
-    if numbered and (not blocks or len(numbered) >= len(blocks)):
+        # 1) 严格连续序号 1..N（已防正文误切）→ 2) 空行段 → 3) 纯行
+        for candidate in (numbered, blocks, lines):
+            if len(candidate) == expected:
+                return candidate
+        # 段数对不上：优先返回空行分段（最接近真实结构），交给上层报错/回退
+        ranked = sorted(
+            [blocks, lines, numbered],
+            key=lambda c: (
+                abs(len(c) - expected) if c else 10_000,
+                0 if c is blocks else 1 if c is lines else 2,
+            ),
+        )
+        for candidate in ranked:
+            if candidate:
+                return candidate
+        return []
+    # 无期望段数：空行优先，其次严格序号，再逐行
+    if len(blocks) >= 2:
+        return blocks
+    if numbered:
         return numbered
-    return blocks if blocks else lines
+    return lines
 
 
 def _script_key(folder):
@@ -237,7 +269,11 @@ def _word_tokens(value):
 
 
 def _text_similarity(source, target):
-    """Multi-signal similarity robust to ASR noise and long script vs short clip text."""
+    """Multi-signal similarity robust to ASR noise and long script vs short clip text.
+
+    Containment is capped so a short shared opening (e.g. Αμήν) cannot tie
+    every long script segment at ~0.95 and scramble assignment.
+    """
     s_raw, t_raw = str(source or "").strip(), str(target or "").strip()
     s, t = _plain_text(s_raw), _plain_text(t_raw)
     if not s or not t:
@@ -249,9 +285,11 @@ def _text_similarity(source, target):
     # Partial / containment: shorter spoken text inside longer pasted script (or vice versa).
     shorter, longer = (s, t) if len(s) <= len(t) else (t, s)
     contain = 0.0
-    if len(shorter) >= 8 and shorter in longer:
-        contain = 0.95
-    elif len(shorter) >= 10 and len(longer) >= len(shorter):
+    if len(shorter) >= 12 and shorter in longer:
+        # 长度差越大，包含分越打折，避免短句「沾边」高分
+        ratio = len(shorter) / max(1, len(longer))
+        contain = 0.70 + 0.25 * ratio
+    elif len(shorter) >= 14 and len(longer) >= len(shorter):
         best = 0.0
         window = len(shorter)
         step = max(1, window // 5)
@@ -259,11 +297,11 @@ def _text_similarity(source, target):
             best = max(best, SequenceMatcher(None, shorter, longer[i:i + window]).ratio())
             if best >= 0.92:
                 break
-        contain = best
+        contain = best * 0.85
     ws, wt = _word_tokens(s_raw), _word_tokens(t_raw)
     jacc = (len(ws & wt) / len(ws | wt)) if ws and wt else 0.0
-    # Weight distinctive signals higher than full-string ratio (length mismatch hurts full ratio).
-    return max(full, 0.94 * prefix, 0.92 * contain, 0.88 * jacc)
+    # 强调词集合重合 + 全文/前缀；包含分降权
+    return max(full, 0.92 * prefix, 0.75 * contain, 0.95 * jacc)
 
 
 def _transcript_variants(analysis_or_text):
@@ -411,14 +449,16 @@ def _max_weight_assignment(score_matrix):
     return seg_to_clip
 
 
-def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
+def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.50):
     """One-to-one match clips to script segments; return clips in script-segment order.
 
-    Final list order follows the pasted script segments (line/block 1 → first clip,
-    line 2 → second, …), not the original filename order.
+    Returns (ordered_clips_or_None, reason, details).
+    Each details item includes ``segment_text`` so trim can use the *matched*
+    script line instead of re-splitting by index (which caused chaos when split
+    disagreed with match order).
 
-    Uses global optimal assignment (not greedy) so similar openings / near-ties
-    don't steal the wrong segment.
+    minimum_score default 0.50：低于此的「勉强匹配」会打乱合成顺序（例如 0.25～0.39
+    实际文案与识别几乎无关，必须回退文件名排序）。
     """
     segments = split_group_script(script_text, len(clips))
     clips = list(clips)
@@ -428,7 +468,7 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
         return (
             None,
             f"分段文案数量与视频片段数量不一致（文案 {got} 段 / 视频 {need} 段；"
-            f"请用空行或 1. 2. 3. 序号分隔，段数须一致）",
+            f"请用空行分隔每段，或使用连续序号 1. 2. 3.，段数须与视频数一致）",
             [],
         )
     # 匹配用去序号正文；预览仍显示原文前缀
@@ -453,6 +493,14 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
     if empty_sources == len(clips):
         return None, "片段识别文案为空，无法按分段文案匹配排序", []
 
+    # 若某段「第二高分」与最高分非常接近，加大顺序先验，减少互换
+    for seg in range(len(match_segments)):
+        col = sorted(((score_matrix[c][seg], c) for c in range(len(clips))), reverse=True)
+        if len(col) >= 2 and col[0][0] - col[1][0] < 0.08:
+            for c in range(len(clips)):
+                # 文件名自然序接近段序时微调
+                score_matrix[c][seg] += 0.01 * (1.0 - abs(c - seg) / max(1, len(clips) - 1))
+
     seg_to_clip = _max_weight_assignment(score_matrix)
     mapping = {}
     details = []
@@ -467,24 +515,47 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.12):
             "clip": clip,
             "score": score,
             "script_preview": segments[seg_index][:60],
+            "segment_text": segments[seg_index],
             "transcript_preview": source_previews.get(clip_index, ""),
         })
 
     if len(mapping) != len(clips) or len(set(seg_to_clip)) != len(clips):
         return None, "文案匹配未能建立一一对应", details
     scores = [item["score"] for item in details]
-    if min(scores) < minimum_score:
+    min_score = min(scores)
+    mean_score = sum(scores) / max(1, len(scores))
+    # 单段过低 或 整体偏低：说明粘贴文案与这组视频对不上，禁止强行重排
+    if min_score < minimum_score or mean_score < max(0.45, minimum_score - 0.05):
         weak = ", ".join(
             f"第{item['segment_index'] + 1}段↔{item['clip'].name}({item['score']:.2f})"
-            for item in details if item["score"] < minimum_score
+            for item in details
+            if item["score"] < minimum_score
+        ) or ", ".join(
+            f"第{item['segment_index'] + 1}段↔{item['clip'].name}({item['score']:.2f})"
+            for item in details
         )
-        return None, f"文案匹配可信度不足（{weak}）", details
+        return (
+            None,
+            f"文案匹配可信度不足（最低 {min_score:.2f} / 平均 {mean_score:.2f}；"
+            f"需单段≥{minimum_score:.2f}）。弱匹配：{weak}。"
+            f"请检查该组粘贴文案是否对应这些视频，或改用文件名自然排序",
+            details,
+        )
     ordered = [mapping[index][0] for index in range(len(segments))]
-    # 若与文件名自然序不同，提示更清晰
     natural = list(clips)
     if [str(p) for p in ordered] != [str(p) for p in natural]:
-        return ordered, "已按分段文案自动匹配排序（已重排，与文件名顺序不同）", details
-    return ordered, "已按分段文案自动匹配排序（与文件名顺序一致）", details
+        return (
+            ordered,
+            f"已按分段文案自动匹配排序（已重排，与文件名顺序不同；"
+            f"最低相似度 {min_score:.2f}，平均 {mean_score:.2f}）",
+            details,
+        )
+    return (
+        ordered,
+        f"已按分段文案自动匹配排序（与文件名顺序一致；"
+        f"最低相似度 {min_score:.2f}，平均 {mean_score:.2f}）",
+        details,
+    )
 
 
 def _speech_spans(srt):
@@ -1580,7 +1651,10 @@ class GroupMergeWorker(QObject):
                 return key, self._fast_analysis(clip, analysis_cache)
             raise
 
-    def _normalize(self, clip, index, total_count, cache_dir, analysis, target_w, target_h, watermark=None, group_script=""):
+    def _normalize(
+        self, clip, index, total_count, cache_dir, analysis, target_w, target_h,
+        watermark=None, group_script="", clip_scripts=None,
+    ):
         self.log.emit(
             f"[{index + 1}/{total_count}] 开始裁剪/编码片段：{clip.name}"
             f"（编码器 {ENCODER_LABELS.get(self.encoder, self.encoder)}）"
@@ -1590,8 +1664,17 @@ class GroupMergeWorker(QObject):
         # so clip.parent is NOT the group key used when saving 分段文案).
         if not str(group_script or "").strip():
             group_script = lookup_group_script(self.settings.get("scripts", {}), clip.parent)
-        segments = split_group_script(group_script, total_count)
-        clip_script = segments[index] if index < len(segments) else ""
+        # 优先用匹配结果带来的「第 N 段原文」，避免再次 split 与排序不一致
+        if isinstance(clip_scripts, (list, tuple)) and index < len(clip_scripts):
+            clip_script = str(clip_scripts[index] or "")
+        else:
+            segments = split_group_script(group_script, total_count)
+            clip_script = segments[index] if index < len(segments) and len(segments) == total_count else ""
+            if group_script and len(segments) != total_count:
+                self.log.emit(
+                    f"提醒：{clip.name} 分段文案 {len(segments)} 段 ≠ 视频 {total_count} 段，"
+                    f"本段裁剪不按文案窗（请用空行或 1.2.3. 保证段数一致）。"
+                )
         
         manual_bounds = None
         if clip_script:
@@ -2156,6 +2239,8 @@ class GroupMergeWorker(QObject):
                     f"边界分析完成：{folder.name} 共 {len(clips)} 段，"
                     f"开始裁剪编码（进度不会停在「智能混合边界」）。"
                 )
+                # 与 clips 平行的分段文案（排序成功后按文案第 1..N 段对齐）
+                clip_scripts = None
                 if self.settings.get("sort_mode") == "script":
                     if not str(group_script or "").strip():
                         self.log.emit("提醒：本组未找到分段文案，自动回退为文件名自然排序。")
@@ -2168,6 +2253,10 @@ class GroupMergeWorker(QObject):
                         )
                         if ordered:
                             clips = ordered
+                            clip_scripts = [
+                                str(item.get("segment_text") or item.get("script_preview") or "")
+                                for item in sorted(details, key=lambda d: d["segment_index"])
+                            ]
                             self.log.emit(reason)
                             for item in details:
                                 self.log.emit(
@@ -2185,6 +2274,20 @@ class GroupMergeWorker(QObject):
                                         f" (相似度 {item['score']:.2f})"
                                     )
                             self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
+                            # 回退自然序时：仅当分段数恰好等于片段数才按索引取文案裁剪
+                            segs = split_group_script(group_script, len(clips))
+                            if len(segs) == len(clips):
+                                clip_scripts = list(segs)
+                            else:
+                                clip_scripts = [""] * len(clips)
+                                self.log.emit(
+                                    "提醒：文案段数与视频数不一致，裁剪将不按分段文案窗"
+                                    "（请用空行或连续 1.2.3. 分隔）。"
+                                )
+                elif str(group_script or "").strip():
+                    segs = split_group_script(group_script, len(clips))
+                    if len(segs) == len(clips):
+                        clip_scripts = list(segs)
                 first_probe = self._probe(clips[0])
                 target_w, target_h = calculate_target_size(
                     first_probe["width"], first_probe["height"],
@@ -2227,6 +2330,7 @@ class GroupMergeWorker(QObject):
                     return self._normalize(
                         clip, clip_index, total_count, cache_dir, analyses[str(clip.resolve())],
                         target_w, target_h, watermark, group_script=group_script,
+                        clip_scripts=clip_scripts,
                     )
                 tasks = [(clip, clip_index, len(clips)) for clip_index, clip in enumerate(clips)]
                 normalized = [None] * len(clips)
@@ -2289,7 +2393,7 @@ class GroupMergeWorker(QObject):
                     "aspect_ratio": self.settings.get("aspect_ratio", "原始比例"),
                     "resolution": self.settings.get("resolution", "默认最高"),
                     "group_script": group_script,
-                    "version": 6,
+                    "version": 8,  # v8: 低相似度禁止文案重排
                 }, sort_keys=True).encode("utf-8")).hexdigest()
                 state_file = cache_dir / "final.json"
                 try:

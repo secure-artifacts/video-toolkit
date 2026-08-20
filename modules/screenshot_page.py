@@ -403,6 +403,168 @@ class ImageConvertThread(QThread):
             self.log_signal.emit(f"首个失败原因：{first_error}")
         self.finished_signal.emit(ok, fail, self.output_dir)
 
+
+class VideoCompressThread(QThread):
+    """批量视频：优先转封装（画质不变），必要时高质量重编码。"""
+    log_signal = Signal(str)
+    progress_signal = Signal(int)
+    finished_signal = Signal(int, int, str)
+
+    VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v", ".flv", ".ts", ".mts", ".m2ts"}
+    FORMAT_MAP = {
+        "MP4": ".mp4",
+        "MOV": ".mov",
+        "MKV": ".mkv",
+        "保持原扩展名": "",
+    }
+
+    def __init__(self, paths, output_dir, mode, target_format, overwrite=False, ffmpeg="ffmpeg"):
+        super().__init__()
+        self.paths = [str(Path(p)) for p in paths]
+        self.output_dir = str(output_dir)
+        self.mode = str(mode or "仅转封装（推荐）")
+        self.target_format = str(target_format or "MP4")
+        self.overwrite = bool(overwrite)
+        self.ffmpeg = str(ffmpeg or "ffmpeg")
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def _destination(self, src: Path) -> Path:
+        ext = self.FORMAT_MAP.get(self.target_format, ".mp4")
+        if not ext:
+            ext = src.suffix.lower() or ".mp4"
+        out = Path(self.output_dir) / f"{src.stem}{ext}"
+        if self.overwrite or not out.exists():
+            return out
+        index = 2
+        while True:
+            candidate = out.with_name(f"{out.stem}_{index}{out.suffix}")
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def _probe_size(self, path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    def _run_ffmpeg(self, cmd: list[str]) -> tuple[bool, str]:
+        creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creation,
+                timeout=3600,
+            )
+            out = (result.stdout or "")[-1200:]
+            return result.returncode == 0, out
+        except Exception as exc:
+            return False, str(exc)
+
+    def _build_remux_cmd(self, src: Path, dst: Path) -> list[str]:
+        # 转封装：音视频流复制，画质完全不变；体积通常接近（容器开销不同）
+        cmd = [
+            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(src),
+            "-map", "0",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+        # 某些 MOV 里的 pcm / 特殊轨 copy 到 mp4 会失败，调用方再回退重编码
+        return cmd
+
+    def _build_reencode_cmd(self, src: Path, dst: Path) -> list[str]:
+        # 高质量重编码：分辨率/帧率不变，CRF18 + aac，体积通常明显下降
+        return [
+            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(src),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+
+    def run(self):
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        ok = fail = 0
+        remux_first = "转封装" in self.mode or "推荐" in self.mode
+        self.log_signal.emit("════════ 视频压缩 / 转格式开始 ════════")
+        self.log_signal.emit(
+            f"模式：{self.mode}｜目标：{self.target_format}｜共 {len(self.paths)} 个"
+        )
+        self.log_signal.emit(f"输出目录：{self.output_dir}")
+        for index, path_text in enumerate(self.paths, 1):
+            if self.cancelled:
+                self.log_signal.emit("已取消剩余任务。")
+                break
+            src = Path(path_text)
+            if not src.is_file() or src.suffix.lower() not in self.VIDEO_EXTS:
+                fail += 1
+                self.log_signal.emit(f"❌ [{index}/{len(self.paths)}] 跳过非视频：{src.name}")
+                self.progress_signal.emit(int(index / max(1, len(self.paths)) * 100))
+                continue
+            dst = self._destination(src)
+            if dst.resolve() == src.resolve():
+                dst = src.with_name(f"{src.stem}_out{dst.suffix}")
+            src_size = self._probe_size(src)
+            self.log_signal.emit(
+                f"▶ [{index}/{len(self.paths)}] {src.name} "
+                f"（{src_size / (1024 * 1024):.1f} MB）→ {dst.name}"
+            )
+            success = False
+            detail = ""
+            if remux_first:
+                ok_run, detail = self._run_ffmpeg(self._build_remux_cmd(src, dst))
+                if ok_run and dst.is_file() and dst.stat().st_size > 1024:
+                    success = True
+                    self.log_signal.emit("  · 转封装成功（流复制，画质不变）")
+                else:
+                    self.log_signal.emit(
+                        "  · 转封装失败（容器/编码不兼容），改用高质量重编码…"
+                    )
+                    try:
+                        if dst.exists():
+                            dst.unlink()
+                    except OSError:
+                        pass
+            if not success:
+                ok_run, detail = self._run_ffmpeg(self._build_reencode_cmd(src, dst))
+                if ok_run and dst.is_file() and dst.stat().st_size > 1024:
+                    success = True
+                    self.log_signal.emit("  · 高质量重编码完成（CRF18，分辨率不变）")
+                else:
+                    self.log_signal.emit(f"  · 失败：{(detail or '')[-400:]}")
+            if success:
+                ok += 1
+                dst_size = self._probe_size(dst)
+                ratio = (dst_size / src_size * 100) if src_size else 0
+                self.log_signal.emit(
+                    f"✓ [{index}/{len(self.paths)}] {dst.name} "
+                    f"（{dst_size / (1024 * 1024):.1f} MB，约为原体积 {ratio:.0f}%）"
+                )
+            else:
+                fail += 1
+                try:
+                    if dst.exists() and dst.stat().st_size < 1024:
+                        dst.unlink()
+                except OSError:
+                    pass
+            self.progress_signal.emit(int(index / max(1, len(self.paths)) * 100))
+        self.log_signal.emit(f"════════ 完成：成功 {ok}｜失败 {fail} ════════")
+        self.finished_signal.emit(ok, fail, self.output_dir)
+
+
 # --- 主界面 ---
 class VideoTool(QMainWindow):
     def __init__(self):
@@ -410,10 +572,25 @@ class VideoTool(QMainWindow):
         self.last_folder = ""
         self.image_convert_paths = []
         self.convert_thread = None
+        self.video_compress_paths = []
+        self.video_thread = None
+        self._ffmpeg_finder = None
         self.initUI()
 
+    def set_ffmpeg_finder(self, finder):
+        """由主程序注入：返回可用 ffmpeg 路径。"""
+        self._ffmpeg_finder = finder
+
+    def _resolve_ffmpeg(self) -> str:
+        if callable(self._ffmpeg_finder):
+            try:
+                return str(self._ffmpeg_finder())
+            except Exception as exc:
+                raise RuntimeError(f"未找到 FFmpeg：{exc}") from exc
+        return "ffmpeg"
+
     def initUI(self):
-        self.setWindowTitle("图片工具")
+        self.setWindowTitle("格式转换")
         self.setMinimumSize(760, 620)
         self.setStyleSheet("")
 
@@ -423,10 +600,13 @@ class VideoTool(QMainWindow):
         root.setContentsMargins(18, 14, 18, 14)
         root.setSpacing(8)
 
-        title = QLabel("🖼 图片工具")
+        title = QLabel("🔄 格式转换")
         title.setObjectName("heading")
         root.addWidget(title)
-        sub = QLabel("使用标签页切换「批量截图」与「图片格式转换」。依赖与 FFmpeg 请在顶部「设置与组件」管理。")
+        sub = QLabel(
+            "标签页：批量截图 · 图片格式转换 · 视频压缩/转格式。"
+            "视频默认优先转封装（画质不变）；FFmpeg 请在「设置与组件」管理。"
+        )
         sub.setWordWrap(True)
         sub.setStyleSheet("color:#94a3b8;")
         root.addWidget(sub)
@@ -569,6 +749,86 @@ class VideoTool(QMainWindow):
         tab_cv_layout.addWidget(self.convert_btn)
 
         self.tab_widget.addTab(tab_convert, "🖼 图片格式转换")
+
+        # ═══════════ Tab 3: 视频压缩 / 转格式 ═══════════
+        tab_video = QWidget()
+        tab_vd_layout = QVBoxLayout(tab_video)
+        tab_vd_layout.setContentsMargins(0, 8, 0, 0)
+        tab_vd_layout.setSpacing(8)
+
+        video_group = QGroupBox("视频压缩 / 转格式（批量）")
+        video_form = QFormLayout(video_group)
+        video_form.setContentsMargins(10, 12, 10, 10)
+        video_form.setSpacing(7)
+
+        self.video_source = QLineEdit()
+        self.video_source.setReadOnly(True)
+        self.video_source.setPlaceholderText("尚未选择视频；支持 MP4 / MOV / MKV / AVI / WebM 等")
+        video_src_row = QHBoxLayout()
+        video_src_row.addWidget(self.video_source, 1)
+        choose_videos = QPushButton("选视频")
+        choose_videos.clicked.connect(self.select_compress_videos)
+        choose_video_folder = QPushButton("选文件夹")
+        choose_video_folder.clicked.connect(self.select_compress_folder)
+        video_src_row.addWidget(choose_videos)
+        video_src_row.addWidget(choose_video_folder)
+        video_form.addRow("视频来源", video_src_row)
+
+        self.video_mode = QComboBox()
+        self.video_mode.addItems([
+            "仅转封装（推荐）",
+            "高质量压缩（可转格式）",
+        ])
+        self.video_mode.setToolTip(
+            "仅转封装：音视频流复制，只换容器（如 MOV→MP4），画质完全不变；"
+            "体积通常接近，部分素材因编码不兼容会自动改用高质量重编码。\n"
+            "高质量压缩：保持分辨率，H.264 CRF18 重编码，体积通常明显变小，肉眼几乎无损。"
+        )
+        video_form.addRow("处理模式", self.video_mode)
+
+        self.video_format = QComboBox()
+        self.video_format.addItems(list(VideoCompressThread.FORMAT_MAP.keys()))
+        self.video_format.setCurrentText("MP4")
+        self.video_format.setToolTip("目标容器格式。4K MOV→4K MP4 时选 MP4 +「仅转封装」即可保画质。")
+        video_form.addRow("目标格式", self.video_format)
+
+        self.video_overwrite = QCheckBox("覆盖同名输出")
+        video_form.addRow("选项", self.video_overwrite)
+
+        self.video_output = QLineEdit(
+            os.path.join(os.path.expanduser("~"), "Videos", "VideoToolkit_Compressed")
+        )
+        video_out_row = QHBoxLayout()
+        video_out_row.addWidget(self.video_output, 1)
+        choose_video_out = QPushButton("选择")
+        choose_video_out.clicked.connect(self.select_compress_output)
+        video_out_row.addWidget(choose_video_out)
+        video_form.addRow("保存目录", video_out_row)
+
+        video_hint = QLabel(
+            "逻辑：能 copy 就 copy（画质 100% 不变）；不能再 CRF18 重编码。"
+            "不会放大分辨率；4K 素材仍输出 4K。"
+        )
+        video_hint.setWordWrap(True)
+        video_hint.setStyleSheet("color:#94a3b8;font-size:11px;")
+        video_form.addRow(video_hint)
+        tab_vd_layout.addWidget(video_group, 1)
+
+        self.vd_pbar = QProgressBar()
+        tab_vd_layout.addWidget(self.vd_pbar)
+        video_btn_row = QHBoxLayout()
+        self.video_btn = QPushButton("开始压缩 / 转格式")
+        self.video_btn.setObjectName("primary")
+        self.video_btn.setMinimumHeight(36)
+        self.video_btn.clicked.connect(self.start_video_compress)
+        self.video_stop_btn = QPushButton("停止")
+        self.video_stop_btn.setEnabled(False)
+        self.video_stop_btn.clicked.connect(self.stop_video_compress)
+        video_btn_row.addWidget(self.video_btn, 1)
+        video_btn_row.addWidget(self.video_stop_btn)
+        tab_vd_layout.addLayout(video_btn_row)
+
+        self.tab_widget.addTab(tab_video, "🎬 视频压缩/转格式")
 
         left_layout.addWidget(self.tab_widget, 1)
 
@@ -751,6 +1011,99 @@ class VideoTool(QMainWindow):
         if os.path.exists(path):
             os.remove(path)
             QMessageBox.information(self, "完成", "歷史記錄已重置。")
+
+    def _set_compress_paths(self, files):
+        self.video_compress_paths = list(files or [])
+        n = len(self.video_compress_paths)
+        if n == 0:
+            self.video_source.setText("")
+            self.video_source.setPlaceholderText("尚未选择视频；支持 MP4 / MOV / MKV / AVI / WebM 等")
+        elif n == 1:
+            self.video_source.setText(self.video_compress_paths[0])
+        else:
+            self.video_source.setText(f"已选 {n} 个视频")
+            self.video_source.setToolTip("\n".join(Path(p).name for p in self.video_compress_paths[:40]))
+
+    def select_compress_videos(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择视频", "",
+            "视频 (*.mp4 *.mov *.mkv *.avi *.wmv *.webm *.m4v *.flv *.ts *.mts *.m2ts);;所有文件 (*.*)",
+        )
+        if files:
+            self._set_compress_paths(files)
+
+    def select_compress_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择视频文件夹")
+        if not folder:
+            return
+        files = collect_files([folder], VIDEO_EXTENSIONS)
+        if not files:
+            QMessageBox.information(self, "没有视频", "该文件夹下没有可识别的视频文件。")
+            return
+        self._set_compress_paths(files)
+
+    def select_compress_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择压缩/转格式输出目录", self.video_output.text().strip()
+        )
+        if folder:
+            self.video_output.setText(folder)
+
+    def start_video_compress(self):
+        if self.video_thread and self.video_thread.isRunning():
+            QMessageBox.information(self, "视频压缩", "当前任务仍在运行。")
+            return
+        if not self.video_compress_paths:
+            QMessageBox.warning(self, "视频压缩", "请先选择视频或视频文件夹。")
+            return
+        output = self.video_output.text().strip()
+        if not output:
+            QMessageBox.warning(self, "视频压缩", "请选择保存目录。")
+            return
+        try:
+            ffmpeg = self._resolve_ffmpeg()
+        except Exception as exc:
+            QMessageBox.critical(self, "缺少 FFmpeg", str(exc))
+            return
+        self.video_btn.setEnabled(False)
+        self.video_stop_btn.setEnabled(True)
+        self.vd_pbar.setValue(0)
+        self.video_thread = VideoCompressThread(
+            self.video_compress_paths,
+            output,
+            self.video_mode.currentText(),
+            self.video_format.currentText(),
+            self.video_overwrite.isChecked(),
+            ffmpeg=ffmpeg,
+        )
+        self.video_thread.log_signal.connect(self.log_view.append)
+        self.video_thread.progress_signal.connect(self.vd_pbar.setValue)
+        self.video_thread.finished_signal.connect(self._video_compress_finished)
+        self.video_thread.start()
+
+    def stop_video_compress(self):
+        if self.video_thread and self.video_thread.isRunning():
+            self.video_thread.cancel()
+            self.log_view.append("正在停止视频压缩任务…")
+
+    def _video_compress_finished(self, ok, fail, folder):
+        self.video_btn.setEnabled(True)
+        self.video_stop_btn.setEnabled(False)
+        if ok:
+            self.last_folder = folder
+            self.btn_open.setEnabled(True)
+        if fail and ok == 0:
+            QMessageBox.warning(
+                self, "视频压缩失败",
+                f"全部 {fail} 个都未成功。请查看右侧日志。",
+            )
+        elif fail:
+            QMessageBox.warning(
+                self, "视频压缩完成",
+                f"成功 {ok} 个，失败 {fail} 个。详情见日志。",
+            )
+        else:
+            QMessageBox.information(self, "视频压缩完成", f"已成功处理 {ok} 个视频。")
 
     def start_task(self):
         urls = [u.strip() for u in self.url_input.toPlainText().split('\n') if u.strip()]
