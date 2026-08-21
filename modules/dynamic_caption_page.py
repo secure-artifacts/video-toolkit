@@ -326,7 +326,18 @@ STATIC_BOLD_FONT_FILES = {
     "Libre Baskerville": "LibreBaskerville-Bold.ttf",
 }
 
-CAPTION_RENDERER_VERSION = 12
+CAPTION_RENDERER_VERSION = 14
+
+# Visual keys that must stay identical between batch snapshot / UI / export.
+_BATCH_STYLE_VISUAL_KEYS = (
+    "text_color", "outline_color", "highlight_color",
+    "background_color", "active_text_color", "preset",
+    "font", "font_size", "outline_width", "position",
+    "margin_v", "letter_spacing", "word_spacing", "line_spacing",
+    "line_length", "line_width", "max_words", "max_lines",
+    "highlight_padding", "highlight_padding_y", "animation_speed",
+    "caption_mode", "free_animation",
+)
 
 
 def custom_font_dir():
@@ -363,6 +374,97 @@ def render_font_dir():
             except OSError:
                 pass
     return destination
+
+
+def _windows_font_file_for_family(family: str) -> Path | None:
+    """Locate a system TTF/OTF for a Qt font family (Windows). Preview uses Qt;
+    libass only sees fontsdir — without this, system fonts preview≠export."""
+    name = str(family or "").strip()
+    if not name:
+        return None
+    windir = Path(os.environ.get("WINDIR") or r"C:\Windows")
+    fonts_dir = windir / "Fonts"
+    if not fonts_dir.is_dir():
+        return None
+    # Registry: "Arial (TrueType)" → "arial.ttf"
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+        ) as key:
+            i = 0
+            want = name.casefold()
+            while True:
+                try:
+                    value_name, value_data, _ = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                label = str(value_name or "").casefold()
+                # "arial (truetype)" / "microsoft yahei ui (truetype)"
+                base = label.split("(")[0].strip()
+                if base != want and want not in base and base not in want:
+                    continue
+                raw = str(value_data or "").strip()
+                if not raw:
+                    continue
+                candidate = Path(raw) if Path(raw).is_absolute() else fonts_dir / raw
+                if candidate.is_file() and candidate.suffix.casefold() in (".ttf", ".otf", ".ttc"):
+                    return candidate
+    except Exception:
+        pass
+    # Filename heuristic fallback
+    compact = re.sub(r"[^a-z0-9]+", "", name.casefold())
+    if compact:
+        for candidate in fonts_dir.iterdir():
+            if candidate.suffix.casefold() not in (".ttf", ".otf", ".ttc"):
+                continue
+            stem = re.sub(r"[^a-z0-9]+", "", candidate.stem.casefold())
+            if stem == compact or compact in stem or stem in compact:
+                return candidate
+    return None
+
+
+def ensure_font_in_render_dir(family: str) -> Path | None:
+    """Copy the family face into render fontsdir so libass matches Qt preview."""
+    name = str(family or "").strip()
+    if not name:
+        return None
+    destination = render_font_dir()
+    # Already present via custom/bundled?
+    try:
+        for candidate in destination.iterdir():
+            if candidate.suffix.casefold() not in (".ttf", ".otf", ".ttc"):
+                continue
+            stem = candidate.stem.casefold().replace(" ", "").replace("-", "")
+            want = name.casefold().replace(" ", "").replace("-", "")
+            if want and (stem == want or want in stem or stem in want):
+                return candidate
+    except OSError:
+        pass
+    if sys.platform.startswith("win"):
+        source = _windows_font_file_for_family(name)
+        if source and source.is_file():
+            target = destination / source.name
+            try:
+                if not target.exists() or source.stat().st_size != target.stat().st_size:
+                    shutil.copy2(source, target)
+                return target
+            except OSError:
+                return None
+    return None
+
+
+def merge_batch_style_into(settings: dict, batch_snap: dict | None) -> dict:
+    """Apply batch visual snapshot onto settings (export/preview parity)."""
+    out = dict(settings or {})
+    if not isinstance(batch_snap, dict) or not batch_snap:
+        return out
+    for key in _BATCH_STYLE_VISUAL_KEYS:
+        if key in batch_snap and batch_snap.get(key) not in (None, ""):
+            out[key] = batch_snap[key]
+    return out
 
 
 class FontDownloadWorker(QObject):
@@ -1148,9 +1250,14 @@ def render_timeline_edits(ffmpeg, source, state, cache_dir):
             external_video_paths.append(media_path)
     transitions=list((state or {}).get("transitions",[]) or [])
     original_duration=max(1,int(media_duration(ffmpeg,source)*1000))
+    try:
+        first_speed=float((segments[0] or {}).get("speed",1.0) or 1.0)
+    except (TypeError,ValueError):
+        first_speed=1.0
     unchanged=(len(segments)==1 and not image_paths and not external_video_paths
                and int(segments[0].get("source_start",0))<=5
-               and abs(int(segments[0].get("source_end",original_duration))-original_duration)<=20)
+               and abs(int(segments[0].get("source_end",original_duration))-original_duration)<=20
+               and abs(first_speed-1.0)<0.01)
     original_audio_enabled=bool((state or {}).get("original_audio_enabled",True))
     if unchanged and original_audio_enabled and not transitions:
         return source
@@ -1202,10 +1309,17 @@ def render_timeline_edits(ffmpeg, source, state, cache_dir):
     for index,item in enumerate(segments):
         start=max(0,float(item.get("source_start",0))/1000)
         end=max(start+.08,float(item.get("source_end",0))/1000)
-        segment_duration=end-start
+        try:
+            speed=max(0.25,min(4.0,float(item.get("speed",1.0) or 1.0)))
+        except (TypeError,ValueError):
+            speed=1.0
+        source_duration=end-start
+        # 时间轴输出时长 = 源时长 / 速度（2× 加速则更短）
+        segment_duration=max(0.08,source_duration/speed)
         segment_durations.append(segment_duration)
         media_type=str(item.get("media_type","video"))
         media_path=Path(str(item.get("path",""))) if item.get("path") else None
+        speed_pts="" if abs(speed-1.0)<0.001 else f",setpts=PTS/{speed:.6f}"
         if media_type=="image":
             image_key=str(Path(str(item.get("path",""))).resolve())
             input_index=extra_input_indices[image_key]
@@ -1224,7 +1338,7 @@ def render_timeline_edits(ffmpeg, source, state, cache_dir):
             normalize=",settb=AVTB,fps=30" if extra_input_indices else ""
             filters.append(
                 f"[{input_index}:v]trim=start={start:.3f}:end={end:.3f},"
-                f"setpts=PTS-STARTPTS{normalize}[v{index}]"
+                f"setpts=PTS-STARTPTS{speed_pts}{normalize}[v{index}]"
             )
         concat_inputs.append(f"[v{index}]")
         if segment_audio:
@@ -1246,9 +1360,11 @@ def render_timeline_edits(ffmpeg, source, state, cache_dir):
                     ",aresample=48000,aformat=channel_layouts=stereo"
                     if extra_input_indices else ""
                 )
+                tempo=atempo_chain(speed)
+                tempo_part=f",{tempo}" if tempo else ""
                 filters.append(
                     f"[{input_index}:a]atrim=start={start:.3f}:end={end:.3f},"
-                    f"asetpts=PTS-STARTPTS{audio_normalize}[a{index}]"
+                    f"asetpts=PTS-STARTPTS{tempo_part}{audio_normalize}[a{index}]"
                 )
             concat_inputs.append(f"[a{index}]")
     if transitions and len(segments)>1:
@@ -1393,9 +1509,211 @@ def added_audio_fade_filters(mode="直接加入（无淡入淡出）", fade_in_m
     return filters
 
 
+def _grade_params(settings) -> tuple[int, int, int]:
+    """Normalize UI grade params: brightness -100..100, contrast/sat 0..200 (100 neutral)."""
+    settings = settings or {}
+    brightness = max(-100, min(100, int(settings.get("grade_brightness", 0) or 0)))
+    contrast = max(0, min(200, int(settings.get("grade_contrast", 100) or 100)))
+    saturation = max(0, min(200, int(settings.get("grade_saturation", 100) or 100)))
+    return brightness, contrast, saturation
+
+
+def color_grade_filter_expr(settings) -> str:
+    """Build FFmpeg eq filter from brightness/contrast/saturation (UI 0–200, 100=中性).
+
+    Returns empty string when all neutral so we skip the filter.
+    """
+    brightness, contrast, saturation = _grade_params(settings)
+    if brightness == 0 and contrast == 100 and saturation == 100:
+        return ""
+    # eq: brightness -1..1；contrast/saturation 相对 1.0
+    b = brightness / 100.0
+    c = contrast / 100.0
+    s = saturation / 100.0
+    return f"eq=brightness={b:.4f}:contrast={c:.4f}:saturation={s:.4f}"
+
+
+def apply_color_grade_qimage(image: QImage, settings) -> QImage:
+    """Apply the same grade params to a live-preview QImage (visible immediately)."""
+    if image is None or image.isNull():
+        return image
+    brightness, contrast, saturation = _grade_params(settings)
+    if brightness == 0 and contrast == 100 and saturation == 100:
+        return image
+    try:
+        import numpy as np
+    except Exception:
+        return image
+    src = image.convertToFormat(QImage.Format.Format_RGB32)
+    w, h = src.width(), src.height()
+    if w <= 0 or h <= 0:
+        return image
+    ptr = src.bits()
+    if ptr is None:
+        return image
+    try:
+        # bytesPerLine 可能 > w*4（行对齐），不能直接 reshape(h,w,4)
+        bpl = max(int(src.bytesPerLine()), w * 4)
+        raw = np.frombuffer(ptr, dtype=np.uint8, count=src.sizeInBytes())
+        if raw.size < h * bpl:
+            raw = np.frombuffer(ptr, dtype=np.uint8, count=h * bpl)
+        row = raw.reshape(h, bpl)
+        arr = row[:, : w * 4].reshape(h, w, 4).copy()
+    except Exception:
+        return image
+    bgr = arr[:, :, :3].astype(np.float32)
+    # 与 FFmpeg eq 一致（不再额外放大，避免预览过曝）
+    c = contrast / 100.0
+    b = brightness / 100.0
+    s = saturation / 100.0
+    bgr = (bgr - 128.0) * c + 128.0 + (b * 255.0)
+    gray = bgr.mean(axis=2, keepdims=True)
+    bgr = gray + (bgr - gray) * s
+    arr[:, :, :3] = np.clip(bgr, 0, 255).astype(np.uint8)
+    out = QImage(arr.data, w, h, w * 4, QImage.Format.Format_RGB32).copy()
+    return out if image.format() == QImage.Format.Format_RGB32 else out.convertToFormat(image.format())
+
+
+def apply_color_grade_content_region(image: QImage, settings, content_rect) -> QImage:
+    """只调画面内容区，不碰 letterbox 黑边（否则黑边会被提成灰色）。"""
+    if image is None or image.isNull():
+        return image
+    brightness, contrast, saturation = _grade_params(settings)
+    if brightness == 0 and contrast == 100 and saturation == 100:
+        return image
+    try:
+        x, y, cw, ch = [int(v) for v in (content_rect or (0, 0, 0, 0))]
+    except Exception:
+        return apply_color_grade_qimage(image, settings)
+    if cw <= 2 or ch <= 2:
+        return apply_color_grade_qimage(image, settings)
+    x = max(0, min(x, image.width() - 1))
+    y = max(0, min(y, image.height() - 1))
+    cw = max(1, min(cw, image.width() - x))
+    ch = max(1, min(ch, image.height() - y))
+    region = image.copy(x, y, cw, ch)
+    graded = apply_color_grade_qimage(region, settings)
+    if graded is None or graded.isNull():
+        return image
+    out = QImage(image)
+    if out.format() != QImage.Format.Format_RGB32:
+        out = out.convertToFormat(QImage.Format.Format_RGB32)
+    else:
+        out = out.copy()
+    painter = QPainter(out)
+    painter.drawImage(x, y, graded)
+    painter.end()
+    return out
+
+
+def voice_cleanup_filter_expr(settings, *, portable: bool = True) -> str:
+    """人声增强 + 环境降噪（串在对白/原声音轨上）。空字符串表示关闭。
+
+    portable=True 时避免 equalizer 等部分精简 FFmpeg 没有的滤镜
+    （用户报错：Filter not found: 'equalizer'）。
+    """
+    settings = settings or {}
+    denoise = bool(settings.get("audio_denoise", False))
+    boost = bool(settings.get("voice_boost", False))
+    boost_pct = int(settings.get("voice_boost_pct", 150) or 150)
+    if not denoise and not boost:
+        return ""
+    parts = []
+    if denoise:
+        # 默认只用 highpass：几乎所有 FFmpeg 都有，避免精简包缺滤镜
+        parts.append("highpass=f=120")
+    if boost:
+        gain = max(100, min(200, boost_pct)) / 100.0
+        if not portable:
+            # 完整 FFmpeg 可用 EQ 抬人声频段
+            parts.append("equalizer=f=280:t=q:w=1.0:g=3.5")
+            parts.append("equalizer=f=2200:t=q:w=1.3:g=5.5")
+            parts.append("equalizer=f=4500:t=q:w=1.2:g=2.5")
+        parts.append(f"volume={gain:.3f}")
+        # alimiter 也可能缺失，便携链路由 fallbacks 决定是否加
+        if not portable:
+            parts.append("alimiter=limit=0.90")
+    return ",".join(parts)
+
+
+def voice_cleanup_filter_fallbacks(settings) -> list[str]:
+    """按兼容性从高到低返回多套滤镜，供试听/导出逐个尝试。"""
+    settings = settings or {}
+    denoise = bool(settings.get("audio_denoise", False))
+    boost = bool(settings.get("voice_boost", False))
+    boost_pct = max(100, min(200, int(settings.get("voice_boost_pct", 150) or 150)))
+    gain = boost_pct / 100.0
+    chains = []
+    # 1) 最稳：highpass + volume（无 equalizer / afftdn / alimiter）
+    parts = []
+    if denoise:
+        parts.append("highpass=f=120")
+    if boost:
+        parts.append(f"volume={gain:.3f}")
+    if parts:
+        chains.append(",".join(parts))
+    # 2) + alimiter
+    parts = []
+    if denoise:
+        parts.append("highpass=f=120")
+    if boost:
+        parts.extend([f"volume={gain:.3f}", "alimiter=limit=0.90"])
+    if parts:
+        chains.append(",".join(parts))
+    # 3) + afftdn 降噪
+    parts = []
+    if denoise:
+        parts.extend(["highpass=f=100", "afftdn=nr=22:nf=-18"])
+    if boost:
+        parts.extend([f"volume={gain:.3f}", "alimiter=limit=0.90"])
+    if parts:
+        chains.append(",".join(parts))
+    # 4) + anlmdn
+    parts = []
+    if denoise:
+        parts.extend(["highpass=f=100", "anlmdn=s=0.0005:p=0.002"])
+    if boost:
+        parts.extend([f"volume={gain:.3f}", "alimiter=limit=0.90"])
+    if parts:
+        chains.append(",".join(parts))
+    # 5) 完整 EQ（仅完整 FFmpeg）
+    full = voice_cleanup_filter_expr(settings, portable=False)
+    if full:
+        chains.append(full)
+    seen = set()
+    ordered = []
+    for c in chains:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+
+def atempo_chain(speed: float) -> str:
+    """FFmpeg atempo only accepts 0.5–2.0; chain for wider range."""
+    speed = max(0.25, min(4.0, float(speed or 1.0)))
+    if abs(speed - 1.0) < 0.001:
+        return ""
+    parts = []
+    remaining = speed
+    # Speed up: multiply; slow down: multiply factors < 1
+    if remaining > 1.0:
+        while remaining > 2.0 + 1e-6:
+            parts.append("atempo=2.0")
+            remaining /= 2.0
+        parts.append(f"atempo={remaining:.6f}")
+    else:
+        while remaining < 0.5 - 1e-6:
+            parts.append("atempo=0.5")
+            remaining /= 0.5
+        parts.append(f"atempo={remaining:.6f}")
+    return ",".join(parts)
+
+
 def mixed_audio_filter(original_volume=100, background_volume=25,
                        fade_mode="直接加入（无淡入淡出）", fade_in_ms=500,
-                       fade_out_ms=500, duration=0, background_delay_ms=0):
+                       fade_out_ms=500, duration=0, background_delay_ms=0,
+                       voice_fx=""):
     """Shared FFmpeg graph used by exact preview and final export."""
     original = max(0, min(200, int(original_volume))) / 100
     background = max(0, min(200, int(background_volume))) / 100
@@ -1404,8 +1722,12 @@ def mixed_audio_filter(original_volume=100, background_volume=25,
         background_filters.append(f"adelay={int(background_delay_ms)}|{int(background_delay_ms)}")
     background_filters.extend(added_audio_fade_filters(
         fade_mode,fade_in_ms,fade_out_ms,duration))
+    orig_parts = ["aresample=48000", "aformat=channel_layouts=stereo"]
+    if voice_fx:
+        orig_parts.append(str(voice_fx).strip().strip(","))
+    orig_parts.append(f"volume={original:.3f}")
     return (
-        f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={original:.3f}[original_audio];"
+        f"[0:a:0]{','.join(orig_parts)}[original_audio];"
         f"[1:a:0]{','.join(background_filters)}[background_audio];"
         "[original_audio][background_audio]amix=inputs=2:duration=longest:"
         "dropout_transition=2:normalize=0,asetpts=PTS-STARTPTS[aout]"
@@ -1413,9 +1735,11 @@ def mixed_audio_filter(original_volume=100, background_volume=25,
 
 
 def replacement_audio_filter(fade_mode="直接加入（无淡入淡出）", fade_in_ms=500,
-                             fade_out_ms=500, duration=0, delay_ms=0):
+                             fade_out_ms=500, duration=0, delay_ms=0, voice_fx=""):
     """Pad a replacement track with silence; -shortest then keeps video length."""
     filters=["aresample=48000","aformat=channel_layouts=stereo","asetpts=PTS-STARTPTS"]
+    if voice_fx:
+        filters.append(str(voice_fx).strip().strip(","))
     if int(delay_ms or 0)>0:
         filters.append(f"adelay={int(delay_ms)}|{int(delay_ms)}")
     filters.extend(added_audio_fade_filters(
@@ -1427,7 +1751,7 @@ def replacement_audio_filter(fade_mode="直接加入（无淡入淡出）", fade
 
 def bgm_mix_audio_filter(dialogue_input, bgm_input, original_volume=100, background_volume=25,
                          fade_mode="直接加入（无淡入淡出）", fade_in_ms=500, fade_out_ms=500,
-                         duration=0, dialogue_delay_ms=0, bgm_delay_ms=0):
+                         duration=0, dialogue_delay_ms=0, bgm_delay_ms=0, voice_fx=""):
     dialogue_vol = max(0, min(200, int(original_volume))) / 100
     bgm_vol = max(0, min(200, int(background_volume))) / 100
     bgm_filters = ["aresample=48000", "aformat=channel_layouts=stereo", f"volume={bgm_vol:.3f}"]
@@ -1436,7 +1760,10 @@ def bgm_mix_audio_filter(dialogue_input, bgm_input, original_volume=100, backgro
     # BGM 可正常淡入；旁白/TTS 淡入单独收紧，避免第一句听不见
     bgm_filters.extend(added_audio_fade_filters(fade_mode, fade_in_ms, fade_out_ms, duration))
     dialogue_filters=["aresample=48000","aformat=channel_layouts=stereo",
-                      "asetpts=PTS-STARTPTS", f"volume={dialogue_vol:.3f}"]
+                      "asetpts=PTS-STARTPTS"]
+    if voice_fx:
+        dialogue_filters.append(str(voice_fx).strip().strip(","))
+    dialogue_filters.append(f"volume={dialogue_vol:.3f}")
     if int(dialogue_delay_ms or 0)>0:
         dialogue_filters.append(f"adelay={int(dialogue_delay_ms)}|{int(dialogue_delay_ms)}")
     dialogue_filters.extend(added_audio_fade_filters(
@@ -2316,6 +2643,43 @@ def _clear_timeline_cache(output, source):
         path.with_suffix(".tmp").unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _lookup_settings_map(mapping, *keys_or_paths) -> str:
+    """Look up timeline_overrides / word_timelines with path normalize fallbacks.
+
+    UI stores keys via Path.resolve(); export historically used str(path.resolve()).
+    On Windows, slash/case differences used to miss校对后的文案，导致烧录旧字。
+    """
+    mapping = mapping or {}
+    if not isinstance(mapping, dict) or not mapping:
+        return ""
+    candidates: list[str] = []
+    for item in keys_or_paths:
+        if item is None or item == "":
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        candidates.append(text)
+        try:
+            resolved = str(Path(text).resolve())
+            candidates.append(resolved)
+            candidates.append(resolved.replace("\\", "/"))
+            candidates.append(resolved.replace("\\", "/").lower())
+        except Exception:
+            candidates.append(text.replace("\\", "/"))
+    for key in candidates:
+        value = mapping.get(key)
+        if value and str(value).strip():
+            return str(value).strip()
+    # last resort: casefold compare
+    lowered = {str(k).replace("\\", "/").lower(): v for k, v in mapping.items()}
+    for key in candidates:
+        value = lowered.get(str(key).replace("\\", "/").lower())
+        if value and str(value).strip():
+            return str(value).strip()
+    return ""
 
 
 def _render_fingerprint(video, audio, settings):
@@ -3236,6 +3600,49 @@ def caption_page_geometry(lines,settings,context=None):
     return result
 
 
+# PNG 声明图相对字幕的默认层级：在字幕之上（挡住重叠区）
+STACK_ABOVE_CAPTIONS = "above_captions"
+STACK_BELOW_CAPTIONS = "below_captions"
+
+
+def layer_stack_order(layer) -> str:
+    """Return stack order for image/mask overlays. Default: PNG above captions."""
+    if not isinstance(layer, dict):
+        return STACK_ABOVE_CAPTIONS
+    raw = str(layer.get("stack_order") or "").strip().lower()
+    if raw in (STACK_BELOW_CAPTIONS, "below", "字幕上", "under", "behind"):
+        return STACK_BELOW_CAPTIONS
+    if raw in (STACK_ABOVE_CAPTIONS, "above", "top", "front", "字幕下"):
+        return STACK_ABOVE_CAPTIONS
+    # 兼容旧字段
+    if layer.get("above_captions") is False or layer.get("below_captions") is True:
+        return STACK_BELOW_CAPTIONS
+    return STACK_ABOVE_CAPTIONS
+
+
+def edit_state_with_image_stack(edit_state, stack_orders) -> dict:
+    """Clone edit_state keeping only image overlays whose stack_order is in stack_orders."""
+    wanted = {str(x) for x in (stack_orders or set())}
+    state = dict(edit_state or {})
+    kept = []
+    for item in (state.get("overlays") or []):
+        if not isinstance(item, dict):
+            continue
+        layer = dict(item.get("layer") or {})
+        if layer.get("type") != "image":
+            continue
+        if layer_stack_order(layer) not in wanted:
+            continue
+        kept.append({
+            "start": int(item.get("start", 0) or 0),
+            "end": int(item.get("end", 0) or 0),
+            "name": str(item.get("name", "")),
+            "layer": layer,
+        })
+    state["overlays"] = kept
+    return state
+
+
 def settings_with_timeline_overlays(settings, edit_state):
     """Merge per-video timed declaration layers without mutating shared batch settings."""
     merged = dict(settings or {})
@@ -3257,13 +3664,19 @@ def settings_with_timeline_overlays(settings, edit_state):
     return merged
 
 
-def render_timed_image_overlays(ffmpeg, source, edit_state, cache_dir):
-    """Burn time-limited PNG declaration templates while preserving source audio."""
+def render_timed_image_overlays(ffmpeg, source, edit_state, cache_dir, stack_orders=None):
+    """Burn time-limited PNG declaration templates while preserving source audio.
+
+    stack_orders: optional set of STACK_* values to include. None = all image overlays.
+    """
     source=Path(source)
     items=[]
+    wanted = None if stack_orders is None else {str(x) for x in stack_orders}
     for item in (edit_state or {}).get("overlays",[]) or []:
         layer=dict(item.get("layer") or {}) if isinstance(item,dict) else {}
         if layer.get("type")!="image":
+            continue
+        if wanted is not None and layer_stack_order(layer) not in wanted:
             continue
         image_path=Path(str(layer.get("path","")))
         start=max(0,int(item.get("start",0)))
@@ -3280,6 +3693,7 @@ def render_timed_image_overlays(ffmpeg, source, edit_state, cache_dir):
             "start":start,"end":end,"w":layer.get("w",80),"opacity":layer.get("opacity",100),
             "x":layer.get("x",50),"y":layer.get("y",50),
             "fade_in":layer.get("fade_in_ms",0),"fade_out":layer.get("fade_out_ms",0),
+            "stack_order": layer_stack_order(layer),
         })
     source_stat=source.stat()
     payload=json.dumps({
@@ -3287,7 +3701,9 @@ def render_timed_image_overlays(ffmpeg, source, edit_state, cache_dir):
         "size":source_stat.st_size,"items":signatures,
         # v2 uses the same center-point coordinates as the live QPainter preview.
         # Bumping this invalidates cached renders created with the old top-left formula.
-        "layout_version":2,
+        # v3: stack_order (PNG above/below captions) participates in the cache key.
+        "layout_version":3,
+        "stack_filter": sorted(wanted) if wanted is not None else ["*"],
     },ensure_ascii=False,sort_keys=True)
     key=hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     cache=Path(cache_dir)/".timeline_overlay_cache"; cache.mkdir(parents=True,exist_ok=True)
@@ -3369,7 +3785,18 @@ def write_ass(path, srt, settings, word_srt=""):
         if hinted:
             render_settings["font"] = hinted
     metric_font = caption_layout_context(render_settings)[0]
-    font = str(render_settings.get("font", "Arial")).replace(",", "")
+    # 与实时预览一致：用 Qt 实际解析到的字体族名写入 ASS，避免系统字体名与 libass 不一致
+    try:
+        resolved_family = QFontInfo(metric_font).family()
+    except Exception:
+        resolved_family = ""
+    font = str(resolved_family or render_settings.get("font", "Arial")).replace(",", "")
+    # 把该字型文件拷入 fontsdir，否则 libass 回退到别的字体 → 预览好看、导出变样
+    try:
+        ensure_font_in_render_dir(font)
+        ensure_font_in_render_dir(str(render_settings.get("font") or ""))
+    except Exception:
+        pass
     alignment = {"底部": 2, "画面中间": 5, "顶部": 8}.get(settings.get("position", "底部"), 2)
     is_static_bold = any(key in font for key in STATIC_BOLD_FONT_FILES)
     bold_flag=-1 if (caption_uses_bold_face(render_settings) or is_static_bold) else 0
@@ -3918,17 +4345,20 @@ class CaptionWorker(QObject):
                         f"[{index + 1}/{len(self.videos)}] 已应用时间轴切片/删除："
                         f"{len(edit_state.get('tracks',{}).get('video',[]))} 个视频片段；"
                         f"原声{'保留' if edit_state.get('original_audio_enabled',True) else '静音'}。")
+                # 字幕下方的 PNG 先烧进画面；字幕上方的 PNG 在字幕烧录后再叠（默认在上）
                 if any(
-                    isinstance(item,dict)
-                    and isinstance(item.get("layer"),dict)
-                    and item["layer"].get("type")=="image"
+                    isinstance(item, dict)
+                    and isinstance(item.get("layer"), dict)
+                    and item["layer"].get("type") == "image"
+                    and layer_stack_order(item["layer"]) == STACK_BELOW_CAPTIONS
                     for item in (edit_state.get("overlays") or [])
                 ):
-                    render_video=render_timed_image_overlays(
-                        self.ffmpeg,render_video,edit_state,self.output
+                    render_video = render_timed_image_overlays(
+                        self.ffmpeg, render_video, edit_state, self.output,
+                        stack_orders={STACK_BELOW_CAPTIONS},
                     )
                     self.log.emit(
-                        f"[{index + 1}/{len(self.videos)}] 已应用 PNG 声明轨，原音轨保持不变。"
+                        f"[{index + 1}/{len(self.videos)}] 已应用 PNG 声明轨（字幕下方），原音轨保持不变。"
                     )
                 # 动态追踪模糊：在字幕烧录前处理画面（不影响字幕/音轨时间）
                 motion_tracks = [
@@ -3954,8 +4384,12 @@ class CaptionWorker(QObject):
                 
                 # Check for manual slice bounds [start-end] in overrides or free texts
                 manual_bounds = None
-                override = str(self.settings.get("timeline_overrides", {}).get(source_key, "")).strip()
-                free_text = str(self.settings.get("free_texts", {}).get(str(video.resolve()), "")).strip()
+                override = _lookup_settings_map(
+                    self.settings.get("timeline_overrides"), source_key, caption_audio, video,
+                )
+                free_text = _lookup_settings_map(
+                    self.settings.get("free_texts"), str(video.resolve()), video,
+                )
                 text_to_check = override or free_text
                 if text_to_check:
                     match = re.search(r'\[\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\]', text_to_check)
@@ -4001,9 +4435,9 @@ class CaptionWorker(QObject):
                         burn_captions = True
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 使用自由文案动画，不执行语音识别：{video.name}")
                 else:
-                    saved_word_srt = str(self.settings.get("word_timelines", {}).get(source_key, "")).strip()
-                    if not saved_word_srt:
-                        saved_word_srt = str(self.settings.get("word_timelines", {}).get(str(video.resolve()), "")).strip()
+                    saved_word_srt = _lookup_settings_map(
+                        self.settings.get("word_timelines"), source_key, caption_audio, video,
+                    )
                     sidecar = caption_audio.with_suffix(".srt")
                     srt = ""
                     if saved_word_srt:
@@ -4041,11 +4475,10 @@ class CaptionWorker(QObject):
                             chinese = chinese or ""
                         else:
                             # 有人工修订句级 SRT 时仍可烧录
-                            override_try = str(
-                                self.settings.get("timeline_overrides", {}).get(str(caption_audio.resolve()), "")
-                                or self.settings.get("timeline_overrides", {}).get(str(video.resolve()), "")
-                                or ""
-                            ).strip()
+                            override_try = _lookup_settings_map(
+                                self.settings.get("timeline_overrides"),
+                                caption_audio, video, source_key,
+                            )
                             if override_try and "-->" in override_try:
                                 phrase_srt = override_try
                                 word_srt = ""
@@ -4060,9 +4493,15 @@ class CaptionWorker(QObject):
                         word_srt = srt
                         phrase_srt = group_word_srt(word_srt, self.settings["line_length"] * 2,
                                                     max_words=self.settings.get("max_words", 8))
-                        override = str(self.settings.get("timeline_overrides", {}).get(str(caption_audio.resolve()), "")).strip()
-                        if not override:
-                            override = str(self.settings.get("timeline_overrides", {}).get(str(video.resolve()), "")).strip()
+                        override = _lookup_settings_map(
+                            self.settings.get("timeline_overrides"),
+                            caption_audio, video, source_key,
+                        )
+                        # 单视频队列：再回退到字幕编辑区快照（用户刚改完直接导出）
+                        if (not override or "-->" not in override) and len(self.videos) == 1:
+                            ot = str(self.settings.get("override_text") or "").strip()
+                            if ot and "-->" in ot:
+                                override = ot
                         if manual_bounds is not None:
                             override = re.sub(r'\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]', '', override).strip()
                         if override:
@@ -4084,29 +4523,34 @@ class CaptionWorker(QObject):
                 # 字幕时钟处理（二选一，禁止「先平移再切片映射」造成双重偏移）：
                 # 1) 有视频轨切片 → 从源时钟（或未对齐工作副本）按片段映射到成片
                 # 2) 仅有文案里的手动起止 → 简单平移
+                # 重要：文案校对后的「工作副本」phrase_srt 必须优先于 timeline_overrides_source，
+                # 否则已对齐切片时会拿源轴旧字覆盖校对结果（预览/导出文字都错）。
                 caption_retiming_done = False
                 if burn_captions and edit_tracks.get("video"):
                     video_segs = list(edit_tracks.get("video") or [])
                     vkey = str(video.resolve())
-                    word_src = str(
-                        self.settings.get("word_timelines_source", {}).get(source_key, "")
-                        or self.settings.get("word_timelines_source", {}).get(vkey, "")
-                        or ""
-                    ).strip()
-                    phrase_src = str(
-                        self.settings.get("timeline_overrides_source", {}).get(source_key, "")
-                        or self.settings.get("timeline_overrides_source", {}).get(vkey, "")
-                        or ""
-                    ).strip()
+                    word_src = _lookup_settings_map(
+                        self.settings.get("word_timelines_source"), source_key, vkey, caption_audio, video,
+                    )
+                    phrase_src = _lookup_settings_map(
+                        self.settings.get("timeline_overrides_source"), source_key, vkey, caption_audio, video,
+                    )
                     aligned = bool(edit_state.get("captions_timeline_aligned"))
                     need = video_segments_need_caption_retime(video_segs)
-                    if need and aligned and not (word_src or phrase_src):
-                        # 工作副本已是成片时钟且无源轴：直接用，勿再映射
+                    working_phrase_ok = bool(phrase_srt and "-->" in phrase_srt)
+                    if need and aligned and working_phrase_ok:
+                        # 工作副本已是成片时钟（含校对后的新文字）→ 直接烧录，禁止再用源轴旧字覆盖
+                        caption_retiming_done = True
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 字幕已按成片时钟对齐，"
+                            f"使用当前工作区文案烧录（含校对修订）。"
+                        )
+                    elif need and aligned and not (word_src or phrase_src):
                         caption_retiming_done = True
                     elif need and (word_src or phrase_src or not aligned):
-                        # 有源轴 → 必须从源映射；无源且未对齐 → 映射当前工作副本一次
-                        base_p = phrase_src or phrase_srt
-                        base_w = word_src or word_srt
+                        # 未对齐：优先工作区文案（校对后），再回退源轴
+                        base_p = phrase_srt if working_phrase_ok else phrase_src
+                        base_w = word_srt if (word_srt and "-->" in word_srt) else word_src
                         before_p, before_w = phrase_srt, word_srt
                         if base_p and "-->" in base_p:
                             phrase_srt = retime_srt_for_video_segments(base_p, video_segs) or phrase_srt
@@ -4220,8 +4664,10 @@ class CaptionWorker(QObject):
                 # the Windows/libass path limit even when the source video opens fine.
                 ass = None
                 ass_filter = None
-                # 单视频独立样式优先，否则用批量共用样式
+                # 批量快照颜色作底，再叠独立样式，避免「当前选中视频 UI」污染其它片
                 base_style = dict(self.settings or {})
+                batch_snap = base_style.get("batch_style_snapshot") or {}
+                base_style = merge_batch_style_into(base_style, batch_snap)
                 overrides = base_style.get("video_style_overrides") or {}
                 vkey = str(video.resolve())
                 per = overrides.get(vkey) or overrides.get(str(video)) or overrides.get(video.name)
@@ -4232,8 +4678,19 @@ class CaptionWorker(QObject):
                         f"（普通背景 {base_style.get('background_color') or '—'}，"
                         f"预设 {base_style.get('preset') or '—'}）"
                     )
+                elif isinstance(batch_snap, dict) and batch_snap:
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 使用批量共用样式"
+                        f"（普通背景 {base_style.get('background_color') or '—'}，"
+                        f"预设 {base_style.get('preset') or '—'}）"
+                    )
                 video_settings = settings_with_timeline_overlays(base_style, edit_state)
                 if burn_captions and str(phrase_srt or "").strip():
+                    # 系统字体拷进 fontsdir，保证 libass 与 Qt 预览同一字型
+                    try:
+                        ensure_font_in_render_dir(str(video_settings.get("font") or ""))
+                    except Exception:
+                        pass
                     ass = temporary_ass_path(f"caption_{short_media_id(video)}")
                     write_ass(ass, phrase_srt, video_settings, word_srt)
                     ass_filter = ass
@@ -4384,6 +4841,15 @@ class CaptionWorker(QObject):
                 if need_resize:
                     v_filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}:(iw-ow)/2:(ih-oh)/2,setsar=1")
                 v_filters.append("fps=30")
+                grade_expr = color_grade_filter_expr(self.settings)
+                if grade_expr:
+                    v_filters.append(grade_expr)
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 画面调色："
+                        f"亮度 {int(self.settings.get('grade_brightness', 0))}，"
+                        f"对比度 {int(self.settings.get('grade_contrast', 100))}，"
+                        f"饱和度 {int(self.settings.get('grade_saturation', 100))}。"
+                    )
                 if extend_filters:
                     v_filters.extend(extend_filters)
                 # 时间戳归零：避免成品 video start_time≈0.033（B帧/CTS）→ 达芬奇片头黑帧
@@ -4613,6 +5079,13 @@ class CaptionWorker(QObject):
                 # 输出硬限：始终锁到目标时长，避免音轨略长时用末帧静帧填空
                 command += ["-t", f"{output_duration:.3f}"]
 
+                voice_fx = voice_cleanup_filter_expr(self.settings)
+                if voice_fx:
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 收音优化："
+                        f"{'降噪 ' if self.settings.get('audio_denoise') else ''}"
+                        f"{'人声增强' if self.settings.get('voice_boost') else ''}".strip()
+                    )
                 if bgm_file:
                     dialogue_input = "[1:a:0]" if replace_audio else "[0:a:0]"
                     bgm_input = f"[{bgm_input_index}:a:0]"
@@ -4631,6 +5104,7 @@ class CaptionWorker(QObject):
                             video_duration,
                             tts_delay_ms if replace_audio else 0,
                             bgm_delay_ms,
+                            voice_fx=voice_fx,
                         )
                     else:
                         audio_graph = bgm_only_audio_filter(
@@ -4652,14 +5126,20 @@ class CaptionWorker(QObject):
                                                       self.settings.get("audio_fade_mode"),
                                                       self.settings.get("audio_fade_in_ms",500),
                                                       self.settings.get("audio_fade_out_ms",500),video_duration,
-                                                      tts_delay_ms)
+                                                      tts_delay_ms, voice_fx=voice_fx)
                                    if mix_audio and source_has_audio else
                                    (replacement_audio_filter(self.settings.get("audio_fade_mode"),
                                                              self.settings.get("audio_fade_in_ms",500),
                                                              self.settings.get("audio_fade_out_ms",500),video_duration,
-                                                             tts_delay_ms)
+                                                             tts_delay_ms, voice_fx=voice_fx)
                                     if replace_audio else ""))
-                # 将环境音叠到主音轨末尾 [aout]
+                    # 仅保留原声时也套用降噪/人声增强
+                    if not audio_graph and voice_fx and source_has_audio and not replace_audio:
+                        audio_graph = (
+                            f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,"
+                            f"{voice_fx},"
+                            f"atrim=0:{output_duration:.3f},asetpts=PTS-STARTPTS[aout]"
+                        )                # 将环境音叠到主音轨末尾 [aout]
                 if ambient_file and ambient_input_index is not None:
                     amb_vol = max(0, min(200, int(self.settings.get("ambient_volume", 20) or 20))) / 100.0
                     amb_in = f"[{ambient_input_index}:a:0]"
@@ -4777,6 +5257,28 @@ class CaptionWorker(QObject):
                     try: Path(ass).unlink(missing_ok=True)
                     except OSError: pass
                 if returncode: raise RuntimeError(render_log.strip() or "动态文案渲染失败")
+                # 默认：PNG 在字幕之上 → 字幕烧录完成后再叠 above 声明图
+                if any(
+                    isinstance(item, dict)
+                    and isinstance(item.get("layer"), dict)
+                    and item["layer"].get("type") == "image"
+                    and layer_stack_order(item["layer"]) == STACK_ABOVE_CAPTIONS
+                    for item in (edit_state.get("overlays") or [])
+                ):
+                    stacked = render_timed_image_overlays(
+                        self.ffmpeg, destination, edit_state, self.output,
+                        stack_orders={STACK_ABOVE_CAPTIONS},
+                    )
+                    stacked_path = Path(stacked)
+                    if stacked_path.resolve() != Path(destination).resolve() and stacked_path.is_file():
+                        try:
+                            Path(destination).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        stacked_path.replace(destination)
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 已叠加 PNG 声明轨（字幕上方，默认）。"
+                    )
                 # AAC 编码器仍可能写入 ~21ms 的 video start_time；轻量重封装归零
                 if remux_zero_start(self.ffmpeg, destination, fps=30):
                     self.log.emit(
@@ -4876,17 +5378,20 @@ class PreviewWorker(QObject):
                 self.log.emit("轨道渲染：正在根据时间轴切片/转场生成画面…")
                 source = Path(render_timeline_edits(self.ffmpeg, source, edit_state, cache_dir))
                 self.log.emit(f"轨道画面已就绪：{source.name}")
+            # 字幕下方 PNG 先叠；字幕上方 PNG 在烧录字幕的成品上再叠（与导出一致）
             if any(
-                isinstance(item,dict)
-                and isinstance(item.get("layer"),dict)
-                and item["layer"].get("type")=="image"
+                isinstance(item, dict)
+                and isinstance(item.get("layer"), dict)
+                and item["layer"].get("type") == "image"
+                and layer_stack_order(item["layer"]) == STACK_BELOW_CAPTIONS
                 for item in (edit_state.get("overlays") or [])
             ):
-                self.log.emit("声明轨渲染：正在叠加 PNG 模板…")
-                source=Path(render_timed_image_overlays(
-                    self.ffmpeg,source,edit_state,cache_dir
+                self.log.emit("声明轨渲染：正在叠加 PNG（字幕下方）…")
+                source = Path(render_timed_image_overlays(
+                    self.ffmpeg, source, edit_state, cache_dir,
+                    stack_orders={STACK_BELOW_CAPTIONS},
                 ))
-                self.log.emit("PNG 声明模板已加入预览，原声音轨未改动。")
+                self.log.emit("PNG（字幕下方）已加入预览。")
 
             video_dur = max(0.2, float(media_duration(self.ffmpeg, source) or 0.2))
             # 轨道预览默认整段；超长片限制上限以免卡死（可用 settings 覆盖）
@@ -5063,6 +5568,9 @@ class PreviewWorker(QObject):
             v_filters.append("fps=30")
             if extend_filters:
                 v_filters.extend(extend_filters)
+            grade_expr = color_grade_filter_expr(self.settings)
+            if grade_expr:
+                v_filters.append(grade_expr)
             v_filters.append(f"trim=duration={preview_duration:.3f}")
             v_filters.append("setpts=PTS-STARTPTS")
             v_filter_str = ",".join(v_filters) if v_filters else "setpts=PTS-STARTPTS"
@@ -5076,12 +5584,14 @@ class PreviewWorker(QObject):
 
             # Build audio graph
             bgm_vol = int(self.settings.get("background_volume", 25) or 25)
+            voice_fx = voice_cleanup_filter_expr(self.settings)
             if bgm_enabled and external and mix_audio and source_has_audio:
                 # 原声 + 配音混合后再加 BGM 较复杂；预览简化为：原声/配音主轨 + BGM
                 bgm_in = "[2:a]" if external else "[1:a]"
                 dialogue_in = "[1:a]" if external else "[0:a]"
+                fx = f",{voice_fx}" if voice_fx else ""
                 audio_graph = (
-                    f"[0:a]aformat=channel_layouts=stereo,volume="
+                    f"[0:a]aformat=channel_layouts=stereo{fx},volume="
                     f"{max(0,min(200,int(self.settings.get('original_volume',100))))/100:.3f}[oa];"
                     f"{dialogue_in}aformat=channel_layouts=stereo,volume=1.0[da];"
                     f"[oa][da]amix=inputs=2:duration=first:dropout_transition=2[mix];"
@@ -5098,6 +5608,7 @@ class PreviewWorker(QObject):
                     self.settings.get("audio_fade_in_ms", 500),
                     self.settings.get("audio_fade_out_ms", 500),
                     preview_duration,
+                    voice_fx=voice_fx,
                 )
             elif bgm_enabled and external and replace_audio:
                 audio_graph = bgm_mix_audio_filter(
@@ -5108,18 +5619,26 @@ class PreviewWorker(QObject):
                     self.settings.get("audio_fade_in_ms", 500),
                     self.settings.get("audio_fade_out_ms", 500),
                     preview_duration,
+                    voice_fx=voice_fx,
                 )
             else:
                 audio_graph = (mixed_audio_filter(self.settings.get("original_volume", 100),
                                                   self.settings.get("background_volume", 25),
                                                   self.settings.get("audio_fade_mode"),
                                                   self.settings.get("audio_fade_in_ms",500),
-                                                  self.settings.get("audio_fade_out_ms",500),preview_duration)
+                                                  self.settings.get("audio_fade_out_ms",500),preview_duration,
+                                                  voice_fx=voice_fx)
                                if mix_audio and source_has_audio else
                                (replacement_audio_filter(self.settings.get("audio_fade_mode"),
                                                          self.settings.get("audio_fade_in_ms",500),
-                                                         self.settings.get("audio_fade_out_ms",500),preview_duration)
-                                if replace_audio else ""))
+                                                         self.settings.get("audio_fade_out_ms",500),preview_duration,
+                                                         voice_fx=voice_fx)
+                                if replace_audio else
+                                (
+                                    f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,{voice_fx},"
+                                    f"atrim=0:{preview_duration:.3f},asetpts=PTS-STARTPTS[aout]"
+                                    if voice_fx and source_has_audio else ""
+                                )))
 
             command += ["-t", f"{preview_duration:.3f}"]
             self.log.emit(f"轨道渲染预览：编码约 {preview_duration:.1f}s（含字幕/水印核对）…")
@@ -5167,6 +5686,27 @@ class PreviewWorker(QObject):
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
             if result.returncode: raise RuntimeError(result.stderr.strip() or "轨道渲染预览失败")
+            # 默认 PNG 在字幕之上：字幕预览成片后再叠 above 声明图
+            if any(
+                isinstance(item, dict)
+                and isinstance(item.get("layer"), dict)
+                and item["layer"].get("type") == "image"
+                and layer_stack_order(item["layer"]) == STACK_ABOVE_CAPTIONS
+                for item in (edit_state.get("overlays") or [])
+            ):
+                self.log.emit("声明轨渲染：正在叠加 PNG（字幕上方）…")
+                stacked = render_timed_image_overlays(
+                    self.ffmpeg, self.destination, edit_state, cache_dir,
+                    stack_orders={STACK_ABOVE_CAPTIONS},
+                )
+                stacked_path = Path(stacked)
+                if stacked_path.resolve() != self.destination.resolve() and stacked_path.is_file():
+                    try:
+                        self.destination.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    stacked_path.replace(self.destination)
+                self.log.emit("PNG（字幕上方）已加入预览。")
             self.finished.emit(True, str(self.destination))
         except Exception as exc:
             self.finished.emit(False, str(exc))
@@ -5820,6 +6360,8 @@ class DynamicCaptionPage(QWidget):
         self.free_texts = {}
         self.audio_offsets = {}; self._audio_edit_source = ""; self._preview_audio_offset_ms = 0
         self._active_timeline_source = ""; self._syncing_media_selection = False; self._timeline_pending_source = ""
+        # 当前字幕编辑器绑定的视频路径；切换前必须写回「上一片」，不能写到新选中项
+        self._active_caption_video_path = ""
         self.timeline_edit_states = {}
         self._selected_bgm_path = ""
         self._selected_ambient_path = ""  # 环境音（独立于 BGM，可上时间轴）
@@ -6978,6 +7520,44 @@ class DynamicCaptionPage(QWidget):
         audio_form.addRow("音轨音量", audio_volume_line)
         audio_form.addRow("音轨淡化", self.audio_fade_mode)
         audio_form.addRow("淡化时长", fade_time_line)
+        self.audio_denoise=QCheckBox("降低环境噪音（降噪）")
+        self.audio_denoise.setToolTip(
+            "对对白/原声音轨降噪（高通 + 频谱降噪）。\n"
+            "普通播放听不到；请点「试听收音效果」，或导出/轨道预览。"
+        )
+        self.voice_boost=QCheckBox("增大人声")
+        self.voice_boost.setToolTip(
+            "抬升人声频段并加大音量。\n"
+            "普通播放听不到；请点「试听收音效果」，或导出/轨道预览。"
+        )
+        self.voice_boost_pct=QSpinBox(); self.voice_boost_pct.setRange(100,200)
+        self.voice_boost_pct.setValue(150); self.voice_boost_pct.setSuffix(" %")
+        self.voice_boost_pct.setToolTip("人声整体增益；建议 140%～170% 更明显。")
+        voice_row=QHBoxLayout(); voice_row.setContentsMargins(0,0,0,0)
+        voice_row.addWidget(self.voice_boost); voice_row.addWidget(QLabel("增益")); voice_row.addWidget(self.voice_boost_pct)
+        voice_row.addStretch(1)
+        voice_wrap=QWidget(); voice_wrap.setLayout(voice_row)
+        self.voice_fx_preview_btn=QPushButton("试听收音效果（8秒）")
+        self.voice_fx_preview_btn.setObjectName("primary")
+        self.voice_fx_preview_btn.setToolTip(
+            "从当前播放位置截取约 8 秒，套用降噪/人声增强后试听。\n"
+            "实时预览播放器不会即时处理音轨，必须点此按钮才能对比。"
+        )
+        self.voice_fx_preview_btn.clicked.connect(self._preview_voice_cleanup_audio)
+        voice_tip=QLabel(
+            "勾选后点「试听」才能听到；导出成品也会生效。普通点播放听不出差别。"
+        )
+        voice_tip.setWordWrap(True)
+        voice_tip.setStyleSheet("color:#fbbf24;font-size:11px;")
+        audio_form.addRow("收音优化", self.audio_denoise)
+        audio_form.addRow("", voice_wrap)
+        audio_form.addRow("", self.voice_fx_preview_btn)
+        audio_form.addRow("", voice_tip)
+        for w in (self.audio_denoise, self.voice_boost, self.voice_boost_pct):
+            if hasattr(w, "toggled"):
+                w.toggled.connect(lambda *_: self._save_style_preferences() if hasattr(self, "_save_style_preferences") else None)
+            if hasattr(w, "valueChanged"):
+                w.valueChanged.connect(lambda *_: self._save_style_preferences() if hasattr(self, "_save_style_preferences") else None)
         audio_layout.addLayout(audio_form)
         self.audio_form=audio_form
         settings_layout.addWidget(audio_group)
@@ -7022,10 +7602,17 @@ class DynamicCaptionPage(QWidget):
         layer_layout.addLayout(layer_actions)
 
         # 时间设置固定在列表和操作按钮下方，不再被蒙版/文字长表单挤出可视区域。
-        overlay_hint=QLabel("选图层 → 设区间 → 加入轨道（轨道中拖动）")
-        overlay_hint.setToolTip("加入后：拖动轨道块中间可改变开始位置；拖动左右白色边缘可调整开始和结束时间。")
-        overlay_hint.setWordWrap(False)
-        overlay_hint.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:4px 6px;border-radius:4px;")
+        overlay_hint=QLabel(
+            "三步：①选中 PNG，调宽度/位置（中间预览立刻变，需勾选「实时字幕预览」）"
+            "→ ②设开始/结束秒 → ③点「加入当前视频」或「批量全部视频」。"
+        )
+        overlay_hint.setToolTip(
+            "导入 PNG 后先在预览里调好看位置（请勾选播放器旁「实时字幕预览」）。\n"
+            "再填开始/结束时间，点「加入当前视频」才会变成限时出现。\n"
+            "加入后：时间轴紫色块可拖动；「从当前视频移除」或列表「删除」可清掉。"
+        )
+        overlay_hint.setWordWrap(True)
+        overlay_hint.setStyleSheet("color:#7dd3fc;background:#0b1830;padding:6px 8px;border-radius:4px;")
         layer_layout.addWidget(overlay_hint)
         overlay_timing=QGridLayout(); overlay_timing.setHorizontalSpacing(5); overlay_timing.setVerticalSpacing(4)
         self.overlay_start=QDoubleSpinBox(); self.overlay_start.setRange(0,86400); self.overlay_start.setDecimals(2); self.overlay_start.setSuffix(" s")
@@ -7056,11 +7643,18 @@ class DynamicCaptionPage(QWidget):
             "时长超过片长的会自动截断。与字幕「批量共用样式」同类。"
         )
         self.add_layer_to_all_videos.clicked.connect(self._add_selected_layer_to_all_videos)
+        self.remove_layer_from_timeline=QPushButton("从当前视频移除")
+        self.remove_layer_from_timeline.setToolTip(
+            "删除当前视频声明轨上、与选中模板同 ID 的叠加块（不删模板本身）。"
+            "也可在时间轴选中色块后点「删除」或右键删除。"
+        )
+        self.remove_layer_from_timeline.clicked.connect(self._remove_selected_layer_from_current_video)
         overlay_timing.addWidget(QLabel("开始"),0,0); overlay_timing.addWidget(self.overlay_start,0,1)
         overlay_timing.addWidget(QLabel("结束"),0,2); overlay_timing.addWidget(self.overlay_end,0,3)
         overlay_timing.addWidget(self.overlay_from_playhead,1,0,1,2)
         overlay_timing.addWidget(self.add_layer_to_timeline,1,2,1,2)
-        overlay_timing.addWidget(self.add_layer_to_all_videos,2,0,1,4)
+        overlay_timing.addWidget(self.add_layer_to_all_videos,2,0,1,2)
+        overlay_timing.addWidget(self.remove_layer_from_timeline,2,2,1,2)
         overlay_timing.addWidget(QLabel("淡入"),3,0); overlay_timing.addWidget(self.overlay_fade_in,3,1)
         overlay_timing.addWidget(QLabel("淡出"),3,2); overlay_timing.addWidget(self.overlay_fade_out,3,3)
         layer_layout.addLayout(overlay_timing)
@@ -7944,7 +8538,8 @@ class DynamicCaptionPage(QWidget):
         self.timeline_timestamp_view.setReadOnly(False)
         self.timeline_timestamp_view.setMinimumHeight(150)
         self.timeline_timestamp_view.setPlaceholderText(
-            "提取字幕后可直接修改时间戳或文字；修改会同步到底部字幕轨道和最终导出。"
+            "提取字幕后可直接改时间戳或文字；会写入当前视频导出缓存。"
+            "改完请直接「开始批量导出」（不必再走文案校对）。"
         )
         self.timeline_timestamp_view.setStyleSheet("font-family:Consolas,'Microsoft YaHei UI';font-size:12px;")
         self.override_text.textChanged.connect(self._sync_timeline_timestamp_view)
@@ -8084,6 +8679,16 @@ class DynamicCaptionPage(QWidget):
         compact_image_layout.addWidget(QLabel("纵向"),2,2); compact_image_layout.addWidget(self.image_layer_y,2,3)
         compact_image_layout.addWidget(QLabel("定位"),3,0)
         compact_image_layout.addWidget(self.image_quick_combo,3,1)
+        self.image_stack_order=QComboBox()
+        self.image_stack_order.addItem("图片在字幕上面（默认）", STACK_ABOVE_CAPTIONS)
+        self.image_stack_order.addItem("字幕在图片上面", STACK_BELOW_CAPTIONS)
+        self.image_stack_order.setToolTip(
+            "控制 PNG 声明图与字幕谁在上层。\n"
+            "默认图片压在字幕上；需要读字幕时再选「字幕在图片上面」。"
+        )
+        self.image_stack_order.currentIndexChanged.connect(self._image_layer_changed)
+        compact_image_layout.addWidget(QLabel("层级"),4,0)
+        compact_image_layout.addWidget(self.image_stack_order,4,1,1,3)
         compact_image_layout.setColumnStretch(1,1); compact_image_layout.setColumnStretch(3,1)
         self.image_layer_path.setMinimumWidth(0)
         self.image_layer_path.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed)
@@ -8122,9 +8727,152 @@ class DynamicCaptionPage(QWidget):
         video_settings_layout.addRow("画面比例", self.aspect_ratio)
         video_settings_layout.addRow("画面分辨率", self.resolution)
         video_settings_layout.addRow("视频延长", self.video_extend_mode)
+
+        grade_group=QGroupBox("画面调色（亮度 / 对比度 / 饱和度）")
+        grade_layout=QFormLayout(grade_group)
+        grade_layout.setVerticalSpacing(8)
+        grade_tip=QLabel(
+            "拖滑条后预览马上变（只调画面，黑边不变灰）。"
+            "若在看「轨道预览」成品，请先点「清除预览」。可选「一键提亮」温和提亮。"
+        )
+        grade_tip.setWordWrap(True)
+        grade_tip.setStyleSheet("color:#7dd3fc;font-size:11px;")
+        grade_layout.addRow(grade_tip)
+        self.grade_brightness=QSlider(Qt.Orientation.Horizontal)
+        self.grade_brightness.setRange(-100,100); self.grade_brightness.setValue(0)
+        self.grade_brightness.setToolTip(
+            "偏暗素材可往右提亮；0 为原片。\n"
+            "实时预览会立刻变亮/变暗；导出与轨道预览同样生效。\n"
+            "建议先拖到 +30～+50 看差异。"
+        )
+        self.grade_brightness_value=QLabel("0")
+        self.grade_contrast=QSlider(Qt.Orientation.Horizontal)
+        self.grade_contrast.setRange(0,200); self.grade_contrast.setValue(100)
+        self.grade_contrast.setToolTip("100 为原片对比度。")
+        self.grade_contrast_value=QLabel("100")
+        self.grade_saturation=QSlider(Qt.Orientation.Horizontal)
+        self.grade_saturation.setRange(0,200); self.grade_saturation.setValue(100)
+        self.grade_saturation.setToolTip("100 为原片饱和度；略提高可让画面更鲜艳。")
+        self.grade_saturation_value=QLabel("100")
+
+        def _grade_row(slider, value_label):
+            row=QHBoxLayout(); row.setContentsMargins(0,0,0,0)
+            row.addWidget(slider,1); row.addWidget(value_label)
+            wrap=QWidget(); wrap.setLayout(row); return wrap
+
+        grade_layout.addRow("亮度", _grade_row(self.grade_brightness, self.grade_brightness_value))
+        grade_layout.addRow("对比度", _grade_row(self.grade_contrast, self.grade_contrast_value))
+        grade_layout.addRow("饱和度", _grade_row(self.grade_saturation, self.grade_saturation_value))
+        grade_preset_row=QHBoxLayout()
+        self.grade_preset=QComboBox()
+        self.grade_preset.addItem("自定义 / 原片", "custom")
+        self.grade_preset.addItem("一键提亮", "brighten")
+        self.grade_preset.addItem("清新", "fresh")
+        self.grade_preset.addItem("电影感", "cinema")
+        self.grade_preset.setToolTip("快速套用常用调色；之后仍可用滑条微调。")
+        grade_reset=QPushButton("复位原片")
+        grade_reset.setToolTip("亮度 0，对比度/饱和度 100")
+        grade_preset_row.addWidget(self.grade_preset,1)
+        grade_preset_row.addWidget(grade_reset)
+        grade_layout.addRow("预设", grade_preset_row)
+
+        def _refresh_grade_preview():
+            if getattr(self, "_precise_preview_active", False) and hasattr(self, "_clear_precise_preview"):
+                try:
+                    self._clear_precise_preview()
+                except Exception:
+                    self._precise_preview_active = False
+            try:
+                if getattr(self, "preview_capture", None) is not None:
+                    self._render_preview_frame(force=True)
+                elif hasattr(self, "_display_cached_preview"):
+                    self._display_cached_preview()
+                elif hasattr(self, "_refresh_live_preview"):
+                    self._refresh_live_preview()
+            except Exception:
+                if hasattr(self, "_refresh_live_preview"):
+                    self._refresh_live_preview()
+
+        def _sync_grade_labels(*_a):
+            self.grade_brightness_value.setText(str(self.grade_brightness.value()))
+            self.grade_contrast_value.setText(str(self.grade_contrast.value()))
+            self.grade_saturation_value.setText(str(self.grade_saturation.value()))
+            # 仅「用户拖滑条」时回到自定义；套用预设时不要把下拉框改回去
+            if not getattr(self, "_grade_applying_preset", False):
+                if hasattr(self, "grade_preset") and self.grade_preset.currentData() != "custom":
+                    self.grade_preset.blockSignals(True)
+                    self.grade_preset.setCurrentIndex(0)
+                    self.grade_preset.blockSignals(False)
+                if hasattr(self, "_save_style_preferences"):
+                    self._save_style_preferences()
+                _refresh_grade_preview()
+
+        for sl in (self.grade_brightness, self.grade_contrast, self.grade_saturation):
+            sl.valueChanged.connect(_sync_grade_labels)
+        self.grade_brightness_value.setText(str(self.grade_brightness.value()))
+        self.grade_contrast_value.setText(str(self.grade_contrast.value()))
+        self.grade_saturation_value.setText(str(self.grade_saturation.value()))
+
+        def _apply_grade_preset(index):
+            key=str(self.grade_preset.itemData(index) or "custom")
+            # 温和预设：能看出来，但不过曝（接近上次「还可以」的幅度）
+            presets={
+                "brighten": (18, 108, 108),
+                "fresh": (10, 105, 118),
+                "cinema": (-8, 112, 92),
+            }
+            if key not in presets:
+                return
+            b,c,s=presets[key]
+            self._grade_applying_preset = True
+            try:
+                for w in (self.grade_brightness, self.grade_contrast, self.grade_saturation):
+                    w.blockSignals(True)
+                self.grade_brightness.setValue(b)
+                self.grade_contrast.setValue(c)
+                self.grade_saturation.setValue(s)
+                for w in (self.grade_brightness, self.grade_contrast, self.grade_saturation):
+                    w.blockSignals(False)
+                self.grade_brightness_value.setText(str(b))
+                self.grade_contrast_value.setText(str(c))
+                self.grade_saturation_value.setText(str(s))
+            finally:
+                self._grade_applying_preset = False
+            if hasattr(self, "_save_style_preferences"):
+                self._save_style_preferences()
+            _refresh_grade_preview()
+            if hasattr(self, "_append_run_log"):
+                self._append_run_log(
+                    f"已套用调色预设「{self.grade_preset.currentText()}」："
+                    f"亮度 {b} / 对比度 {c} / 饱和度 {s}。"
+                )
+        self.grade_preset.currentIndexChanged.connect(_apply_grade_preset)
+
+        def _reset_grade():
+            self._grade_applying_preset = True
+            try:
+                for w in (self.grade_brightness, self.grade_contrast, self.grade_saturation, self.grade_preset):
+                    w.blockSignals(True)
+                self.grade_brightness.setValue(0)
+                self.grade_contrast.setValue(100)
+                self.grade_saturation.setValue(100)
+                self.grade_preset.setCurrentIndex(0)
+                for w in (self.grade_brightness, self.grade_contrast, self.grade_saturation, self.grade_preset):
+                    w.blockSignals(False)
+                self.grade_brightness_value.setText("0")
+                self.grade_contrast_value.setText("100")
+                self.grade_saturation_value.setText("100")
+            finally:
+                self._grade_applying_preset = False
+            if hasattr(self, "_save_style_preferences"):
+                self._save_style_preferences()
+            _refresh_grade_preview()
+        grade_reset.clicked.connect(_reset_grade)
+
         video_settings_page_content=QWidget()
         video_settings_page_layout=QVBoxLayout(video_settings_page_content)
         video_settings_page_layout.addWidget(video_settings_group)
+        video_settings_page_layout.addWidget(grade_group)
         video_settings_page_layout.addStretch()
 
         video_effects_group=QGroupBox("转场预设")
@@ -8675,7 +9423,11 @@ class DynamicCaptionPage(QWidget):
             return
         text=self.timeline_timestamp_view.toPlainText()
         if self.override_text.toPlainText()!=text:
+            # 会触发 _timeline_text_changed → 持久化到 timeline_overrides
             self.override_text.setPlainText(text)
+        else:
+            # 内容相同也可能是首次绑定；仍强制写入导出缓存
+            self._persist_caption_editor_text(text)
 
     def _show_left_setting_index(self, index):
         if not hasattr(self, "left_settings_stack"):
@@ -8712,9 +9464,21 @@ class DynamicCaptionPage(QWidget):
             self.bgm_selection_mode.blockSignals(True)
             self.bgm_selection_mode.setCurrentIndex(0)
             self.bgm_selection_mode.blockSignals(False)
+        if hasattr(self, "bgm_enabled"):
+            self.bgm_enabled.blockSignals(True)
+            self.bgm_enabled.setChecked(True)
+            self.bgm_enabled.blockSignals(False)
+            self.background_volume.setEnabled(True)
+        # 若当前还是「仅视频原声」，自动升到「原声＋背景音乐」以便记忆与导出一致
+        if hasattr(self, "audio_mode") and "背景音乐" not in self.audio_mode.currentText():
+            self.audio_mode.setCurrentText("视频原声＋背景音乐")
         self.load_audio_preview(self._selected_bgm_path)
         self._append_run_log(f"已添加背景音乐轨道：{Path(path).name}")
         self._refresh_canva_timeline()
+        try:
+            self._save_style_preferences()
+        except Exception:
+            pass
 
     def _bgm_selection_mode_changed(self, text):
         random_mode = str(text).startswith("随机")
@@ -8728,6 +9492,10 @@ class DynamicCaptionPage(QWidget):
             if random_mode else "背景音乐已设为固定音频与固定起始点。"
         )
         self._refresh_canva_timeline()
+        try:
+            self._save_style_preferences()
+        except Exception:
+            pass
 
     def _bgm_enabled_changed(self, enabled):
         enabled=bool(enabled)
@@ -8737,6 +9505,10 @@ class DynamicCaptionPage(QWidget):
             if enabled else "已关闭背景音乐，最终合成不会加入 BGM 轨道。"
         )
         self._refresh_canva_timeline()
+        try:
+            self._save_style_preferences()
+        except Exception:
+            pass
 
     def _choose_ambient_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -8753,8 +9525,16 @@ class DynamicCaptionPage(QWidget):
             self.ambient_enabled.blockSignals(True)
             self.ambient_enabled.setChecked(True)
             self.ambient_enabled.blockSignals(False)
+        if hasattr(self, "audio_mode"):
+            cur = self.audio_mode.currentText()
+            if "配乐" not in cur and "视频配音" not in cur:
+                self.audio_mode.setCurrentText("视频原声＋背景音乐＋配乐")
         self._append_run_log(f"已添加环境音轨道：{Path(path).name}")
         self._refresh_canva_timeline()
+        try:
+            self._save_style_preferences()
+        except Exception:
+            pass
 
     def _clear_ambient_file(self):
         self._selected_ambient_path = ""
@@ -8765,6 +9545,10 @@ class DynamicCaptionPage(QWidget):
             self.ambient_enabled.setChecked(False)
             self.ambient_enabled.blockSignals(False)
         self._append_run_log("已清除环境音。")
+        try:
+            self._save_style_preferences()
+        except Exception:
+            pass
         self._refresh_canva_timeline()
 
     def _ambient_enabled_changed(self, enabled):
@@ -9663,6 +10447,7 @@ class DynamicCaptionPage(QWidget):
         
         caption_source = self._caption_source_for_video(video_path)
         self._active_timeline_source = caption_source
+        self._active_caption_video_path = str(video_path)
         
         # Sync audio selection
         if source and hasattr(self, "audios"):
@@ -9729,7 +10514,13 @@ class DynamicCaptionPage(QWidget):
                 text_state="已填写" if self.free_texts.get(video_key,"").strip() else "待填写"
             else:
                 audio_key=self._timeline_key(str(audio))
-                text_state="已提取" if (self.timeline_overrides.get(audio_key,"").strip() or self.timeline_words.get(audio_key,"")) else "待提取"
+                has_caps = bool(
+                    (self.timeline_overrides.get(video_key, "") or "").strip()
+                    or (self.timeline_words.get(video_key, "") or "").strip()
+                    or (self.timeline_overrides.get(audio_key, "") or "").strip()
+                    or (self.timeline_words.get(audio_key, "") or "").strip()
+                )
+                text_state = "已提取" if has_caps else "待提取"
             values=(f"{row+1:02d}",video.name,f"{audio.name}（{reason}）",text_state)
             for column,value in enumerate(values):
                 item=QTableWidgetItem(value); item.setToolTip(value); self.task_queue.setItem(row,column,item)
@@ -10497,16 +11288,35 @@ class DynamicCaptionPage(QWidget):
 
         返回 (cut, active_word)：cut 为 1-based 当前词序号；无词时为 (0, "")。
         仅有句级字幕时也会推进高亮，避免 Descript 经典黄等 word_color 效果一直全白。
+        时钟必须与 _live_caption_data 一致（切片未对齐时映射到源时刻）。
         """
         n = len(tokens or [])
         if n <= 0:
             return 0, ""
         phrase_events, word_events_all = getattr(self, "_live_timeline_cache", ([], [])) or ([], [])
+        adj = max(0.0, float(seconds or 0.0))
         try:
-            v_start = self._current_video_v_start() if hasattr(self, "_current_video_v_start") else 0.0
+            state = self._current_timeline_edit_state() if self._timeline_edits_active() else {}
+            segs = list((state.get("tracks") or {}).get("video") or [])
+            aligned = bool(state.get("captions_timeline_aligned"))
+            need_map = (
+                not getattr(self, "_precise_preview_active", False)
+                and self._timeline_edits_active()
+                and video_segments_need_caption_retime(segs)
+                and not aligned
+            )
+            if need_map:
+                source_ms, _path = self._map_timeline_ms_to_source(int(adj * 1000))
+                adj = max(0.0, float(source_ms) / 1000.0)
+            else:
+                v_start = self._current_video_v_start() if hasattr(self, "_current_video_v_start") else 0.0
+                adj = max(0.0, adj - float(v_start or 0.0))
         except Exception:
-            v_start = 0.0
-        adj = max(0.0, float(seconds) - float(v_start or 0.0))
+            try:
+                v_start = self._current_video_v_start() if hasattr(self, "_current_video_v_start") else 0.0
+                adj = max(0.0, float(seconds) - float(v_start or 0.0))
+            except Exception:
+                adj = max(0.0, float(seconds or 0.0))
 
         event = next((item for item in phrase_events if item[0] <= adj <= item[1]), None)
         if event is None and phrase_events:
@@ -10525,9 +11335,10 @@ class DynamicCaptionPage(QWidget):
             start, end = float(event[0]), float(event[1])
             phrase_words = []
             if word_events_all:
+                # 与 write_ass 一致用 ±0.01，避免边界词预览/导出不一致
                 phrase_words = [
                     w for w in word_events_all
-                    if start - 0.02 <= (w[0] + w[1]) / 2 <= end + 0.02
+                    if start - 0.01 <= (w[0] + w[1]) / 2 <= end + 0.01
                 ]
             # 与 write_ass 相同：词级足够则用真实时间，否则句内均分
             if len(phrase_words) == n:
@@ -10564,6 +11375,51 @@ class DynamicCaptionPage(QWidget):
                     return i + 1, active_word
         return 1, tokens[0]
 
+    def _live_layers_cache_sig(self, seconds: float = 0.0) -> tuple:
+        """Fingerprint of mask/PNG/text layers so slider edits bust the overlay cache."""
+        rows = []
+        try:
+            for layer in (self.layers or []):
+                if not isinstance(layer, dict):
+                    continue
+                rows.append((
+                    str(layer.get("type", "")),
+                    str(layer.get("template_id", "")),
+                    bool(layer.get("timeline_template_only")),
+                    bool(layer.get("enabled", True)),
+                    str(layer.get("path", "")),
+                    int(layer.get("w", 0) or 0),
+                    int(layer.get("h", 0) or 0),
+                    int(layer.get("x", 0) or 0),
+                    int(layer.get("y", 0) or 0),
+                    int(layer.get("opacity", 0) or 0),
+                    str(layer.get("stack_order", "")),
+                    str(layer.get("text", ""))[:40],
+                    str(layer.get("color", "")),
+                ))
+            key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+            state = dict(self.timeline_edit_states.get(key, {}) or {}) if key else {}
+            for item in (state.get("overlays") or []):
+                if not isinstance(item, dict):
+                    continue
+                layer = dict(item.get("layer") or {})
+                rows.append((
+                    "overlay",
+                    int(item.get("start", 0) or 0),
+                    int(item.get("end", 0) or 0),
+                    str(layer.get("type", "")),
+                    str(layer.get("template_id", "")),
+                    str(layer.get("path", "")),
+                    int(layer.get("w", 0) or 0),
+                    int(layer.get("x", 0) or 0),
+                    int(layer.get("y", 0) or 0),
+                    int(layer.get("opacity", 0) or 0),
+                    str(layer.get("stack_order", "")),
+                ))
+        except Exception:
+            return ("err",)
+        return tuple(rows)
+
     def _caption_progress_key(self, seconds: float) -> tuple:
         """词级进度键：跟读切到第几个词时必须重建字幕层，否则高亮会卡住跟不上节奏。"""
         try:
@@ -10599,6 +11455,19 @@ class DynamicCaptionPage(QWidget):
                 display = base
             else:
                 display = self._make_916_canvas(base)
+        # 实时调色：只处理画面内容区，letterbox 黑边保持原色（避免提亮变灰/过曝）
+        try:
+            grade_settings = {
+                "grade_brightness": int(self.grade_brightness.value()) if hasattr(self, "grade_brightness") else 0,
+                "grade_contrast": int(self.grade_contrast.value()) if hasattr(self, "grade_contrast") else 100,
+                "grade_saturation": int(self.grade_saturation.value()) if hasattr(self, "grade_saturation") else 100,
+            }
+            content_rect = getattr(self, "_preview_content_rect", None) or (
+                0, 0, display.width(), display.height()
+            )
+            display = apply_color_grade_content_region(display, grade_settings, content_rect)
+        except Exception:
+            pass
         # 永远用播放器时间对齐口播节奏（OpenCV 读头可能略滞后）
         try:
             clock_ms = int(self.player.position() or 0)
@@ -10634,6 +11503,8 @@ class DynamicCaptionPage(QWidget):
                 for e in (getattr(self, "_watermark_entries", None) or [])
             )
             wm_t_bucket = int(max(0.0, float(seconds)) * 20) if has_anim_wm else 0  # 20fps 刷新 Logo
+            # 图层几何必须进 cache key，否则调 PNG 宽高/位置预览不刷新
+            layers_sig = self._live_layers_cache_sig(float(seconds))
             overlay_key = (
                 display.width(), display.height(), progress, style_token, margin, preset,
                 bool(getattr(self, "_watermark_images", None) or (
@@ -10641,6 +11512,7 @@ class DynamicCaptionPage(QWidget):
                 )),
                 wm_t_bucket,
                 len(getattr(self, "_watermark_entries", None) or []),
+                layers_sig,
             )
             caption_layer = getattr(self, "_preview_caption_overlay", QImage())
             if (
@@ -11274,20 +12146,32 @@ class DynamicCaptionPage(QWidget):
         name = item["name"]
         for btn in self.preset_buttons:
             btn.setChecked(btn.name == name)
-        # 应用预设 = 更新批量共用样式；当前若在「独立样式」视频上则也覆盖该视频
+        # 点预设 = 批量共用样式。必须清掉其它视频的「独立样式」，
+        # 否则个别视频导出仍用旧颜色（用户反馈批量预设颜色不一致的主因）。
         self._loading_video_style = False
+        if hasattr(self, "style_scope_video_only"):
+            self.style_scope_video_only.blockSignals(True)
+            self.style_scope_video_only.setChecked(False)
+            self.style_scope_video_only.blockSignals(False)
+        cleared = 0
+        if getattr(self, "video_style_overrides", None):
+            cleared = len(self.video_style_overrides)
+            self.video_style_overrides = {}
         if item["is_custom"]:
             self._apply_style_template_data(item["data"])
             self._append_run_log(f"已应用自定义预设：{name}")
         else:
             self.apply_preset(name)
         self._remember_batch_style_snapshot()
-        # 若当前视频已有独立样式，预设也写入该视频（用户主动点预设）
-        if self._has_video_style_override():
-            self._mark_current_video_style_override()
-        else:
-            # 批量样式变化不自动给未标记视频写 override
-            self._update_batch_style_hint()
+        self._update_batch_style_hint()
+        self._live_caption_style_cache = None
+        self._invalidate_preview_caption_overlay()
+        self._refresh_live_preview()
+        if cleared:
+            self._append_run_log(
+                f"已清除 {cleared} 个视频的独立样式，全部改用批量预设「{name}」"
+                f"（避免个别片颜色/底色与预设不一致）。"
+            )
 
     def _delete_preset_by_index(self, idx):
         if idx < 0 or idx >= len(self.all_presets):
@@ -11588,10 +12472,21 @@ class DynamicCaptionPage(QWidget):
             "animation_speed":self.animation_speed.value(),
             "outline_width":self.outline_width.value(),"position":self.position.currentText(),
             "margin_v":self.margin_v.value(),"audio_match_mode":self.audio_match_mode.currentText(),
-            "audio_mode":self._get_audio_mode_internal(),"encoder_backend":self.encoder_backend.currentText(),
+            # 同时存内部三态 + UI 四选一文案，避免「原声＋BGM」被压成「保留原音」丢记忆
+            "audio_mode": self._get_audio_mode_internal(),
+            "audio_mode_ui": (
+                self.audio_mode.currentText() if hasattr(self, "audio_mode") else "视频原声"
+            ),
+            "encoder_backend":self.encoder_backend.currentText(),
             "original_volume":self.original_volume.value(),"background_volume":self.background_volume.value(),
             "audio_fade_mode":self.audio_fade_mode.currentText(),
             "audio_fade_in_ms":self.audio_fade_in.value(),"audio_fade_out_ms":self.audio_fade_out.value(),
+            "audio_denoise": bool(getattr(self, "audio_denoise", None) and self.audio_denoise.isChecked()),
+            "voice_boost": bool(getattr(self, "voice_boost", None) and self.voice_boost.isChecked()),
+            "voice_boost_pct": int(self.voice_boost_pct.value()) if hasattr(self, "voice_boost_pct") else 130,
+            "grade_brightness": int(self.grade_brightness.value()) if hasattr(self, "grade_brightness") else 0,
+            "grade_contrast": int(self.grade_contrast.value()) if hasattr(self, "grade_contrast") else 100,
+            "grade_saturation": int(self.grade_saturation.value()) if hasattr(self, "grade_saturation") else 100,
             "encode_preset":self.encode_preset.currentText(),"clean_metadata":self.clean_metadata.isChecked(),
             "watermark_mode":self.watermark_mode.currentText(),"watermark_position":self.watermark_position.currentText(),
             "watermark_width":self.watermark_width.value(),"watermark_opacity":self.watermark_opacity.value(),
@@ -11657,11 +12552,45 @@ class DynamicCaptionPage(QWidget):
         }
 
     def _get_audio_mode_internal(self, text=None):
-        txt = text if text is not None else (self.audio_mode.currentText() if hasattr(self, "audio_mode") else "")
+        """UI 文案 → 导出/预览内部三态。
+
+        以前把「视频原声＋背景音乐」也压成「保留视频原音」，导致偏好存盘丢失合成方式，
+        重启后又被还原成「视频原声」并关掉 BGM。
+        """
+        txt = str(
+            text if text is not None
+            else (self.audio_mode.currentText() if hasattr(self, "audio_mode") else "")
+        )
         if ("视频配音" in txt or "清除视频原音" in txt or "消除视频原音" in txt
-                or "清除视频噪音" in txt or "替换" in txt):
+                or "清除视频噪音" in txt or ("替换" in txt and "背景" not in txt)):
             return "替换为添加的音频"
+        if ("背景音乐" in txt or "原声＋背景" in txt or "混合" in txt
+                or "BGM" in txt.upper()):
+            return "原声＋背景音混合"
+        if txt in ("替换为添加的音频", "原声＋背景音混合", "保留视频原音"):
+            return txt
         return "保留视频原音"
+
+    def _audio_mode_ui_label(self, internal_or_ui: str = "") -> str:
+        """偏好/内部值 → 下拉框可见文案（四选一）。"""
+        val = str(internal_or_ui or "").strip()
+        if not val and hasattr(self, "audio_mode"):
+            return self.audio_mode.currentText()
+        # 已是 UI 文案
+        if hasattr(self, "audio_mode"):
+            idx = self.audio_mode.findText(val)
+            if idx >= 0:
+                return val
+        if val == "替换为添加的音频" or "视频配音" in val:
+            return "视频配音＋背景音乐"
+        if "配乐" in val and "视频配音" not in val:
+            return "视频原声＋背景音乐＋配乐"
+        if val in ("原声＋背景音混合",) or "背景音乐" in val or "原声＋背景" in val:
+            # 若记忆里单独有配乐开关，加载时再用 ambient 覆盖为「＋配乐」
+            return "视频原声＋背景音乐"
+        if val in ("保留视频原音", "视频原声"):
+            return "视频原声"
+        return val or "视频原声"
 
     def _save_style_preferences(self,*_args):
         """防抖写入：拖滑条时不每步写盘。"""
@@ -11689,8 +12618,15 @@ class DynamicCaptionPage(QWidget):
                 if hasattr(self, "style_scope_video_only") and self.style_scope_video_only.isChecked():
                     self._mark_current_video_style_override()
                 else:
+                    # 批量改字号/间距等也必须清掉独立样式，否则个别片仍带旧底色导出
+                    n = len(getattr(self, "video_style_overrides", {}) or {})
+                    if n:
+                        self.video_style_overrides = {}
+                        self._append_run_log(
+                            f"已更新批量样式，并清除 {n} 个视频独立样式"
+                            f"（避免个别片颜色/底色与批量预设不一致）。"
+                        )
                     self._remember_batch_style_snapshot()
-                    # 若当前视频已有独立样式且未勾选「仅当前视频」，不覆盖独立样式
                     self._update_batch_style_hint()
         except Exception:
             pass
@@ -11767,7 +12703,7 @@ class DynamicCaptionPage(QWidget):
             )
 
     def _settings_for_video_path(self, video_path: str) -> dict:
-        """导出/预览用：有独立样式则合并，否则当前批量 UI 设置。"""
+        """导出/预览用：有独立样式则合并；否则优先批量快照（与 CaptionWorker 一致）。"""
         base = self._current_settings() if hasattr(self, "_current_settings") else {}
         key = self._style_override_key(video_path)
         overrides = getattr(self, "video_style_overrides", None) or {}
@@ -11778,14 +12714,27 @@ class DynamicCaptionPage(QWidget):
                 per = overrides.get(Path(video_path).name)
             except Exception:
                 per = None
+        # 当前选中视频：UI 即真相（可能刚拖了滑条尚未写入 snapshot）
+        current_key = ""
+        try:
+            current_key = self._style_override_key() if hasattr(self, "_style_override_key") else ""
+        except Exception:
+            current_key = ""
+        is_current = bool(key and current_key and key == current_key)
         if isinstance(per, dict) and per:
             merged = dict(base)
             merged.update(per)
             return merged
+        if not is_current:
+            # 非当前片：绝不能用「当前 UI 上某片独立样式」污染，改用批量快照
+            batch = getattr(self, "_batch_style_snapshot", None) or base.get("batch_style_snapshot")
+            base = merge_batch_style_into(base, batch)
         return base
 
     def _remember_batch_style_snapshot(self):
         """在应用批量预设时记录「共用样式」快照。"""
+        if getattr(self, "_loading_video_style", False) or getattr(self, "_restoring_style", False):
+            return
         try:
             self._batch_style_snapshot = self._style_template_snapshot()
         except Exception:
@@ -11820,8 +12769,30 @@ class DynamicCaptionPage(QWidget):
         if preset in ("Reels 白字柔影", "Reels 重点放大"):
             preset = "Reels 语义重点"
         if preset in PRESETS: self.apply_preset(preset)
+        # 先还原声音合成 UI（含 BGM/配乐四选一），再还原其它下拉，避免 audio_mode_changed 冲掉 match_mode
+        saved_audio_ui = str(saved.get("audio_mode_ui") or "").strip()
+        if not saved_audio_ui:
+            saved_audio_ui = self._audio_mode_ui_label(str(saved.get("audio_mode") or ""))
+        # 旧版只存了「保留视频原音」，但 bgm_enabled=True → 实际是原声+BGM
+        if (
+            saved_audio_ui in ("视频原声", "保留视频原音", "")
+            and bool(saved.get("bgm_enabled"))
+        ):
+            if bool(saved.get("ambient_enabled")) or str(saved.get("selected_ambient_path") or "").strip():
+                saved_audio_ui = "视频原声＋背景音乐＋配乐"
+            else:
+                saved_audio_ui = "视频原声＋背景音乐"
+        if hasattr(self, "audio_mode") and saved_audio_ui:
+            label = self._audio_mode_ui_label(saved_audio_ui)
+            if self.audio_mode.findText(label) < 0 and bool(saved.get("ambient_enabled")):
+                label = "视频原声＋背景音乐＋配乐"
+            if self.audio_mode.findText(label) >= 0:
+                self.audio_mode.blockSignals(True)
+                self.audio_mode.setCurrentText(label)
+                self.audio_mode.blockSignals(False)
+
         combos={"font":self.font,"caption_mode":self.caption_mode,"free_animation":self.free_animation,
-                "position":self.position,"audio_match_mode":self.audio_match_mode,"audio_mode":self.audio_mode,
+                "position":self.position,"audio_match_mode":self.audio_match_mode,
                 "audio_fade_mode":self.audio_fade_mode,
                 "encoder_backend":self.encoder_backend,"encode_preset":self.encode_preset,
                 "watermark_mode":self.watermark_mode,"watermark_position":self.watermark_position,
@@ -11836,22 +12807,24 @@ class DynamicCaptionPage(QWidget):
                "original_volume":self.original_volume,"background_volume":self.background_volume,
                "audio_fade_in_ms":self.audio_fade_in,"audio_fade_out_ms":self.audio_fade_out,
                "watermark_opacity":self.watermark_opacity,"watermark_margin":self.watermark_margin,
-               "transition_duration":self.transition_duration}
+               "transition_duration":self.transition_duration,
+               "voice_boost_pct": getattr(self, "voice_boost_pct", None),
+               "grade_brightness": getattr(self, "grade_brightness", None),
+               "grade_contrast": getattr(self, "grade_contrast", None),
+               "grade_saturation": getattr(self, "grade_saturation", None)}
+        spins={k:v for k,v in spins.items() if v is not None}
         for key,control in combos.items():
             if key in saved:
                 val = str(saved[key])
-                if key == "audio_mode":
-                    if val == "替换为添加的音频":
-                        val = "视频配音＋背景音乐"
-                    elif val == "原声＋背景音混合":
-                        val = "视频原声＋背景音乐"
-                    elif val == "保留视频原音":
-                        val = "视频原声"
                 control.setCurrentText(val)
         for key,control in spins.items():
             if key in saved:
                 try: control.setValue(float(saved[key]) if isinstance(control.value(),float) else int(saved[key]))
                 except (TypeError,ValueError): pass
+        if "audio_denoise" in saved and hasattr(self, "audio_denoise"):
+            self.audio_denoise.setChecked(bool(saved.get("audio_denoise")))
+        if "voice_boost" in saved and hasattr(self, "voice_boost"):
+            self.voice_boost.setChecked(bool(saved.get("voice_boost")))
         if "bgm_dir" in saved:
             self.bgm_dir_input.setText(str(saved["bgm_dir"]))
         if "bgm_selection_mode" in saved and hasattr(self,"bgm_selection_mode"):
@@ -11883,6 +12856,11 @@ class DynamicCaptionPage(QWidget):
                     self.load_audio_preview(str(saved["bgm_dir"]))
                 except Exception:
                     pass
+            elif (not random_bgm) and saved.get("bgm_dir") and Path(str(saved["bgm_dir"])).is_dir():
+                try:
+                    self._load_first_bgm_preview(str(saved["bgm_dir"]))
+                except Exception:
+                    pass
         ambient_path = str(saved.get("selected_ambient_path") or "").strip()
         if ambient_path and Path(ambient_path).is_file():
             self._selected_ambient_path = str(Path(ambient_path).resolve())
@@ -11895,7 +12873,22 @@ class DynamicCaptionPage(QWidget):
                 self.ambient_volume.setValue(int(saved.get("ambient_volume") or 20))
             except (TypeError, ValueError):
                 pass
+        # 恢复控件启用状态；_restoring_style 期间不会强改 audio_match_mode / 冲掉路径
         self._audio_mode_changed(self.audio_mode.currentText())
+        # 再强制对齐一次 BGM/配乐勾选（与 UI 合成方式、记忆一致）
+        if hasattr(self, "bgm_enabled"):
+            want_bgm = "背景音乐" in str(self.audio_mode.currentText()) or bool(saved.get("bgm_enabled"))
+            self.bgm_enabled.blockSignals(True)
+            self.bgm_enabled.setChecked(bool(want_bgm))
+            self.bgm_enabled.blockSignals(False)
+            self.background_volume.setEnabled(bool(want_bgm))
+        if hasattr(self, "ambient_enabled"):
+            want_amb = bool(saved.get("ambient_enabled")) or (
+                "配乐" in str(self.audio_mode.currentText()) and "视频配音" not in str(self.audio_mode.currentText())
+            )
+            self.ambient_enabled.blockSignals(True)
+            self.ambient_enabled.setChecked(bool(want_amb))
+            self.ambient_enabled.blockSignals(False)
         if "proj_img_transition" in saved and hasattr(self, "proj_img_transition"):
             self.proj_img_transition.setCurrentText(str(saved["proj_img_transition"]))
         if "proj_img_animation" in saved and hasattr(self, "proj_img_animation"):
@@ -12166,7 +13159,11 @@ class DynamicCaptionPage(QWidget):
         if not phrase_srt and word_srt:
             phrase_srt = group_word_srt(word_srt, max_chars=max(18, self.line_length.value() * 2),
                                         max_words=self.max_words.value())
-        # 时间轴紫色字幕条是成片时钟；仅在已对齐/无需源映射时覆盖，避免「源时刻 + 成片轴」错位
+        # 时间轴紫色字幕条是成片时钟；仅在已对齐/无需源映射时可用。
+        # 但若 SRT 编辑器已有完整轴（例如刚「文案校对」），优先编辑器，避免预览仍显示旧字。
+        editor_srt = ""
+        if hasattr(self, "override_text"):
+            editor_srt = (self.override_text.toPlainText() or "").strip()
         if not need_map and hasattr(self, "canva_timeline"):
             try:
                 from .canva_timeline import write_srt
@@ -12180,10 +13177,15 @@ class DynamicCaptionPage(QWidget):
                     clips = getattr(canvas, "clips", None) or []
                     if clips:
                         canva_srt = (write_srt(clips) or "").strip()
-                if canva_srt and "-->" in canva_srt:
+                if editor_srt and "-->" in editor_srt:
+                    phrase_srt = editor_srt
+                elif canva_srt and "-->" in canva_srt:
                     phrase_srt = canva_srt
             except Exception:
-                pass
+                if editor_srt and "-->" in editor_srt:
+                    phrase_srt = editor_srt
+        elif editor_srt and "-->" in editor_srt and (not phrase_srt or "-->" not in phrase_srt):
+            phrase_srt = editor_srt
         cache_key = (phrase_srt, word_srt, bool(need_map))
         if cache_key != self._live_timeline_cache_key:
             self._live_timeline_cache_key = cache_key
@@ -12223,6 +13225,9 @@ class DynamicCaptionPage(QWidget):
             layer for layer in layers
             if not (isinstance(layer, dict) and layer.get("timeline_template_only"))
         ]
+        timed_images_below = []
+        timed_images_above = []
+        timed_other = []
         # 合并当前视频时间轴上的限时叠加（与导出 settings_with_timeline_overlays 对齐）
         try:
             key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
@@ -12243,7 +13248,13 @@ class DynamicCaptionPage(QWidget):
                 if not (o_start - 0.02 <= float(seconds) <= o_end + 0.02):
                     continue
                 layer["enabled"] = True
-                layers.append(layer)
+                if layer.get("type") == "image":
+                    if layer_stack_order(layer) == STACK_BELOW_CAPTIONS:
+                        timed_images_below.append(layer)
+                    else:
+                        timed_images_above.append(layer)
+                else:
+                    timed_other.append(layer)
         except Exception:
             pass
         if not any(isinstance(layer, dict) and layer.get("type") == "caption" for layer in layers):
@@ -12265,40 +13276,68 @@ class DynamicCaptionPage(QWidget):
         oy = cy + (ch - 1920.0 * scale) / 2.0
         painter.translate(ox, oy)
         painter.scale(scale, scale)
+
+        def _paint_one_layer(layer):
+            if not layer.get("enabled", True):
+                return False
+            if layer.get("type") == "mask":
+                color = QColor(layer.get("color", "#000000")); color.setAlphaF(max(0,min(1,float(layer.get("opacity",55))/100)))
+                x=1080*float(layer.get("x",10))/100; y=1920*float(layer.get("y",66))/100
+                width=1080*float(layer.get("w",80))/100; height=1920*float(layer.get("h",15))/100
+                radius_percent=max(0,min(100,int(layer.get("radius",35))))
+                radius=min(width,height)*.5*radius_percent/100
+                painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QBrush(color)); painter.drawRoundedRect(int(x),int(y),int(width),int(height),radius,radius)
+                return False
+            if layer.get("type") == "text":
+                self._paint_live_text_layer(painter,layer)
+                return False
+            if layer.get("type") == "image":
+                source=QImage(str(layer.get("path","")))
+                if not source.isNull():
+                    width=max(1,round(1080*float(layer.get("w",80))/100))
+                    scaled=source.scaledToWidth(width,Qt.TransformationMode.SmoothTransformation)
+                    center_x=1080*float(layer.get("x",50))/100
+                    center_y=1920*float(layer.get("y",50))/100
+                    painter.save()
+                    painter.setOpacity(max(.05,min(1.0,float(layer.get("opacity",100))/100)))
+                    painter.drawImage(
+                        int(center_x-scaled.width()/2),
+                        int(center_y-scaled.height()/2),
+                        scaled,
+                    )
+                    painter.restore()
+                return False
+            if layer.get("type") == "caption":
+                self._paint_live_caption(painter, image, seconds)
+                return True
+            return False
+
         try:
             painted_caption = False
+            # 1) 常驻非字幕层 + 声明文字/蒙版 + 字幕下方 PNG
             for layer in reversed(layers):
-                if not layer.get("enabled", True):
+                if layer.get("type") == "caption":
                     continue
-                if layer.get("type") == "mask":
-                    color = QColor(layer.get("color", "#000000")); color.setAlphaF(max(0,min(1,float(layer.get("opacity",55))/100)))
-                    x=1080*float(layer.get("x",10))/100; y=1920*float(layer.get("y",66))/100
-                    width=1080*float(layer.get("w",80))/100; height=1920*float(layer.get("h",15))/100
-                    radius_percent=max(0,min(100,int(layer.get("radius",35))))
-                    radius=min(width,height)*.5*radius_percent/100
-                    painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QBrush(color)); painter.drawRoundedRect(int(x),int(y),int(width),int(height),radius,radius)
-                elif layer.get("type") == "text":
-                    self._paint_live_text_layer(painter,layer)
-                elif layer.get("type") == "image":
-                    source=QImage(str(layer.get("path","")))
-                    if not source.isNull():
-                        width=max(1,round(1080*float(layer.get("w",80))/100))
-                        scaled=source.scaledToWidth(width,Qt.TransformationMode.SmoothTransformation)
-                        center_x=1080*float(layer.get("x",50))/100
-                        center_y=1920*float(layer.get("y",50))/100
-                        painter.save()
-                        painter.setOpacity(max(.05,min(1.0,float(layer.get("opacity",100))/100)))
-                        painter.drawImage(
-                            int(center_x-scaled.width()/2),
-                            int(center_y-scaled.height()/2),
-                            scaled,
-                        )
-                        painter.restore()
-                elif layer.get("type") == "caption":
-                    self._paint_live_caption(painter, image, seconds)
-                    painted_caption = True
+                if layer.get("type") == "image" and layer_stack_order(layer) != STACK_BELOW_CAPTIONS:
+                    continue
+                _paint_one_layer(layer)
+            for layer in timed_images_below:
+                _paint_one_layer(layer)
+            for layer in timed_other:
+                _paint_one_layer(layer)
+            # 2) 字幕
+            for layer in layers:
+                if layer.get("type") == "caption" and layer.get("enabled", True):
+                    painted_caption = _paint_one_layer(layer) or painted_caption
             if not painted_caption:
                 self._paint_live_caption(painter, image, seconds)
+            # 3) 默认：PNG 在字幕之上
+            for layer in reversed(layers):
+                if layer.get("type") == "image" and layer_stack_order(layer) == STACK_ABOVE_CAPTIONS:
+                    if not layer.get("timeline_template_only"):
+                        _paint_one_layer(layer)
+            for layer in timed_images_above:
+                _paint_one_layer(layer)
             # 成片已烧录水印时不再叠一层；红字若是成片里的烧录水印/字幕，属文件内容
             if not self._current_video_has_baked_watermark():
                 self._paint_live_watermark(painter, float(seconds or 0.0))
@@ -12714,13 +13753,21 @@ class DynamicCaptionPage(QWidget):
         layer={
             "type":"image","name":f"PNG模板 {self._image_counter} · {path.name}",
             "enabled":True,"path":str(path.resolve()),"w":80,"opacity":100,
-            "x":50,"y":50,"timeline_template_only":True,
+            "x":50,"y":50,
+            # 导入后先常驻预览，方便调宽度/位置；点「加入当前/批量」后再变成限时声明轨
+            "timeline_template_only": False,
+            "stack_order": STACK_ABOVE_CAPTIONS,
             "template_id":hashlib.sha1(f"image|{time.time_ns()}".encode()).hexdigest()[:12],
         }
         self.layers.insert(caption_index,layer)
         self._refresh_layer_list(caption_index)
+        self._invalidate_preview_caption_overlay()
         self._refresh_live_preview()
         self._save_style_preferences()
+        self._append_run_log(
+            f"已导入 PNG「{path.name}」。先调宽度/位置（预览会立刻变），"
+            "满意后设开始/结束时间，再点「加入当前视频」或「批量全部视频」。"
+        )
         return True
 
     def _add_image_layer(self):
@@ -12761,6 +13808,8 @@ class DynamicCaptionPage(QWidget):
         layer["fade_in_ms"] = min(int(self.overlay_fade_in.value()), clip_duration // 2)
         layer["fade_out_ms"] = min(int(self.overlay_fade_out.value()), clip_duration // 2)
         layer["enabled"] = True
+        if layer.get("type") == "image":
+            layer["stack_order"] = layer_stack_order(layer)
         return (source_layer, layer, start_ms, end_ms), ""
 
     def _append_overlay_to_edit_state(self, video_path: str, layer: dict, start_ms: int, end_ms: int) -> bool:
@@ -12900,10 +13949,151 @@ class DynamicCaptionPage(QWidget):
             f"已应用到 {ok_n} 条视频。\n切换到其它视频时可在声明叠加轨上看到/调整该图层。",
         )
 
+    def _count_overlays_for_template(self, template_id: str) -> tuple[int, int]:
+        """Return (instances_on_current_video, instances_on_all_videos)."""
+        tid = str(template_id or "")
+        if not tid:
+            return 0, 0
+        current_key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+        current_n = 0
+        total_n = 0
+        for key, state in (getattr(self, "timeline_edit_states", {}) or {}).items():
+            n = 0
+            for item in (state or {}).get("overlays") or []:
+                if not isinstance(item, dict):
+                    continue
+                layer = item.get("layer") or {}
+                if str(layer.get("template_id") or "") == tid:
+                    n += 1
+            total_n += n
+            if key == current_key:
+                current_n = n
+        return current_n, total_n
+
+    def _remove_overlays_by_template_id(self, template_id: str, *, scope: str = "current") -> int:
+        """Remove declaration overlays matching template_id. scope: current|all. Returns removed count."""
+        tid = str(template_id or "")
+        if not tid:
+            return 0
+        current_key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+        removed = 0
+        keys = list((getattr(self, "timeline_edit_states", {}) or {}).keys())
+        for key in keys:
+            if scope == "current" and key != current_key:
+                continue
+            state = dict(self.timeline_edit_states.get(key, {}) or {})
+            overlays = list(state.get("overlays") or [])
+            kept = []
+            for item in overlays:
+                if not isinstance(item, dict):
+                    continue
+                layer = item.get("layer") or {}
+                if str(layer.get("template_id") or "") == tid:
+                    removed += 1
+                    continue
+                kept.append(item)
+            if len(kept) != len(overlays):
+                state["overlays"] = kept
+                self.timeline_edit_states[key] = state
+        # 同步当前画布
+        if hasattr(self, "canva_timeline") and current_key and (
+            scope == "all" or scope == "current"
+        ):
+            canvas = getattr(self.canva_timeline, "canvas", self.canva_timeline)
+            if hasattr(canvas, "overlays"):
+                before = list(canvas.overlays)
+                canvas.overlays = [
+                    item for item in before
+                    if str((item.get("layer") or {}).get("template_id") or "") != tid
+                ]
+                if len(canvas.overlays) != len(before):
+                    if hasattr(canvas, "selected"):
+                        canvas.selected = None
+                    if hasattr(canvas, "_emit_timeline_state"):
+                        # 用当前画布状态写回，避免旧 overlays 残留
+                        try:
+                            self.timeline_edit_states[current_key] = (
+                                self.canva_timeline.current_state()
+                                if hasattr(self.canva_timeline, "current_state")
+                                else canvas.current_state()
+                            )
+                        except Exception:
+                            pass
+                    if hasattr(canvas, "update"):
+                        canvas.update()
+        return removed
+
+    def _remove_selected_layer_from_current_video(self):
+        row = self.layer_list.currentRow()
+        if not (0 <= row < len(self.layers)):
+            QMessageBox.information(self, "未选择", "请先在图层列表中选择 PNG/文字/蒙版模板。")
+            return
+        layer = self.layers[row]
+        if layer.get("type") not in ("text", "mask", "image"):
+            QMessageBox.information(self, "无法移除", "字幕主层不在声明轨上。")
+            return
+        tid = str(layer.get("template_id") or "")
+        if not tid:
+            QMessageBox.information(self, "无法移除", "该图层没有模板 ID，请重新导入后再加入声明轨。")
+            return
+        n = self._remove_overlays_by_template_id(tid, scope="current")
+        self._live_timeline_cache_key = None
+        if hasattr(self, "_invalidate_preview_caption_overlay"):
+            self._invalidate_preview_caption_overlay()
+        self._refresh_live_preview()
+        if n:
+            self._append_run_log(f"已从当前视频声明轨移除 {n} 个「{layer.get('name', '图层')}」。")
+            QMessageBox.information(self, "已移除", f"已从当前视频声明轨移除 {n} 处叠加。")
+        else:
+            QMessageBox.information(self, "无叠加", "当前视频声明轨上没有该模板的实例。")
+
     def _delete_layer(self):
-        row=self.layer_list.currentRow()
-        if row<0 or self.layers[row].get("type")=="caption": return
-        self.layers.pop(row); self._refresh_layer_list(max(0,row-1)); self._refresh_live_preview()
+        row = self.layer_list.currentRow()
+        if row < 0 or self.layers[row].get("type") == "caption":
+            return
+        layer = self.layers[row]
+        tid = str(layer.get("template_id") or "")
+        cur_n, all_n = self._count_overlays_for_template(tid) if tid else (0, 0)
+        scope = "template_only"
+        if all_n > 0:
+            box = QMessageBox(self)
+            box.setWindowTitle("删除图层")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(
+                f"「{layer.get('name', '图层')}」已在声明轨上使用"
+                f"（当前视频 {cur_n} 处，全部视频共 {all_n} 处）。\n"
+                "要怎么删除？"
+            )
+            btn_all = box.addButton("删模板+全部视频上的叠加", QMessageBox.ButtonRole.AcceptRole)
+            btn_cur = box.addButton("删模板+当前视频上的叠加", QMessageBox.ButtonRole.ActionRole)
+            btn_tpl = box.addButton("只删模板（保留轨道叠加）", QMessageBox.ButtonRole.ActionRole)
+            btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(btn_all if all_n > cur_n else btn_cur)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is None or clicked is btn_cancel:
+                return
+            if clicked is btn_all:
+                scope = "all"
+            elif clicked is btn_cur:
+                scope = "current"
+            else:
+                scope = "template_only"
+        removed = 0
+        if scope in ("current", "all") and tid:
+            removed = self._remove_overlays_by_template_id(tid, scope=scope)
+        self.layers.pop(row)
+        self._refresh_layer_list(max(0, row - 1))
+        self._live_timeline_cache_key = None
+        if hasattr(self, "_invalidate_preview_caption_overlay"):
+            self._invalidate_preview_caption_overlay()
+        self._refresh_live_preview()
+        self._save_style_preferences()
+        name = layer.get("name", "图层")
+        if removed:
+            self._append_run_log(f"已删除图层「{name}」，并清除声明轨叠加 {removed} 处。")
+        else:
+            self._append_run_log(f"已删除图层「{name}」。")
 
     def _move_layer(self, delta):
         row=self.layer_list.currentRow(); target=row+delta
@@ -12925,6 +14115,8 @@ class DynamicCaptionPage(QWidget):
             self.add_layer_to_timeline.setEnabled(mask_enabled or text_enabled or image_enabled)
         if hasattr(self,"add_layer_to_all_videos"):
             self.add_layer_to_all_videos.setEnabled(mask_enabled or text_enabled or image_enabled)
+        if hasattr(self,"remove_layer_from_timeline"):
+            self.remove_layer_from_timeline.setEnabled(mask_enabled or text_enabled or image_enabled)
         if hasattr(self,"mask_quick_combo"):
             self.mask_quick_combo.setEnabled(mask_enabled)
         for control in (self.mask_color,self.mask_opacity,self.mask_x,self.mask_y,self.mask_w,self.mask_h,self.mask_radius,*self.mask_quick_buttons): control.setEnabled(mask_enabled)
@@ -12937,7 +14129,7 @@ class DynamicCaptionPage(QWidget):
             getattr(self,"image_layer_path",None),getattr(self,"image_layer_change",None),
             getattr(self,"image_layer_width",None),getattr(self,"image_layer_opacity",None),
             getattr(self,"image_layer_x",None),getattr(self,"image_layer_y",None),
-            getattr(self,"image_quick_combo",None),
+            getattr(self,"image_quick_combo",None),getattr(self,"image_stack_order",None),
         )
         for control in image_controls:
             if control is not None: control.setEnabled(image_enabled)
@@ -12963,13 +14155,46 @@ class DynamicCaptionPage(QWidget):
                 (self.image_layer_x,"x"),(self.image_layer_y,"y"),
             ):
                 control.blockSignals(True); control.setValue(int(layer.get(key,50))); control.blockSignals(False)
+            if hasattr(self, "image_stack_order"):
+                order = layer_stack_order(layer)
+                idx = self.image_stack_order.findData(order)
+                self.image_stack_order.blockSignals(True)
+                self.image_stack_order.setCurrentIndex(idx if idx >= 0 else 0)
+                self.image_stack_order.blockSignals(False)
 
     def _sync_layer_template_to_timeline(self, layer):
         """Keep existing declaration clips visually identical to the live template."""
+        # 仅当已「加入声明轨」后才把模板几何同步到各视频轨道实例
         if not isinstance(layer,dict) or not layer.get("timeline_template_only"):
             return
         if hasattr(self,"canva_timeline") and hasattr(self.canva_timeline,"update_overlay_template"):
             self.canva_timeline.update_overlay_template(layer)
+        # 批量加入过的其它视频：同步几何/层级等到各 edit_state
+        tid = str(layer.get("template_id") or "")
+        if not tid:
+            return
+        for key, state in list((getattr(self, "timeline_edit_states", {}) or {}).items()):
+            state = dict(state or {})
+            overlays = list(state.get("overlays") or [])
+            changed = False
+            for item in overlays:
+                if not isinstance(item, dict):
+                    continue
+                current = dict(item.get("layer") or {})
+                if str(current.get("template_id") or "") != tid:
+                    continue
+                preserved = {
+                    k: current[k] for k in ("fade_in_ms", "fade_out_ms") if k in current
+                }
+                updated = {k: v for k, v in layer.items() if k != "timeline_template_only"}
+                updated.update(preserved)
+                updated["enabled"] = True
+                item["layer"] = updated
+                item["name"] = str(updated.get("name") or item.get("name") or "声明叠加")
+                changed = True
+            if changed:
+                state["overlays"] = overlays
+                self.timeline_edit_states[key] = state
 
     def _mask_control_changed(self, *_args):
         row=self.layer_list.currentRow()
@@ -13004,13 +14229,21 @@ class DynamicCaptionPage(QWidget):
     def _image_layer_changed(self,*_args):
         row=self.layer_list.currentRow()
         if row<0 or self.layers[row].get("type")!="image": return
+        stack = STACK_ABOVE_CAPTIONS
+        if hasattr(self, "image_stack_order"):
+            data = self.image_stack_order.currentData()
+            stack = str(data or STACK_ABOVE_CAPTIONS)
         self.layers[row].update({
             "w":self.image_layer_width.value(),
             "opacity":self.image_layer_opacity.value(),
             "x":self.image_layer_x.value(),
             "y":self.image_layer_y.value(),
+            "stack_order": stack,
         })
-        self._sync_layer_template_to_timeline(self.layers[row]); self._refresh_live_preview()
+        # 未加入声明轨时也要在预览里立刻看见；已加入则同步到轨道实例
+        self._sync_layer_template_to_timeline(self.layers[row])
+        self._invalidate_preview_caption_overlay()
+        self._refresh_live_preview()
 
     def _quick_image_position(self,mode):
         self.image_layer_x.setValue(50)
@@ -13734,10 +14967,20 @@ class DynamicCaptionPage(QWidget):
                 "highlight_padding_y":self.highlight_padding_y.value(),
                 "animation_speed":self.animation_speed.value(),
                 "position":self.position.currentText(),"margin_v":self.margin_v.value(),
-                "audio_mode":self._get_audio_mode_internal(),"audio_match_mode":self.audio_match_mode.currentText(),
+                "audio_mode": self._get_audio_mode_internal(),
+                "audio_mode_ui": (
+                    self.audio_mode.currentText() if hasattr(self, "audio_mode") else "视频原声"
+                ),
+                "audio_match_mode":self.audio_match_mode.currentText(),
                 "original_volume":self.original_volume.value(),"background_volume":self.background_volume.value(),
                 "audio_fade_mode":self.audio_fade_mode.currentText(),
                 "audio_fade_in_ms":self.audio_fade_in.value(),"audio_fade_out_ms":self.audio_fade_out.value(),
+                "audio_denoise": bool(getattr(self, "audio_denoise", None) and self.audio_denoise.isChecked()),
+                "voice_boost": bool(getattr(self, "voice_boost", None) and self.voice_boost.isChecked()),
+                "voice_boost_pct": int(self.voice_boost_pct.value()) if hasattr(self, "voice_boost_pct") else 130,
+                "grade_brightness": int(self.grade_brightness.value()) if hasattr(self, "grade_brightness") else 0,
+                "grade_contrast": int(self.grade_contrast.value()) if hasattr(self, "grade_contrast") else 100,
+                "grade_saturation": int(self.grade_saturation.value()) if hasattr(self, "grade_saturation") else 100,
                 "bgm_dir": self.bgm_dir_input.text().strip(),
                 "bgm_selection_mode": (
                     self.bgm_selection_mode.currentText()
@@ -13745,7 +14988,7 @@ class DynamicCaptionPage(QWidget):
                 ),
                 "bgm_enabled": (
                     self.bgm_enabled.isChecked() if hasattr(self,"bgm_enabled") else False
-                ),
+                ) or ("背景音乐" in str(self.audio_mode.currentText() if hasattr(self, "audio_mode") else "")),
                 "audio_offsets":dict(self.audio_offsets),
                 "clean_metadata":self.clean_metadata.isChecked(),
                 "override_text":self.override_text.toPlainText().strip(),"encode_preset":self.encode_preset.currentText(),
@@ -13803,6 +15046,9 @@ class DynamicCaptionPage(QWidget):
                 "rename_padding": self.rename_padding.value(),
                 "rename_titles": self._rename_titles_list(),
                 "already_renamed_videos": list(getattr(self, "_already_renamed_videos", set()) or []),
+                "batch_style_snapshot": json.loads(json.dumps(
+                    getattr(self, "_batch_style_snapshot", None) or {}, ensure_ascii=False
+                )) if getattr(self, "_batch_style_snapshot", None) else {},
                 "video_style_overrides": json.loads(json.dumps(
                     getattr(self, "video_style_overrides", {}) or {}, ensure_ascii=False
                 )),
@@ -14161,6 +15407,21 @@ class DynamicCaptionPage(QWidget):
 
     def _video_selection_changed(self, video_path):
         if not video_path: return
+        # 关键：currentItem 此时已是「新视频」，但编辑器里仍是「上一片」字幕。
+        # 若按当前选中项 persist，会把上一片文案写进新视频键 → 批量提取后每片都变成最后/上一片的字。
+        try:
+            if not getattr(self, "_loading_timeline", False):
+                previous = str(getattr(self, "_active_caption_video_path", "") or "")
+                new_key = self._timeline_key(video_path)
+                prev_key = self._timeline_key(previous) if previous else ""
+                if previous and prev_key and prev_key != new_key:
+                    self._persist_caption_editor_text(
+                        target_video=previous,
+                        target_source=self._caption_source_for_video(previous),
+                    )
+        except Exception:
+            pass
+        self._active_caption_video_path = str(video_path)
         if hasattr(self,"task_queue") and self.videos.currentRow()>=0:
             self.task_queue.selectRow(self.videos.currentRow())
         
@@ -14192,8 +15453,17 @@ class DynamicCaptionPage(QWidget):
         try:
             if isinstance(per, dict) and per:
                 self._apply_style_template_data(per)
+                # 载入独立样式时勾上「仅当前视频」，避免滑条误把单片颜色写进批量快照
+                if hasattr(self, "style_scope_video_only"):
+                    self.style_scope_video_only.blockSignals(True)
+                    self.style_scope_video_only.setChecked(True)
+                    self.style_scope_video_only.blockSignals(False)
             elif getattr(self, "_batch_style_snapshot", None):
                 self._apply_style_template_data(self._batch_style_snapshot)
+                if hasattr(self, "style_scope_video_only"):
+                    self.style_scope_video_only.blockSignals(True)
+                    self.style_scope_video_only.setChecked(False)
+                    self.style_scope_video_only.blockSignals(False)
             self._update_batch_style_hint()
             self._live_caption_style_cache = None
         finally:
@@ -14219,8 +15489,19 @@ class DynamicCaptionPage(QWidget):
             self.bgm_source_display.setText(str(Path(path).resolve()))
         if hasattr(self,"bgm_selection_mode"):
             self.bgm_selection_mode.setCurrentIndex(1)
-        self._audio_mode_changed(self.audio_mode.currentText())
+        if hasattr(self, "bgm_enabled"):
+            self.bgm_enabled.blockSignals(True)
+            self.bgm_enabled.setChecked(True)
+            self.bgm_enabled.blockSignals(False)
+        if hasattr(self, "audio_mode") and "背景音乐" not in self.audio_mode.currentText():
+            self.audio_mode.setCurrentText("视频原声＋背景音乐")
+        else:
+            self._audio_mode_changed(self.audio_mode.currentText())
         self._load_first_bgm_preview(path)
+        try:
+            self._save_style_preferences()
+        except Exception:
+            pass
 
     def _choose_bgm_folder(self):
         path = QFileDialog.getExistingDirectory(self, "选择背景音乐文件夹")
@@ -14231,10 +15512,21 @@ class DynamicCaptionPage(QWidget):
                 self.bgm_source_display.setText(str(Path(path).resolve()))
             if hasattr(self,"bgm_selection_mode"):
                 self.bgm_selection_mode.setCurrentIndex(1)
-            self._audio_mode_changed(self.audio_mode.currentText())
+            if hasattr(self, "bgm_enabled"):
+                self.bgm_enabled.blockSignals(True)
+                self.bgm_enabled.setChecked(True)
+                self.bgm_enabled.blockSignals(False)
+            if hasattr(self, "audio_mode") and "背景音乐" not in self.audio_mode.currentText():
+                self.audio_mode.setCurrentText("视频原声＋背景音乐")
+            else:
+                self._audio_mode_changed(self.audio_mode.currentText())
             self._load_first_bgm_preview(path)
             self._append_run_log("已添加背景音乐文件夹，将为任务随机选择音乐和起始点。")
             self._refresh_canva_timeline()
+            try:
+                self._save_style_preferences()
+            except Exception:
+                pass
 
     def _load_first_bgm_preview(self, folder):
         path=Path(str(folder))
@@ -14248,10 +15540,130 @@ class DynamicCaptionPage(QWidget):
         if candidates:
             self.load_audio_preview(str(candidates[0]))
 
+    def _preview_voice_cleanup_audio(self):
+        """试听：从播放头截 8 秒，套用降噪/人声增强后用预览播放器播放。"""
+        denoise = bool(getattr(self, "audio_denoise", None) and self.audio_denoise.isChecked())
+        boost = bool(getattr(self, "voice_boost", None) and self.voice_boost.isChecked())
+        if not denoise and not boost:
+            QMessageBox.information(
+                self, "请先勾选",
+                "请先勾选「降低环境噪音」和/或「增大人声」，再点试听。",
+            )
+            return
+        item = self.videos.currentItem() if hasattr(self, "videos") else None
+        if not item:
+            QMessageBox.information(self, "无视频", "请先在视频列表中选择一条视频。")
+            return
+        video = Path(item.text().strip())
+        if not video.is_file():
+            QMessageBox.warning(self, "文件不存在", f"找不到视频：{video}")
+            return
+        try:
+            ffmpeg = self.find_ffmpeg()
+        except Exception as exc:
+            QMessageBox.critical(self, "缺少 FFmpeg", str(exc))
+            return
+        settings = {
+            "audio_denoise": denoise,
+            "voice_boost": boost,
+            "voice_boost_pct": int(self.voice_boost_pct.value()) if hasattr(self, "voice_boost_pct") else 150,
+        }
+        chains = voice_cleanup_filter_fallbacks(settings)
+        if not chains:
+            QMessageBox.information(self, "无效果", "当前设置未生成滤镜，请勾选后再试。")
+            return
+        try:
+            start_ms = int(self.player.position() or 0) if hasattr(self, "player") else 0
+        except Exception:
+            start_ms = 0
+        start_sec = max(0.0, start_ms / 1000.0)
+        out_dir = Path(self.output.text().strip() or ".") / ".voice_fx_preview"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            out_dir = Path(tempfile.gettempdir()) / "video_toolkit_voice_fx"
+            out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / f"{video.stem[:40]}_fx_{start_ms}.m4a"
+        # 优先对白轨（配音替换模式），否则用视频原声
+        audio_src = video
+        if self._get_audio_mode_internal() == "替换为添加的音频":
+            matched = self._matched_source_for_video(str(video))
+            if matched and Path(matched).is_file():
+                audio_src = Path(matched)
+        self.voice_fx_preview_btn.setEnabled(False)
+        self.voice_fx_preview_btn.setText("试听生成中…")
+        self._append_run_log(
+            f"正在生成收音试听（约 8 秒，起点 {start_sec:.1f}s）："
+            f"{'降噪 ' if denoise else ''}{'人声增强' if boost else ''}…"
+        )
+        QApplication.processEvents()
+        last_err = ""
+        ok = False
+        for fx in chains:
+            command = [
+                str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{start_sec:.3f}", "-t", "8",
+                "-i", str(audio_src),
+                "-vn", "-map", "0:a:0?",
+                "-af", fx,
+                "-c:a", "aac", "-b:a", "192k",
+                str(dest),
+            ]
+            try:
+                result = subprocess.run(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace", timeout=60,
+                    **hidden_kwargs(),
+                )
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+            if result.returncode == 0 and dest.is_file() and dest.stat().st_size >= 256:
+                ok = True
+                break
+            last_err = (result.stderr or "").strip()[-500:] or "未生成音频"
+            try:
+                if dest.exists():
+                    dest.unlink()
+            except OSError:
+                pass
+        self.voice_fx_preview_btn.setEnabled(True)
+        self.voice_fx_preview_btn.setText("试听收音效果（8秒）")
+        if not ok:
+            QMessageBox.warning(
+                self, "试听失败",
+                "无法生成试听音频（当前 FFmpeg 可能缺少部分滤镜，已自动尝试兼容方案仍失败）。\n"
+                + (last_err[-400:] if last_err else ""),
+            )
+            return
+        # 暂停画面播放，用独立音轨播放器试听
+        try:
+            if hasattr(self, "player"):
+                self.player.pause()
+            if hasattr(self, "bgm_player"):
+                self.bgm_player.pause()
+        except Exception:
+            pass
+        try:
+            self.audio_player.setSource(QUrl.fromLocalFile(str(dest.resolve())))
+            self.audio_preview_output.setVolume(1.0)
+            self.audio_player.setPosition(0)
+            self.audio_player.play()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法播放", str(exc))
+            return
+        self._append_run_log(f"正在试听收音效果：{dest.name}（约 8 秒，可再点试听对比不同增益）。")
+        QMessageBox.information(
+            self, "正在试听",
+            "已对当前播放位置起约 8 秒套用降噪/人声增强。\n"
+            "请戴耳机听对比：人声应更亮、底噪更低。\n"
+            "满意后导出成品也会带上同样处理。",
+        )
+
     def _audio_mode_changed(self, mode_text):
         mode = self._get_audio_mode_internal(mode_text)
         text = str(mode_text or "")
-        uses_bgm = "背景音乐" in text or "BGM" in text.upper()
+        uses_bgm = "背景音乐" in text or "BGM" in text.upper() or mode == "原声＋背景音混合"
         # 「…＋配乐」= 原声 + BGM + 环境音/配乐轨
         uses_score = ("配乐" in text) and ("视频配音" not in text)
         if hasattr(self, "bgm_enabled"):
@@ -14262,12 +15674,20 @@ class DynamicCaptionPage(QWidget):
             self.ambient_enabled.blockSignals(True)
             self.ambient_enabled.setChecked(True)
             self.ambient_enabled.blockSignals(False)
-            try:
-                self._ambient_enabled_changed(True)
-            except Exception:
-                pass
-        self.audio_match_mode.setCurrentText("自动匹配（同名优先，其次按队列）")
-        self.original_volume.setEnabled(uses_bgm and mode == "保留视频原音")
+            if not getattr(self, "_restoring_style", False):
+                try:
+                    self._ambient_enabled_changed(True)
+                except Exception:
+                    pass
+        # 恢复偏好时禁止把「音频匹配方式」打回默认，否则每次启动都丢记忆
+        if not getattr(self, "_restoring_style", False):
+            # 仅用户手动改合成方式时：配音替换模式才需要默认「自动匹配」
+            if mode == "替换为添加的音频" and hasattr(self, "audio_match_mode"):
+                if not self.audio_match_mode.currentText().strip():
+                    self.audio_match_mode.setCurrentText("自动匹配（同名优先，其次按队列）")
+        self.original_volume.setEnabled(
+            uses_bgm and mode in ("保留视频原音", "原声＋背景音混合")
+        )
         self.background_volume.setEnabled(uses_bgm)
         if hasattr(self, "ambient_volume"):
             self.ambient_volume.setEnabled(uses_score or (
@@ -14276,6 +15696,11 @@ class DynamicCaptionPage(QWidget):
         self._update_preview_audio_levels()
         self._audio_fade_mode_changed(self.audio_fade_mode.currentText())
         self._refresh_live_preview()
+        if not getattr(self, "_restoring_style", False):
+            try:
+                self._save_style_preferences()
+            except Exception:
+                pass
 
     def _audio_fade_mode_changed(self, mode):
         external_mode=(
@@ -14372,15 +15797,139 @@ class DynamicCaptionPage(QWidget):
         if hasattr(self,"timeline_source_label"):
             self.timeline_source_label.setText(f"当前字幕：{Path(source).name}" if source else "当前字幕：尚未选择视频")
         key=self._timeline_key(source) if source else ""
-        text=self.timeline_overrides.get(key,"")
-        if not text and key in self.timeline_words:
-            text=self._group_words_for_current_layout(self.timeline_words[key])
+        video_key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+        if video_key and not getattr(self, "_active_caption_video_path", ""):
+            try:
+                item = self.videos.currentItem() if hasattr(self, "videos") else None
+                if item:
+                    self._active_caption_video_path = item.text()
+            except Exception:
+                pass
+        # 优先：字幕源键 → 当前视频键（批量提取会双写，防止只写了一边）
+        text = ""
+        for candidate in (key, video_key):
+            if not candidate:
+                continue
+            text = str(self.timeline_overrides.get(candidate, "") or "")
+            if text.strip():
+                break
+        if not text:
+            for candidate in (key, video_key):
+                if candidate and candidate in self.timeline_words:
+                    text = self._group_words_for_current_layout(self.timeline_words[candidate])
+                    if text.strip():
+                        break
         self._loading_timeline=True
         try: self.override_text.setPlainText(text)
         finally: self._loading_timeline=False
         if hasattr(self, "canva_timeline"):
             self.canva_timeline.set_srt(text)
+        self._live_timeline_cache_key = None
+        self._invalidate_preview_caption_overlay()
         self._refresh_live_preview()
+
+    def _merge_editor_text_onto_srt(self, base_srt: str, editor_srt: str) -> str:
+        """Keep base timings, take cue texts from editor (same cue count)."""
+        base = parse_srt(base_srt or "")
+        edit = parse_srt(editor_srt or "")
+        if not base or not edit:
+            return editor_srt or base_srt or ""
+        if len(base) != len(edit):
+            # 条数变了：以编辑器为准（含时间），避免硬套错位
+            return editor_srt or base_srt or ""
+        merged = [(b[0], b[1], e[2]) for b, e in zip(base, edit)]
+        return events_to_srt(merged)
+
+    def _persist_caption_editor_text(
+        self,
+        text: str | None = None,
+        *,
+        target_video: str | None = None,
+        target_source: str | None = None,
+    ):
+        """把字幕区当前内容写入导出用的 timeline_overrides（视频键+配音键）。
+
+        target_video/target_source：切换列表时必须传入「上一片」路径。
+        若误用新选中项，会把上一片字幕写进新片缓存（批量提取后每片都显示同一段字）。
+        """
+        if text is None:
+            text = ""
+            if hasattr(self, "timeline_timestamp_view"):
+                text = self.timeline_timestamp_view.toPlainText()
+            if (not str(text).strip()) and hasattr(self, "override_text"):
+                text = self.override_text.toPlainText()
+        text = str(text or "")
+        if not text.strip():
+            return
+        keys: set[str] = set()
+        video_path = str(target_video or "").strip()
+        if not video_path:
+            # 编辑器实时改字：写当前绑定片；若尚未记录则退回列表选中项
+            video_path = str(getattr(self, "_active_caption_video_path", "") or "")
+            if not video_path:
+                try:
+                    item = self.videos.currentItem() if hasattr(self, "videos") else None
+                    video_path = item.text() if item else ""
+                except Exception:
+                    video_path = ""
+        video_key = self._timeline_key(video_path) if video_path else ""
+        if video_key:
+            keys.add(video_key)
+        source = str(target_source or "").strip()
+        if not source and video_path:
+            try:
+                source = self._caption_source_for_video(video_path)
+            except Exception:
+                source = ""
+        if not source and not target_video:
+            try:
+                source = self._timeline_source() if hasattr(self, "_timeline_source") else ""
+            except Exception:
+                source = ""
+        if source:
+            keys.add(self._timeline_key(source))
+        if video_path:
+            try:
+                matched = self._matched_source_for_video(video_path)
+                if matched:
+                    keys.add(self._timeline_key(matched))
+            except Exception:
+                pass
+        if not keys and video_key:
+            keys.add(video_key)
+        for key in keys:
+            if not key:
+                continue
+            old_working = str(self.timeline_overrides.get(key) or "")
+            self.timeline_overrides[key] = text
+            # 源时钟副本：尽量只换文字、保留源时间，避免导出重映射时拿回旧字
+            if not hasattr(self, "timeline_overrides_source") or self.timeline_overrides_source is None:
+                self.timeline_overrides_source = {}
+            old_src = str(self.timeline_overrides_source.get(key) or "")
+            if old_src and "-->" in old_src and "-->" in text:
+                try:
+                    self.timeline_overrides_source[key] = self._merge_editor_text_onto_srt(old_src, text)
+                except Exception:
+                    plain = " ".join(t for _, _, t in parse_srt(text))
+                    try:
+                        self.timeline_overrides_source[key] = (
+                            replace_srt_copy(old_src, plain) if plain else old_src
+                        )
+                    except Exception:
+                        pass
+            if (
+                key in self.timeline_words
+                and old_working
+                and old_working != text
+                and "-->" in old_working
+                and "-->" in text
+            ):
+                try:
+                    self.timeline_words[key] = align_word_srt_to_phrase_srt(
+                        self.timeline_words[key], text, old_working,
+                    )
+                except Exception:
+                    pass
 
     def _timeline_text_changed(self):
         if self._loading_timeline: return
@@ -14398,10 +15947,12 @@ class DynamicCaptionPage(QWidget):
             if hasattr(self, "canva_timeline"):
                 self.canva_timeline.set_srt(self.override_text.toPlainText())
             return
-        source=self._timeline_source()
-        if source: self.timeline_overrides[self._timeline_key(source)]=self.override_text.toPlainText()
+        # 始终写入视频+配音键，保证批量导出能读到手动修改
+        self._persist_caption_editor_text(self.override_text.toPlainText())
         if hasattr(self, "canva_timeline"):
             self.canva_timeline.set_srt(self.override_text.toPlainText())
+        self._live_timeline_cache_key = None
+        self._invalidate_preview_caption_overlay()
         self._refresh_task_queue()
 
     def _timeline_track_srt_changed(self, text):
@@ -14567,7 +16118,11 @@ class DynamicCaptionPage(QWidget):
             offset = max(0, min(t, end - 1) - start)
             src0 = int(item.get("source_start", 0) or 0)
             src1 = int(item.get("source_end", src0 + (end - start)) or 0)
-            source_ms = src0 + offset
+            try:
+                speed = max(0.25, min(4.0, float(item.get("speed", 1.0) or 1.0)))
+            except (TypeError, ValueError):
+                speed = 1.0
+            source_ms = src0 + int(round(offset * speed))
             source_ms = max(src0, min(source_ms, max(src0, src1 - 1)))
             media_type = str(item.get("media_type", "video") or "video")
             path = str(item.get("path", "") or "")
@@ -14896,10 +16451,26 @@ class DynamicCaptionPage(QWidget):
         if not corrected or "-->" not in corrected:
             return
         changes = dialog.result_change_count()
+        self._apply_proofread_result(corrected, timeline, changes, source_script=dialog.source_script())
+
+    def _apply_proofread_result(self, corrected: str, old_timeline: str, changes, *, source_script: str = ""):
+        """把校对后的 SRT 写入编辑器/缓存/时间轴，并强制刷新预览（含退出轨道预览）。"""
+        corrected = str(corrected or "")
+        old_timeline = str(old_timeline or "")
+        if "-->" not in corrected:
+            return
+        # 轨道预览是烧进旧字幕的成品，不退出则用户一直以为「校对没生效」
+        if getattr(self, "_precise_preview_active", False) and hasattr(self, "_clear_precise_preview"):
+            try:
+                self._clear_precise_preview()
+            except Exception:
+                self._precise_preview_active = False
         self._loading_timeline = True
         try:
             if hasattr(self, "override_text"):
+                self.override_text.blockSignals(True)
                 self.override_text.setPlainText(corrected)
+                self.override_text.blockSignals(False)
             if hasattr(self, "timeline_timestamp_view"):
                 self.timeline_timestamp_view.blockSignals(True)
                 self.timeline_timestamp_view.setPlainText(corrected)
@@ -14907,21 +16478,79 @@ class DynamicCaptionPage(QWidget):
         finally:
             self._loading_timeline = False
         source = self._timeline_source()
-        key = self._timeline_key(source) if source else ""
-        if key:
+        source_key = self._timeline_key(source) if source else ""
+        video_item = self.videos.currentItem() if hasattr(self, "videos") else None
+        video_key = self._timeline_key(video_item.text()) if video_item else ""
+        keys = [k for k in (source_key, video_key) if k]
+        for key in keys:
             self.timeline_overrides[key] = corrected
+            # 切片「源时钟」模式读这个字典；不写则预览仍显示旧字。
+            # 重要：源轴只换文字、尽量保留源时间戳——若直接写成片时钟，
+            # 未对齐切片时 need_map 会拿错时刻，口型/跟读全部错位。
+            if not hasattr(self, "timeline_overrides_source") or self.timeline_overrides_source is None:
+                self.timeline_overrides_source = {}
+            old_src = str(self.timeline_overrides_source.get(key) or "")
+            if old_src and "-->" in old_src and "-->" in corrected:
+                try:
+                    self.timeline_overrides_source[key] = self._merge_editor_text_onto_srt(
+                        old_src, corrected
+                    )
+                except Exception:
+                    try:
+                        plain = " ".join(t for _, _, t in parse_srt(corrected))
+                        self.timeline_overrides_source[key] = (
+                            replace_srt_copy(old_src, plain) if plain else corrected
+                        )
+                    except Exception:
+                        self.timeline_overrides_source[key] = corrected
+            else:
+                self.timeline_overrides_source[key] = corrected
             if key in self.timeline_words:
                 self.timeline_words[key] = align_word_srt_to_phrase_srt(
-                    self.timeline_words[key], corrected, timeline)
-        if hasattr(self, "source_proofread"):
-            self.source_proofread.setPlainText(dialog.source_script())
+                    self.timeline_words[key], corrected, old_timeline)
+            src_words = getattr(self, "timeline_words_source", None)
+            if isinstance(src_words, dict) and key in src_words:
+                try:
+                    src_words[key] = align_word_srt_to_phrase_srt(
+                        src_words[key],
+                        self.timeline_overrides_source.get(key, corrected),
+                        old_src or old_timeline,
+                    )
+                except Exception:
+                    src_words[key] = align_word_srt_to_phrase_srt(
+                        src_words[key], corrected, old_timeline)
+        if source_script and hasattr(self, "source_proofread"):
+            self.source_proofread.setPlainText(source_script)
         if hasattr(self, "canva_timeline"):
-            self.canva_timeline.set_srt(corrected)
+            try:
+                self.canva_timeline.set_srt(corrected)
+                canvas = getattr(self.canva_timeline, "canvas", None)
+                if canvas is not None and hasattr(canvas, "update"):
+                    canvas.update()
+            except Exception:
+                pass
+        # 强制打掉实时字幕缓存，否则仍可能画旧字
+        self._live_timeline_cache_key = None
+        self._live_timeline_cache = ([], [])
+        self._live_caption_style_cache = None
+        self._invalidate_preview_caption_overlay()
         self._refresh_task_queue()
         self._refresh_live_preview()
-        name = Path(source).name if source else "当前素材"
+        try:
+            if getattr(self, "preview_capture", None) is not None:
+                self._render_preview_frame(force=True)
+            elif hasattr(self, "_display_cached_preview"):
+                self._display_cached_preview()
+        except Exception:
+            pass
+        name = Path(source).name if source else (video_item.text() if video_item else "当前素材")
+        try:
+            name = Path(name).name
+        except Exception:
+            pass
+        n = changes if isinstance(changes, int) else len(changes or [])
         self._append_run_log(
-            f"文案校对已提交：{name}，共 {changes} 处文字修改，时间戳未改动。"
+            f"文案校对已生效：{name}，共 {n} 处文字修改；已刷新预览（时间戳未改）。"
         )
 
     def _apply_source_proofread(self):
@@ -14963,26 +16592,7 @@ class DynamicCaptionPage(QWidget):
                 )
         except Exception:
             pass
-        self._loading_timeline = True
-        try:
-            self.override_text.setPlainText(corrected)
-        finally:
-            self._loading_timeline = False
-        source = self._timeline_source()
-        key = self._timeline_key(source) if source else ""
-        if key:
-            self.timeline_overrides[key] = corrected
-            if key in self.timeline_words:
-                self.timeline_words[key] = align_word_srt_to_phrase_srt(
-                    self.timeline_words[key], corrected, timeline)
-        if hasattr(self, "canva_timeline"):
-            self.canva_timeline.set_srt(corrected)
-        self._refresh_task_queue()
-        self._refresh_live_preview()
-        self._append_run_log(
-            f"已用源文案校对字幕并保留原时间轴：{Path(source).name if source else '当前素材'}"
-            f"（{len(changes)} 处修改）"
-        )
+        self._apply_proofread_result(corrected, timeline, changes, source_script=source_copy)
 
     def _sync_local_whisper_model_enabled(self, provider_text=""):
         """仅本地 Whisper / 自动选择时允许改本地模型体积。"""
@@ -15243,21 +16853,68 @@ class DynamicCaptionPage(QWidget):
         self._live_timeline_cache_key = None
         self._invalidate_preview_caption_overlay()
 
+    def _videos_using_caption_source(self, source: str) -> list[str]:
+        """找出字幕源等于 source 的视频路径（用于把提取结果绑到对应视频键）。"""
+        source_key = self._timeline_key(source) if source else ""
+        if not source_key or not hasattr(self, "videos"):
+            return []
+        matched = []
+        for i in range(self.videos.count()):
+            item = self.videos.item(i)
+            if not item:
+                continue
+            video = item.text()
+            try:
+                cap = self._caption_source_for_video(video)
+            except Exception:
+                cap = video
+            if self._timeline_key(cap) == source_key or self._timeline_key(video) == source_key:
+                matched.append(video)
+        return matched
+
+    def _store_extracted_timeline(self, source: str, word_srt: str, phrase_srt: str, chinese: str = ""):
+        """把一次识别结果写入字幕源键，并同步到使用该源的每一个视频键。"""
+        source_key = self._timeline_key(source) if source else ""
+        if not source_key:
+            return []
+        word_aligned = align_word_srt_to_phrase_srt(word_srt, phrase_srt) if word_srt else ""
+        keys = [source_key]
+        for video in self._videos_using_caption_source(source):
+            vk = self._timeline_key(video)
+            if vk and vk not in keys:
+                keys.append(vk)
+        for key in keys:
+            if word_aligned:
+                self.timeline_words[key] = word_aligned
+            self.timeline_overrides[key] = phrase_srt
+            self._mark_captions_source_timed(key)
+            if chinese:
+                self.timeline_chinese[key] = chinese
+            if self.caption_mode.currentText() == "自由文案动画（不对口型）":
+                self.free_texts[key] = phrase_srt
+        return keys
+
     def _batch_timeline_item_done(self,source,srt,chinese,index,total):
         self._stop_timeline_activity(round(index/max(1,total)*100))
         # 去掉 Whisper 幻觉水印（如「Υπότιτλοι AUTHORWAVE」），视频里并无此声
         srt = filter_asr_junk_srt(srt)
-        key=self._timeline_key(source); phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
+        phrase_srt,fixes=self._group_words_for_current_layout(srt,True)
         phrase_srt = filter_asr_junk_srt(phrase_srt)
-        self.timeline_words[key]=align_word_srt_to_phrase_srt(srt, phrase_srt); self.timeline_overrides[key]=phrase_srt
-        self._mark_captions_source_timed(key)
-        if chinese: self.timeline_chinese[key]=chinese
-        if self.caption_mode.currentText() == "自由文案动画（不对口型）":
-            self.free_texts[key]=phrase_srt
+        stored_keys = self._store_extracted_timeline(source, srt, phrase_srt, chinese)
         self.extract_all_btn.setText("正在识别中…")
         cue_count = max(0, str(srt or "").count("-->"))
+        bind_note = ""
+        try:
+            videos = self._videos_using_caption_source(source)
+            if len(videos) == 1:
+                bind_note = f" → {Path(videos[0]).name}"
+            elif len(videos) > 1:
+                bind_note = f" → {len(videos)} 个视频"
+        except Exception:
+            bind_note = ""
         self.log.appendPlainText(
-            f"[{index}/{total}] 时间轴已归档到：{Path(source).name}（{cue_count} 条字幕）"
+            f"[{index}/{total}] 时间轴已归档到：{Path(source).name}{bind_note}"
+            f"（{cue_count} 条字幕，{len(stored_keys)} 个缓存键）"
         )
         if cue_count <= 2:
             preview = " ".join(
@@ -15269,7 +16926,12 @@ class DynamicCaptionPage(QWidget):
                 " 若口播更长：书写语言选对（如希腊语）后点「重新提取」。"
             )
         if fixes: self._append_run_log(f"[{index}/{total}] 已自动修正 {fixes} 处逐句字幕时间重叠。")
-        if self._timeline_key(self._timeline_source())==key:
+        # 仅当编辑器当前绑定的就是这条源/视频时才刷新界面，避免批量过程中把别的片冲掉
+        current_source_key = self._timeline_key(self._timeline_source()) if self._timeline_source() else ""
+        active_video = str(getattr(self, "_active_caption_video_path", "") or "")
+        active_key = self._timeline_key(active_video) if active_video else ""
+        source_key = self._timeline_key(source)
+        if source_key and source_key in (current_source_key, active_key):
             self._loading_timeline=True
             try: self.override_text.setPlainText(phrase_srt)
             finally: self._loading_timeline=False
@@ -15304,6 +16966,17 @@ class DynamicCaptionPage(QWidget):
         self.extract_timeline_btn.setEnabled(True); self.extract_all_btn.setEnabled(True)
         self.extract_all_btn.setText("批量提取")
         self._append_run_log(message)
+        # 批量结束后按「当前选中视频」重新载入对应字幕，避免编辑器停在某一片的字上
+        try:
+            item = self.videos.currentItem() if hasattr(self, "videos") else None
+            if item:
+                self._active_caption_video_path = item.text()
+                caption_source = self._caption_source_for_video(item.text())
+                self._timeline_selection_changed(caption_source)
+            elif self._timeline_source():
+                self._timeline_selection_changed(self._timeline_source())
+        except Exception:
+            pass
         if not ok:
             self.run_status.setText("当前状态：字幕队列全部失败，请在“帮助 → 软件日志”查看原因")
 
@@ -15315,11 +16988,7 @@ class DynamicCaptionPage(QWidget):
             source=self._timeline_pending_source or self._timeline_source(); phrase_srt,fixes=self._group_words_for_current_layout(result,True)
             phrase_srt = filter_asr_junk_srt(phrase_srt)
             if source:
-                key=self._timeline_key(source); self.timeline_words[key]=align_word_srt_to_phrase_srt(result, phrase_srt); self.timeline_overrides[key]=phrase_srt
-                self._mark_captions_source_timed(key)
-                if chinese: self.timeline_chinese[key]=chinese
-                if self.caption_mode.currentText() == "自由文案动画（不对口型）":
-                    self.free_texts[key]=phrase_srt
+                self._store_extracted_timeline(source, result, phrase_srt, chinese)
                 cue_count = max(0, str(result or "").count("-->"))
                 # 显示实际落地的识别服务（自动模式下不等于下拉框所选）
                 asr_note = ""
@@ -15342,10 +17011,12 @@ class DynamicCaptionPage(QWidget):
                         f"⚠ 识别结果偏少（{cue_count} 条）：{preview or '无正文'}。"
                         " 该片口播为希腊语时，请把「书写语言」选为 Ελληνικά 希腊语 后再次「重新提取」。"
                     )
-                if self._timeline_key(self._timeline_source())==key:
-                    self._loading_timeline=True
-                    try: self.override_text.setPlainText(phrase_srt)
-                    finally: self._loading_timeline=False
+                # 单片提取：刷新当前编辑器为该片结果
+                self._loading_timeline=True
+                try: self.override_text.setPlainText(phrase_srt)
+                finally: self._loading_timeline=False
+                self._live_timeline_cache_key = None
+                self._invalidate_preview_caption_overlay()
             self.log.appendPlainText("已重新识别并覆盖旧时间轴；词级时间轴已保留，编辑器已合并为逐句字幕。")
             if fixes: self._append_run_log(f"已自动修正 {fixes} 处逐句字幕时间重叠。")
             self._refresh_task_queue()
@@ -15960,6 +17631,9 @@ class DynamicCaptionPage(QWidget):
             self.preview_position_slider.blockSignals(False)
             self.preview_position_value.setText(f"距底部 {self.margin_v.value()}")
         self.update_style_preview(); self._refresh_live_preview()
+        # 切换视频加载独立样式 / 恢复偏好时：只改 UI，禁止污染批量快照或清空其它视频独立样式
+        if getattr(self, "_loading_video_style", False) or getattr(self, "_restoring_style", False):
+            return
         try:
             self._remember_batch_style_snapshot()
         except Exception:
@@ -16087,6 +17761,11 @@ class DynamicCaptionPage(QWidget):
                     return
             except RuntimeError:
                 self.thread = None
+        # 导出前把字幕区手动修改刷进 timeline_overrides，避免改了编辑器却烧旧字
+        try:
+            self._persist_caption_editor_text()
+        except Exception:
+            pass
         self._clear_previews_and_releases()
         try: ffmpeg = self.find_ffmpeg()
         except Exception as exc: QMessageBox.critical(self, "缺少组件", str(exc)); return
@@ -17145,19 +18824,25 @@ class DynamicCaptionPage(QWidget):
         # 清掉旧人工字幕覆盖，避免重合成后仍用上一版文案
         self.timeline_overrides.pop(key, None)
         
-        # 成品里已混好「配音 + BGM」。必须切到真实存在的「视频原声」，
+        # 成品里已混好「配音 + BGM」。预览时必须切到「视频原声」，
         # 否则若仍是「视频配音＋背景音乐」会再叠一路外部配音 → 听成两个朗诵。
+        # 注意：这只是预览临时态，禁止写进偏好，否则会冲掉用户记住的合成方式/BGM。
         try:
-            if hasattr(self, "audio_mode") and self.audio_mode is not None:
-                self.audio_mode.blockSignals(True)
-                self.audio_mode.setCurrentText("视频原声")
-                self.audio_mode.blockSignals(False)
-            if hasattr(self, "bgm_enabled") and self.bgm_enabled is not None:
-                self.bgm_enabled.blockSignals(True)
-                self.bgm_enabled.setChecked(False)
-                self.bgm_enabled.blockSignals(False)
-            if hasattr(self, "_audio_mode_changed"):
-                self._audio_mode_changed("视频原声")
+            previous_restoring = bool(getattr(self, "_restoring_style", False))
+            self._restoring_style = True
+            try:
+                if hasattr(self, "audio_mode") and self.audio_mode is not None:
+                    self.audio_mode.blockSignals(True)
+                    self.audio_mode.setCurrentText("视频原声")
+                    self.audio_mode.blockSignals(False)
+                if hasattr(self, "bgm_enabled") and self.bgm_enabled is not None:
+                    self.bgm_enabled.blockSignals(True)
+                    self.bgm_enabled.setChecked(False)
+                    self.bgm_enabled.blockSignals(False)
+                if hasattr(self, "_audio_mode_changed"):
+                    self._audio_mode_changed("视频原声")
+            finally:
+                self._restoring_style = previous_restoring
         except Exception:
             pass
         

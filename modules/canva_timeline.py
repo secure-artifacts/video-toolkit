@@ -11,6 +11,8 @@ from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QProcess, Qt, Sig
 from PySide6.QtGui import QColor, QDrag, QFont, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -66,6 +68,8 @@ class MediaClip:
     source_duration: int = 0
     media_type: str = "video"
     path: str = ""
+    # Playback speed: 1.0 normal, 2.0 = 2× fast (shorter on timeline), 0.5 = slow-mo.
+    speed: float = 1.0
 
     def as_dict(self) -> dict:
         return {
@@ -77,7 +81,15 @@ class MediaClip:
             "source_duration": self.source_duration or max(self.source_end, 0),
             "media_type": self.media_type,
             "path": self.path,
+            "speed": float(self.speed or 1.0),
         }
+
+    def source_span_ms(self) -> int:
+        return max(80, int(self.source_end) - int(self.source_start))
+
+    def timeline_span_for_speed(self, speed: float | None = None) -> int:
+        spd = max(0.25, min(4.0, float(speed if speed is not None else self.speed or 1.0)))
+        return max(80, int(round(self.source_span_ms() / spd)))
 
     def resolved_source_duration(self, fallback: int = 0) -> int:
         """Full source file length; never shrink just because the clip was trimmed."""
@@ -252,6 +264,10 @@ class TimelineCanvas(QWidget):
                             full_ms,
                             self.media_source_duration_ms,
                         )
+                    try:
+                        spd = float(item.get("speed", 1.0) or 1.0)
+                    except (TypeError, ValueError):
+                        spd = 1.0
                     restored.append(
                         MediaClip(
                             int(item["start"]), int(item["end"]),
@@ -260,6 +276,7 @@ class TimelineCanvas(QWidget):
                             source_duration=src_dur,
                             media_type=str(item.get("media_type", "video") or "video"),
                             path=item_path,
+                            speed=max(0.25, min(4.0, spd)),
                         )
                     )
                 except (KeyError, TypeError, ValueError):
@@ -653,20 +670,70 @@ class TimelineCanvas(QWidget):
         edge = 50
         if cut <= clip.start + edge or cut >= clip.end - edge:
             return False
-        source_cut = clip.source_start + (cut - clip.start)
+        spd = max(0.25, min(4.0, float(getattr(clip, "speed", 1.0) or 1.0)))
+        source_cut = clip.source_start + int(round((cut - clip.start) * spd))
+        source_cut = max(clip.source_start + 40, min(clip.source_end - 40, source_cut))
         src_dur = clip.resolved_source_duration()
         tracks[index:index + 1] = [
             MediaClip(
                 clip.start, cut, clip.source_start, source_cut, clip.name, src_dur,
-                clip.media_type, clip.path,
+                clip.media_type, clip.path, speed=spd,
             ),
             MediaClip(
                 cut, clip.end, source_cut, clip.source_end, clip.name, src_dur,
-                clip.media_type, clip.path,
+                clip.media_type, clip.path, speed=spd,
             ),
         ]
         if kind == "video":
             self._split_linked_original_audio(cut)
+        return True
+
+    def set_selected_video_speed(self, speed: float) -> bool:
+        """Set playback speed on the selected video clip; timeline length = source/speed."""
+        if not self.selected or self.selected[0] != "video":
+            return False
+        kind, index = self.selected
+        tracks = self.media_clips.get("video", [])
+        if not (0 <= index < len(tracks)):
+            return False
+        clip = tracks[index]
+        if str(clip.media_type or "video") == "image":
+            return False
+        new_speed = max(0.25, min(4.0, float(speed or 1.0)))
+        old_speed = max(0.25, min(4.0, float(getattr(clip, "speed", 1.0) or 1.0)))
+        if abs(new_speed - old_speed) < 0.001:
+            return False
+        self.push_undo()
+        old_end = int(clip.end)
+        new_span = clip.timeline_span_for_speed(new_speed)
+        new_end = int(clip.start) + new_span
+        delta = new_end - old_end
+        clip.speed = new_speed
+        clip.end = new_end
+        # Ripple following video clips (and linked original audio loosely via duration)
+        if abs(delta) >= 1:
+            for other in tracks:
+                if other is clip:
+                    continue
+                if int(other.start) >= old_end - 5:
+                    other.start = int(other.start) + delta
+                    other.end = int(other.end) + delta
+            # Keep original_audio clip bounds aligned if 1:1 with video segments when possible
+            for ac in self.media_clips.get("original_audio", []):
+                if int(ac.start) >= old_end - 5:
+                    ac.start = int(ac.start) + delta
+                    ac.end = int(ac.end) + delta
+            self._grow_timeline_if_needed(max(
+                (int(c.end) for c in tracks),
+                default=self.duration_ms,
+            ))
+            if delta < 0:
+                # Shrink duration_ms if trailing empty
+                max_end = max((int(c.end) for c in tracks), default=1000)
+                self.duration_ms = max(1000, max(self.duration_ms + delta, max_end + 200))
+                self._update_width()
+        self._emit_timeline_state()
+        self.update()
         return True
 
     def _ensure_optional_track(self, kind: str, name: str):
@@ -684,6 +751,7 @@ class TimelineCanvas(QWidget):
             self.duration_ms, max((clip.end for clip in self.clips), default=0), 1000
         )
         self._update_width()
+        self.update()
 
     def set_position(self, milliseconds: int):
         value = max(0, min(int(milliseconds), self.duration_ms))
@@ -1435,30 +1503,52 @@ class TimelineCanvas(QWidget):
         event.acceptProposedAction()
 
     def contextMenuEvent(self, event):
-        if not self.transition_names:
-            return super().contextMenuEvent(event)
         position = self._ms(event.pos().x())
+        y = event.pos().y()
         menu = QMenu(self)
-        submenu = menu.addMenu("添加转场")
-        for name in self.transition_names:
-            action = submenu.addAction(name)
-            action.triggered.connect(
-                lambda checked=False, value=name, at=position: (
-                    self.push_undo(), self.add_transition(value, at)
-                )
-            )
-        nearby = next(
-            (
-                item for item in self.transitions
-                if abs(int(item.get("position", 0)) - position) <= 300
-            ),
-            None,
-        )
-        if nearby:
+        # 声明叠加轨：右键删除 PNG/文字/蒙版块
+        overlay_top = self._track_y("overlay")
+        hit_overlay = None
+        hit_overlay_index = -1
+        if overlay_top <= y <= overlay_top + self.TRACK_HEIGHT:
+            for index, item in enumerate(self.overlays):
+                left = self._x(int(item.get("start", 0)))
+                right = self._x(int(item.get("end", 0)))
+                if left - 2 <= event.pos().x() <= right + 2:
+                    hit_overlay = item
+                    hit_overlay_index = index
+                    break
+        if hit_overlay is not None:
+            self.selected = ("overlay", hit_overlay_index)
+            self.update()
+            name = str(hit_overlay.get("name") or "声明叠加")
+            delete_overlay = menu.addAction(f"删除「{name}」")
+            delete_overlay.triggered.connect(self.delete_selected)
             menu.addSeparator()
-            remove = menu.addAction("删除此处转场")
-            remove.triggered.connect(lambda checked=False, item=nearby: self._remove_transition(item))
-        menu.exec(event.globalPos())
+        if self.transition_names:
+            submenu = menu.addMenu("添加转场")
+            for name in self.transition_names:
+                action = submenu.addAction(name)
+                action.triggered.connect(
+                    lambda checked=False, value=name, at=position: (
+                        self.push_undo(), self.add_transition(value, at)
+                    )
+                )
+            nearby = next(
+                (
+                    item for item in self.transitions
+                    if abs(int(item.get("position", 0)) - position) <= 300
+                ),
+                None,
+            )
+            if nearby:
+                menu.addSeparator()
+                remove = menu.addAction("删除此处转场")
+                remove.triggered.connect(lambda checked=False, item=nearby: self._remove_transition(item))
+        if menu.actions():
+            menu.exec(event.globalPos())
+        else:
+            super().contextMenuEvent(event)
 
     def _remove_transition(self, item: dict):
         if item in self.transitions:
@@ -1544,6 +1634,11 @@ class TimelineCanvas(QWidget):
             if 0 <= index < len(self.overlays):
                 self.push_undo()
                 self.overlays.pop(index)
+                # 由 timelineEdited → 父页刷新预览；此处保证选中态清空
+                self.selected = None
+                self._emit_timeline_state()
+                self.update()
+                return
         else:
             tracks = self.media_clips.get(kind, [])
             if 0 <= index < len(tracks):
@@ -1752,6 +1847,10 @@ class TimelineCanvas(QWidget):
                     try:
                         src_end = int(item["source_end"])
                         src_dur = int(item.get("source_duration") or 0) or src_end
+                        try:
+                            spd = float(item.get("speed", 1.0) or 1.0)
+                        except (TypeError, ValueError):
+                            spd = 1.0
                         restored.append(
                             MediaClip(
                                 int(item["start"]), int(item["end"]),
@@ -1760,6 +1859,7 @@ class TimelineCanvas(QWidget):
                                 source_duration=src_dur,
                                 media_type=str(item.get("media_type", "video") or "video"),
                                 path=str(item.get("path", "") or ""),
+                                speed=max(0.25, min(4.0, spd)),
                             )
                         )
                     except (KeyError, TypeError, ValueError):
@@ -1896,7 +1996,10 @@ class CanvaTimelinePanel(QWidget):
             "切点需距片段两端至少约 0.05 秒。"
         )
         self.delete_button = QPushButton("删除")
-        self.delete_button.setToolTip("删除当前选中的时间轴片段")
+        self.delete_button.setToolTip(
+            "删除当前选中的时间轴片段。\n"
+            "声明叠加轨（PNG/文字/蒙版）也可先点选色块再删，或右键删除。"
+        )
         self.undo_button = QPushButton("撤销")
         self.undo_button.setToolTip("撤销上一步时间轴操作（Ctrl+Z）")
         self.redo_button = QPushButton("重做")
@@ -1905,6 +2008,42 @@ class CanvaTimelinePanel(QWidget):
         edit_row.addWidget(self.delete_button)
         edit_row.addWidget(self.undo_button)
         edit_row.addWidget(self.redo_button)
+        edit_row.addWidget(QLabel("片段速度"))
+        self.clip_speed = QDoubleSpinBox()
+        self.clip_speed.setRange(0.25, 4.0)
+        self.clip_speed.setDecimals(2)
+        self.clip_speed.setSingleStep(0.05)
+        self.clip_speed.setValue(1.0)
+        self.clip_speed.setSuffix(" ×")
+        self.clip_speed.setToolTip(
+            "先点选视频轨片段，再输入自定义倍数（0.25～4.00）。\n"
+            "例如 1.25×、2.50×、0.60× 均可。\n"
+            "加速：无声过场更快；慢放：好画面拉长。\n"
+            "会按源时长÷速度重算该段长度，并后移后续片段。"
+        )
+        self.clip_speed.setMinimumWidth(88)
+        self.clip_speed.setMaximumWidth(110)
+        edit_row.addWidget(self.clip_speed)
+        self.clip_speed_apply = QPushButton("应用")
+        self.clip_speed_apply.setToolTip("把当前倍数应用到选中的视频片段")
+        self.clip_speed_apply.setMaximumWidth(48)
+        edit_row.addWidget(self.clip_speed_apply)
+        # 常用快捷
+        self.clip_speed_presets = QComboBox()
+        self.clip_speed_presets.addItem("快捷…", None)
+        for label, value in (
+            ("0.5× 慢放", 0.5),
+            ("0.75×", 0.75),
+            ("1× 正常", 1.0),
+            ("1.25×", 1.25),
+            ("1.5×", 1.5),
+            ("2×", 2.0),
+            ("3×", 3.0),
+        ):
+            self.clip_speed_presets.addItem(label, value)
+        self.clip_speed_presets.setToolTip("选快捷倍数会填入左边输入框，再点「应用」生效")
+        self.clip_speed_presets.setMaximumWidth(96)
+        edit_row.addWidget(self.clip_speed_presets)
         edit_row.addStretch()
         edit_row.addWidget(QLabel("图片时长"))
         self.image_overwrite_duration = QSpinBox()
@@ -2002,6 +2141,9 @@ class CanvaTimelinePanel(QWidget):
         # 直接连接切片（勿再用 connect(lambda:None)+disconnect 占位，部分环境下会丢信号）
         self.cut_button.clicked.connect(self._on_cut_clicked)
         self.delete_button.clicked.connect(self.canvas.delete_selected)
+        self.clip_speed_apply.clicked.connect(self._apply_clip_speed)
+        self.clip_speed.editingFinished.connect(self._apply_clip_speed)
+        self.clip_speed_presets.activated.connect(self._fill_speed_from_preset)
         self.undo_button.clicked.connect(self._undo_clicked)
         self.redo_button.clicked.connect(self._redo_clicked)
         self._refresh_undo_buttons()
@@ -2029,6 +2171,45 @@ class CanvaTimelinePanel(QWidget):
         self.canvas.set_zoom(value)
         if hasattr(self, "zoom_value"):
             self.zoom_value.setText(str(int(value)))
+
+    def _fill_speed_from_preset(self, index: int):
+        if not hasattr(self, "clip_speed_presets") or not hasattr(self, "clip_speed"):
+            return
+        data = self.clip_speed_presets.itemData(index)
+        if data is None:
+            return
+        try:
+            speed = float(data)
+        except (TypeError, ValueError):
+            return
+        self.clip_speed.blockSignals(True)
+        self.clip_speed.setValue(speed)
+        self.clip_speed.blockSignals(False)
+        self._apply_clip_speed()
+        self.clip_speed_presets.blockSignals(True)
+        self.clip_speed_presets.setCurrentIndex(0)
+        self.clip_speed_presets.blockSignals(False)
+
+    def _apply_clip_speed(self, *_args):
+        if not hasattr(self, "clip_speed"):
+            return
+        try:
+            speed = float(self.clip_speed.value())
+        except (TypeError, ValueError):
+            return
+        if self.canvas.set_selected_video_speed(speed):
+            self._refresh_undo_buttons()
+        else:
+            # 未选中视频片段：把输入框同步为当前选中段速度（若有）
+            sel = self.canvas.selected
+            if sel and sel[0] == "video":
+                tracks = self.canvas.media_clips.get("video", [])
+                idx = sel[1]
+                if 0 <= idx < len(tracks):
+                    cur = float(getattr(tracks[idx], "speed", 1.0) or 1.0)
+                    self.clip_speed.blockSignals(True)
+                    self.clip_speed.setValue(cur)
+                    self.clip_speed.blockSignals(False)
 
     def _refresh_undo_buttons(self):
         if hasattr(self, "undo_button"):

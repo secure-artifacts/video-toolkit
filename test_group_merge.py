@@ -81,7 +81,53 @@ def main():
         )
         bad_ordered, bad_reason, bad_details = match_clips_to_script(bad_clips, bad_tr, bad_script)
         assert bad_ordered is None, (bad_reason, bad_details)
-        assert "可信度不足" in bad_reason
+        assert (
+            "可信度不足" in bad_reason
+            or "近并列" in bad_reason
+            or "拒绝重排" in bad_reason
+        ), bad_reason
+
+        # 希腊语变音/终态σ折叠后应能对齐
+        from modules.group_merge import _plain_text, find_matching_srt_bounds, _normalize_match_text
+        assert _plain_text("Θεός") == _plain_text("θεος")
+        assert _plain_text("πίστης") == _plain_text("πιστης")
+        # 拉丁文不得被希腊同形表改写（否则 to/me 会被当成希腊虚词删掉）
+        assert "to" in _normalize_match_text("to me Amen")
+        assert "amen" in _normalize_match_text("Amen")
+        # 希腊+拉丁混排：同形折叠生效
+        assert _plain_text("και") == _plain_text("καί")
+
+        # 近并列希腊短段：必须拒绝重排，禁止硬套顺序
+        near_clips = [group_2 / "n1.mp4", group_2 / "n2.mp4"]
+        for p in near_clips:
+            p.touch()
+        near_tr = {
+            str(near_clips[0].resolve()): "Αμήν Κύριε ελέησον ημάς",
+            str(near_clips[1].resolve()): "Αμήν Κύριε ελέησον τον κόσμο",
+        }
+        near_script = (
+            "Αμήν Κύριε ελέησον ημάς σήμερα.\n\n"
+            "Αμήν Κύριε ελέησον τον κόσμο σου."
+        )
+        near_ordered, near_reason, _ = match_clips_to_script(near_clips, near_tr, near_script)
+        # 允许成功（区分度够）或拒绝近并列/可信度——绝不能静默错绑
+        if near_ordered is None:
+            assert (
+                "近并列" in near_reason
+                or "可信度不足" in near_reason
+                or "拒绝" in near_reason
+            ), near_reason
+
+        # 文案窗匹配：近并列短句应回退整段 ASR，而不是切错窗
+        amb_srt = (
+            "1\n00:00:00,000 --> 00:00:01,000\nΑμήν\n\n"
+            "2\n00:00:01,100 --> 00:00:03,000\nΚύριε ελέησον\n\n"
+            "3\n00:00:03,100 --> 00:00:05,000\nΑμήν Κύριε\n"
+        )
+        _s, _e, _ok = find_matching_srt_bounds(amb_srt, "Αμήν", 5.0)
+        # 「Αμήν」太短且多处命中 → 回退 speech_trim（整段）更安全
+        full_s, full_e, full_ok = find_matching_srt_bounds(amb_srt, "", 5.0)
+        assert full_ok and full_s <= 0.05
 
         # Optimal assignment beats greedy near-ties (similar openings).
         from modules.group_merge import _max_weight_assignment

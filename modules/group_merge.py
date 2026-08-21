@@ -255,17 +255,81 @@ def lookup_group_script(scripts, folder):
     return ""
 
 
+# 希腊语匹配：去变音、终态 sigma、常见拉丁/希腊同形混入（ASR 常混）
+_GREEK_HOMOGLYPHS = str.maketrans({
+    "ς": "σ",
+    "Ϲ": "σ", "ϲ": "σ",
+    "A": "α", "a": "α", "Á": "α", "á": "α",
+    "B": "β", "b": "β",
+    "E": "ε", "e": "ε", "É": "ε", "é": "ε",
+    "H": "η", "h": "η",
+    "I": "ι", "i": "ι", "Í": "ι", "í": "ι",
+    "K": "κ", "k": "κ",
+    "M": "μ", "m": "μ",
+    "N": "ν", "n": "ν",
+    "O": "ο", "o": "ο", "Ó": "ο", "ó": "ο",
+    "P": "ρ", "p": "ρ",
+    "T": "τ", "t": "τ",
+    "X": "χ", "x": "χ",
+    "Y": "υ", "y": "υ",
+    "Z": "ζ", "z": "ζ",
+})
+_GREEK_STOP = {
+    "και", "το", "τα", "τη", "της", "του", "των", "να", "για", "με", "σε",
+    "μου", "σου", "μας", "σας", "απο", "από", "στο", "στη", "στην", "στον",
+    "ειναι", "είναι", "θα", "αν", "ή", "η", "ο", "οι", "μια", "ένα", "ενά",
+    # 常见虚词/指示：短祷文互相沾边时易抬高 Jaccard
+    "δε", "δεν", "που", "πως", "ως", "οτι", "ότι", "αυτο", "αυτό", "αυτη", "αυτή",
+    "αυτα", "αυτά", "εκει", "εκεί", "εδω", "εδώ", "τωρα", "τώρα", "μονο", "μόνο",
+    "ομως", "όμως", "αλλα", "αλλά", "εσυ", "εσύ", "εγω", "εγώ", "μας", "σας",
+}
+
+
+def _text_has_greek(value: str) -> bool:
+    return any(
+        "\u0370" <= ch <= "\u03ff" or "\u1f00" <= ch <= "\u1fff"
+        for ch in str(value or "")
+    )
+
+
+def _normalize_match_text(value: str) -> str:
+    """Fold diacritics / final sigma / Latin-Greek lookalikes for matching only.
+
+    Homoglyph folding is only applied when the string contains Greek letters,
+    so English/Portuguese matching is not rewritten into Greek stopwords.
+    """
+    import unicodedata
+    text = str(value or "")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    if _text_has_greek(text):
+        text = text.translate(_GREEK_HOMOGLYPHS)
+    else:
+        # 无希腊字母时仍折叠终态 σ（极少见）与大小写
+        text = text.replace("ς", "σ")
+    return text.casefold()
+
+
 def _plain_text(value):
     # Include Greek Extended (U+1F00–U+1FFF) used by polytonic / some ASR outputs.
+    folded = _normalize_match_text(value)
     return re.sub(
         r"[^0-9a-z\u00c0-\u024f\u0370-\u03ff\u1f00-\u1fff\u0400-\u04ff\u3400-\u9fff]+",
         "",
-        str(value).casefold(),
+        folded,
     )
 
 
 def _word_tokens(value):
-    return set(re.findall(r"[0-9a-z\u00c0-\u024f\u0370-\u03ff\u1f00-\u1fff\u0400-\u04ff\u3400-\u9fff]+", str(value).casefold()))
+    folded = _normalize_match_text(value)
+    tokens = set(re.findall(
+        r"[0-9a-z\u00c0-\u024f\u0370-\u03ff\u1f00-\u1fff\u0400-\u04ff\u3400-\u9fff]+",
+        folded,
+    ))
+    # 仅希腊文段去掉虚词，避免「και/το」沾边；拉丁文保留原 token
+    if _text_has_greek(value):
+        return {t for t in tokens if t not in _GREEK_STOP and len(t) > 1}
+    return {t for t in tokens if len(t) > 1}
 
 
 def _text_similarity(source, target):
@@ -300,8 +364,11 @@ def _text_similarity(source, target):
         contain = best * 0.85
     ws, wt = _word_tokens(s_raw), _word_tokens(t_raw)
     jacc = (len(ws & wt) / len(ws | wt)) if ws and wt else 0.0
-    # 强调词集合重合 + 全文/前缀；包含分降权
-    return max(full, 0.92 * prefix, 0.75 * contain, 0.95 * jacc)
+    # 短句：降低 Jaccard 权重，避免虚词带动错误高分
+    short = min(len(s), len(t)) < 28 or (len(ws) <= 4 and len(wt) <= 4)
+    jacc_w = 0.60 if short else 0.95
+    contain_w = 0.55 if short else 0.75
+    return max(full, 0.92 * prefix, contain_w * contain, jacc_w * jacc)
 
 
 def _transcript_variants(analysis_or_text):
@@ -331,15 +398,31 @@ def _transcript_for_match(analysis_or_text):
 def _resolve_transcript(transcripts, clip):
     """Look up transcript by resolved path with a few fallback key forms."""
     path = Path(clip)
-    keys = [str(path.resolve()), str(path), str(path.resolve()).replace("\\", "/")]
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    keys = [
+        str(resolved),
+        str(path),
+        str(resolved).replace("\\", "/"),
+        str(path).replace("\\", "/"),
+    ]
     for key in keys:
         if key in transcripts:
             return transcripts[key]
+    # Windows 安装版常见：盘符大小写 / 斜杠不一致导致查不到识别稿 → 误匹配或全空
     try:
-        target = path.resolve()
+        target = resolved
+        target_norm = str(target).replace("\\", "/").lower()
         for key, value in transcripts.items():
             try:
                 if Path(key).resolve() == target:
+                    return value
+            except Exception:
+                pass
+            try:
+                if str(key).replace("\\", "/").lower() == target_norm:
                     return value
             except Exception:
                 continue
@@ -449,7 +532,7 @@ def _max_weight_assignment(score_matrix):
     return seg_to_clip
 
 
-def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.50):
+def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.55):
     """One-to-one match clips to script segments; return clips in script-segment order.
 
     Returns (ordered_clips_or_None, reason, details).
@@ -457,8 +540,8 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.50):
     script line instead of re-splitting by index (which caused chaos when split
     disagreed with match order).
 
-    minimum_score default 0.50：低于此的「勉强匹配」会打乱合成顺序（例如 0.25～0.39
-    实际文案与识别几乎无关，必须回退文件名排序）。
+    minimum_score default 0.55：低于此的「勉强匹配」会打乱合成顺序（例如 0.25～0.45
+    实际文案与识别几乎无关，必须回退文件名排序）。安装版用户反馈弱匹配仍会排错，故略抬高门槛。
     """
     segments = split_group_script(script_text, len(clips))
     clips = list(clips)
@@ -524,12 +607,39 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.50):
     scores = [item["score"] for item in details]
     min_score = min(scores)
     mean_score = sum(scores) / max(1, len(scores))
+    # 短段抬高门槛（希腊语短祷文等容易互相沾边）
+    shortest = min((len(_plain_text(seg)) for seg in match_segments), default=0)
+    adaptive_floor = float(minimum_score)
+    if shortest < 24:
+        adaptive_floor = max(adaptive_floor, 0.70)
+    elif shortest < 48:
+        adaptive_floor = max(adaptive_floor, 0.62)
+    # 任一段空识别稿不得强行配对
+    if any(item["score"] <= 0.0 for item in details):
+        return (
+            None,
+            "部分片段识别文案为空，无法按分段文案可信匹配；已拒绝重排",
+            details,
+        )
+    # 近并列：最高分与次高分太近则拒绝（避免希腊语相邻段互换）
+    ambiguous = []
+    for seg in range(len(match_segments)):
+        col = sorted((score_matrix[c][seg] for c in range(len(clips))), reverse=True)
+        if len(col) >= 2 and (col[0] - col[1]) < (0.12 if shortest < 28 else 0.08):
+            ambiguous.append(seg + 1)
+    if ambiguous:
+        return (
+            None,
+            f"文案匹配存在近并列（第 {','.join(map(str, ambiguous[:8]))} 段与其它片段区分度不足），"
+            f"已拒绝重排以免顺序错乱；请改用文件名自然排序或检查分段文案",
+            details,
+        )
     # 单段过低 或 整体偏低：说明粘贴文案与这组视频对不上，禁止强行重排
-    if min_score < minimum_score or mean_score < max(0.45, minimum_score - 0.05):
+    if min_score < adaptive_floor or mean_score < max(0.50, adaptive_floor - 0.05):
         weak = ", ".join(
             f"第{item['segment_index'] + 1}段↔{item['clip'].name}({item['score']:.2f})"
             for item in details
-            if item["score"] < minimum_score
+            if item["score"] < adaptive_floor
         ) or ", ".join(
             f"第{item['segment_index'] + 1}段↔{item['clip'].name}({item['score']:.2f})"
             for item in details
@@ -537,7 +647,7 @@ def match_clips_to_script(clips, transcripts, script_text, minimum_score=0.50):
         return (
             None,
             f"文案匹配可信度不足（最低 {min_score:.2f} / 平均 {mean_score:.2f}；"
-            f"需单段≥{minimum_score:.2f}）。弱匹配：{weak}。"
+            f"需单段≥{adaptive_floor:.2f}）。弱匹配：{weak}。"
             f"请检查该组粘贴文案是否对应这些视频，或改用文件名自然排序",
             details,
         )
@@ -686,7 +796,8 @@ def parse_srt_with_text(srt):
 def find_matching_srt_bounds(srt, clip_script, duration, head_padding_ms=80, tail_padding_ms=120):
     """按分段文案在本片段 SRT 中找最相似连续句，返回该句时间窗。
 
-    匹配失败时回退到「整段 ASR 首尾词」，宁多留不漏字。
+    匹配失败或近并列时回退到「整段 ASR 首尾词」，宁多留不漏字
+    （希腊语等短句最容易误切到相邻句）。
     """
     entries = parse_srt_with_text(srt)
     duration = max(0.05, float(duration or 0.05))
@@ -697,20 +808,39 @@ def find_matching_srt_bounds(srt, clip_script, duration, head_padding_ms=80, tai
     if not clean_target:
         return speech_trim_bounds(srt, duration, head_padding_ms, tail_padding_ms)
 
+    # 检测希腊文比例：小语种短句抬高接受门槛，避免「και/Αμήν」沾边切错窗
+    raw = str(clip_script or "")
+    greek_chars = sum(1 for ch in raw if "\u0370" <= ch <= "\u03ff" or "\u1f00" <= ch <= "\u1fff")
+    letterish = sum(1 for ch in raw if ch.isalpha())
+    is_greekish = letterish > 0 and (greek_chars / max(1, letterish)) >= 0.35
+
     best_score = -1.0
+    second_score = -1.0
     best_range = (0, len(entries) - 1)
 
     for i in range(len(entries)):
         for j in range(i, len(entries)):
-            subset_text = "".join(entry[2] for entry in entries[i:j + 1])
-            clean_subset = _plain_text(subset_text)
-            score = SequenceMatcher(None, clean_subset, clean_target).ratio()
+            subset_text = " ".join(entry[2] for entry in entries[i:j + 1])
+            score = _text_similarity(subset_text, clip_script)
             if score > best_score:
+                second_score = best_score
                 best_score = score
                 best_range = (i, j)
+            elif score > second_score:
+                second_score = score
 
-    if best_score > 0.3:
+    if is_greekish or len(clean_target) < 28:
+        accept = 0.72 if len(clean_target) < 24 else 0.66
+        margin = 0.12 if len(clean_target) < 28 else 0.09
+    else:
+        accept = 0.65 if len(clean_target) < 28 else 0.55
+        margin = 0.08 if len(clean_target) < 28 else 0.06
+    if best_score >= accept and (best_score - max(0.0, second_score)) >= margin:
         i, j = best_range
+        # 覆盖面过窄（只命中 1 个短 cue）且目标文案明显更长 → 不可信，回退整段
+        covered = _plain_text(" ".join(entries[k][2] for k in range(i, j + 1)))
+        if len(clean_target) >= 36 and len(covered) < len(clean_target) * 0.45:
+            return speech_trim_bounds(srt, duration, head_padding_ms, tail_padding_ms)
         tail = max(200, int(tail_padding_ms or 0)) + 220
         start = max(0.0, entries[i][0] - max(0, head_padding_ms) / 1000.0)
         end = min(duration, entries[j][1] + tail / 1000.0)
@@ -2274,16 +2404,13 @@ class GroupMergeWorker(QObject):
                                         f" (相似度 {item['score']:.2f})"
                                     )
                             self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
-                            # 回退自然序时：仅当分段数恰好等于片段数才按索引取文案裁剪
-                            segs = split_group_script(group_script, len(clips))
-                            if len(segs) == len(clips):
-                                clip_scripts = list(segs)
-                            else:
-                                clip_scripts = [""] * len(clips)
-                                self.log.emit(
-                                    "提醒：文案段数与视频数不一致，裁剪将不按分段文案窗"
-                                    "（请用空行或连续 1.2.3. 分隔）。"
-                                )
+                            # 匹配失败时禁止「按索引硬套分段文案」做智能裁剪窗口
+                            # （希腊语等小语种弱匹配失败后若仍按 1↔文件1 裁剪，会切错口播）
+                            clip_scripts = [""] * len(clips)
+                            self.log.emit(
+                                "提醒：文案匹配未通过，智能混合边界将按识别音轴裁剪，"
+                                "不使用分段文案时间窗（避免错段裁切）。"
+                            )
                 elif str(group_script or "").strip():
                     segs = split_group_script(group_script, len(clips))
                     if len(segs) == len(clips):

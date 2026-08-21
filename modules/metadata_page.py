@@ -287,6 +287,59 @@ def _is_nearly_916(width: int, height: int, tol: float = 0.012) -> bool:
     return abs((width / float(height)) - (9.0 / 16.0)) <= tol
 
 
+# 仅在正常打开失败后使用；完好文件仍走纯流复制，不预探测、不伤画质
+_RECOVERY_INPUT_FLAGS = [
+    "-err_detect", "ignore_err",
+    "-fflags", "+genpts+igndts+discardcorrupt",
+]
+
+
+def _is_container_corrupt_error(text: str) -> bool:
+    low = (text or "").lower()
+    needles = (
+        "stsc",
+        "stco",
+        "contradict",
+        "error reading header",
+        "invalid data found",
+        "moov atom not found",
+        "error opening input",
+        "could not find codec parameters",
+        "partial file",
+    )
+    return any(n in low for n in needles)
+
+
+def _friendly_ffmpeg_error(stderr: str, *, stage: str = "") -> str:
+    """把常见 FFmpeg 英文错误翻成用户可读中文。"""
+    text = (stderr or "").strip()
+    prefix = f"【{stage}】" if stage else ""
+    if _is_container_corrupt_error(text):
+        return (
+            f"{prefix}源视频容器索引损坏（常见：STSC/STCO 矛盾 / Invalid data / 读头失败）。"
+            "已尝试自动修复仍无法打开。"
+            "建议：用能正常播放的播放器「另存为/重新导出」，或换一份完整源文件后再清理元数据。"
+        )
+    low = text.lower()
+    if "no such file" in low:
+        return f"{prefix}找不到输入文件。"
+    if "permission denied" in low or "拒绝访问" in text:
+        return f"{prefix}没有写入权限，请换输出目录或关闭占用该文件的程序。"
+    if "disk" in low and ("space" in low or "full" in low):
+        return f"{prefix}磁盘空间不足。"
+    tail = text[-320:] if len(text) > 320 else text
+    if not tail:
+        return f"{prefix}FFmpeg 处理失败。"
+    return f"{prefix}处理失败：{tail}"
+
+
+def _output_looks_valid(path: Path, *, min_bytes: int = 1024) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size >= min_bytes
+    except OSError:
+        return False
+
+
 class MetadataWorker(QObject):
     log = Signal(str)
     progress = Signal(int)
@@ -314,6 +367,7 @@ class MetadataWorker(QObject):
         self.cancelled = False
         self._proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
+        self._repair_paths: list[Path] = []
 
     def cancel(self):
         self.cancelled = True
@@ -513,54 +567,208 @@ class MetadataWorker(QObject):
                 options = {"optimize": True}
             clean.save(destination, **options)
 
+    def _run_simple_ffmpeg(self, command: list) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_kwargs(),
+        )
+
+    def _cleanup_repairs(self):
+        for path in list(self._repair_paths):
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
+        self._repair_paths.clear()
+        cache = self.output / ".repair_cache"
+        try:
+            if cache.is_dir() and not any(cache.iterdir()):
+                cache.rmdir()
+        except OSError:
+            pass
+
+    def _try_repair_container(self, ffmpeg, source: Path) -> Path | None:
+        """损坏容器抢救：优先流复制（零画质损失），最后才对坏片重编码。
+
+        完好文件不会走到这里。返回可读临时片路径；无法修复则返回 None。
+        """
+        if self.cancelled:
+            raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
+
+        cache = self.output / ".repair_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        stem = source.stem[:48] or "repaired"
+        attempts: list[tuple[str, list]] = [
+            (
+                "容错流复制（画质不变）",
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    *_RECOVERY_INPUT_FLAGS, "-i", str(source),
+                    "-map", "0:V?", "-map", "0:a?",
+                    "-c", "copy", "-movflags", "+faststart",
+                ],
+            ),
+            (
+                "容错流复制（仅主音视频轨）",
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    *_RECOVERY_INPUT_FLAGS, "-i", str(source),
+                    "-map", "0:v:0?", "-map", "0:a:0?",
+                    "-c", "copy", "-movflags", "+faststart",
+                ],
+            ),
+            (
+                "容错重编码抢救（仅坏片最后手段）",
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    *_RECOVERY_INPUT_FLAGS, "-i", str(source),
+                    "-map", "0:v:0?", "-map", "0:a:0?",
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                ],
+            ),
+        ]
+        last_err = ""
+        for label, base_cmd in attempts:
+            if self.cancelled:
+                raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
+            out = unique_path(cache / f"{stem}_fix{source.suffix.lower() or '.mp4'}")
+            if out.suffix.lower() not in {".mp4", ".mov", ".m4v", ".mkv"}:
+                out = out.with_suffix(".mp4")
+            self.log.emit(f"  · 自动修复：{label}…")
+            result = self._run_simple_ffmpeg([*base_cmd, str(out)])
+            last_err = (result.stderr or "").strip()
+            if result.returncode == 0 and _output_looks_valid(out):
+                # 音频-only 或视频轨：至少能被 probe 打开
+                if source.suffix.lower() in AUDIO_EXTENSIONS:
+                    self._repair_paths.append(out)
+                    self.log.emit(f"  · 自动修复成功（{label}），继续清理元数据")
+                    return out
+                w, h, _fps = _probe_video_size(ffmpeg, out)
+                if w > 0 and h > 0:
+                    self._repair_paths.append(out)
+                    self.log.emit(f"  · 自动修复成功（{label}），继续清理元数据")
+                    return out
+                # 纯音频伪装扩展名
+                if source.suffix.lower() in AUDIO_EXTENSIONS or w == 0:
+                    # 再确认文件非空即可
+                    if _output_looks_valid(out, min_bytes=256):
+                        self._repair_paths.append(out)
+                        self.log.emit(f"  · 自动修复成功（{label}），继续清理元数据")
+                        return out
+            try:
+                if out.exists():
+                    out.unlink()
+            except OSError:
+                pass
+            if last_err:
+                self.log.emit(f"  · {label}未成功")
+        self.log.emit(
+            "  · 自动修复未能打开该文件（容器索引可能已彻底损坏）"
+            + (f"：{last_err[-180:]}" if last_err else "")
+        )
+        return None
+
+    def _ensure_readable_av(self, ffmpeg, source: Path, *, err_hint: str = "") -> Path:
+        """正常路径失败后才抢救；成功返回可用源（原片或临时修复片）。"""
+        hint = err_hint or ""
+        if hint and not _is_container_corrupt_error(hint):
+            # 非容器损坏类错误：仍尝试一轮容错 copy 修复（少数 Invalid data 变体）
+            pass
+        self.log.emit("  · 检测到可能的容器异常，尝试自动修复（优先流复制，不伤画质）…")
+        repaired = self._try_repair_container(ffmpeg, source)
+        if repaired is not None:
+            return repaired
+        raise RuntimeError(_friendly_ffmpeg_error(hint or "Invalid data found when processing input", stage="清理元数据"))
+
+    def _maybe_repair_and_retry(self, ffmpeg, source: Path, exc: BaseException):
+        """仅容器损坏类错误才抢救；其它错误原样抛出。"""
+        msg = str(exc)
+        if not _is_container_corrupt_error(msg):
+            raise
+        return self._ensure_readable_av(ffmpeg, source, err_hint=msg)
+
     def _av(self, source: Path, destination: Path):
         ffmpeg = find_media_tool("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("未找到 FFmpeg，请先到“设置与组件”一键安装。")
+        work = source
         # 纯音频：只清元数据
         if source.suffix.lower() in AUDIO_EXTENSIONS:
-            self._av_copy_clean(ffmpeg, source, destination)
+            try:
+                self._av_copy_clean(ffmpeg, work, destination)
+            except RuntimeError as exc:
+                work = self._maybe_repair_and_retry(ffmpeg, source, exc)
+                self._av_copy_clean(ffmpeg, work, destination)
             return
         need_reencode = self._wm_enabled() or self.crop_916
         if not need_reencode:
-            self._av_copy_clean(ffmpeg, source, destination)
+            try:
+                self._av_copy_clean(ffmpeg, work, destination)
+            except RuntimeError as exc:
+                work = self._maybe_repair_and_retry(ffmpeg, source, exc)
+                self._av_copy_clean(ffmpeg, work, destination)
             return
         # 已是 9:16 且仅裁切、无水印：可走流复制
         if self.crop_916 and not self._wm_enabled() and self.crop_916_mode == "keep":
-            w, h, _fps = _probe_video_size(ffmpeg, source)
+            w, h, _fps = _probe_video_size(ffmpeg, work)
             if _is_nearly_916(w, h):
                 self.log.emit(
                     f"  · 画面已是 9:16（{w}×{h}），跳过裁切，仅清除元数据（流复制、零画质损失）。"
                 )
-                self._av_copy_clean(ffmpeg, source, destination)
+                try:
+                    self._av_copy_clean(ffmpeg, work, destination)
+                except RuntimeError as exc:
+                    work = self._maybe_repair_and_retry(ffmpeg, source, exc)
+                    self._av_copy_clean(ffmpeg, work, destination)
                 return
-        self._av_reencode(ffmpeg, source, destination)
+        try:
+            self._av_reencode(ffmpeg, work, destination)
+        except RuntimeError as exc:
+            work = self._maybe_repair_and_retry(ffmpeg, source, exc)
+            self._av_reencode(ffmpeg, work, destination)
 
     def _av_copy_clean(self, ffmpeg, source: Path, destination: Path):
-        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                   "-map", "0:V?", "-map", "0:a?", "-map", "0:s?",
-                   *_META_STRIP, "-c", "copy", str(destination)]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
-
-        if result.returncode:
-            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                       "-map", "0:V?", "-map", "0:a?",
-                       *_META_STRIP, "-c", "copy", str(destination)]
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
-
-        if result.returncode:
-            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                       "-map", "0:V?", "-map", "0:a?", "-map_metadata", "-1",
-                       "-map_metadata:s", "-1", "-map_chapters", "-1", "-metadata", "creation_time=",
-                       "-metadata", "location=", "-metadata", "title=", "-metadata", "artist=",
-                       "-metadata", "copyright=", "-metadata", "comment=", "-c", "copy", str(destination)]
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
-
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or "FFmpeg 清除元数据失败")
+        attempts = [
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+             "-map", "0:V?", "-map", "0:a?", "-map", "0:s?",
+             *_META_STRIP, "-c", "copy", str(destination)],
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+             "-map", "0:V?", "-map", "0:a?",
+             *_META_STRIP, "-c", "copy", str(destination)],
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+             "-map", "0:V?", "-map", "0:a?", "-map_metadata", "-1",
+             "-map_metadata:s", "-1", "-map_chapters", "-1", "-metadata", "creation_time=",
+             "-metadata", "location=", "-metadata", "title=", "-metadata", "artist=",
+             "-metadata", "copyright=", "-metadata", "comment=", "-c", "copy", str(destination)],
+            # 容错输入 + 流复制（仍零画质损失；仅前面失败才执行）
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+             *_RECOVERY_INPUT_FLAGS, "-i", str(source),
+             "-map", "0:V?", "-map", "0:a?",
+             *_META_STRIP, "-c", "copy", str(destination)],
+        ]
+        result = None
+        for command in attempts:
+            if self.cancelled:
+                raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
+            result = self._run_simple_ffmpeg(command)
+            if result.returncode == 0 and _output_looks_valid(destination, min_bytes=256):
+                return
+            try:
+                if destination.exists() and destination.stat().st_size < 256:
+                    destination.unlink()
+            except OSError:
+                pass
+        err = (result.stderr if result else "") or "FFmpeg 清除元数据失败"
+        raise RuntimeError(_friendly_ffmpeg_error(err, stage="清除元数据"))
 
     def _build_video_chain(self, source_w: int = 0, source_h: int = 0) -> tuple[str, tuple | None, str]:
         """Build video filter chain. Returns (vf, out_size_or_None, scale_note).
@@ -721,7 +929,11 @@ class MetadataWorker(QObject):
                 )
             if result.returncode or not destination.is_file() or destination.stat().st_size < 1024:
                 raise RuntimeError(
-                    (result.stderr or "").strip() or "FFmpeg 处理失败（9:16/水印）")
+                    _friendly_ffmpeg_error(
+                        (result.stderr or "").strip() or "FFmpeg 处理失败（9:16/水印）",
+                        stage="9:16/水印",
+                    )
+                )
             return
 
         # 仅裁切 + 清元数据
@@ -779,9 +991,14 @@ class MetadataWorker(QObject):
             )
         if result.returncode or not destination.is_file() or destination.stat().st_size < 1024:
             raise RuntimeError(
-                (result.stderr or "").strip() or "FFmpeg 9:16 裁切失败")
+                _friendly_ffmpeg_error(
+                    (result.stderr or "").strip() or "FFmpeg 9:16 裁切失败",
+                    stage="9:16裁切",
+                )
+            )
 
     def run(self):
+        failed_names: list[str] = []
         try:
             self.output.mkdir(parents=True, exist_ok=True)
             common = None
@@ -791,13 +1008,15 @@ class MetadataWorker(QObject):
                 except ValueError:
                     common = None
             completed = 0
+            failed = 0
+            total = max(1, len(self.files))
             extras = []
             if self.crop_916:
                 extras.append("9:16裁切")
             if self._wm_enabled():
                 extras.append("水印")
             note = f"（清理+{'+'.join(extras)}）" if extras else "（清理元数据）"
-            for source in self.files:
+            for index, source in enumerate(self.files, 1):
                 if self.cancelled:
                     raise RuntimeError("任务已停止；已完成的文件仍保留在输出目录。")
                 relative_parent = Path()
@@ -809,26 +1028,60 @@ class MetadataWorker(QObject):
                 destination_dir = self.output / relative_parent
                 destination_dir.mkdir(parents=True, exist_ok=True)
                 destination = unique_path(destination_dir / source.name)
-                self.log.emit(f"正在处理{note}：{source.name}")
-                if source.suffix.lower() in IMAGE_EXTENSIONS:
-                    self._image(source, destination)
-                else:
-                    self._av(source, destination)
-                if self.preserve_time:
-                    stat = source.stat()
-                    os.utime(destination, (stat.st_atime, stat.st_mtime))
-                completed += 1
-                self.progress.emit(round(completed / len(self.files) * 100))
-                self.log.emit(f"完成：{destination}")
-                self.file_done.emit(str(source), str(destination))
-            msg = f"已处理 {completed} 个素材（清除元数据"
+                self.log.emit(f"正在处理{note} [{index}/{len(self.files)}]：{source.name}")
+                try:
+                    if source.suffix.lower() in IMAGE_EXTENSIONS:
+                        self._image(source, destination)
+                    else:
+                        self._av(source, destination)
+                    if self.preserve_time and destination.is_file():
+                        stat = source.stat()
+                        os.utime(destination, (stat.st_atime, stat.st_mtime))
+                    completed += 1
+                    self.log.emit(f"完成：{destination}")
+                    self.file_done.emit(str(source), str(destination))
+                except RuntimeError as exc:
+                    if self.cancelled or "任务已停止" in str(exc):
+                        raise
+                    failed += 1
+                    failed_names.append(source.name)
+                    self.log.emit(f"跳过：{source.name} — {exc}")
+                    try:
+                        if destination.exists() and destination.stat().st_size < 1024:
+                            destination.unlink()
+                    except OSError:
+                        pass
+                except Exception as exc:
+                    failed += 1
+                    failed_names.append(source.name)
+                    self.log.emit(f"跳过：{source.name} — {exc}")
+                    try:
+                        if destination.exists() and destination.stat().st_size < 1024:
+                            destination.unlink()
+                    except OSError:
+                        pass
+                self.progress.emit(round(index / total * 100))
+            self._cleanup_repairs()
+            ops = "清除元数据"
             if self.crop_916:
-                msg += " + 9:16 居中裁切"
+                ops += " + 9:16 居中裁切"
             if self._wm_enabled():
-                msg += " + 水印合成"
-            msg += f"）。\n{self.output}"
+                ops += " + 水印合成"
+            if completed == 0 and failed > 0:
+                detail = "；".join(failed_names[:5])
+                more = f" 等 {failed} 个" if failed > 5 else ""
+                self.finished.emit(
+                    False,
+                    f"全部失败（{failed} 个）。{ops}未产出可用文件。\n{detail}{more}\n{self.output}",
+                )
+                return
+            msg = f"已处理 {completed} 个素材（{ops}）"
+            if failed:
+                msg += f"，跳过 {failed} 个失败文件"
+            msg += f"。\n{self.output}"
             self.finished.emit(True, msg)
         except Exception as exc:
+            self._cleanup_repairs()
             self.finished.emit(False, str(exc))
 
 
