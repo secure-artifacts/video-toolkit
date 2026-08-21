@@ -79,7 +79,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.54").strip().lstrip("v") or "1.7.54"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.55").strip().lstrip("v") or "1.7.55"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -5239,6 +5239,18 @@ class MainWindow(QMainWindow):
             provider = alias.get(str(provider or "").strip(), provider)
             if provider in TRANSCRIPTION_PROVIDERS and provider != AUTO_PROVIDER and provider not in ordered:
                 ordered.append(provider)
+        # 图文成片 + 长音频：云端偶发「整段 1 条字幕」且很慢；把本地 Whisper 提前，避免干等 Gemini 数分钟
+        if prefer_fast:
+            media_sec = 0.0
+            try:
+                from modules.dynamic_caption_page import media_duration
+                media_sec = float(
+                    media_duration(self._find_ffmpeg(), str(media_path), fallback=0) or 0
+                )
+            except Exception:
+                media_sec = 0.0
+            if media_sec >= 90 and LOCAL_PROVIDER in ordered:
+                ordered = [LOCAL_PROVIDER] + [p for p in ordered if p != LOCAL_PROVIDER]
         errors = []
         asr_language = self._caption_asr_language()
         write_app_log(
@@ -5309,6 +5321,40 @@ class MainWindow(QMainWindow):
                         "WARNING", "字幕识别",
                     )
                     precise_srt = result["srt"]
+                # 长音频护栏：整段只出 1～2 条（Gemini 常见）对跟读/语义几乎无用，强制换下一方案
+                media_dur = 0.0
+                try:
+                    from modules.dynamic_caption_page import media_duration
+                    media_dur = float(
+                        media_duration(self._find_ffmpeg(), str(media_path), fallback=0) or 0
+                    )
+                except Exception:
+                    media_dur = 0.0
+                if media_dur <= 0:
+                    # 从字幕末尾估时长
+                    try:
+                        ends = re.findall(
+                            r"-->\s*(\d+):(\d+):(\d+)[,.](\d+)",
+                            str(precise_srt or result.get("srt") or ""),
+                        )
+                        if ends:
+                            h, m, s, ms = ends[-1]
+                            media_dur = (
+                                int(h) * 3600 + int(m) * 60 + int(s)
+                                + int(ms.ljust(3, "0")[:3]) / 1000.0
+                            )
+                    except Exception:
+                        media_dur = 0.0
+                cue_n = max(phrase_count, word_count, precise_srt.count("-->"))
+                plain_len = len(str(result.get("original") or "").strip())
+                if media_dur >= 60:
+                    min_cues = max(3, int(media_dur / 28))
+                    min_chars = max(100, int(media_dur * 1.8))
+                    if cue_n < min_cues or plain_len < min_chars:
+                        raise RuntimeError(
+                            f"结果过稀（{cue_n} 条/{plain_len} 字/{media_dur:.0f}s，"
+                            f"期望≥{min_cues} 条）：长配音需更细时间轴，改试下一识别服务"
+                        )
                 if errors:
                     write_app_log(f"已自动切换到 {provider} 并继续：{Path(media_path).name}", "INFO", "字幕识别")
                 # 供 Reels 界面日志显示「真正用了谁」

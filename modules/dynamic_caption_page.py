@@ -122,6 +122,39 @@ from .video_encoding import (
 from .app_logging import write_app_log
 from .canva_timeline import CanvaTimelinePanel, TransitionPresetButton
 from .platform_utils import app_data_dir
+
+
+def _qt_widget_alive(widget) -> bool:
+    """True if a PySide widget still has a live C++ object (not deleted/reparent-GC'd)."""
+    if widget is None:
+        return False
+    try:
+        from shiboken6 import isValid
+        return bool(isValid(widget))
+    except Exception:
+        try:
+            widget.objectName()
+            return True
+        except RuntimeError:
+            return False
+
+
+def _safe_set_enabled(widget, enabled: bool) -> None:
+    if not _qt_widget_alive(widget):
+        return
+    try:
+        widget.setEnabled(bool(enabled))
+    except RuntimeError:
+        pass
+
+
+def _safe_set_visible(widget, visible: bool) -> None:
+    if not _qt_widget_alive(widget):
+        return
+    try:
+        widget.setVisible(bool(visible))
+    except RuntimeError:
+        pass
 from .rename_page import clean_filename_part, safe_filename
 
 
@@ -215,6 +248,18 @@ PRESETS = {
         # 不再提前出字，严格跟词级时间，避免「字幕提前导致对不上」
         "semantic_lead_ms": 0,
     },
+    # 语义大小号 + 当前跟读词亮黄变色（卡拉OK）
+    "Reels 语义黄字跟读": {
+        "text": "#FFFFFF", "outline": "#0A0A0A", "highlight": "#FFEE00", "outline_width": 5,
+        "effect": "semantic_karaoke", "font_size": 86, "line_length": 22,
+        "letter_spacing": -1, "line_spacing": 115, "margin_v": 480,
+        "max_words": 7, "highlight_padding": 10, "animation_speed": 70,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 88,
+        "semantic_large_ratio": 1.18,
+        "semantic_small_ratio": 0.78,
+        "semantic_lead_ms": 0,
+    },
     # —— 逐词变色系列 ——
     "卡拉OK 青蓝跟读": {"text": "#FFFFFF", "outline": "#1A1A3A", "highlight": "#00E5FF", "outline_width": 4, "effect": "word_color", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
     "亮黄逐词变色": {"text": "#FFFFFF", "outline": "#222222", "highlight": "#FFEE00", "outline_width": 3, "effect": "word_color", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
@@ -301,7 +346,12 @@ PRESETS = {
         "margin_v": 500,
     },
     # —— 语义重点 ——
-    "Hormozi 大字语义": {"text": "#FFFFFF", "outline": "#000000", "highlight": "#FFFF00", "outline_width": 7, "effect": "word_scale", "font": "Arial", "font_size": 86, "line_length": 18, "margin_v": 500, "max_words": 5},
+    "Hormozi 大字语义": {
+        "text": "#FFFFFF", "outline": "#000000", "highlight": "#FFFF00", "outline_width": 7,
+        "effect": "word_scale", "font": "Arial", "font_size": 86, "line_length": 18,
+        "margin_v": 500, "max_words": 5,
+        "semantic_large_ratio": 1.22, "semantic_small_ratio": 0.72, "semantic_lead_ms": 0,
+    },
 }
 
 
@@ -740,13 +790,14 @@ class PresetPreviewButton(QPushButton):
         elif effect == "word_color":
             painter.setPen(text_color); painter.drawText(x,baseline,"字幕"); x2=x+metrics.horizontalAdvance("字幕")
             painter.setPen(highlight); painter.drawText(x2,baseline,"样式")
-        elif effect in ("semantic_stack", "word_scale"):
-            # 预览卡：大号重点 + 小号陪衬，示意语义堆叠
+        elif effect in SEMANTIC_LAYOUT_EFFECTS:
+            # 预览卡：大号重点 + 小号陪衬；黄字跟读时第二词用高亮色
             small = QFont(font); small.setPixelSize(11); small.setBold(True)
             big = QFont(font); big.setPixelSize(18); big.setBold(True)
             painter.setFont(big); painter.setPen(text_color); painter.drawText(x, baseline - 2, "重点")
-            painter.setFont(small); painter.setPen(text_color)
-            painter.drawText(x + QFontMetricsF(big).horizontalAdvance("重点") + 3, baseline, "铺陈")
+            painter.setFont(small)
+            painter.setPen(highlight if effect == "semantic_karaoke" else text_color)
+            painter.drawText(x + QFontMetricsF(big).horizontalAdvance("重点") + 3, baseline, "跟读" if effect == "semantic_karaoke" else "铺陈")
         else:
             painter.setPen(highlight); painter.drawText(x,baseline,sample)
         painter.end()
@@ -2996,10 +3047,10 @@ def semantic_stack_layout(tokens, emphasized, settings):
 
     # 重点约 +18%、其余约 -22%（相对 base），层次清晰又不过分
     large_size, small_size = _semantic_font_sizes(settings)
-    max_width = 1080 * max(40, min(96, int(settings.get("line_width", 88)))) / 100
-    family = str(settings.get("font", "Arial"))
+    max_width = 1080 * max(40, min(96, int(settings.get("line_width") or 88))) / 100
+    family = str(settings.get("font") or "Arial")
     bold = caption_uses_bold_face(settings)
-    letter = float(settings.get("letter_spacing", 0))
+    letter = _safe_float(settings.get("letter_spacing"), 0)
 
     def make_metrics(size):
         font = QFont(family)
@@ -3010,13 +3061,14 @@ def semantic_stack_layout(tokens, emphasized, settings):
 
     m_large = make_metrics(large_size)
     m_small = make_metrics(small_size)
-    gap_large = max(2.0, m_large.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
-    gap_small = max(2.0, m_small.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
+    word_gap = _safe_float(settings.get("word_spacing"), 0)
+    gap_large = max(2.0, m_large.horizontalAdvance(" ") + word_gap)
+    gap_small = max(2.0, m_small.horizontalAdvance(" ") + word_gap)
 
     lines = []
     small_buf = []
     # 小号行不宜过长，参考图一般 2～4 词一行，更整齐
-    max_small_words = max(2, min(5, int(settings.get("semantic_small_words", 3))))
+    max_small_words = max(2, min(5, int(settings.get("semantic_small_words") or 3)))
 
     def flush_small():
         nonlocal small_buf
@@ -3055,11 +3107,25 @@ def semantic_stack_layout(tokens, emphasized, settings):
     return lines
 
 
+def _safe_float(value, default=0.0):
+    """float() that treats None/'' as missing (dict.get default is skipped when key exists with None)."""
+    if value is None or value == "":
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# 语义堆叠类：大小号排版；semantic_karaoke 额外叠当前词跟读变色
+SEMANTIC_LAYOUT_EFFECTS = ("semantic_stack", "word_scale", "semantic_karaoke")
+
+
 def _semantic_font_sizes(settings):
     """与 layout 一致的大小号像素尺寸（重点明显大于其余，但不过分夸张）。"""
-    base = max(24, int(settings.get("font_size", 86)))
-    large_ratio = float(settings.get("semantic_large_ratio", 1.18))
-    small_ratio = float(settings.get("semantic_small_ratio", 0.78))
+    base = max(24, int(settings.get("font_size") or 86))
+    large_ratio = _safe_float(settings.get("semantic_large_ratio"), 1.18)
+    small_ratio = _safe_float(settings.get("semantic_small_ratio"), 0.78)
     large_size = max(28, int(round(base * max(1.05, min(1.35, large_ratio)))))
     small_size = max(20, int(round(base * max(0.65, min(0.92, small_ratio)))))
     if small_size >= large_size - 4:
@@ -3072,9 +3138,9 @@ def semantic_stack_geometry(lines, settings):
     if not lines:
         return []
     large_size, small_size = _semantic_font_sizes(settings)
-    family = str(settings.get("font", "Arial"))
+    family = str(settings.get("font") or "Arial")
     bold = caption_uses_bold_face(settings)
-    letter = float(settings.get("letter_spacing", 0))
+    letter = _safe_float(settings.get("letter_spacing"), 0)
 
     def make_metrics(size):
         font = QFont(family)
@@ -3085,9 +3151,10 @@ def semantic_stack_geometry(lines, settings):
 
     m_large = make_metrics(large_size)
     m_small = make_metrics(small_size)
-    gap_large = max(2.0, m_large.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
-    gap_small = max(2.0, m_small.horizontalAdvance(" ") + float(settings.get("word_spacing", 0)))
-    spacing = max(70, min(180, int(settings.get("line_spacing", 118)))) / 100.0
+    word_gap = _safe_float(settings.get("word_spacing"), 0)
+    gap_large = max(2.0, m_large.horizontalAdvance(" ") + word_gap)
+    gap_small = max(2.0, m_small.horizontalAdvance(" ") + word_gap)
+    spacing = max(70, min(180, int(settings.get("line_spacing") or 118))) / 100.0
 
     line_heights = []
     for line in lines:
@@ -3097,19 +3164,20 @@ def semantic_stack_geometry(lines, settings):
             line_heights.append(max(small_size * 1.15, m_small.height()) * spacing * 0.92)
 
     total_h = sum(line_heights)
-    position = settings.get("position", "画面中间")
+    position = settings.get("position") or "画面中间"
+    margin_v = _safe_float(settings.get("margin_v"), 250)
     if position == "顶部":
-        top = float(settings.get("margin_v", 250))
+        top = margin_v
     elif position == "画面中间":
         top = max(80.0, 960.0 - total_h / 2.0)
     else:
-        top = max(80.0, 1920.0 - float(settings.get("margin_v", 250)) - total_h)
+        top = max(80.0, 1920.0 - margin_v - total_h)
 
     result = []
     y_cursor = top
     for line, height in zip(lines, line_heights):
         gap = gap_large if any(item.get("large") for item in line) else gap_small
-        widths = [float(item["width"]) for item in line]
+        widths = [_safe_float(item.get("width"), 0) for item in line]
         total_w = sum(widths) + gap * max(0, len(widths) - 1)
         x_cursor = (1080.0 - total_w) / 2.0
         center_y = y_cursor + height / 2.0
@@ -3540,18 +3608,18 @@ def temporary_ass_path(prefix="caption"):
 
 def caption_layout_context(settings):
     """Canonical 1080x1920 caption metrics shared by live preview and ASS."""
-    font=QFont(str(settings.get("font","Arial")))
-    font.setPixelSize(max(1,int(settings.get("font_size",76))))
+    font=QFont(str(settings.get("font") or "Arial"))
+    font.setPixelSize(max(1,int(settings.get("font_size") or 76)))
     font.setBold(caption_uses_bold_face(settings))
-    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,float(settings.get("letter_spacing",0)))
+    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, _safe_float(settings.get("letter_spacing"), 0))
     metrics=QFontMetricsF(font)
-    font_size=max(1,int(settings.get("font_size",76)))
+    font_size=max(1,int(settings.get("font_size") or 76))
     # Word spacing is independent from glyph/letter spacing.  Negative values
     # intentionally remain negative so the control still changes the final
     # geometry after the natural space has reached zero.
-    gap=max(-font_size*1.25,metrics.horizontalAdvance(" ")+float(settings.get("word_spacing",0)))
-    line_gap=max(font_size,metrics.height())*max(70,min(180,int(settings.get("line_spacing",116))))/100
-    max_width=1080*max(40,min(96,int(settings.get("line_width",86))))/100
+    gap=max(-font_size*1.25,metrics.horizontalAdvance(" ")+_safe_float(settings.get("word_spacing"),0))
+    line_gap=max(font_size,metrics.height())*max(70,min(180,int(settings.get("line_spacing") or 116)))/100
+    max_width=1080*max(40,min(96,int(settings.get("line_width") or 86)))/100
     return font,metrics,gap,line_gap,max_width
 
 
@@ -3578,7 +3646,7 @@ def caption_wrapped_lines(text,settings,fixed_all=False,context=None):
     for token in tokens_for(text):
         candidate=" ".join(current+[token])
         width=sum(metrics.horizontalAdvance(value) for value in current+[token])+gap*len(current)
-        if current and (len(candidate)>int(settings.get("line_length",18)) or width>max_width):
+        if current and (len(candidate)>int(settings.get("line_length") or 18) or width>max_width):
             lines.append(current); current=[token]
         else:
             current.append(token)
@@ -3589,13 +3657,15 @@ def caption_wrapped_lines(text,settings,fixed_all=False,context=None):
 def caption_page_geometry(lines,settings,context=None):
     """Return stable token centers/baselines in the common 1080x1920 canvas."""
     context=context or caption_layout_context(settings); _font,metrics,gap,line_gap,_max_width=context
-    position=settings.get("position","底部")
-    if position=="顶部": center_y=float(settings.get("margin_v",250))+line_gap*(len(lines)-1)/2
+    position=settings.get("position") or "底部"
+    margin_v=_safe_float(settings.get("margin_v"),250)
+    if position=="顶部": center_y=margin_v+line_gap*(len(lines)-1)/2
     elif position=="画面中间": center_y=960.0
-    else: center_y=1920-float(settings.get("margin_v",250))-line_gap*(len(lines)-1)/2
+    else: center_y=1920-margin_v-line_gap*(len(lines)-1)/2
     result=[]
+    font_size=_safe_float(settings.get("font_size"),76)
     for line_index,tokens in enumerate(lines):
-        widths=[max(float(settings.get("font_size",76))*.55,metrics.horizontalAdvance(token)) for token in tokens]
+        widths=[max(font_size*.55,metrics.horizontalAdvance(token)) for token in tokens]
         total=sum(widths)+gap*max(0,len(widths)-1); cursor=(1080-total)/2
         y=center_y+(line_index-(len(lines)-1)/2)*line_gap
         baseline=y+metrics.ascent()/2-metrics.descent()/2
@@ -3768,8 +3838,39 @@ def render_timed_image_overlays(ffmpeg, source, edit_state, cache_dir, stack_ord
     return output
 
 
+def resolve_caption_preset(settings) -> dict:
+    """Resolve effect/style preset for live preview + ASS.
+
+    Custom saved presets may keep a display name that is not in PRESETS; fall back
+    to base_preset / effect fields so semantic_stack etc. survive save→reload.
+    """
+    settings = settings or {}
+    name = str(settings.get("preset") or "")
+    if name in ("Reels 白字柔影", "Reels 重点放大"):
+        name = "Reels 语义重点"
+    base_name = str(settings.get("base_preset") or "")
+    if base_name in ("Reels 白字柔影", "Reels 重点放大"):
+        base_name = "Reels 语义重点"
+    builtin = PRESETS.get(name) or PRESETS.get(base_name)
+    if builtin:
+        merged = dict(builtin)
+    else:
+        merged = dict(next(iter(PRESETS.values())))
+    # Overlay effect / semantic knobs from custom snapshot
+    effect = settings.get("effect")
+    if effect:
+        merged["effect"] = effect
+    for key in (
+        "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+        "semantic_max_lines", "semantic_small_words",
+    ):
+        if key in settings and settings.get(key) not in (None, ""):
+            merged[key] = settings[key]
+    return merged
+
+
 def write_ass(path, srt, settings, word_srt=""):
-    preset = PRESETS[settings["preset"]]
+    preset = resolve_caption_preset(settings)
     text_color = ass_color(settings.get("text_color") or "#FFFFFF")
     outline_color = ass_color(settings.get("outline_color") or "#111827")
     highlight = ass_color(settings.get("highlight_color") or "#2563EB")
@@ -3888,7 +3989,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     phrase_entries = list(parse_srt(srt, language=lang))
     # 语义堆叠：句与句时间窗必须互斥。绝不能用 max(start+min, end) 把结束时间
     # 硬拉长越过下一句起点——那正是「只有这个效果叠字」的根因。
-    if effect_name in ("semantic_stack", "word_scale"):
+    if effect_name in SEMANTIC_LAYOUT_EFFECTS:
         # 句与句硬切空隙略大，上一句读完立刻让位，避免停留叠到下一句
         phrase_entries = _semantic_non_overlapping_phrases(phrase_entries, gap=0.10)
 
@@ -3930,25 +4031,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         # —— 语义重点：底层先整句语义排版定稿（位置固定，相当于透明底稿），
         # 上层按词级语速逐词弹出；本句 end 硬切，杜绝停留叠到下一句 ——
-        if effect in ("semantic_stack", "word_scale"):
+        # semantic_karaoke：同样大小号，额外在词级窗口叠亮黄跟读色
+        if effect in SEMANTIC_LAYOUT_EFFECTS:
             geo_settings = dict(render_settings)
             geo_settings["position"] = "画面中间"
+            _semantic_defaults = {
+                "semantic_large_ratio": 1.18,
+                "semantic_small_ratio": 0.78,
+                "semantic_lead_ms": 0,
+                "semantic_max_lines": 5,
+            }
             for key in ("semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
                         "semantic_max_lines", "semantic_small_words"):
-                if key not in geo_settings and key in preset:
-                    geo_settings[key] = preset[key]
+                # key 存在但为 None 时仍要从预设补默认（否则 float(None) 崩预览/导出）
+                if geo_settings.get(key) in (None, ""):
+                    if key in preset and preset.get(key) not in (None, ""):
+                        geo_settings[key] = preset[key]
+                    elif key in _semantic_defaults:
+                        geo_settings[key] = _semantic_defaults[key]
             # 词时间夹进本句，并保证单调递增，避免抢先/乱序
             clamped = []
             prev_s = start
             span = max(0.08, end - start)
             for i, (w_start, w_end) in enumerate(timings):
-                cs = max(start, min(float(w_start), end - 0.04))
+                cs = max(start, min(_safe_float(w_start, start), end - 0.04))
                 cs = max(cs, prev_s)
                 # 均匀兜底：若时间挤在一起，按序号拉开一点，仍不超出本句
                 ideal = start + span * i / max(1, len(timings))
                 if cs > ideal + 0.35:
                     cs = max(prev_s, ideal)
-                ce = max(cs + 0.04, min(float(w_end), end))
+                ce = max(cs + 0.04, min(_safe_float(w_end, end), end))
                 clamped.append((cs, ce))
                 prev_s = cs + 0.02
             timings = clamped
@@ -3956,17 +4068,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             # ① 整句语义定稿：大小号 + 行位一次算死（未读词不显示，但占位已定）
             emphasized = select_emphasis_words(tokens)
             stack_lines = semantic_stack_layout(tokens, emphasized, geo_settings)
-            max_stack_lines = max(3, min(6, int(geo_settings.get("semantic_max_lines", 5))))
+            max_stack_lines = max(3, min(6, int(geo_settings.get("semantic_max_lines") or 5)))
             stack_pages = (
                 [stack_lines]
                 if fixed_all or len(stack_lines) <= max_stack_lines
                 else [stack_lines[i:i + max_stack_lines] for i in range(0, len(stack_lines), max_stack_lines)]
             )
-            lead_ms = geo_settings.get("semantic_lead_ms", 0)
-            try:
-                lead_ms = float(lead_ms)
-            except (TypeError, ValueError):
-                lead_ms = 0.0
+            lead_ms = _safe_float(geo_settings.get("semantic_lead_ms"), 0)
             lead = max(0.0, min(0.08, lead_ms / 1000.0))
             pop_ms = max(40, min(110, int(animation_ms)))
             fad_in = max(15, min(45, pop_ms // 2))
@@ -3994,7 +4102,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for line, line_geo in zip(page_lines, geometry):
                     for item, geo in zip(line, line_geo):
                         ti = page_first + local_i
-                        token_start, _token_end = timings[ti] if ti < len(timings) else (start, end)
+                        token_start, token_end = timings[ti] if ti < len(timings) else (start, end)
                         # ② 上层逐词弹出：严格跟语速，默认不提前
                         visible_start = max(start, token_start - lead)
                         visible_start = min(visible_start, page_end - 0.03)
@@ -4018,6 +4126,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(visible_end)},"
                             f"Base,,0,0,0,,{override}{draw}"
                         )
+                        # 语义黄字跟读：当前词窗口叠亮黄 ActiveColor（与 word_color 同色轨）
+                        if effect == "semantic_karaoke":
+                            karaoke_start = max(visible_start, token_start)
+                            # 跟到下一词开始或本词 end，不拖到页尾
+                            if ti + 1 < len(timings):
+                                karaoke_end = min(page_end, timings[ti + 1][0], max(karaoke_start + 0.06, token_end))
+                            else:
+                                karaoke_end = min(page_end, max(karaoke_start + 0.06, token_end))
+                            if karaoke_end > karaoke_start + 0.02:
+                                active_override = (
+                                    fr"{{\an5\pos({x:.1f},{y:.1f})\fs{size}\fad(25,25)}}"
+                                )
+                                events.append(
+                                    f"Dialogue: {caption_layer + 2},{ass_time(karaoke_start)},{ass_time(karaoke_end)},"
+                                    f"ActiveColor,,0,0,0,,{active_override}{draw}"
+                                )
                 token_index += page_token_count
             continue
 
@@ -6395,6 +6519,10 @@ class DynamicCaptionPage(QWidget):
         self.video_style_overrides = {}
         self._loading_video_style = False  # 切换视频加载独立样式时不写回 override
         self._batch_style_snapshot = None  # 最近一次批量样式快照
+        # 自定义预设的 effect / 语义参数（preset 显示名可能不在 PRESETS 里）
+        self._caption_base_preset = None
+        self._caption_effect_override = None
+        self._caption_semantic_overrides = {}
         # 字幕源时钟（ASR 原始时间）：裁剪后始终从此重映射，避免口型错位
         self.timeline_words_source = {}
         self.timeline_overrides_source = {}
@@ -8606,7 +8734,10 @@ class DynamicCaptionPage(QWidget):
         final_overlay_timing.addWidget(QLabel("结束"),0,2); final_overlay_timing.addWidget(self.overlay_end,0,3)
         final_overlay_timing.addWidget(self.overlay_from_playhead,1,0,1,2)
         final_overlay_timing.addWidget(self.add_layer_to_timeline,1,2,1,2)
-        final_overlay_timing.addWidget(self.add_layer_to_all_videos,2,0,1,4)
+        # 必须把「从当前视频移除」也挂到最终可见布局：旧 layer_group 未入主界面会被回收，
+        # 只留在 legacy overlay_timing 里会导致 C++ 对象已删、点预设时 RuntimeError。
+        final_overlay_timing.addWidget(self.add_layer_to_all_videos,2,0,1,2)
+        final_overlay_timing.addWidget(self.remove_layer_from_timeline,2,2,1,2)
         final_overlay_timing.addWidget(QLabel("淡入"),3,0); final_overlay_timing.addWidget(self.overlay_fade_in,3,1)
         final_overlay_timing.addWidget(QLabel("淡出"),3,2); final_overlay_timing.addWidget(self.overlay_fade_out,3,3)
         mask_group_layout.addLayout(final_overlay_timing)
@@ -11061,7 +11192,37 @@ class DynamicCaptionPage(QWidget):
             self.player.play()
             self.play_btn.setText("暂停")
             if self.preview_capture is not None:
-                self.preview_frame_timer.start(42)
+                self.preview_frame_timer.start(self._preview_frame_interval_ms())
+
+    def _preview_frame_interval_ms(self) -> int:
+        """长成片预览降帧：OpenCV+实时字幕在 3 分钟以上容易卡死 UI。"""
+        dur_ms = 0
+        try:
+            dur_ms = int(self.player.duration() or 0)
+        except Exception:
+            dur_ms = 0
+        if dur_ms <= 0:
+            try:
+                dur_ms = int(self.seek.maximum() or 0) if hasattr(self, "seek") else 0
+            except Exception:
+                dur_ms = 0
+        dur_s = max(0.0, dur_ms / 1000.0)
+        live = bool(
+            getattr(self, "live_preview", None)
+            and self.live_preview.isChecked()
+            and not getattr(self, "_precise_preview_active", False)
+        )
+        if dur_s >= 300:
+            base = 100  # ~10 fps
+        elif dur_s >= 180:
+            base = 80   # ~12 fps
+        elif dur_s >= 90:
+            base = 55   # ~18 fps
+        else:
+            base = 42   # ~24 fps
+        if live and dur_s >= 120:
+            base = min(120, base + 20)
+        return int(base)
 
     def _seek_preview(self, milliseconds):
         v_start = self._current_video_v_start()
@@ -11524,53 +11685,61 @@ class DynamicCaptionPage(QWidget):
             and not getattr(self, "_precise_preview_active", False)
         )
         if need_live:
-            progress = self._caption_progress_key(float(seconds))
-            style_token = id(getattr(self, "_live_caption_style_cache", None))
-            margin = int(self.margin_v.value()) if hasattr(self, "margin_v") else 0
-            preset = ""
             try:
-                preset = next((b.text() for b in self.preset_buttons if b.isChecked()), "")
-            except Exception:
+                sec = _safe_float(seconds, 0.0)
+                progress = self._caption_progress_key(sec)
+                style_token = id(getattr(self, "_live_caption_style_cache", None))
+                margin = int(self.margin_v.value()) if hasattr(self, "margin_v") else 0
                 preset = ""
-            # 动态水印（视频/GIF）时把时间桶打进 key，保证预览逐帧换 Logo 画面
-            has_anim_wm = any(
-                is_video_watermark_entry(e)
-                for e in (getattr(self, "_watermark_entries", None) or [])
-            )
-            wm_t_bucket = int(max(0.0, float(seconds)) * 20) if has_anim_wm else 0  # 20fps 刷新 Logo
-            # 图层几何必须进 cache key，否则调 PNG 宽高/位置预览不刷新
-            layers_sig = self._live_layers_cache_sig(float(seconds))
-            overlay_key = (
-                display.width(), display.height(), progress, style_token, margin, preset,
-                bool(getattr(self, "_watermark_images", None) or (
-                    hasattr(self, "_watermark_image") and not self._watermark_image.isNull()
-                )),
-                wm_t_bucket,
-                len(getattr(self, "_watermark_entries", None) or []),
-                layers_sig,
-            )
-            caption_layer = getattr(self, "_preview_caption_overlay", QImage())
-            if (
-                overlay_key != getattr(self, "_preview_caption_overlay_key", None)
-                or caption_layer is None
-                or caption_layer.isNull()
-                or caption_layer.size() != display.size()
-            ):
-                # 只缓存「字幕/效果层」（透明底），视频帧每 tick 仍更新
-                caption_layer = QImage(display.size(), QImage.Format.Format_ARGB32_Premultiplied)
-                caption_layer.fill(Qt.GlobalColor.transparent)
-                self._paint_live_layers(caption_layer, float(seconds))
-                self._preview_caption_overlay = caption_layer
-                self._preview_caption_overlay_key = overlay_key
-            # 当前视频帧 + 字幕效果层
-            composed = display.copy()
-            painter = QPainter(composed)
-            try:
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                painter.drawImage(0, 0, caption_layer)
-            finally:
-                painter.end()
-            display = composed
+                try:
+                    preset = next((b.text() for b in self.preset_buttons if b.isChecked()), "")
+                except Exception:
+                    preset = ""
+                # 动态水印（视频/GIF）时把时间桶打进 key，保证预览逐帧换 Logo 画面
+                has_anim_wm = any(
+                    is_video_watermark_entry(e)
+                    for e in (getattr(self, "_watermark_entries", None) or [])
+                )
+                wm_t_bucket = int(max(0.0, sec) * 20) if has_anim_wm else 0  # 20fps 刷新 Logo
+                # 图层几何必须进 cache key，否则调 PNG 宽高/位置预览不刷新
+                layers_sig = self._live_layers_cache_sig(sec)
+                overlay_key = (
+                    display.width(), display.height(), progress, style_token, margin, preset,
+                    bool(getattr(self, "_watermark_images", None) or (
+                        hasattr(self, "_watermark_image") and not self._watermark_image.isNull()
+                    )),
+                    wm_t_bucket,
+                    len(getattr(self, "_watermark_entries", None) or []),
+                    layers_sig,
+                )
+                caption_layer = getattr(self, "_preview_caption_overlay", QImage())
+                if (
+                    overlay_key != getattr(self, "_preview_caption_overlay_key", None)
+                    or caption_layer is None
+                    or caption_layer.isNull()
+                    or caption_layer.size() != display.size()
+                ):
+                    # 只缓存「字幕/效果层」（透明底），视频帧每 tick 仍更新
+                    caption_layer = QImage(display.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                    caption_layer.fill(Qt.GlobalColor.transparent)
+                    self._paint_live_layers(caption_layer, sec)
+                    self._preview_caption_overlay = caption_layer
+                    self._preview_caption_overlay_key = overlay_key
+                # 当前视频帧 + 字幕效果层
+                composed = display.copy()
+                painter = QPainter(composed)
+                try:
+                    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                    painter.drawImage(0, 0, caption_layer)
+                finally:
+                    painter.end()
+                display = composed
+            except Exception as live_exc:
+                # 字幕叠层失败不应整段预览加载失败（画面仍可播）
+                if not getattr(self, "_preview_live_paint_err_logged", False):
+                    self._preview_live_paint_err_logged = True
+                    if hasattr(self, "log") and self.log is not None:
+                        self.log.appendPlainText(f"实时字幕叠层跳过：{live_exc}")
         pm = QPixmap.fromImage(display)
         if pm.isNull():
             return
@@ -11956,16 +12125,19 @@ class DynamicCaptionPage(QWidget):
                         self.watermark_mode, self.watermark_position, self.writing_language,
                         # 第 7 节：此前改了不记忆，重启后回默认
                         self.aspect_ratio, self.resolution, self.video_extend_mode, self.transition_name):
+            control.currentTextChanged.connect(self._invalidate_live_style)
             control.currentTextChanged.connect(self._refresh_live_preview)
             control.currentTextChanged.connect(self._save_style_preferences)
         self.transition_duration.valueChanged.connect(self._save_style_preferences)
         self.rtl_word_highlight.toggled.connect(self._save_style_preferences)
+        self.rtl_word_highlight.toggled.connect(self._invalidate_live_style)
         self.rtl_word_highlight.toggled.connect(self._refresh_live_preview)
         for control in (self.font_size, self.line_length, self.line_width, self.letter_spacing, self.word_spacing,
                         self.line_spacing, self.max_words, self.max_lines, self.highlight_padding, self.highlight_padding_y,
                         self.animation_speed, self.outline_width, self.margin_v, self.free_page_seconds,
                         self.original_volume, self.background_volume,self.audio_fade_in,self.audio_fade_out,
                         self.watermark_width, self.watermark_opacity, self.watermark_margin):
+            control.valueChanged.connect(self._invalidate_live_style)
             control.valueChanged.connect(self._refresh_live_preview)
             control.valueChanged.connect(self._save_style_preferences)
         self.clean_metadata.toggled.connect(self._save_style_preferences)
@@ -12072,6 +12244,15 @@ class DynamicCaptionPage(QWidget):
             data = item["data"]
             
             if is_custom:
+                # Prefer explicit effect / base_preset; never treat free_animation as effect
+                effect = data.get("effect")
+                if not effect:
+                    base = data.get("base_preset") or data.get("preset")
+                    if base in ("Reels 白字柔影", "Reels 重点放大"):
+                        base = "Reels 语义重点"
+                    if base in PRESETS:
+                        effect = PRESETS[base].get("effect")
+                effect = effect or "word_color"
                 repr_preset = {
                     "text": data.get("text_color", "#FFFFFF"),
                     "outline": data.get("outline_color", "#111827"),
@@ -12079,21 +12260,16 @@ class DynamicCaptionPage(QWidget):
                     "background": data.get("background_color", "#168AAD"),
                     "active_text": data.get("active_text_color", "#FFFFFF"),
                     "outline_width": data.get("outline_width", 3),
-                    "effect": data.get("free_animation", "word_color"),
+                    "effect": effect,
                     "font": data.get("font", "Arial"),
-                    "font_size": data.get("font_size", 58)
+                    "font_size": data.get("font_size", 58),
                 }
-                anim = repr_preset["effect"]
-                if anim == "卡点单行":
-                    repr_preset["effect"] = "descript"
-                elif anim == "逐字弹出":
-                    repr_preset["effect"] = "pop"
-                elif anim == "逐字渐出":
-                    repr_preset["effect"] = "glow"
-                elif anim == "智能卡点":
-                    repr_preset["effect"] = "highlight"
-                else:
-                    repr_preset["effect"] = "word_color"
+                for key in (
+                    "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+                    "semantic_max_lines", "semantic_small_words",
+                ):
+                    if key in data:
+                        repr_preset[key] = data[key]
             else:
                 repr_preset = data
                 
@@ -12233,6 +12409,11 @@ class DynamicCaptionPage(QWidget):
                 self.all_presets.remove(item)
                 break
         snapshot = self._style_template_snapshot()
+        # 自定义名不在 PRESETS：务必带上 base_preset/effect，否则再应用会丢「语义重点」
+        if not snapshot.get("base_preset") or snapshot.get("base_preset") not in PRESETS:
+            fields = self._resolved_style_effect_fields()
+            snapshot["base_preset"] = fields.get("base_preset") or "Descript 经典黄"
+            snapshot["effect"] = fields.get("effect") or snapshot.get("effect") or "word_color"
         self.all_presets.insert(0, {
             "name": name,
             "is_custom": True,
@@ -12242,7 +12423,12 @@ class DynamicCaptionPage(QWidget):
         store.setValue("presets_list_json", json.dumps(self.all_presets, ensure_ascii=False))
         store.sync()
         self._load_all_presets()
-        self._append_run_log(f"已保存自定义预设：{name}")
+        # 保存后自动勾选并应用刚存的预设，方便继续微调
+        try:
+            self._apply_preset_by_index(0)
+        except Exception:
+            pass
+        self._append_run_log(f"已保存自定义预设：{name}（可继续改颜色/字体后再覆盖保存）")
 
     def _import_preset(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入字幕样式预设", "", "样式预设 (*.json)")
@@ -12299,13 +12485,28 @@ class DynamicCaptionPage(QWidget):
         """Return portable visual settings only; media/timelines never enter a template."""
         values=self._style_preferences()
         allowed={
-            "preset","font","font_size","caption_mode","free_animation","free_page_seconds",
+            "preset","base_preset","effect","font","font_size","caption_mode","free_animation","free_page_seconds",
             "line_length","line_width","letter_spacing","word_spacing","line_spacing","max_words","max_lines",
             "highlight_padding","highlight_padding_y","animation_speed","outline_width","position","margin_v",
             "text_color","outline_color","highlight_color","background_color","active_text_color","watermark_mode",
             "watermark_position","watermark_width","watermark_opacity","watermark_margin",
+            "semantic_large_ratio","semantic_small_ratio","semantic_lead_ms","semantic_max_lines","semantic_small_words",
         }
         result={key:value for key,value in values.items() if key in allowed}
+        # Ensure effect/base_preset survive custom rename (preset display name may not be in PRESETS)
+        resolved = resolve_caption_preset(values)
+        result["effect"] = values.get("effect") or resolved.get("effect")
+        base = values.get("base_preset") or values.get("preset")
+        if base in PRESETS:
+            result["base_preset"] = base
+        elif values.get("base_preset") in PRESETS:
+            result["base_preset"] = values.get("base_preset")
+        for key in (
+            "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+            "semantic_max_lines", "semantic_small_words",
+        ):
+            if key in resolved and key not in result:
+                result[key] = resolved[key]
         result["layers"]=json.loads(json.dumps(self.layers,ensure_ascii=False))
         result["watermarks"]=json.loads(json.dumps(self._watermark_entries,ensure_ascii=False))
         return result
@@ -12314,8 +12515,12 @@ class DynamicCaptionPage(QWidget):
         if not isinstance(saved,dict): raise ValueError("模板内容不是有效对象")
         previous=self._restoring_style; self._restoring_style=True
         try:
-            preset=saved.get("preset")
-            if preset in PRESETS: self.apply_preset(preset)
+            # 先按内置底预设恢复 effect（语义重点等），再叠自定义颜色/字体
+            base = saved.get("base_preset") or saved.get("preset")
+            if base in ("Reels 白字柔影", "Reels 重点放大"):
+                base = "Reels 语义重点"
+            if base in PRESETS:
+                self.apply_preset(base)
             combos={"font":self.font,"caption_mode":self.caption_mode,"free_animation":self.free_animation,
                     "position":self.position,"watermark_mode":self.watermark_mode,
                     "watermark_position":self.watermark_position}
@@ -12333,15 +12538,33 @@ class DynamicCaptionPage(QWidget):
                 if key in saved:
                     try: control.setValue(int(saved[key]))
                     except (TypeError,ValueError): pass
+            # 语义重点：跟读色按钮标签用「重点词」
+            effect = str(saved.get("effect") or "")
+            if not effect and base in PRESETS:
+                effect = str(PRESETS[base].get("effect") or "")
+            highlight_label = (
+                "跟读文字" if effect in ("semantic_karaoke", "word_color")
+                else "重点词" if effect in ("semantic_stack", "word_scale")
+                else "跟读背景"
+            )
             for button,label,key in (
                 (self.text_color,"普通文字","text_color"),
                 (self.background_color,"普通背景","background_color"),
                 (self.outline_color,"描边","outline_color"),
-                (self.highlight_color,"跟读背景","highlight_color"),
+                (self.highlight_color,highlight_label,"highlight_color"),
                 (self.active_text_color,"跟读文字","active_text_color"),
             ):
                 color=str(saved.get(key,""))
                 if re.fullmatch(r"#[0-9A-Fa-f]{6}",color): button.setText(f"{label} {color.upper()}")
+            # Stash effect knobs on the page for _current_settings / snapshot
+            self._caption_effect_override = effect or None
+            self._caption_base_preset = base if base in PRESETS else None
+            self._caption_semantic_overrides = {
+                k: saved[k] for k in (
+                    "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+                    "semantic_max_lines", "semantic_small_words",
+                ) if k in saved
+            }
             if isinstance(saved.get("layers"),list):
                 self.layers=json.loads(json.dumps(saved["layers"],ensure_ascii=False))
                 if not any(item.get("type")=="caption" for item in self.layers if isinstance(item,dict)):
@@ -12379,6 +12602,7 @@ class DynamicCaptionPage(QWidget):
                 if missing: self._append_run_log("模板中的水印文件在本机不存在，已跳过："+"；".join(missing))
         finally:
             self._restoring_style=previous
+        self._invalidate_live_style()
         self._sync_preview_margin(self.margin_v.value()); self.update_style_preview(); self._refresh_live_preview()
         self._save_style_preferences()
 
@@ -12493,10 +12717,61 @@ class DynamicCaptionPage(QWidget):
         families=self._register_font_files(paths) if paths else []
         write_app_log(message+(f"｜可用字体：{'、'.join(families)}" if families else ""), "INFO" if ok else "ERROR", "字体管理")
 
-    def _style_preferences(self):
-        preset=next((button.text() for button in self.preset_buttons if button.isChecked()),"Descript 经典黄")
+    def _resolved_style_effect_fields(self) -> dict:
+        """当前勾选预设对应的 effect / base_preset（自定义名也能找回语义重点等）。"""
+        checked = next((b.name for b in self.preset_buttons if b.isChecked()), "")
+        base = getattr(self, "_caption_base_preset", None)
+        effect = getattr(self, "_caption_effect_override", None)
+        semantic = dict(getattr(self, "_caption_semantic_overrides", None) or {})
+        if checked in PRESETS:
+            base = checked
+            effect = PRESETS[checked].get("effect")
+            for key in (
+                "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+                "semantic_max_lines", "semantic_small_words",
+            ):
+                if key in PRESETS[checked]:
+                    semantic[key] = PRESETS[checked][key]
+        elif not base:
+            # 自定义勾选：尽量从按钮关联的 builtin 预览数据取 effect
+            for b in self.preset_buttons:
+                if b.isChecked() and isinstance(getattr(b, "preset", None), dict):
+                    effect = effect or b.preset.get("effect")
+                    break
+        resolved_effect = effect or PRESETS.get(base or "", {}).get("effect") or "word_color"
+        # 语义堆叠/大小号：缺省比例时补默认，避免 settings 里留下 None
+        if resolved_effect in SEMANTIC_LAYOUT_EFFECTS:
+            semantic.setdefault("semantic_large_ratio", 1.18)
+            semantic.setdefault("semantic_small_ratio", 0.78)
+            semantic.setdefault("semantic_lead_ms", 0)
+            # 清掉显式 None
+            for key in ("semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+                        "semantic_max_lines", "semantic_small_words"):
+                if semantic.get(key) in (None, ""):
+                    semantic.pop(key, None)
+            semantic.setdefault("semantic_large_ratio", 1.18)
+            semantic.setdefault("semantic_small_ratio", 0.78)
+            semantic.setdefault("semantic_lead_ms", 0)
+        else:
+            # 非语义效果：不要把空语义字段带出去
+            for key in list(semantic.keys()):
+                if semantic.get(key) in (None, ""):
+                    semantic.pop(key, None)
         return {
-            "preset":preset,"font":self.font.currentText(),"font_size":self.font_size.value(),
+            "preset": checked or base or "Descript 经典黄",
+            "base_preset": base or (checked if checked in PRESETS else "Descript 经典黄"),
+            "effect": resolved_effect,
+            **semantic,
+        }
+
+    def _style_preferences(self):
+        effect_fields = self._resolved_style_effect_fields()
+        preset = effect_fields.get("preset") or "Descript 经典黄"
+        prefs = {
+            "preset":preset,
+            "base_preset": effect_fields.get("base_preset"),
+            "effect": effect_fields.get("effect"),
+            "font":self.font.currentText(),"font_size":self.font_size.value(),
             "caption_mode":self.caption_mode.currentText(),"free_animation":self.free_animation.currentText(),
             "free_page_seconds":self.free_page_seconds.value(),"line_length":self.line_length.value(),
             "line_width":self.line_width.value(),"letter_spacing":self.letter_spacing.value(),
@@ -12585,6 +12860,15 @@ class DynamicCaptionPage(QWidget):
                 if hasattr(self, "proj_tts_reverb_mode") else "大厅"
             ),
         }
+        # 仅写入非空语义参数，避免存盘/恢复后出现 semantic_*=None → float(None)
+        for key in (
+            "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+            "semantic_max_lines", "semantic_small_words",
+        ):
+            val = effect_fields.get(key)
+            if val not in (None, ""):
+                prefs[key] = val
+        return prefs
 
     def _get_audio_mode_internal(self, text=None):
         """UI 文案 → 导出/预览内部三态。
@@ -13581,10 +13865,7 @@ class DynamicCaptionPage(QWidget):
                 settings = None
             if not settings:
                 settings = self._current_settings() if hasattr(self, "_current_settings") else {}
-            preset_name = settings.get("preset")
-            if preset_name in ("Reels 白字柔影", "Reels 重点放大"):
-                preset_name = "Reels 语义重点"
-            preset = PRESETS.get(preset_name) or next(iter(PRESETS.values()))
+            preset = resolve_caption_preset(settings)
             context=caption_layout_context(settings)
             self._live_caption_style_cache={"settings":settings,"preset":preset,"context":context}
         settings=self._live_caption_style_cache["settings"]; preset=self._live_caption_style_cache["preset"]
@@ -13624,17 +13905,24 @@ class DynamicCaptionPage(QWidget):
                     active_word = tokens[0]
 
         # 语义重点：整句定稿占位，只绘制已读到的词（位置与导出一致，不随逐词重排）
-        if effect in ("semantic_stack", "word_scale"):
+        # semantic_karaoke：当前词用跟读色（默认黄），已读词仍白字大小号
+        if effect in SEMANTIC_LAYOUT_EFFECTS:
             geo_settings = dict(settings)
             geo_settings["position"] = "画面中间"
             preset_data = preset if isinstance(preset, dict) else {}
             for key in ("semantic_large_ratio", "semantic_small_ratio", "semantic_max_lines"):
-                if key not in geo_settings and key in preset_data:
+                if geo_settings.get(key) in (None, "") and key in preset_data:
                     geo_settings[key] = preset_data[key]
+            if geo_settings.get("semantic_large_ratio") in (None, ""):
+                geo_settings["semantic_large_ratio"] = 1.18
+            if geo_settings.get("semantic_small_ratio") in (None, ""):
+                geo_settings["semantic_small_ratio"] = 0.78
+            if geo_settings.get("semantic_max_lines") in (None, ""):
+                geo_settings["semantic_max_lines"] = 5
             emphasized = select_emphasis_words(tokens)
             # 底稿：整句排版
             full_lines = semantic_stack_layout(tokens, emphasized, geo_settings)
-            max_stack_lines = max(3, min(6, int(geo_settings.get("semantic_max_lines", 5))))
+            max_stack_lines = max(3, min(6, int(geo_settings.get("semantic_max_lines") or 5)))
             full_pages = (
                 [full_lines]
                 if fixed_all or len(full_lines) <= max_stack_lines
@@ -13642,6 +13930,7 @@ class DynamicCaptionPage(QWidget):
             ) or [[]]
             spoken_cut = max(1, min(int(cut or len(tokens)), len(tokens)))
             spoken = set(range(spoken_cut))
+            active_i = spoken_cut - 1 if effect == "semantic_karaoke" else -1
 
             # 落在哪一页：按词序号
             page_index = 0
@@ -13655,9 +13944,9 @@ class DynamicCaptionPage(QWidget):
             page_lines = full_pages[page_index]
             page_token_offset = sum(sum(len(line) for line in full_pages[i]) for i in range(page_index))
             geometry = semantic_stack_geometry(page_lines, geo_settings)
-            family = str(settings.get("font", "Arial"))
+            family = str(settings.get("font") or "Arial")
             bold = caption_uses_bold_face(settings)
-            letter = float(settings.get("letter_spacing", 0))
+            letter = _safe_float(settings.get("letter_spacing"), 0)
             flat_i = 0
             for line, line_geo in zip(page_lines, geometry):
                 for item, geo in zip(line, line_geo):
@@ -13665,20 +13954,21 @@ class DynamicCaptionPage(QWidget):
                     flat_i += 1
                     if global_i not in spoken:
                         continue  # 未读到的词：透明底稿不画
-                    size = int(item.get("size") or settings.get("font_size", 86))
+                    size = int(item.get("size") or settings.get("font_size") or 86)
                     word_font = QFont(family)
                     word_font.setPixelSize(size)
                     word_font.setBold(bold)
                     word_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter)
                     path = QPainterPath()
                     path.addText(0, 0, word_font, item["token"])
+                    fill = highlight if global_i == active_i else base_color
                     painter.save()
                     painter.translate(geo["left"], geo["baseline"])
                     painter.setPen(QPen(outline, pen_width * 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
                     painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawPath(path)
                     painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(base_color)
+                    painter.setBrush(fill)
                     painter.drawPath(path)
                     painter.restore()
             return
@@ -14143,23 +14433,22 @@ class DynamicCaptionPage(QWidget):
         image_enabled=bool(layer and layer.get("type")=="image")
         if (mask_enabled or text_enabled or image_enabled):
             self._show_right_setting(2)  # 蒙版与图层 is now stack index 2
-        if hasattr(self,"mask_editor"): self.mask_editor.setVisible(mask_enabled)
-        if hasattr(self,"text_editor"): self.text_editor.setVisible(text_enabled)
-        if hasattr(self,"image_editor"): self.image_editor.setVisible(image_enabled)
-        if hasattr(self,"add_layer_to_timeline"):
-            self.add_layer_to_timeline.setEnabled(mask_enabled or text_enabled or image_enabled)
-        if hasattr(self,"add_layer_to_all_videos"):
-            self.add_layer_to_all_videos.setEnabled(mask_enabled or text_enabled or image_enabled)
-        if hasattr(self,"remove_layer_from_timeline"):
-            self.remove_layer_from_timeline.setEnabled(mask_enabled or text_enabled or image_enabled)
-        if hasattr(self,"mask_quick_combo"):
-            self.mask_quick_combo.setEnabled(mask_enabled)
-        for control in (self.mask_color,self.mask_opacity,self.mask_x,self.mask_y,self.mask_w,self.mask_h,self.mask_radius,*self.mask_quick_buttons): control.setEnabled(mask_enabled)
+        _safe_set_visible(getattr(self, "mask_editor", None), mask_enabled)
+        _safe_set_visible(getattr(self, "text_editor", None), text_enabled)
+        _safe_set_visible(getattr(self, "image_editor", None), image_enabled)
+        any_overlay = mask_enabled or text_enabled or image_enabled
+        _safe_set_enabled(getattr(self, "add_layer_to_timeline", None), any_overlay)
+        _safe_set_enabled(getattr(self, "add_layer_to_all_videos", None), any_overlay)
+        _safe_set_enabled(getattr(self, "remove_layer_from_timeline", None), any_overlay)
+        _safe_set_enabled(getattr(self, "mask_quick_combo", None), mask_enabled)
+        for control in (self.mask_color,self.mask_opacity,self.mask_x,self.mask_y,self.mask_w,self.mask_h,self.mask_radius,*self.mask_quick_buttons):
+            _safe_set_enabled(control, mask_enabled)
         text_controls=(self.layer_text,self.layer_text_font,self.layer_text_size,self.layer_text_color,
                        self.layer_text_outline_color,self.layer_text_outline,
                        self.layer_text_opacity,self.layer_text_x,self.layer_text_y,*self.text_quick_buttons)
-        for control in text_controls: control.setEnabled(text_enabled)
-        if hasattr(self,"text_quick_combo"): self.text_quick_combo.setEnabled(text_enabled)
+        for control in text_controls:
+            _safe_set_enabled(control, text_enabled)
+        _safe_set_enabled(getattr(self, "text_quick_combo", None), text_enabled)
         image_controls=(
             getattr(self,"image_layer_path",None),getattr(self,"image_layer_change",None),
             getattr(self,"image_layer_width",None),getattr(self,"image_layer_opacity",None),
@@ -14167,7 +14456,7 @@ class DynamicCaptionPage(QWidget):
             getattr(self,"image_quick_combo",None),getattr(self,"image_stack_order",None),
         )
         for control in image_controls:
-            if control is not None: control.setEnabled(image_enabled)
+            _safe_set_enabled(control, image_enabled)
         if mask_enabled:
             controls=((self.mask_x,"x"),(self.mask_y,"y"),(self.mask_w,"w"),(self.mask_h,"h"),(self.mask_opacity,"opacity"),(self.mask_radius,"radius"))
             for control,key in controls: control.blockSignals(True); control.setValue(int(layer.get(key,0))); control.blockSignals(False)
@@ -14968,11 +15257,15 @@ class DynamicCaptionPage(QWidget):
         self._refresh_canva_timeline(path)
 
     def _current_settings(self):
-        preset = next((button.text() for button in self.preset_buttons if button.isChecked()), None)
+        effect_fields = self._resolved_style_effect_fields() if hasattr(self, "_resolved_style_effect_fields") else {}
+        preset = effect_fields.get("preset") or next(
+            (getattr(button, "name", button.text()) for button in self.preset_buttons if button.isChecked()),
+            None,
+        )
         if not preset and self.preset_buttons:
-            preset = self.preset_buttons[0].text()
+            preset = getattr(self.preset_buttons[0], "name", self.preset_buttons[0].text())
         if not preset:
-            preset = "Descript 💬"
+            preset = "Descript 经典黄"
         watermark_fingerprint=watermark_config_fingerprint(self._watermark_entries)
         baked_videos=[]
         if watermark_fingerprint and hasattr(self,"videos"):
@@ -14985,7 +15278,10 @@ class DynamicCaptionPage(QWidget):
             writing_lang = self.asr_language_code() or writing_language_from_ui(self.writing_language.currentText())
         else:
             writing_lang = writing_language_from_ui(self.writing_language.currentText())
-        return {"preset":preset,"font":self.font.currentText(),"font_size":self.font_size.value(),
+        settings = {"preset":preset,
+                "base_preset": effect_fields.get("base_preset") or (preset if preset in PRESETS else None),
+                "effect": effect_fields.get("effect"),
+                "font":self.font.currentText(),"font_size":self.font_size.value(),
                 "caption_mode":self.caption_mode.currentText(),
                 "free_animation":self.free_animation.currentText(),
                 "free_page_seconds":self.free_page_seconds.value(),
@@ -15097,6 +15393,15 @@ class DynamicCaptionPage(QWidget):
                     hasattr(self, "group_skip_transcript") and self.group_skip_transcript.isChecked()
                 ),
                 }
+        # 仅附加有效语义参数；禁止写入 None（否则 layout 里 float(get) 会崩）
+        for key in (
+            "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+            "semantic_max_lines", "semantic_small_words",
+        ):
+            val = effect_fields.get(key)
+            if val not in (None, ""):
+                settings[key] = val
+        return settings
 
     def _refresh_motion_track_list(self):
         if not hasattr(self, "track_list"):
@@ -17595,10 +17900,19 @@ class DynamicCaptionPage(QWidget):
     def _tts_ended(self):
         self.tts_worker = None; self.tts_thread = None
 
+    def _invalidate_live_style(self):
+        """改色/换字体/调字号后必须丢掉预览样式缓存，否则看起来像「改不了」。"""
+        self._live_caption_style_cache = None
+        try:
+            self._invalidate_preview_caption_overlay()
+        except Exception:
+            pass
+
     def pick_color(self, button):
         current = re.search(r"#[0-9A-Fa-f]{6}", button.text()); color = QColorDialog.getColor(QColor(current.group() if current else "#ffffff"), self)
         if color.isValid():
             button.setText(re.sub(r"#[0-9A-Fa-f]{6}", color.name().upper(), button.text()))
+            self._invalidate_live_style()
             self.update_style_preview()
             self._refresh_live_preview()
             try:
@@ -17624,8 +17938,17 @@ class DynamicCaptionPage(QWidget):
 
     def apply_preset(self, name):
         preset = PRESETS[name]
-        for button in self.preset_buttons: button.setChecked(button.text() == name)
-        if preset["effect"] == "word_color":
+        for button in self.preset_buttons:
+            button.setChecked(getattr(button, "name", button.text()) == name)
+        self._caption_base_preset = name
+        self._caption_effect_override = preset.get("effect")
+        self._caption_semantic_overrides = {
+            k: preset[k] for k in (
+                "semantic_large_ratio", "semantic_small_ratio", "semantic_lead_ms",
+                "semantic_max_lines", "semantic_small_words",
+            ) if k in preset
+        }
+        if preset["effect"] in ("word_color", "semantic_karaoke"):
             highlight_label = "跟读文字"
         elif preset["effect"] in ("semantic_stack", "word_scale"):
             highlight_label = "重点词"
@@ -17640,6 +17963,7 @@ class DynamicCaptionPage(QWidget):
         self.active_text_color.setText(
             f"跟读文字 {preset.get('active_text','#FFFFFF')}"
         )
+        self._invalidate_live_style()
         self.outline_width.setValue(preset["outline_width"])
         if "font" in preset: self.font.setCurrentText(preset["font"])
         if "font_size" in preset: self.font_size.setValue(preset["font_size"])
@@ -19072,7 +19396,7 @@ class DynamicCaptionPage(QWidget):
                 self.bgm_player.setPosition(bgm_pos)
                 self.bgm_player.play()
             if getattr(self, "preview_capture", None) is not None and hasattr(self, "preview_frame_timer"):
-                self.preview_frame_timer.start(42)
+                self.preview_frame_timer.start(self._preview_frame_interval_ms())
             self.play_btn.setText("暂停")
 
 class SlideshowWorker(QObject):
@@ -19413,6 +19737,13 @@ class ProjectGroupWorker(QObject):
             self.log.emit("未识别到有效字幕，改用文案均分时间轴…")
             return self._fallback_word_srt(script, tts_duration)
         cue_n = max(0, word_srt.count("-->"))
+        # 长配音却只出极少条：跟读会对不齐；改用文案均分保底（识别层也应已切换服务）
+        if float(tts_duration or 0) >= 60 and cue_n < max(3, int(float(tts_duration) / 28)):
+            self.log.emit(
+                f"识别时间轴过稀（{cue_n} 条 / 音频 {tts_duration:.0f}s），"
+                f"改用文案均分时间轴以保证跟读节奏…"
+            )
+            return self._fallback_word_srt(script, tts_duration)
         self.log.emit(
             f"字幕时间轴提取完成（约 {cue_n} 条，用时 {time.monotonic() - started:.0f}s），继续合成画面…"
         )

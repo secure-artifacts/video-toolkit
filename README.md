@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.54**
+当前版本：**v1.7.55**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,12 +56,20 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.54.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.54/video-toolkit-windows-x64-v1.7.54.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.54/VideoToolkit_Setup_v1.7.54.exe) |
-| Linux x64 | [video-toolkit-linux-x64-v1.7.54.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.54/video-toolkit-linux-x64-v1.7.54.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.54.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.54/video-toolkit-macos-arm64-v1.7.54.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.54.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.54/video-toolkit-macos-x64-v1.7.54.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.55.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.55/video-toolkit-windows-x64-v1.7.55.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.55/VideoToolkit_Setup_v1.7.55.exe) |
+| Linux x64 | [video-toolkit-linux-x64-v1.7.55.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.55/video-toolkit-linux-x64-v1.7.55.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.55.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.55/video-toolkit-macos-arm64-v1.7.55.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.55.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.55/video-toolkit-macos-x64-v1.7.55.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。Linux 解压后执行 `./run-videotoolkit.sh`（或 `./VideoToolkit`）；若 GUI 起不来可安装 `libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.55 · 2026-08-21
+- **Reels 语义黄字跟读**：新增预设——语义大小号 + 当前词亮黄跟读（预览/导出一致）。
+- **字幕预设可改色**：改颜色/字体后实时预览生效；自定义预设保留 effect / base_preset。
+- **图文成品预览**：修复 `float(None)` 导致的预览加载失败；语义比例空值兜底。
+- **长配音字幕**：拒绝 Gemini/云端「整段仅 1～2 条」过稀结果；≥90s 优先本地 Whisper；过稀时文案均分保底。
+- **长片预览卡顿**：按时长自动降帧（约 3 分钟以上更顺）。
+- **预设点击崩溃**：修复「从当前视频移除」按钮被回收后 `QPushButton already deleted`。
 
 ### v1.7.54 · 2026-08-21
 - **图文成片音轨**：默认无背景音；外部配音路径可靠保存；成品预览/再导出不再叠全局 BGM（修复铃声怪声、双人声）。
