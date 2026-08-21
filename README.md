@@ -2,7 +2,7 @@
 
 一站式桌面视频工作台，将批量截图、智能剪辑、Reels 编辑、批量重命名、元数据清理、字幕提取和自动上传填表集中在同一个 PySide6 界面中。
 
-当前版本：**v1.7.52**
+当前版本：**v1.7.53**
 
 [查看最新版本与更新说明](https://github.com/secure-artifacts/video-toolkit/releases/latest)
 
@@ -56,12 +56,16 @@ BGM/文字配音的切片与时间位置也会合成为独立音轨。分组合�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.52.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.52/video-toolkit-windows-x64-v1.7.52.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.52/VideoToolkit_Setup_v1.7.52.exe) |
-| Linux x64 | [video-toolkit-linux-x64-v1.7.52.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.52/video-toolkit-linux-x64-v1.7.52.zip) |
-| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.52.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.52/video-toolkit-macos-arm64-v1.7.52.zip) |
-| macOS Intel | [video-toolkit-macos-x64-v1.7.52.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.52/video-toolkit-macos-x64-v1.7.52.zip) |
+| Windows 10/11 x64 | [video-toolkit-windows-x64-v1.7.53.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.53/video-toolkit-windows-x64-v1.7.53.zip) · [安装包 Setup](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.53/VideoToolkit_Setup_v1.7.53.exe) |
+| Linux x64 | [video-toolkit-linux-x64-v1.7.53.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.53/video-toolkit-linux-x64-v1.7.53.zip) |
+| macOS Apple Silicon | [video-toolkit-macos-arm64-v1.7.53.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.53/video-toolkit-macos-arm64-v1.7.53.zip) |
+| macOS Intel | [video-toolkit-macos-x64-v1.7.53.zip](https://github.com/secure-artifacts/video-toolkit/releases/download/v1.7.53/video-toolkit-macos-x64-v1.7.53.zip) |
 
 Windows 解压后运行 `VideoToolkit.exe`。Linux 解压后执行 `./run-videotoolkit.sh`（或 `./VideoToolkit`）；若 GUI 起不来可安装 `libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1`。macOS 解压后将“视频工具合集.app”拖入“应用程序”；首次运行如被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+
+### v1.7.53 · 2026-08-21
+- **检查更新下载**：官方失败自动尝试镜像；校验文件完整性；失败可一键打开 Releases 手动下载。
+- Release 说明补齐 Windows / macOS / Linux 下载链接。
 
 ### v1.7.52 · 2026-08-21
 - **批量字幕提取**：修复切换视频时把上一片字幕写进新片缓存，导致每片都显示同一段字。

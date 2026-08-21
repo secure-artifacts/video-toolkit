@@ -79,7 +79,7 @@ _startup_trace("tool modules ready")
 
 
 APP_NAME = "视频工具合集"
-APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.52").strip().lstrip("v") or "1.7.52"
+APP_VERSION = os.environ.get("VIDEO_TOOLKIT_VERSION", "1.7.53").strip().lstrip("v") or "1.7.53"
 APP_DISPLAY_NAME = f"{APP_NAME}  v{APP_VERSION}"
 _SINGLE_INSTANCE_MUTEX = None
 ALL_RESULTS_LABEL = "【全部结果】"
@@ -3001,6 +3001,9 @@ def _select_release_asset(assets, *, is_win=True, is_mac=False, machine=""):
             if name_l.endswith(".dmg"):
                 return 70
             return -1
+        # Linux / other
+        if "linux" in name_l and name_l.endswith(".zip"):
+            return 80
         if name_l.endswith((".zip", ".tar.gz", ".appimage")):
             return 30
         return -1
@@ -3010,6 +3013,24 @@ def _select_release_asset(assets, *, is_win=True, is_mac=False, machine=""):
         return "", ""
     best = ranked[0]
     return str(best.get("browser_download_url") or ""), str(best.get("name") or "")
+
+
+def _github_download_candidates(url: str) -> list[str]:
+    """Official URL first, then common release proxies (helps when GitHub CDN is blocked)."""
+    url = str(url or "").strip()
+    if not url:
+        return []
+    candidates = [url]
+    if url.startswith("https://github.com/") or url.startswith("https://objects.githubusercontent.com/"):
+        for prefix in (
+            "https://ghproxy.net/",
+            "https://gh.llkk.cc/",
+            "https://mirror.ghproxy.com/",
+        ):
+            proxied = prefix + url
+            if proxied not in candidates:
+                candidates.append(proxied)
+    return candidates
 
 
 class UpdateCheckWorker(QObject):
@@ -3099,9 +3120,6 @@ class DownloadWorker(QObject):
             if not str(self.url or "").strip():
                 self.finished.emit(False, "", "下载地址为空")
                 return
-            response = requests.get(self.url, stream=True, timeout=60)
-            response.raise_for_status()
-            total = int(response.headers.get("content-length", 0) or 0)
 
             ext = ".exe"
             if self.filename:
@@ -3111,27 +3129,71 @@ class DownloadWorker(QObject):
                 if url_path.lower().endswith(".zip"):
                     ext = ".zip"
             dest = Path(tempfile.gettempdir()) / f"VideoToolkit_v{self.version}{ext}"
-            downloaded = 0
-            with open(dest, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=128 * 1024):
-                    if self.cancelled:
-                        try:
-                            handle.close()
-                            dest.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        self.finished.emit(False, "", "下载已取消")
+            headers = {
+                "User-Agent": f"VideoToolkit-Updater/{self.version or APP_VERSION}",
+                "Accept": "*/*",
+            }
+            # connect 15s；单次读块 180s（大安装包/弱网）；官方失败再试镜像
+            timeouts = (15, 180)
+            last_error = ""
+            for attempt, candidate in enumerate(_github_download_candidates(self.url), 1):
+                if self.cancelled:
+                    self.finished.emit(False, "", "下载已取消")
+                    return
+                try:
+                    with requests.get(
+                        candidate,
+                        stream=True,
+                        timeout=timeouts,
+                        headers=headers,
+                        allow_redirects=True,
+                    ) as response:
+                        response.raise_for_status()
+                        total = int(response.headers.get("content-length", 0) or 0)
+                        downloaded = 0
+                        with open(dest, "wb") as handle:
+                            for chunk in response.iter_content(chunk_size=256 * 1024):
+                                if self.cancelled:
+                                    try:
+                                        handle.close()
+                                        dest.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                                    self.finished.emit(False, "", "下载已取消")
+                                    return
+                                if not chunk:
+                                    continue
+                                handle.write(chunk)
+                                downloaded += len(chunk)
+                                if total > 0:
+                                    self.progress.emit(min(99, int(downloaded / total * 100)))
+                        size = dest.stat().st_size if dest.exists() else 0
+                        if size < 1024 * 100:
+                            raise RuntimeError(f"下载文件过小（{size} 字节），可能被拦截或不完整")
+                        if total > 0 and size < int(total * 0.98):
+                            raise RuntimeError(
+                                f"下载不完整：已下 {size // (1024 * 1024)} MB /"
+                                f" 预期 {total // (1024 * 1024)} MB"
+                            )
+                        self.progress.emit(100)
+                        self.finished.emit(True, str(dest), "")
                         return
-                    if chunk:
-                        handle.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            self.progress.emit(int(downloaded / total * 100))
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    try:
+                        if dest.exists():
+                            dest.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    # 下一个候选镜像
+                    continue
 
-            if dest.stat().st_size < 1024:
-                self.finished.emit(False, "", "下载文件过小，可能不完整")
-                return
-            self.finished.emit(True, str(dest), "")
+            tip = (
+                f"下载失败（已尝试官方与镜像通道）。\n{last_error or '未知错误'}\n\n"
+                "可到 GitHub Releases 页面用浏览器手动下载：\n"
+                "https://github.com/secure-artifacts/video-toolkit/releases/latest"
+            )
+            self.finished.emit(False, "", tip)
         except Exception as exc:
             self.finished.emit(False, "", f"{type(exc).__name__}: {exc}")
 
@@ -6374,7 +6436,28 @@ class MainWindow(QMainWindow):
                 getattr(self, "_download_worker", None)
                 and self._download_worker.cancelled)
             if not is_cancelled:
-                QMessageBox.warning(self, "下载失败", f"后台下载升级安装包失败：\n{error}")
+                releases = "https://github.com/secure-artifacts/video-toolkit/releases/latest"
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle("下载失败")
+                box.setText("后台下载升级安装包失败。")
+                box.setInformativeText(
+                    f"{error}\n\n若网络访问 GitHub 不稳定，请用浏览器打开 Releases 手动下载。"
+                )
+                open_btn = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
+                box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+                box.exec()
+                if box.clickedButton() is open_btn:
+                    try:
+                        from PySide6.QtCore import QUrl
+                        from PySide6.QtGui import QDesktopServices
+                        QDesktopServices.openUrl(QUrl(releases))
+                    except Exception:
+                        try:
+                            import webbrowser
+                            webbrowser.open(releases)
+                        except Exception:
+                            pass
 
     def _download_thread_cleanup(self):
         worker = getattr(self, "_download_worker", None)
