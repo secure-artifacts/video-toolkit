@@ -1796,20 +1796,23 @@ def bgm_only_audio_filter(bgm_input, background_volume=25,
     return f"{bgm_input}{','.join(filters)}[aout]"
 
 
-def find_bgm_file(bgm_dir, index, video=None, randomize=False):
-    """Resolve a BGM path from a single file or a folder of audio/video clips."""
+def find_bgm_file(bgm_dir, index, video=None, randomize=False, *, audio_only=False):
+    """Resolve a BGM path from a single file or a folder.
+
+    audio_only=True：只选音频（图文成片必须），避免抽到带口播的 mp4 当「背景音」造成双人声。
+    """
     if not bgm_dir:
         return None
     path = Path(bgm_dir)
+    allowed = set(AUDIO_EXTENSIONS) if audio_only else set(AUDIO_EXTENSIONS).union(VIDEO_EXTENSIONS)
     if path.is_file():
-        if path.suffix.lower() in AUDIO_EXTENSIONS.union(VIDEO_EXTENSIONS):
+        if path.suffix.lower() in allowed:
             return path
         return None
     if not path.is_dir():
         return None
     bgm_files = sorted(
-        [x for x in path.rglob("*") if x.is_file()
-         and x.suffix.lower() in AUDIO_EXTENSIONS.union(VIDEO_EXTENSIONS)],
+        [x for x in path.rglob("*") if x.is_file() and x.suffix.lower() in allowed],
         key=lambda x: natural_key(x.name)
     )
     if not bgm_files:
@@ -1818,6 +1821,11 @@ def find_bgm_file(bgm_dir, index, video=None, randomize=False):
         import random, hashlib
         # 使用基于视频绝对路径和索引的 MD5 哈希种子，保证重启后分配结果一致且分布均匀
         h = hashlib.md5(f"{Path(video).resolve()}_{index}".encode("utf-8")).hexdigest()
+        rnd = random.Random(int(h, 16))
+        return rnd.choice(bgm_files)
+    if randomize:
+        import random, hashlib
+        h = hashlib.md5(f"{path.resolve()}_{index}_bgm".encode("utf-8")).hexdigest()
         rnd = random.Random(int(h, 16))
         return rnd.choice(bgm_files)
     return bgm_files[index % len(bgm_files)]
@@ -4918,12 +4926,29 @@ class CaptionWorker(QObject):
                     self.settings.get("bgm_selection_mode","")
                 ).startswith("随机")
                 selected_bgm=Path(str(self.settings.get("selected_bgm_path","")))
+                # 图文成片成品音轨已烧录：禁止再叠全局 BGM（否则听感像多出铃声/第二轨）
+                baked = {
+                    str(Path(p).resolve())
+                    for p in (self.settings.get("project_baked_videos") or [])
+                    if p
+                }
+                video_baked = False
+                try:
+                    video_baked = str(video.resolve()) in baked or video.name.endswith("_成品.mp4")
+                except Exception:
+                    video_baked = str(video) in baked or str(video).endswith("_成品.mp4")
                 bgm_file=(
+                    None if video_baked else (
                     (selected_bgm if selected_bgm.is_file() else
                      find_bgm_file(self.settings.get("bgm_dir"),index,video,
                                    randomize=randomize_bgm))
                     if self.settings.get("bgm_enabled",False) else None
+                    )
                 )
+                if video_baked and self.settings.get("bgm_enabled", False):
+                    self.log.emit(
+                        f"[{index + 1}/{len(self.videos)}] 图文成品已含音轨，跳过全局 BGM 叠加。"
+                    )
                 bgm_offset_ms = 0
                 if bgm_file:
                     bgm_input_index = 2 if external else 1
@@ -10808,13 +10833,17 @@ class DynamicCaptionPage(QWidget):
                     self._preview_duration_changed(5000)
                     self._display_cached_preview()
             
-            # Resolve BGM settings
+            # Resolve BGM settings（图文成品已烧录音轨时禁止再叠预览 BGM）
             self._preview_bgm_active = False
             self._preview_bgm_file = None
             self._preview_bgm_offset_ms = 0
+            media_baked = self._is_project_baked_media(media)
             
             bgm_dir = self.bgm_dir_input.text().strip() if hasattr(self, "bgm_dir_input") else ""
-            if hasattr(self,"bgm_enabled") and self.bgm_enabled.isChecked():
+            if (
+                hasattr(self, "bgm_enabled") and self.bgm_enabled.isChecked()
+                and not media_baked
+            ):
                 video_index = 0
                 for i in range(self.videos.count()):
                     if self.videos.item(i).text() == str(media):
@@ -10842,6 +10871,12 @@ class DynamicCaptionPage(QWidget):
                         self._preview_bgm_offset_ms=int(
                             self.audio_offsets.get(str(self._preview_bgm_file.resolve()),0)
                         )
+            elif media_baked and hasattr(self, "bgm_player"):
+                try:
+                    self.bgm_player.stop()
+                    self.bgm_player.setSource(QUrl())
+                except Exception:
+                    pass
 
             if self._preview_bgm_active:
                 self.bgm_player.setSource(QUrl.fromLocalFile(str(self._preview_bgm_file.resolve())))
@@ -14996,6 +15031,7 @@ class DynamicCaptionPage(QWidget):
                 "timeline_overrides":dict(self.timeline_overrides),
                 "timeline_edits":dict(self.timeline_edit_states),
                 "selected_bgm_path":self._selected_bgm_path,
+                "project_baked_videos": list(getattr(self, "_project_baked_videos", set()) or set()),
                 "selected_ambient_path": getattr(self, "_selected_ambient_path", "") or "",
                 "ambient_enabled": (
                     (
@@ -18163,6 +18199,71 @@ class DynamicCaptionPage(QWidget):
             rows.add(self.project_table.currentRow())
         return sorted(rows)
 
+    def _is_project_baked_media(self, path) -> bool:
+        """图文成片成品音轨已烧录：预览/导出勿再叠全局 BGM。"""
+        try:
+            key = self._timeline_key(str(path))
+        except Exception:
+            key = str(path)
+        baked = getattr(self, "_project_baked_videos", set()) or set()
+        if key in baked:
+            return True
+        try:
+            name = Path(path).name
+        except Exception:
+            name = str(path)
+        # 命名约定：{项目名}_成品.mp4
+        return bool(name.endswith("_成品.mp4"))
+
+    def _project_voice_from_item(self, script_item) -> str:
+        """读出项目真实配音源：优先 UserRole 完整音频路径，避免只剩占位文案去 TTS。"""
+        if script_item is None:
+            return ""
+        try:
+            stored = str(script_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        except Exception:
+            stored = ""
+        if stored:
+            try:
+                if Path(stored).is_file() and Path(stored).suffix.lower() in AUDIO_EXTENSIONS:
+                    return str(Path(stored).resolve())
+            except Exception:
+                pass
+        text = script_item.text().strip() if hasattr(script_item, "text") else ""
+        if not text:
+            return ""
+        if text.startswith("[已指定外部音频") or text.startswith("[已指定"):
+            return ""
+        try:
+            if Path(text).is_file() and Path(text).suffix.lower() in AUDIO_EXTENSIONS:
+                return str(Path(text).resolve())
+        except Exception:
+            pass
+        return text
+
+    def _set_project_script_item(self, row: int, script: str):
+        """写入语音文案列：外部音频完整路径进 UserRole，界面只显示友好名。"""
+        item = self.project_table.item(row, 1)
+        if item is None:
+            item = QTableWidgetItem()
+            self.project_table.setItem(row, 1, item)
+        script = str(script or "").strip()
+        audio_path = ""
+        try:
+            p = Path(script)
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
+                audio_path = str(p.resolve())
+        except Exception:
+            audio_path = ""
+        if audio_path:
+            item.setData(Qt.ItemDataRole.UserRole, audio_path)
+            item.setText(f"[已指定外部音频: {Path(audio_path).name}]")
+            item.setToolTip(audio_path)
+        else:
+            item.setData(Qt.ItemDataRole.UserRole, "")
+            item.setText(script)
+            item.setToolTip("配音文案；外部音频请在「新增/编辑项目」里选择文件")
+
     def _project_row_data(self, row):
         """Snapshot one project table row into a dict for edit dialogs."""
         name_item = self.project_table.item(row, 0)
@@ -18174,9 +18275,9 @@ class DynamicCaptionPage(QWidget):
         materials = [p.strip() for p in materials_str.split(";") if p.strip()] if materials_str else []
         return {
             "name": name_item.text().strip() if name_item else "",
-            "script": script_item.text().strip() if script_item else "",
+            "script": self._project_voice_from_item(script_item),
             "materials": materials,
-            "bgm": bgm_item.text().strip() if bgm_item else "随机分配 (全局BGM)",
+            "bgm": bgm_item.text().strip() if bgm_item else "无背景音",
             "dim": dim_combo.currentText() if dim_combo else "9:16",
         }
 
@@ -18191,7 +18292,7 @@ class DynamicCaptionPage(QWidget):
             mats_s = mats
         else:
             mats_s = ";".join(str(p) for p in mats if str(p).strip())
-        bgm = str(data.get("bgm") or "随机分配 (全局BGM)").strip() or "随机分配 (全局BGM)"
+        bgm = str(data.get("bgm") or "无背景音").strip() or "无背景音"
         dim = str(data.get("dim") or "9:16")
 
         def _set(col, text):
@@ -18202,7 +18303,7 @@ class DynamicCaptionPage(QWidget):
             item.setText(text)
 
         _set(0, name)
-        _set(1, script)
+        self._set_project_script_item(row, script)
         _set(2, mats_s)
         mat_item = self.project_table.item(row, 2)
         if mat_item is not None:
@@ -18251,7 +18352,7 @@ class DynamicCaptionPage(QWidget):
                     name=data.get("name", ""),
                     script=data.get("script", ""),
                     materials=mats_s,
-                    bgm=data.get("bgm", "随机分配 (全局BGM)"),
+                    bgm=data.get("bgm", "无背景音"),
                     dim=data.get("dim", "9:16"),
                 )
         elif len(data_list) < len(rows):
@@ -18533,19 +18634,18 @@ class DynamicCaptionPage(QWidget):
         except Exception:
             pass
 
-    def _add_project_row(self, name="", script="", materials="", bgm="随机分配 (全局BGM)", dim="9:16"):
+    def _add_project_row(self, name="", script="", materials="", bgm="无背景音", dim="9:16"):
         row = self.project_table.rowCount()
         self.project_table.insertRow(row)
         if not name:
             name = f"video_{time.strftime('%Y%m%d_%H%M%S')}_{row+1}"
         item_name = QTableWidgetItem(name)
         self.project_table.setItem(row, 0, item_name)
-        item_script = QTableWidgetItem(script)
-        self.project_table.setItem(row, 1, item_script)
+        self._set_project_script_item(row, script)
         item_materials = QTableWidgetItem(materials)
         item_materials.setToolTip("双击选择图片/视频素材；或将文件直接拖入此行")
         self.project_table.setItem(row, 2, item_materials)
-        item_bgm = QTableWidgetItem(bgm)
+        item_bgm = QTableWidgetItem(bgm or "无背景音")
         self.project_table.setItem(row, 3, item_bgm)
         dim_combo = QComboBox()
         dim_combo.addItems(["9:16", "16:9", "1:1", "4:3"])
@@ -18568,7 +18668,7 @@ class DynamicCaptionPage(QWidget):
             name = f"video_{time.strftime('%Y%m%d_%H%M%S')}_{added_count+1}"
             script = ""
             materials = ""
-            bgm = "随机分配 (全局BGM)"
+            bgm = "无背景音"
             dim = "9:16"
             
             if len(cols) >= 1:
@@ -18613,15 +18713,26 @@ class DynamicCaptionPage(QWidget):
             name_item = self.project_table.item(r, 0)
             name = name_item.text().strip() if name_item else ""
             script_item = self.project_table.item(r, 1)
-            script = script_item.text().strip() if script_item else ""
+            script = self._project_voice_from_item(script_item)
             materials_item = self.project_table.item(r, 2)
             materials_str = materials_item.text().strip() if materials_item else ""
             bgm_item = self.project_table.item(r, 3)
-            bgm = bgm_item.text().strip() if bgm_item else ""
+            bgm = bgm_item.text().strip() if bgm_item else "无背景音"
+            # 兼容旧行：界面显示「随机分配」但用户以为没加 BGM → 若未设文件夹则当无
+            if bgm.startswith("随机分配"):
+                folder = self.bgm_dir_input.text().strip() if hasattr(self, "bgm_dir_input") else ""
+                if not folder or not Path(folder).is_dir():
+                    bgm = "无背景音"
             dim_combo = self.project_table.cellWidget(r, 4)
             dim = dim_combo.currentText() if dim_combo else "9:16"
             
             if not script:
+                # 占位文案丢路径时给出明确失败，避免拿「已指定外部音频」去 TTS 出怪声
+                raw_disp = script_item.text().strip() if script_item else ""
+                if raw_disp.startswith("[已指定外部音频"):
+                    self._append_run_log(
+                        f"跳过 {name or f'第{r+1}行'}：外部配音路径已丢失，请重新在编辑里选择音频文件。"
+                    )
                 continue
             
             m_list = []
@@ -18637,7 +18748,7 @@ class DynamicCaptionPage(QWidget):
                 "name": name,
                 "script": script,
                 "materials": m_list,
-                "bgm": bgm,
+                "bgm": bgm or "无背景音",
                 "dim": dim
             })
             # 标记排队，便于用户看出会重做（含已成功行）
@@ -18808,6 +18919,39 @@ class DynamicCaptionPage(QWidget):
                     self.project_table.setItem(r, 5, QTableWidgetItem("成功"))
                     break
 
+        # 成品里已混好「配音 ± BGM」。必须先关掉全局预览 BGM/配音叠轨，再入队选中，
+        # 否则 _add 触发预览时会把右侧 BGM（甚至短铃声）叠到成品上，听起来像「多出铃声」。
+        try:
+            previous_restoring = bool(getattr(self, "_restoring_style", False))
+            self._restoring_style = True
+            try:
+                if hasattr(self, "bgm_player"):
+                    try:
+                        self.bgm_player.stop()
+                        self.bgm_player.setSource(QUrl())
+                    except Exception:
+                        pass
+                self._preview_bgm_active = False
+                self._preview_bgm_file = None
+                if hasattr(self, "audio_mode") and self.audio_mode is not None:
+                    self.audio_mode.blockSignals(True)
+                    self.audio_mode.setCurrentText("视频原声")
+                    self.audio_mode.blockSignals(False)
+                if hasattr(self, "bgm_enabled") and self.bgm_enabled is not None:
+                    self.bgm_enabled.blockSignals(True)
+                    self.bgm_enabled.setChecked(False)
+                    self.bgm_enabled.blockSignals(False)
+                if hasattr(self, "ambient_enabled") and self.ambient_enabled is not None:
+                    self.ambient_enabled.blockSignals(True)
+                    self.ambient_enabled.setChecked(False)
+                    self.ambient_enabled.blockSignals(False)
+                if hasattr(self, "_audio_mode_changed"):
+                    self._audio_mode_changed("视频原声")
+            finally:
+                self._restoring_style = previous_restoring
+        except Exception:
+            pass
+
         # 同一成品再次生成时：先去掉旧队列路径再加入，避免重复
         out_path = str(Path(output_file).resolve())
         for i in range(self.videos.count() - 1, -1, -1):
@@ -18823,33 +18967,18 @@ class DynamicCaptionPage(QWidget):
         self.timeline_chinese[key] = ""
         # 清掉旧人工字幕覆盖，避免重合成后仍用上一版文案
         self.timeline_overrides.pop(key, None)
-        
-        # 成品里已混好「配音 + BGM」。预览时必须切到「视频原声」，
-        # 否则若仍是「视频配音＋背景音乐」会再叠一路外部配音 → 听成两个朗诵。
-        # 注意：这只是预览临时态，禁止写进偏好，否则会冲掉用户记住的合成方式/BGM。
-        try:
-            previous_restoring = bool(getattr(self, "_restoring_style", False))
-            self._restoring_style = True
-            try:
-                if hasattr(self, "audio_mode") and self.audio_mode is not None:
-                    self.audio_mode.blockSignals(True)
-                    self.audio_mode.setCurrentText("视频原声")
-                    self.audio_mode.blockSignals(False)
-                if hasattr(self, "bgm_enabled") and self.bgm_enabled is not None:
-                    self.bgm_enabled.blockSignals(True)
-                    self.bgm_enabled.setChecked(False)
-                    self.bgm_enabled.blockSignals(False)
-                if hasattr(self, "_audio_mode_changed"):
-                    self._audio_mode_changed("视频原声")
-            finally:
-                self._restoring_style = previous_restoring
-        except Exception:
-            pass
+        # 标记：成品音轨已烧录，导出时勿再叠全局 BGM
+        if not hasattr(self, "_project_baked_videos"):
+            self._project_baked_videos = set()
+        self._project_baked_videos.add(key)
         
         for i in range(self.videos.count()):
             if self._timeline_key(self.videos.item(i).text()) == key:
                 self.videos.setCurrentRow(i)
                 break
+        self._append_run_log(
+            f"图文成品已入队：{Path(out_path).name}（预览仅播成品轨，已关闭全局 BGM 叠音）"
+        )
 
     def _on_project_item_failed(self, name, reason):
         for r in range(self.project_table.rowCount()):
@@ -19357,6 +19486,13 @@ class ProjectGroupWorker(QObject):
         }
         target_w, target_h = res_map.get(dim, (1080, 1920))
                 
+        script = str(script or "").strip()
+        # 绝不能把占位文案拿去 TTS（会念出「已指定外部音频」或落到错误缓存，听感怪异）
+        if script.startswith("[已指定外部音频") or script.startswith("[已指定"):
+            raise RuntimeError(
+                f"项目 {name}：外部配音路径丢失（只剩占位文字）。请重新在编辑里选择音频文件后再合成。"
+            )
+
         is_audio_file = False
         try:
             if Path(script).is_file() and Path(script).suffix.lower() in [
@@ -19375,11 +19511,14 @@ class ProjectGroupWorker(QObject):
         tts_path = temp_dir / "tts.wav"
                 
         if is_audio_file:
-            self.log.emit(f"项目 {name} 正在使用指定的外部配音音频文件（规范为单声道）...")
+            voice_src = Path(script).resolve()
+            self.log.emit(
+                f"项目 {name} 使用外部配音：{voice_src.name}（{voice_src}）→ 规范为单声道…"
+            )
             # 强制单声道下混，避免立体声左右各一路人声听成「两个朗诵」
             norm_cmd = [
                 self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(script),
+                "-i", str(voice_src),
                 "-vn",
                 "-af", "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono",
                 "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
@@ -19390,7 +19529,26 @@ class ProjectGroupWorker(QObject):
             )
             if res.returncode != 0 or not tts_path.is_file() or tts_path.stat().st_size < 256:
                 err = (res.stdout or b"").decode("utf-8", errors="replace")
-                raise RuntimeError(f"外部配音无法读取：{err[-500:]}")
+                raise RuntimeError(f"外部配音无法读取：{voice_src.name}｜{err[-500:]}")
+            # 过短几乎一定是选错了铃声/提示音
+            try:
+                probe = subprocess.run(
+                    [
+                        self.ffprobe, "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1", str(tts_path),
+                    ],
+                    stdout=subprocess.PIPE, text=True, creationflags=creation,
+                )
+                dur = float((probe.stdout or "0").strip() or 0)
+                if dur > 0 and dur < 0.8:
+                    raise RuntimeError(
+                        f"外部配音「{voice_src.name}」只有 {dur:.2f}s，过短（像铃声/提示音）。"
+                        f"请确认选的是口播音频而不是系统提示音。"
+                    )
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
         else:
             if not script:
                 failures.append(f"项目 {name}：文案为空")
@@ -19403,7 +19561,7 @@ class ProjectGroupWorker(QObject):
             reverb_amt = int(self.settings.get("tts_reverb_amount", 45) or 45)
             reverb_mode = normalize_reverb_mode(self.settings.get("tts_reverb_mode", "大厅"))
             tts_fingerprint = hashlib.sha256(
-                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:{reverb_mode}:v6mono".encode("utf-8")
+                f"{self.tts_service}\n{self.tts_voice}\n{script}\nreverb={int(reverb_on)}:{reverb_amt}:{reverb_mode}:v7proj_mono".encode("utf-8")
             ).hexdigest()
                     
             reused_tts = False
@@ -19685,17 +19843,13 @@ class ProjectGroupWorker(QObject):
         self.log.emit("正在合成最终音轨：1 路配音 + 可选 BGM（画面素材原声一律丢弃）…")
         bgm_file = None
         bgm_label = "无"
-        if bgm_choice == "无背景音" or not str(bgm_choice or "").strip():
-            pass
-        elif bgm_choice.startswith("随机分配") and self.bgm_dir and self.bgm_dir.is_dir():
-            bgm_file = find_bgm_file(str(self.bgm_dir), idx, randomize=True)
-            if bgm_file:
-                bgm_label = f"随机BGM {Path(bgm_file).name}"
-        elif Path(bgm_choice).is_file():
-            bgm_file = Path(bgm_choice)
-            bgm_label = bgm_file.name
+        bgm_choice = str(bgm_choice or "").strip()
+        # 兼容旧表里的「随机分配 (全局BGM)」文案；默认必须是「无背景音」
+        want_none = (not bgm_choice) or bgm_choice in (
+            "无背景音", "无", "无BGM", "-", "none", "None",
+        )
+        want_random = (not want_none) and bgm_choice.startswith("随机分配")
 
-        # BGM 与配音不能是同一文件（否则等于两路朗诵）。随机模式则换一首，仍尽量保留 BGM。
         def _same_audio_file(a, b) -> bool:
             try:
                 return Path(a).resolve() == Path(b).resolve()
@@ -19703,30 +19857,76 @@ class ProjectGroupWorker(QObject):
                 return False
 
         voice_src_path = Path(script).resolve() if is_audio_file else None
-        if bgm_file and (
-            _same_audio_file(bgm_file, tts_path)
-            or (voice_src_path and _same_audio_file(bgm_file, voice_src_path))
-        ):
-            replaced = False
-            if bgm_choice.startswith("随机分配") and self.bgm_dir and self.bgm_dir.is_dir():
-                # 再抽几次，避开与配音相同的文件
-                for attempt in range(8):
-                    cand = find_bgm_file(str(self.bgm_dir), idx * 17 + attempt + 3, randomize=True)
-                    if not cand:
+        banned_voice = set()
+        if voice_src_path and voice_src_path.is_file():
+            banned_voice.add(str(voice_src_path.resolve()))
+        try:
+            banned_voice.add(str(Path(tts_path).resolve()))
+        except Exception:
+            pass
+        for m in materials:
+            try:
+                if Path(m).suffix.lower() in AUDIO_EXTENSIONS:
+                    banned_voice.add(str(Path(m).resolve()))
+            except Exception:
+                pass
+
+        def _is_safe_bgm(path) -> bool:
+            """拒绝：配音文件、视频口播、素材列里的音频。"""
+            try:
+                p = Path(path)
+                if not p.is_file():
+                    return False
+                if p.suffix.lower() not in AUDIO_EXTENSIONS:
+                    return False  # 图文成片 BGM 只允许纯音频
+                if str(p.resolve()) in banned_voice:
+                    return False
+                return True
+            except Exception:
+                return False
+
+        if want_none:
+            bgm_file = None
+            bgm_label = "无"
+            self.log.emit("  · 本项目未配置背景音乐（无背景音）")
+        elif want_random:
+            if self.bgm_dir and self.bgm_dir.is_dir():
+                # 只抽音频；避开配音同名文件
+                for attempt in range(12):
+                    cand = find_bgm_file(
+                        str(self.bgm_dir), idx * 19 + attempt + 1,
+                        video=name, randomize=True, audio_only=True,
+                    )
+                    if cand and _is_safe_bgm(cand):
+                        bgm_file = cand
+                        bgm_label = f"随机BGM {Path(bgm_file).name}"
                         break
-                    if _same_audio_file(cand, tts_path):
-                        continue
-                    if voice_src_path and _same_audio_file(cand, voice_src_path):
-                        continue
-                    bgm_file = cand
-                    bgm_label = f"随机BGM {Path(bgm_file).name}"
-                    replaced = True
-                    self.log.emit(f"  · BGM 与配音重复，已改抽：{bgm_label}")
-                    break
-            if not replaced:
-                self.log.emit("  · BGM 与配音是同一文件，已跳过该 BGM（请另选背景音乐，配音不会重复）")
-                bgm_file = None
-                bgm_label = "无（与配音重复已跳过）"
+                if not bgm_file:
+                    self.log.emit(
+                        "  · 已选「随机分配」但文件夹里没有可用纯音频 BGM"
+                        "（或全是视频/配音），本项目不加背景音"
+                    )
+            else:
+                self.log.emit(
+                    "  · 已选「随机分配」但未设置右侧背景音乐文件夹，本项目不加背景音"
+                )
+        elif Path(bgm_choice).is_file():
+            if _is_safe_bgm(bgm_choice):
+                bgm_file = Path(bgm_choice)
+                bgm_label = bgm_file.name
+            else:
+                self.log.emit(
+                    f"  · 指定的 BGM「{Path(bgm_choice).name}」不可用"
+                    f"（视频口播或与配音相同），已跳过"
+                )
+        else:
+            self.log.emit(f"  · 无法识别 BGM 设置「{bgm_choice}」，本项目不加背景音")
+
+        # BGM 与配音不能是同一文件（否则等于两路朗诵）
+        if bgm_file and not _is_safe_bgm(bgm_file):
+            self.log.emit("  · BGM 校验未通过，已跳过（避免双人声）")
+            bgm_file = None
+            bgm_label = "无"
 
         # 先去掉 main_video 上可能残留的音轨，避免与配音叠成「两个朗诵」
         main_vonly = temp_dir / "main_vonly.mp4"
@@ -19748,16 +19948,19 @@ class ProjectGroupWorker(QObject):
             "-i", str(tts_path),
         ]
 
-        # 配音：aformat 下混为单声道 → 左右同相立体声（杜绝双声道左右各一路人声）
+        # 配音：先把任意声道压成真正单声道，再复制为同相立体声（杜绝 L/R 各一路人声）
         # 只 map 配音(+BGM)，绝不 map 画面轨 0:a
         tts_af = (
-            "[1:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono,"
+            # 先升为立体声再压回单声道，避免源已是 mono 时 c1 不存在
+            "[1:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            "pan=mono|c0=0.5*c0+0.5*c1,"
+            "aformat=channel_layouts=mono,"
             "pan=stereo|c0=c0|c1=c0,volume=1.0[tts]"
         )
         bgm_offset_s = 0
 
         if bgm_file:
-            if bgm_choice.startswith("随机分配"):
+            if want_random:
                 res = subprocess.run([
                     self.ffprobe, "-v", "error", "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1", str(bgm_file)
@@ -19775,14 +19978,17 @@ class ProjectGroupWorker(QObject):
                 mix_inputs += ["-i", str(bgm_file)]
 
             bgm_vol = float(self.settings.get("background_volume", 15)) / 100.0
-            # BGM 保留（立体声）；配音单路居中 → 听感 = 1 个朗诵 + 背景乐
+            bgm_vol = max(0.02, min(1.0, bgm_vol))
+            # BGM 也压低并限制；配音单路居中 → 听感 = 1 个朗诵 + 背景乐
             filter_complex = (
                 f"{tts_af};"
                 f"[2:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                f"volume={bgm_vol:.3f},aloop=loop=-1:size=2e+09,apad[bgm];"
-                f"[tts][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+                f"volume={bgm_vol:.3f},aloop=loop=-1:size=2e+09,apad,"
+                f"alimiter=limit=0.85:attack=5:release=50[bgm];"
+                f"[tts][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,"
+                f"alimiter=limit=0.95:attack=5:release=50[aout]"
             )
-            self.log.emit(f"  · 音轨：1 路配音 + BGM「{bgm_label}」（BGM 保留）")
+            self.log.emit(f"  · 音轨：1 路配音 + BGM「{bgm_label}」（音量 {int(bgm_vol * 100)}%）")
         else:
             filter_complex = f"{tts_af};[tts]anull[aout]"
             self.log.emit("  · 音轨：仅 1 路配音（未配置 BGM）")
@@ -19796,6 +20002,7 @@ class ProjectGroupWorker(QObject):
             "-shortest",
             "-movflags", "+faststart",
             "-map_metadata", "-1",
+            "-dn", "-sn",
         ]
         mix_tmp = temp_dir / "mix_out.mp4"
         mix_inputs.append(str(mix_tmp))
@@ -20239,7 +20446,7 @@ class ProjectFolderMatchDialog(QDialog):
                 "name": name,
                 "script": voice,
                 "materials": mats,
-                "bgm": "随机分配 (全局BGM)",
+                "bgm": "无背景音",
                 "dim": "9:16",
                 "match_note": f"#{num}" if num is not None else stem,
             })
@@ -20457,17 +20664,21 @@ class ProjectAddDialog(QDialog):
         
         bgm_btn = QPushButton()
         bgm_btn.setStyleSheet("QPushButton { text-align: left; padding: 6px; }")
-        bgm_val = bgm.strip() if bgm else "随机分配 (全局BGM)"
+        bgm_val = (bgm.strip() if bgm else "") or "无背景音"
         bgm_btn.bgm_path = bgm_val
-        if bgm_val != "随机分配 (全局BGM)" and bgm_val:
+        if bgm_val.startswith("随机分配"):
+            bgm_btn.setText("🎲 随机分配")
+            bgm_btn.setToolTip("从右侧「背景音乐」文件夹随机选一首（仅音频，不含视频口播）")
+        elif bgm_val in ("无背景音", "无", "无BGM", "-"):
+            bgm_btn.bgm_path = "无背景音"
+            bgm_btn.setText("🔇 无背景音")
+            bgm_btn.setToolTip("本项目不叠加背景音乐")
+        else:
             try:
                 bgm_btn.setText(f"🎵 {Path(bgm_val).name}")
             except Exception:
                 bgm_btn.setText(f"🎵 {bgm_val}")
             bgm_btn.setToolTip(bgm_val)
-        else:
-            bgm_btn.setText("🎲 随机分配")
-            bgm_btn.setToolTip("")
             
         bgm_btn.clicked.connect(lambda checked=False, b=bgm_btn: self._on_bgm_clicked(b))
         self.table.setCellWidget(row, 3, bgm_btn)
@@ -20522,7 +20733,7 @@ class ProjectAddDialog(QDialog):
                 name=str(data.get("name") or ""),
                 script=str(data.get("script") or ""),
                 materials=mats_s,
-                bgm=str(data.get("bgm") or "随机分配 (全局BGM)"),
+                bgm=str(data.get("bgm") or "无背景音"),
                 dim=str(data.get("dim") or "9:16"),
                 batch_thumb=True,
             )
@@ -20651,14 +20862,19 @@ class ProjectAddDialog(QDialog):
         from PySide6.QtWidgets import QMenu
         from PySide6.QtGui import QCursor
         menu = QMenu(self)
+        action_none = menu.addAction("🔇 无背景音（推荐默认）")
         action_choose = menu.addAction("🎵 指定音频文件...")
-        action_random = menu.addAction("🎲 设为随机分配 (默认)")
+        action_random = menu.addAction("🎲 随机分配（右侧 BGM 文件夹）")
         
         action = menu.exec(QCursor.pos())
-        if action == action_choose:
+        if action == action_none:
+            btn.bgm_path = "无背景音"
+            btn.setText("🔇 无背景音")
+            btn.setToolTip("本项目不叠加背景音乐")
+        elif action == action_choose:
             file, _ = QFileDialog.getOpenFileName(
                 self, "选择背景音乐", "",
-                "音频文件 (*.mp3 *.wav *.aac *.ogg)"
+                "音频文件 (*.mp3 *.wav *.aac *.ogg *.m4a *.flac)"
             )
             if file:
                 btn.bgm_path = file
@@ -20667,7 +20883,7 @@ class ProjectAddDialog(QDialog):
         elif action == action_random:
             btn.bgm_path = "随机分配 (全局BGM)"
             btn.setText("🎲 随机分配")
-            btn.setToolTip("")
+            btn.setToolTip("从右侧「背景音乐」文件夹随机选一首（仅音频）")
             
     def _batch_import_external_audio(self):
         """Multi-select audio files and assign one per project row (create rows if needed)."""
@@ -20801,7 +21017,7 @@ class ProjectAddDialog(QDialog):
             name = f"项目 {current_rows + added_count + 1}"
             script = ""
             materials = ""
-            bgm = "随机分配 (全局BGM)"
+            bgm = "无背景音"
             
             if len(cols) >= 1:
                 if len(cols) == 1:
@@ -20841,7 +21057,7 @@ class ProjectAddDialog(QDialog):
                     inner = getattr(mat_widget, "mat_btn", None)
                     if inner is not None:
                         materials_list = getattr(inner, "mat_list", []) or []
-                bgm_path = getattr(bgm_widget, "bgm_path", "随机分配 (全局BGM)")
+                bgm_path = getattr(bgm_widget, "bgm_path", "无背景音")
                 dim = dim_widget.currentText() if dim_widget else "9:16"
                 
                 results.append({
