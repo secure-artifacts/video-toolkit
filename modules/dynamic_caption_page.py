@@ -102,6 +102,7 @@ from .group_merge import (
     build_segmented_edit_state,
     discover_groups,
     load_group_segments_map,
+    lookup_group_script,
     merge_transition_labels,
     resolve_merge_transition,
     split_group_script,
@@ -6001,7 +6002,7 @@ class GroupCaptionDialog(QDialog):
             for column,value in enumerate(values):
                 item=QTableWidgetItem(value); item.setToolTip(value); self.table.setItem(row,column,item)
             editor=QPlainTextEdit(); editor.setPlaceholderText(f"粘贴 {len(clips)} 行文案")
-            existing=str(self.saved_scripts.get(str(folder.resolve()),""))
+            existing = lookup_group_script(self.saved_scripts, folder)
             editor.setPlainText("\n".join(split_group_script(existing)))
             editor.textChanged.connect(lambda r=row:self._update_status(r)); self.table.setCellWidget(row,4,editor); self.editors.append(editor)
             self.table.setRowHeight(row,122); self._update_status(row)
@@ -6052,7 +6053,19 @@ class GroupCaptionDialog(QDialog):
         self.accept()
 
     def scripts(self):
-        return {str(folder.resolve()):"\n\n".join(self._lines(editor)) for editor,(folder,_clips) in zip(self.editors,self.groups)}
+        out = {}
+        for editor, (folder, _clips) in zip(self.editors, self.groups):
+            text = "\n\n".join(self._lines(editor))
+            try:
+                out[str(folder.resolve())] = text
+            except Exception:
+                out[str(folder)] = text
+            # 文件夹名双写：换盘符/换电脑后仍可按组名找回
+            try:
+                out[folder.name] = text
+            except Exception:
+                pass
+        return out
 
 
 class ScriptProofreadDialog(QDialog):
@@ -6799,6 +6812,12 @@ class DynamicCaptionPage(QWidget):
         sort_row = QHBoxLayout(); sort_row.addWidget(QLabel("排序"))
         self.group_sort_mode = QComboBox(); self.group_sort_mode.addItems(["文件名自然排序（推荐）","按分段文案自动匹配"])
         self.group_sort_mode.currentTextChanged.connect(self._group_sort_mode_changed)
+        self.group_sort_mode.setToolTip(
+            "决定片段「播放先后」：\n"
+            "· 文件名自然排序：按 1、2、3…10 文件名顺序拼（不按口播内容重排）。\n"
+            "· 按分段文案自动匹配：识别每段口播，按你粘贴的文案第 1、2、3… 行顺序重排。\n"
+            "注意：「智能混合/文案边界」只负责裁掉口气，不会改播放顺序。"
+        )
         self.group_trim_mode = QComboBox()
         self.group_trim_mode.addItems([
             "智能混合边界（推荐）",
@@ -6808,8 +6827,11 @@ class DynamicCaptionPage(QWidget):
         ])
         self.group_trim_mode.setCurrentText("智能混合边界（推荐）")
         self.group_trim_mode.setToolTip(
-            "智能混合模式会用文案首词/末词时间定位正文，再用声音检测修正首尾；"
-            "识别失败会自动退回本地声音检测，不会中断整批任务。"
+            "只决定每段「从哪剪到哪」（去口气），不决定先后顺序。\n"
+            "· 智能混合：用匹配到的分段文案定位正文，再用声音修正首尾。\n"
+            "· 仅按文案边界：主要靠文案在识别轴上的位置裁剪。\n"
+            "· 快速声音边界：不依赖文案，只听声音掐头去尾。\n"
+            "口播顺序不对时，请改上方「排序」，不要只改裁剪方式。"
         )
         self.group_head_padding = QSpinBox(); self.group_head_padding.setRange(0,1000); self.group_head_padding.setValue(100); self.group_head_padding.setSuffix(" ms")
         # 尾保护默认加大，减轻 ASR 词尾偏早导致的吞尾音
@@ -9838,7 +9860,8 @@ class DynamicCaptionPage(QWidget):
             if 0<=current<len(self.group_merge_groups):
                 folder=self.group_merge_groups[current][0]
                 self._loading_group_script=True
-                try: self.group_script.setPlainText(self.group_scripts.get(str(folder.resolve()),""))
+                try:
+                    self.group_script.setPlainText(lookup_group_script(self.group_scripts, folder))
                 finally: self._loading_group_script=False
             self.group_sort_mode.setCurrentText("按分段文案自动匹配")
             self._append_run_log(
@@ -9870,15 +9893,29 @@ class DynamicCaptionPage(QWidget):
             finally: self._loading_group_script = False
             if folder: self.log.appendPlainText("所选目录中没有找到可处理的视频组。")
 
+    def _store_group_script(self, folder, text: str):
+        """按绝对路径 + 文件夹名双写，换电脑/换盘符后仍可按组名找回。"""
+        if folder is None:
+            return
+        text = str(text or "")
+        try:
+            self.group_scripts[str(Path(folder).resolve())] = text
+        except Exception:
+            self.group_scripts[str(folder)] = text
+        try:
+            self.group_scripts[Path(folder).name] = text
+        except Exception:
+            pass
+
     def _group_selection_changed(self, current_row, _current_column, previous_row, _previous_column):
         if 0 <= previous_row < len(self.group_merge_groups):
             folder = self.group_merge_groups[previous_row][0]
-            self.group_scripts[str(folder.resolve())] = self.group_script.toPlainText()
+            self._store_group_script(folder, self.group_script.toPlainText())
         self._loading_group_script = True
         try:
             if 0 <= current_row < len(self.group_merge_groups):
                 folder = self.group_merge_groups[current_row][0]
-                self.group_script.setPlainText(self.group_scripts.get(str(folder.resolve()), ""))
+                self.group_script.setPlainText(lookup_group_script(self.group_scripts, folder))
             else:
                 self.group_script.clear()
         finally:
@@ -9890,14 +9927,15 @@ class DynamicCaptionPage(QWidget):
         row = self.group_table.currentRow()
         if 0 <= row < len(self.group_merge_groups):
             folder = self.group_merge_groups[row][0]
-            self.group_scripts[str(folder.resolve())] = self.group_script.toPlainText()
+            self._store_group_script(folder, self.group_script.toPlainText())
 
     def _group_sort_mode_changed(self, text):
         script_mode = "文案" in str(text)
         self.group_script.setEnabled(script_mode)
         self.group_script.setToolTip(
             "选择一个组后粘贴它的分段文案；段数必须与视频数一致。" if script_mode
-            else "文件名自然排序会正确处理 1、2、3…10；裁剪方式可选择智能混合、仅文案或快速声音边界。"
+            else "「文件名自然排序」只按文件名拼先后；智能/文案边界只负责去口气。"
+            "口播顺序不对时请改选「按分段文案自动匹配」，并在「字幕对应表」粘贴分段文案。"
         )
 
     def start_group_merge_selected(self):
@@ -10124,13 +10162,22 @@ class DynamicCaptionPage(QWidget):
         self.group_merge_start.setEnabled(False); self.group_merge_stop.setEnabled(True); self.group_merge_selected.setEnabled(False); self.progress.setValue(0)
         if settings["sort_mode"] == "natural":
             if settings["trim_mode"] == "hybrid":
-                self._append_run_log("开始智能混合分组合成：文件名自然排序 → 文案首尾定位 → 声音边界修正 → 自动去口气音 → 无缝合成；不核对字幕内容。")
+                self._append_run_log(
+                    "开始智能混合分组合成：排序=文件名自然序（不重排）→ "
+                    "识别后把分段文案对齐到各文件再定位首尾 → 声音边界修正 → 去口气音 → 无缝合成。"
+                    " 若口播先后不对，请改「排序」为「按分段文案自动匹配」。"
+                )
             elif settings["trim_mode"] == "text":
-                self._append_run_log("开始文案边界分组合成：文件名自然排序 → 识别每段首词/末词时间 → 自动去口气音 → 无缝合成。")
+                self._append_run_log(
+                    "开始文案边界分组合成：排序=文件名自然序（不重排）→ "
+                    "识别对齐分段文案 → 按文案时间窗裁剪 → 去口气音 → 无缝合成。"
+                )
             else:
                 self._append_run_log("开始快速分组合成：文件名自然排序 → 本地检测首尾声音 → 去口气音 → 无缝合成。")
         else:
-            self._append_run_log("开始文案匹配合成：识别片段文字 → 按文案排序 → 去口气音 → 无缝合成。")
+            self._append_run_log(
+                "开始文案匹配合成：识别片段文字 → 按分段文案重排先后 → 去口气音 → 无缝合成。"
+            )
         transition = settings.get("transition_name") or "无转场"
         if transition and transition != "无转场":
             dur = float(settings.get("transition_duration") or 0.5)

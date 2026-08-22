@@ -2369,33 +2369,76 @@ class GroupMergeWorker(QObject):
                     f"边界分析完成：{folder.name} 共 {len(clips)} 段，"
                     f"开始裁剪编码（进度不会停在「智能混合边界」）。"
                 )
-                # 与 clips 平行的分段文案（排序成功后按文案第 1..N 段对齐）
+                # 与 clips 平行的分段文案：必须按「识别↔文案」匹配绑定，禁止按文件名序号硬套。
+                # 旧逻辑在「文件名自然排序 + 智能/文案边界」时把第 N 行文案套到自然序第 N 个文件，
+                # 另一台电脑文件名顺序不同或片段未按 1/2/3 命名时就会裁错/像「排错序」。
                 clip_scripts = None
-                if self.settings.get("sort_mode") == "script":
-                    if not str(group_script or "").strip():
+                has_script = bool(str(group_script or "").strip())
+                want_script_sort = bool(script_mode and has_script)
+                want_script_trim = bool(has_script and trim_mode in ("hybrid", "text"))
+                if want_script_sort or want_script_trim:
+                    if not has_script:
                         self.log.emit("提醒：本组未找到分段文案，自动回退为文件名自然排序。")
                     else:
-                        # Pass full analysis dicts so matching can use SRT + original variants.
                         ordered, reason, details = match_clips_to_script(
                             clips,
                             analyses,
                             group_script,
                         )
-                        if ordered:
-                            clips = ordered
-                            clip_scripts = [
-                                str(item.get("segment_text") or item.get("script_preview") or "")
-                                for item in sorted(details, key=lambda d: d["segment_index"])
-                            ]
-                            self.log.emit(reason)
+                        if ordered and details:
+                            by_clip = {}
+                            for item in details:
+                                try:
+                                    key = str(Path(item["clip"]).resolve())
+                                except Exception:
+                                    key = str(item.get("clip") or "")
+                                by_clip[key] = str(
+                                    item.get("segment_text") or item.get("script_preview") or ""
+                                )
                             for item in details:
                                 self.log.emit(
                                     f"  文案第{item['segment_index'] + 1}段 ↔ {item['clip'].name}"
                                     f" (相似度 {item['score']:.2f})｜文案: {item['script_preview']!s}"
                                     f"｜识别: {item['transcript_preview']!s}"
                                 )
-                            order_desc = " → ".join(f"{i + 1}.{path.name}" for i, path in enumerate(clips))
-                            self.log.emit(f"合成顺序（按分段文案）：{order_desc}")
+                            if want_script_sort:
+                                clips = ordered
+                                clip_scripts = [
+                                    str(item.get("segment_text") or item.get("script_preview") or "")
+                                    for item in sorted(details, key=lambda d: d["segment_index"])
+                                ]
+                                self.log.emit(reason)
+                                order_desc = " → ".join(
+                                    f"{i + 1}.{path.name}" for i, path in enumerate(clips)
+                                )
+                                self.log.emit(f"合成顺序（按分段文案）：{order_desc}")
+                            else:
+                                # 保留文件名顺序，但裁剪窗口用「该文件真正匹配到的那段文案」
+                                clip_scripts = []
+                                for c in clips:
+                                    try:
+                                        clip_scripts.append(by_clip.get(str(c.resolve()), ""))
+                                    except Exception:
+                                        clip_scripts.append("")
+                                self.log.emit(
+                                    f"排序=文件名自然序（不重排）；已按识别把分段文案对齐到各片段，"
+                                    f"供「{trim_mode}」裁剪使用。{reason}"
+                                )
+                                matched_order = [
+                                    str(Path(item["clip"]).resolve())
+                                    for item in sorted(details, key=lambda d: d["segment_index"])
+                                ]
+                                natural_order = []
+                                for c in clips:
+                                    try:
+                                        natural_order.append(str(c.resolve()))
+                                    except Exception:
+                                        natural_order.append(str(c))
+                                if matched_order != natural_order:
+                                    self.log.emit(
+                                        "提醒：按文案的最佳播放顺序与当前文件名顺序不一致。"
+                                        "若口播先后不对，请把「排序」改为「按分段文案自动匹配」后重新合成。"
+                                    )
                         else:
                             if details:
                                 for item in details:
@@ -2403,18 +2446,17 @@ class GroupMergeWorker(QObject):
                                         f"  候选 文案第{item['segment_index'] + 1}段 ↔ {item['clip'].name}"
                                         f" (相似度 {item['score']:.2f})"
                                     )
-                            self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
-                            # 匹配失败时禁止「按索引硬套分段文案」做智能裁剪窗口
-                            # （希腊语等小语种弱匹配失败后若仍按 1↔文件1 裁剪，会切错口播）
+                            if want_script_sort:
+                                self.log.emit(f"提醒：{reason}，本组自动回退为文件名自然排序。")
+                            else:
+                                self.log.emit(f"提醒：{reason}（文件名顺序不变）。")
+                            # 匹配失败时禁止「按索引硬套分段文案」做智能/文案裁剪
                             clip_scripts = [""] * len(clips)
-                            self.log.emit(
-                                "提醒：文案匹配未通过，智能混合边界将按识别音轴裁剪，"
-                                "不使用分段文案时间窗（避免错段裁切）。"
-                            )
-                elif str(group_script or "").strip():
-                    segs = split_group_script(group_script, len(clips))
-                    if len(segs) == len(clips):
-                        clip_scripts = list(segs)
+                            if want_script_trim:
+                                self.log.emit(
+                                    "提醒：文案匹配未通过，智能/文案边界将按识别音轴裁剪，"
+                                    "不使用分段文案时间窗（避免错段裁切）。"
+                                )
                 first_probe = self._probe(clips[0])
                 target_w, target_h = calculate_target_size(
                     first_probe["width"], first_probe["height"],
