@@ -298,6 +298,33 @@ PRESETS = {
         "position": "画面中间", "caption_mode": "语音同步字幕",
         "line_width": 84,
     },
+    # 白字+当前词亮黄 · 粗黑描边 · 居中（保留）
+    "FB Reel 黄字跟读": {
+        "text": "#FFFFFF", "outline": "#0A0A0A", "highlight": "#FFEE00",
+        "outline_width": 5, "effect": "word_color",
+        "font": "Arial Black", "font_size": 86, "line_length": 24,
+        "letter_spacing": -2, "word_spacing": -2, "line_spacing": 108,
+        "margin_v": 500, "max_words": 6, "max_lines": 2,
+        "highlight_padding": 8, "animation_speed": 85,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 88,
+    },
+    # 参考：facebook.com/reel/1033593986178713
+    # 语义大小号 + 逐词弹出 + 当前词亮红放大跟读（读完留白字）
+    "FB Reel 红字跟读": {
+        "text": "#FFFFFF", "outline": "#000000", "highlight": "#FF2D2D",
+        "outline_width": 6, "effect": "semantic_karaoke",
+        "font": "Arial Black", "font_size": 90, "line_length": 22,
+        "letter_spacing": -2, "word_spacing": -4, "line_spacing": 112,
+        "margin_v": 500, "max_words": 5, "max_lines": 2,
+        "highlight_padding": 8, "animation_speed": 65,
+        "position": "画面中间", "caption_mode": "语音同步字幕",
+        "line_width": 86,
+        "semantic_large_ratio": 1.22,
+        "semantic_small_ratio": 0.72,
+        "semantic_lead_ms": 0,
+        "semantic_max_lines": 5,
+    },
     # —— 弹出缩放系列 ——
     "默认白字": {"text": "#FFFFFF", "outline": "#000000", "highlight": "#FFD700", "outline_width": 3, "effect": "pop", "font": "Arial", "font_size": 74, "line_length": 26, "margin_v": 500, "max_words": 7},
     "黄字黑边 (经典)": {"text": "#FFD700", "outline": "#000000", "highlight": "#FF4444", "outline_width": 5, "effect": "pop", "font": "Arial", "font_size": 74, "line_length": 26, "margin_v": 500, "max_words": 7},
@@ -791,14 +818,25 @@ class PresetPreviewButton(QPushButton):
         elif effect == "word_color":
             painter.setPen(text_color); painter.drawText(x,baseline,"字幕"); x2=x+metrics.horizontalAdvance("字幕")
             painter.setPen(highlight); painter.drawText(x2,baseline,"样式")
+        elif effect == "word_pop_color":
+            # 预览卡：白字 + 当前词红字略放大，示意弹出跟读
+            painter.setPen(text_color); painter.drawText(x, baseline, "字幕")
+            x2 = x + metrics.horizontalAdvance("字幕") + 2
+            pop_font = QFont(font); pop_font.setPixelSize(20); pop_font.setBold(True)
+            painter.setFont(pop_font)
+            painter.setPen(highlight); painter.drawText(x2, baseline, "弹出")
         elif effect in SEMANTIC_LAYOUT_EFFECTS:
-            # 预览卡：大号重点 + 小号陪衬；黄字跟读时第二词用高亮色
+            # 预览卡：大号重点 + 小号陪衬；semantic_karaoke 第二词用高亮色并略放大
             small = QFont(font); small.setPixelSize(11); small.setBold(True)
             big = QFont(font); big.setPixelSize(18); big.setBold(True)
             painter.setFont(big); painter.setPen(text_color); painter.drawText(x, baseline - 2, "重点")
-            painter.setFont(small)
-            painter.setPen(highlight if effect == "semantic_karaoke" else text_color)
-            painter.drawText(x + QFontMetricsF(big).horizontalAdvance("重点") + 3, baseline, "跟读" if effect == "semantic_karaoke" else "铺陈")
+            if effect == "semantic_karaoke":
+                pop = QFont(font); pop.setPixelSize(15); pop.setBold(True)
+                painter.setFont(pop); painter.setPen(highlight)
+                painter.drawText(x + QFontMetricsF(big).horizontalAdvance("重点") + 2, baseline, "弹出")
+            else:
+                painter.setFont(small); painter.setPen(text_color)
+                painter.drawText(x + QFontMetricsF(big).horizontalAdvance("重点") + 3, baseline, "铺陈")
         else:
             painter.setPen(highlight); painter.drawText(x,baseline,sample)
         painter.end()
@@ -3608,20 +3646,35 @@ def temporary_ass_path(prefix="caption"):
 
 
 def caption_layout_context(settings):
-    """Canonical 1080x1920 caption metrics shared by live preview and ASS."""
-    font=QFont(str(settings.get("font") or "Arial"))
-    font.setPixelSize(max(1,int(settings.get("font_size") or 76)))
-    font.setBold(caption_uses_bold_face(settings))
-    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, _safe_float(settings.get("letter_spacing"), 0))
-    metrics=QFontMetricsF(font)
-    font_size=max(1,int(settings.get("font_size") or 76))
+    """Canonical 1080x1920 caption metrics shared by live preview and ASS.
+
+    Always resolve QFontInfo.family() first so word widths match the face
+    libass will load (requested name like \"Arial Black\" may map elsewhere).
+    """
+    requested = str(settings.get("font") or "Arial")
+    font_size = max(1, int(settings.get("font_size") or 76))
+    bold = caption_uses_bold_face(settings)
+    letter = _safe_float(settings.get("letter_spacing"), 0)
+    font = QFont(requested)
+    font.setPixelSize(font_size)
+    font.setBold(bold)
+    try:
+        resolved = QFontInfo(font).family()
+        if resolved and resolved.casefold() != requested.casefold():
+            font = QFont(resolved)
+            font.setPixelSize(font_size)
+            font.setBold(bold)
+    except Exception:
+        pass
+    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter)
+    metrics = QFontMetricsF(font)
     # Word spacing is independent from glyph/letter spacing.  Negative values
     # intentionally remain negative so the control still changes the final
     # geometry after the natural space has reached zero.
-    gap=max(-font_size*1.25,metrics.horizontalAdvance(" ")+_safe_float(settings.get("word_spacing"),0))
-    line_gap=max(font_size,metrics.height())*max(70,min(180,int(settings.get("line_spacing") or 116)))/100
-    max_width=1080*max(40,min(96,int(settings.get("line_width") or 86)))/100
-    return font,metrics,gap,line_gap,max_width
+    gap = max(-font_size * 1.25, metrics.horizontalAdvance(" ") + _safe_float(settings.get("word_spacing"), 0))
+    line_gap = max(font_size, metrics.height()) * max(70, min(180, int(settings.get("line_spacing") or 116))) / 100
+    max_width = 1080 * max(40, min(96, int(settings.get("line_width") or 86))) / 100
+    return font, metrics, gap, line_gap, max_width
 
 
 def caption_uses_bold_face(settings):
@@ -3666,7 +3719,8 @@ def caption_page_geometry(lines,settings,context=None):
     result=[]
     font_size=_safe_float(settings.get("font_size"),76)
     for line_index,tokens in enumerate(lines):
-        widths=[max(font_size*.55,metrics.horizontalAdvance(token)) for token in tokens]
+        # 用真实字宽，禁止用 font_size*0.55 虚高撑宽——否则预览/导出词间距都会被拉开
+        widths=[max(2.0, metrics.horizontalAdvance(token)) for token in tokens]
         total=sum(widths)+gap*max(0,len(widths)-1); cursor=(1080-total)/2
         y=center_y+(line_index-(len(lines)-1)/2)*line_gap
         baseline=y+metrics.ascent()/2-metrics.descent()/2
@@ -3901,10 +3955,13 @@ def write_ass(path, srt, settings, word_srt=""):
     except Exception:
         resolved_family = ""
     font = str(resolved_family or render_settings.get("font", "Arial")).replace(",", "")
+    # 关键：排版几何必须用「解析后的字体族」，否则 \pos 按 A 字体量、libass 用 B 字体画 → 词间距被拉开
+    if font:
+        render_settings["font"] = font
     # 把该字型文件拷入 fontsdir，否则 libass 回退到别的字体 → 预览好看、导出变样
     try:
         ensure_font_in_render_dir(font)
-        ensure_font_in_render_dir(str(render_settings.get("font") or ""))
+        ensure_font_in_render_dir(str(settings.get("font") or ""))
     except Exception:
         pass
     alignment = {"底部": 2, "画面中间": 5, "顶部": 8}.get(settings.get("position", "底部"), 2)
@@ -4127,7 +4184,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(visible_end)},"
                             f"Base,,0,0,0,,{override}{draw}"
                         )
-                        # 语义黄字跟读：当前词窗口叠亮黄 ActiveColor（与 word_color 同色轨）
+                        # 语义跟读：当前词窗口叠 ActiveColor，并再做一次放大弹出
                         if effect == "semantic_karaoke":
                             karaoke_start = max(visible_start, token_start)
                             # 跟到下一词开始或本词 end，不拖到页尾
@@ -4136,8 +4193,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             else:
                                 karaoke_end = min(page_end, max(karaoke_start + 0.06, token_end))
                             if karaoke_end > karaoke_start + 0.02:
+                                punch = max(45, min(130, int(animation_ms)))
                                 active_override = (
-                                    fr"{{\an5\pos({x:.1f},{y:.1f})\fs{size}\fad(25,25)}}"
+                                    fr"{{\an5\pos({x:.1f},{y:.1f})\fs{size}"
+                                    fr"\fscx78\fscy78"
+                                    fr"\t(0,{punch},\fscx118\fscy118)"
+                                    fr"\t({punch},{punch + 55},\fscx100\fscy100)"
+                                    fr"\fad(18,18)}}"
                                 )
                                 events.append(
                                     f"Dialogue: {caption_layer + 2},{ass_time(karaoke_start)},{ass_time(karaoke_end)},"
@@ -4201,8 +4263,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                                 f"Dialogue: {caption_layer},{ass_time(visible_start)},{ass_time(page_end)},"
                                 f"Base,,0,0,0,,{override}{draw}")
                         continue
-                    intro=fr"{{\an5\pos({x:.1f},{y:.1f})\fad(70,70)}}"
-                    if effect == "glow": intro=fr"{{\an5\pos({x:.1f},{y:.1f})\blur3\fad(70,70)}}"
+                    # \fsp 与 Style Spacing 双写：部分 libass 版本对逐词 Dialogue 不继承 Style Spacing
+                    fsp = fr"\fsp{spacing:.2f}" if abs(float(spacing or 0)) > 0.01 else ""
+                    intro=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fad(70,70)}}"
+                    if effect == "glow": intro=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\blur3\fad(70,70)}}"
                     if effect == "double_outline":
                         events.append(f"Dialogue: {caption_layer},{ass_time(page_start)},{ass_time(page_end)},DoubleOuter,,0,0,0,,{intro}{draw}")
                         events.append(f"Dialogue: {caption_layer + 1},{ass_time(page_start)},{ass_time(page_end)},Base,,0,0,0,,{intro}{draw}")
@@ -4249,7 +4313,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     active_style="Active"
                     if effect == "word_color":
                         active_style="ActiveColor"
-                        active_override=fr"{{\an5\pos({x:.1f},{y:.1f})\fad(30,30)}}"
+                        active_override=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fad(30,30)}}"
+                    elif effect == "word_pop_color":
+                        # 当前词：红色 ActiveColor + 弹出缩放；读完后底层 Base 白字留下
+                        active_style="ActiveColor"
+                        pop_ms = max(40, min(140, int(animation_ms)))
+                        active_override=(
+                            fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}"
+                            fr"\fscx70\fscy70"
+                            fr"\t(0,{pop_ms},\fscx112\fscy112)"
+                            fr"\t({pop_ms},{pop_ms + 70},\fscx100\fscy100)"
+                            fr"\fad(20,20)}}"
+                        )
                     elif effect in ("descript","heygen","highlight"):
                         box_width=width+padding_x*2; box_height=max(font_size*1.12,metrics.height())+padding_y*2
                         box_x=x-box_width/2; box_y=y-box_height/2
@@ -4257,14 +4332,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         box_override=(fr"{{\an7\pos({box_x:.1f},{box_y:.1f})\p1\fscx92\fscy92"
                                       fr"\t(0,{animation_ms},\fscx100\fscy100)}}")
                         events.append(f"Dialogue: {caption_layer + 1},{ass_time(token_start)},{ass_time(token_end)},HighlightBox,,0,0,0,,{box_override}{box}")
-                        active_override=(fr"{{\an5\pos({x:.1f},{y:.1f})\fscx92\fscy92"
+                        active_override=(fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fscx92\fscy92"
                                          fr"\t(0,{animation_ms},\fscx100\fscy100)}}")
                     elif effect == "pop":
-                        active_override=(fr"{{\an5\pos({x:.1f},{y:.1f})\fscx75\fscy75"
+                        active_override=(fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fscx75\fscy75"
                                          fr"\t(0,{animation_ms},\fscx108\fscy108)"
                                          fr"\t({animation_ms},{animation_ms+90},\fscx100\fscy100)}}")
-                    elif effect == "underline": active_override=fr"{{\an5\pos({x:.1f},{y:.1f})\u1}}"
-                    else: active_override=fr"{{\an5\pos({x:.1f},{y:.1f})}}"
+                    elif effect == "underline": active_override=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\u1}}"
+                    else: active_override=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}}}"
                     events.append(f"Dialogue: {caption_layer + 2},{ass_time(token_start)},{ass_time(token_end)},{active_style},,0,0,0,,{active_override}{draw}")
     path.write_text(header + "\n".join(events), encoding="utf-8-sig")
 
@@ -12590,7 +12665,7 @@ class DynamicCaptionPage(QWidget):
             if not effect and base in PRESETS:
                 effect = str(PRESETS[base].get("effect") or "")
             highlight_label = (
-                "跟读文字" if effect in ("semantic_karaoke", "word_color")
+                "跟读文字" if effect in ("semantic_karaoke", "word_color", "word_pop_color")
                 else "重点词" if effect in ("semantic_stack", "word_scale")
                 else "跟读背景"
             )
@@ -13912,9 +13987,26 @@ class DynamicCaptionPage(QWidget):
                 settings = None
             if not settings:
                 settings = self._current_settings() if hasattr(self, "_current_settings") else {}
+            settings = dict(settings or {})
+            # 与 write_ass 对齐：字距、解析后的字体族必须一致，否则预览紧、导出词距被拉开
+            sample = ""
+            try:
+                text0, _ = self._live_caption_data(0.0)
+                sample = str(text0 or "")
+            except Exception:
+                sample = ""
+            settings["letter_spacing"] = effective_letter_spacing(settings, sample)
+            try:
+                probe = caption_layout_context(settings)[0]
+                resolved = QFontInfo(probe).family()
+                if resolved:
+                    settings["font"] = resolved
+                    ensure_font_in_render_dir(resolved)
+            except Exception:
+                pass
             preset = resolve_caption_preset(settings)
-            context=caption_layout_context(settings)
-            self._live_caption_style_cache={"settings":settings,"preset":preset,"context":context}
+            context = caption_layout_context(settings)
+            self._live_caption_style_cache = {"settings": settings, "preset": preset, "context": context}
         settings=self._live_caption_style_cache["settings"]; preset=self._live_caption_style_cache["preset"]
         text, active_word = self._live_caption_data(seconds); tokens = tokens_for(text)
         if not tokens: return
@@ -13977,6 +14069,7 @@ class DynamicCaptionPage(QWidget):
             ) or [[]]
             spoken_cut = max(1, min(int(cut or len(tokens)), len(tokens)))
             spoken = set(range(spoken_cut))
+            # semantic_karaoke：当前词变色+放大；其它语义效果仅大小号
             active_i = spoken_cut - 1 if effect == "semantic_karaoke" else -1
 
             # 落在哪一页：按词序号
@@ -14002,14 +14095,24 @@ class DynamicCaptionPage(QWidget):
                     if global_i not in spoken:
                         continue  # 未读到的词：透明底稿不画
                     size = int(item.get("size") or settings.get("font_size") or 86)
+                    is_active = global_i == active_i
+                    # 当前词再放大一截，预览看出「弹出」
+                    draw_size = int(round(size * 1.14)) if is_active and effect == "semantic_karaoke" else size
                     word_font = QFont(family)
-                    word_font.setPixelSize(size)
+                    word_font.setPixelSize(draw_size)
                     word_font.setBold(bold)
                     word_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter)
                     path = QPainterPath()
                     path.addText(0, 0, word_font, item["token"])
-                    fill = highlight if global_i == active_i else base_color
+                    fill = highlight if is_active else base_color
                     painter.save()
+                    # 以词中心为锚点放大，避免只往右下偏
+                    if is_active and effect == "semantic_karaoke":
+                        cx = geo["left"] + _safe_float(item.get("width"), size) / 2.0
+                        cy = geo["baseline"]
+                        painter.translate(cx, cy)
+                        painter.scale(1.12, 1.12)
+                        painter.translate(-cx, -cy)
                     painter.translate(geo["left"], geo["baseline"])
                     painter.setPen(QPen(outline, pen_width * 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
                     painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -14081,11 +14184,16 @@ class DynamicCaptionPage(QWidget):
                     painter.setBrush(base_color)
                     painter.drawPath(path)
                 else:
+                    # word_pop_color：当前词略放大，模拟 ASS 弹出
+                    if is_active and effect in ("word_pop_color", "pop"):
+                        painter.translate(width / 2.0, -metrics.ascent() / 3.0)
+                        painter.scale(1.12, 1.12)
+                        painter.translate(-width / 2.0, metrics.ascent() / 3.0)
                     painter.setPen(QPen(outline,pen_width*2,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap,Qt.PenJoinStyle.RoundJoin)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawPath(path)
                     if effect=="dual_box" and is_active:
                         fill=active_text_color
                     else:
-                        fill=highlight if is_active and effect in ("word_color","pop","underline") else base_color
+                        fill=highlight if is_active and effect in ("word_color","word_pop_color","pop","underline") else base_color
                     painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(fill); painter.drawPath(path)
                 painter.restore()
                 if is_active and effect=="underline":
@@ -17995,7 +18103,7 @@ class DynamicCaptionPage(QWidget):
                 "semantic_max_lines", "semantic_small_words",
             ) if k in preset
         }
-        if preset["effect"] in ("word_color", "semantic_karaoke"):
+        if preset["effect"] in ("word_color", "word_pop_color", "semantic_karaoke"):
             highlight_label = "跟读文字"
         elif preset["effect"] in ("semantic_stack", "word_scale"):
             highlight_label = "重点词"

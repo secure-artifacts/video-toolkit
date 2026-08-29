@@ -355,6 +355,7 @@ class MetadataWorker(QObject):
         watermark=None,
         crop_916=False,
         crop_916_mode="keep",
+        rotate_mode="none",
     ):
         super().__init__()
         self.files = [Path(value) for value in files]
@@ -364,10 +365,30 @@ class MetadataWorker(QObject):
         self.watermark = watermark if isinstance(watermark, dict) else None
         self.crop_916 = bool(crop_916)
         self.crop_916_mode = str(crop_916_mode or "keep")
+        # none | 180 | 90cw | 90ccw
+        self.rotate_mode = str(rotate_mode or "none").strip().lower()
         self.cancelled = False
         self._proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
         self._repair_paths: list[Path] = []
+
+    def _rotate_enabled(self) -> bool:
+        return self.rotate_mode in ("180", "90cw", "90ccw")
+
+    def _rotate_vf(self) -> str:
+        """FFmpeg 画面旋转（真正改像素，不是只写旋转元数据）。"""
+        return {
+            "180": "hflip,vflip",
+            "90cw": "transpose=1",
+            "90ccw": "transpose=2",
+        }.get(self.rotate_mode, "")
+
+    def _rotate_label(self) -> str:
+        return {
+            "180": "旋转 180°（倒着拍放正）",
+            "90cw": "顺时针 90°",
+            "90ccw": "逆时针 90°",
+        }.get(self.rotate_mode, "")
 
     def cancel(self):
         self.cancelled = True
@@ -539,6 +560,18 @@ class MetadataWorker(QObject):
         with Image.open(source) as image:
             clean = Image.new(image.mode, image.size)
             clean.putdata(list(image.getdata()))
+            if self._rotate_enabled():
+                before = (clean.width, clean.height)
+                if self.rotate_mode == "180":
+                    clean = clean.rotate(180, expand=True)
+                elif self.rotate_mode == "90cw":
+                    clean = clean.transpose(Image.Transpose.ROTATE_270)  # PIL: 90 CW
+                elif self.rotate_mode == "90ccw":
+                    clean = clean.transpose(Image.Transpose.ROTATE_90)
+                self.log.emit(
+                    f"  · {self._rotate_label()}：{before[0]}×{before[1]} → "
+                    f"{clean.width}×{clean.height}"
+                )
             if self.crop_916:
                 before = (clean.width, clean.height)
                 target, note = _effective_crop_target(before[0], before[1], self.crop_916_mode)
@@ -709,7 +742,7 @@ class MetadataWorker(QObject):
                 work = self._maybe_repair_and_retry(ffmpeg, source, exc)
                 self._av_copy_clean(ffmpeg, work, destination)
             return
-        need_reencode = self._wm_enabled() or self.crop_916
+        need_reencode = self._wm_enabled() or self.crop_916 or self._rotate_enabled()
         if not need_reencode:
             try:
                 self._av_copy_clean(ffmpeg, work, destination)
@@ -718,7 +751,12 @@ class MetadataWorker(QObject):
                 self._av_copy_clean(ffmpeg, work, destination)
             return
         # 已是 9:16 且仅裁切、无水印：可走流复制
-        if self.crop_916 and not self._wm_enabled() and self.crop_916_mode == "keep":
+        if (
+            self.crop_916
+            and not self._wm_enabled()
+            and not self._rotate_enabled()
+            and self.crop_916_mode == "keep"
+        ):
             w, h, _fps = _probe_video_size(ffmpeg, work)
             if _is_nearly_916(w, h):
                 self.log.emit(
@@ -777,9 +815,17 @@ class MetadataWorker(QObject):
         - 目标分辨率仅允许缩小，禁止放大（小图强制 1080p 会发糊）
         - 不改 fps
         """
-        parts = ["setpts=PTS-STARTPTS", "format=yuv420p"]
+        parts = ["setpts=PTS-STARTPTS"]
         out_w, out_h = int(source_w or 0), int(source_h or 0)
         scale_note = ""
+        rot = self._rotate_vf()
+        if rot:
+            parts.append(rot)
+            # 90° 交换宽高供后续裁切估算
+            if self.rotate_mode in ("90cw", "90ccw") and out_w and out_h:
+                out_w, out_h = out_h, out_w
+                source_w, source_h = out_w, out_h
+        parts.append("format=yuv420p")
         if self.crop_916:
             parts.append(_CROP_916_VF)
             # 估算裁后尺寸
@@ -813,8 +859,12 @@ class MetadataWorker(QObject):
         w, h, fps, src_br = _probe_video_meta(ffmpeg, source)
         notes = []
         v_prep, out_size, scale_note = self._build_video_chain(w, h)
+        if self._rotate_enabled():
+            notes.append(self._rotate_label())
+            if w and h and self.rotate_mode in ("90cw", "90ccw"):
+                notes.append(f"源 {w}×{h} → 旋转后约 {h}×{w}")
         if self.crop_916:
-            if w and h:
+            if w and h and not self._rotate_enabled():
                 notes.append(f"源 {w}×{h}")
             if scale_note:
                 notes.append(scale_note)
@@ -1011,6 +1061,8 @@ class MetadataWorker(QObject):
             failed = 0
             total = max(1, len(self.files))
             extras = []
+            if self._rotate_enabled():
+                extras.append(self._rotate_label())
             if self.crop_916:
                 extras.append("9:16裁切")
             if self._wm_enabled():
@@ -1063,6 +1115,8 @@ class MetadataWorker(QObject):
                 self.progress.emit(round(index / total * 100))
             self._cleanup_repairs()
             ops = "清除元数据"
+            if self._rotate_enabled():
+                ops += f" + {self._rotate_label()}"
             if self.crop_916:
                 ops += " + 9:16 居中裁切"
             if self._wm_enabled():
@@ -1104,6 +1158,7 @@ class MetadataPage(QWidget):
         note = QLabel(
             "隐私清理会强制删除 GPS、拍摄时间、设备/序列号、作者版权、唯一标识、标题描述、软件来源、"
             "章节、附件和封面图；图片重建像素并清除 EXIF/XMP/IPTC。原文件不会被修改。"
+            "可选「旋转校正」：倒着拍的视频/图片转正（真正改像素，不是只改元数据）。"
             "可选「9:16 裁切」：所有视频/图片居中裁成竖屏，不拉伸变形，不强制改帧率，高质量编码。"
             "可选「水印合成」：清理同时把 Logo 烧进画面（视频会重编码）。"
             "注意：文件名以及画面、声音中直接出现的隐私内容需要另行处理。"
@@ -1232,6 +1287,27 @@ class MetadataPage(QWidget):
         self.crop_916.toggled.connect(_sync_crop_enabled)
         _sync_crop_enabled(False)
         options_layout.addWidget(crop_box)
+
+        # —— 旋转校正（倒着拍放正）——
+        rot_box = QGroupBox("旋转校正（可选）")
+        rot_layout = QVBoxLayout(rot_box)
+        rot_layout.setSpacing(10)
+        self.rotate_mode = QComboBox()
+        self.rotate_mode.addItem("不旋转", "none")
+        self.rotate_mode.addItem("旋转 180°（倒着拍放正，推荐）", "180")
+        self.rotate_mode.addItem("顺时针 90°", "90cw")
+        self.rotate_mode.addItem("逆时针 90°", "90ccw")
+        self.rotate_mode.setMinimumHeight(CTRL_H)
+        self.rotate_mode.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.rotate_mode.setToolTip(
+            "用于手机倒着拍、横竖拿反的素材：\n"
+            "· 180°：整段倒置放正（最常见）\n"
+            "· 90°：横拍竖看或竖拍横看\n"
+            "会重编码并真正改画面像素（不是只写旋转标记），"
+            "可与 9:16 裁切/水印同时开启（先旋转再裁切）。"
+        )
+        rot_layout.addLayout(_labeled_row("旋转方式", self.rotate_mode))
+        options_layout.addWidget(rot_box)
 
         # —— 水印合成：严格单列（标签在左固定宽，控件在右），永不挤成竖排 ——
         wm_box = QGroupBox("水印合成（可选）")
@@ -1594,12 +1670,16 @@ class MetadataPage(QWidget):
         self.progress.setValue(0)
         self.thread = QThread(self)
         crop_on = bool(getattr(self, "crop_916", None) and self.crop_916.isChecked())
+        rotate_key = "none"
+        if hasattr(self, "rotate_mode"):
+            rotate_key = str(self.rotate_mode.currentData() or "none")
         self.worker = MetadataWorker(
             files, self.output.text(), self.keep_structure.isChecked(),
             self.preserve_time.isChecked(),
             watermark=self._watermark_cfg(),
             crop_916=crop_on,
             crop_916_mode=self._crop_916_mode_key() if crop_on else "keep",
+            rotate_mode=rotate_key,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1612,6 +1692,10 @@ class MetadataPage(QWidget):
         self.thread.finished.connect(self.thread.deleteLater)
         self.start.setEnabled(False)
         self.stop.setEnabled(True)
+        if rotate_key and rotate_key != "none":
+            self.log.appendPlainText(
+                f"已开启旋转校正：{self.rotate_mode.currentText()}（重编码改像素，放正后再进 Reels）。"
+            )
         if crop_on:
             self.log.appendPlainText(
                 f"已开启 9:16 居中裁切（模式：{self.crop_916_mode.currentText()}）；"
