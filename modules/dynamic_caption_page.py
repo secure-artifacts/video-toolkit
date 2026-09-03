@@ -56,6 +56,15 @@ from .path_picker import (
     AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, DropFolderLineEdit, DropListWidget, DropButton, DropTableWidget, collect_files, default_output_path, natural_key,
 )
 from .text_rules import filter_asr_junk_srt
+# 顶层导入：确保 PyInstaller 打包一定打进跟读/Qt 烧录模块（勿只放在函数内懒加载）
+from . import caption_qt_burn  # noqa: F401
+from .caption_qt_burn import (
+    bake_qt_caption_overlay_mov,
+    build_qt_caption_filter_complex,
+    fit_phrase_word_timings,
+    karaoke_lead_seconds,
+    resolve_lip_sync_cut,
+)
 
 ALLOWED_VIDEO_INPUTS = VIDEO_EXTENSIONS.union(IMAGE_EXTENSIONS)
 
@@ -404,7 +413,7 @@ STATIC_BOLD_FONT_FILES = {
     "Libre Baskerville": "LibreBaskerville-Bold.ttf",
 }
 
-CAPTION_RENDERER_VERSION = 20  # preset/color must not break ASR karaoke; span-map cut
+CAPTION_RENDERER_VERSION = 21  # portable word timeline (cross-machine basename + .words.srt)
 
 
 # Visual keys that must stay identical between batch snapshot / UI / export.
@@ -2733,15 +2742,40 @@ def _media_signature(path):
     return {"path": str(path.resolve()), "size": stat.st_size, "mtime": stat.st_mtime_ns}
 
 
+def _portable_media_fingerprint(path):
+    """跨盘符/换电脑可复用的媒体指纹：文件名 + 大小 + mtime（不含绝对路径）。"""
+    path = Path(path)
+    stat = path.stat()
+    return {
+        "name": path.name.casefold(),
+        "size": int(stat.st_size),
+        "mtime": int(stat.st_mtime_ns),
+    }
+
+
 def _timeline_cache_path(output, source):
-    key = hashlib.sha256(json.dumps(_media_signature(source), sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    # 优先便携指纹，换电脑拷贝输出目录仍可命中词级缓存
+    try:
+        payload = _portable_media_fingerprint(source)
+    except Exception:
+        payload = _media_signature(source)
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
     return Path(output) / ".reels_timeline_cache" / f"{key}.srt"
 
 
 def _load_timeline_cache(output, source):
     try:
         path = _timeline_cache_path(output, source)
-        return path.read_text(encoding="utf-8-sig") if path.exists() and path.stat().st_size else ""
+        if path.exists() and path.stat().st_size:
+            return path.read_text(encoding="utf-8-sig")
+        # 兼容旧版：绝对路径指纹缓存
+        legacy_key = hashlib.sha256(
+            json.dumps(_media_signature(source), sort_keys=True).encode("utf-8")
+        ).hexdigest()[:20]
+        legacy = Path(output) / ".reels_timeline_cache" / f"{legacy_key}.srt"
+        if legacy.exists() and legacy.stat().st_size:
+            return legacy.read_text(encoding="utf-8-sig")
+        return ""
     except Exception:
         return ""
 
@@ -2758,8 +2792,87 @@ def _clear_timeline_cache(output, source):
         path = _timeline_cache_path(output, source)
         path.unlink(missing_ok=True)
         path.with_suffix(".tmp").unlink(missing_ok=True)
+        try:
+            legacy_key = hashlib.sha256(
+                json.dumps(_media_signature(source), sort_keys=True).encode("utf-8")
+            ).hexdigest()[:20]
+            (Path(output) / ".reels_timeline_cache" / f"{legacy_key}.srt").unlink(missing_ok=True)
+        except Exception:
+            pass
     except Exception:
         pass
+
+
+def _basename_caption_key(path_or_name: str) -> str:
+    """稳定、跨盘符的字幕字典键：name:文件名（小写）。"""
+    name = Path(str(path_or_name or "")).name.strip()
+    return f"name:{name.casefold()}" if name else ""
+
+
+def _srt_looks_word_level(srt_text: str) -> bool:
+    """粗判 SRT 是否像词级轴（短 cue、少词），用于旁路 .srt 误当句级。"""
+    try:
+        entries = parse_srt(srt_text or "")
+    except Exception:
+        return False
+    if len(entries) < 4:
+        return False
+    durations = [max(0.0, float(e[1]) - float(e[0])) for e in entries]
+    avg = sum(durations) / max(1, len(durations))
+    short = sum(1 for d in durations if d <= 1.25) / len(durations)
+    light = sum(1 for e in entries if len(tokens_for(e[2])) <= 2) / len(entries)
+    return avg <= 1.35 and short >= 0.55 and light >= 0.55
+
+
+def _word_sidecar_paths(source) -> list[Path]:
+    path = Path(source)
+    return [
+        path.with_name(path.stem + ".words.srt"),
+        path.with_suffix(".words.srt") if path.suffix else path.with_name(str(path.name) + ".words.srt"),
+    ]
+
+
+def _write_word_sidecar(source, word_srt: str) -> Path | None:
+    """把词级轴写到素材旁边，换电脑拷贝素材目录即可带走对口型时钟。"""
+    text = str(word_srt or "").strip()
+    if not text or "-->" not in text:
+        return None
+    try:
+        path = Path(source)
+        if not path.parent.is_dir():
+            return None
+        side = path.with_name(path.stem + ".words.srt")
+        temporary = side.with_suffix(".tmp")
+        temporary.write_text(text + ("\n" if not text.endswith("\n") else ""), encoding="utf-8-sig")
+        temporary.replace(side)
+        return side
+    except Exception:
+        return None
+
+
+def _load_word_sidecar(source) -> str:
+    try:
+        path = Path(source)
+    except Exception:
+        return ""
+    for candidate in _word_sidecar_paths(path):
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 32:
+                text = candidate.read_text(encoding="utf-8-sig")
+                if text.strip() and "-->" in text:
+                    return text
+        except Exception:
+            continue
+    # 兼容：旁边同名 .srt 若明显是词级也可用
+    try:
+        plain = path.with_suffix(".srt")
+        if plain.is_file() and plain.stat().st_size > 32:
+            text = plain.read_text(encoding="utf-8-sig")
+            if _srt_looks_word_level(text):
+                return text
+    except Exception:
+        pass
+    return ""
 
 
 def _lookup_settings_map(mapping, *keys_or_paths) -> str:
@@ -2767,11 +2880,13 @@ def _lookup_settings_map(mapping, *keys_or_paths) -> str:
 
     UI stores keys via Path.resolve(); export historically used str(path.resolve()).
     On Windows, slash/case differences used to miss校对后的文案，导致烧录旧字。
+    换电脑/换盘符时再按「文件名」回退（name:xxx），避免词级轴丢失导致跟读均分飞掉。
     """
     mapping = mapping or {}
     if not isinstance(mapping, dict) or not mapping:
         return ""
     candidates: list[str] = []
+    basenames: list[str] = []
     for item in keys_or_paths:
         if item is None or item == "":
             continue
@@ -2784,8 +2899,16 @@ def _lookup_settings_map(mapping, *keys_or_paths) -> str:
             candidates.append(resolved)
             candidates.append(resolved.replace("\\", "/"))
             candidates.append(resolved.replace("\\", "/").lower())
+            bk = _basename_caption_key(resolved)
+            if bk:
+                candidates.append(bk)
+                basenames.append(Path(resolved).name.casefold())
         except Exception:
             candidates.append(text.replace("\\", "/"))
+            bk = _basename_caption_key(text)
+            if bk:
+                candidates.append(bk)
+                basenames.append(Path(text).name.casefold())
     for key in candidates:
         value = mapping.get(key)
         if value and str(value).strip():
@@ -2796,6 +2919,30 @@ def _lookup_settings_map(mapping, *keys_or_paths) -> str:
         value = lowered.get(str(key).replace("\\", "/").lower())
         if value and str(value).strip():
             return str(value).strip()
+    # 文件名唯一命中：换盘符后绝对路径键失效时仍能找回词级轴
+    if basenames:
+        by_name: dict[str, list] = {}
+        for k, v in mapping.items():
+            if not v or not str(v).strip():
+                continue
+            ks = str(k)
+            if ks.lower().startswith("name:"):
+                name = ks.split(":", 1)[-1].casefold()
+            else:
+                name = Path(ks).name.casefold()
+            if not name:
+                continue
+            by_name.setdefault(name, []).append(str(v).strip())
+        for name in basenames:
+            rows = by_name.get(name) or []
+            # 同名多份时取第一条非空（通常是同一份字幕）
+            if len(rows) == 1:
+                return rows[0]
+            if len(rows) > 1:
+                # 内容相同则仍可用
+                uniq = {r for r in rows}
+                if len(uniq) == 1:
+                    return rows[0]
     return ""
 
 
@@ -4101,8 +4248,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # could produce two highlighted words at the same time.
         phrase_words=[item for item in precise_words
                       if start-.01 <= (item[0]+item[1])/2 <= end+.01]
-        from .caption_qt_burn import fit_phrase_word_timings, karaoke_lead_seconds
-        # 词数一致时用 ASR 真词轴对口型；不一致才句内均分（不用百分比拉伸）
+        # 词数一致时用 ASR 真词轴对口型；不一致按 ASR 跨度映射（不用句长假均分）
         timings = fit_phrase_word_timings(start, end, len(tokens), phrase_words)
         karaoke_lead = karaoke_lead_seconds(render_settings)  # 默认 0
 
@@ -4673,12 +4819,26 @@ class CaptionWorker(QObject):
                         self.settings.get("word_timelines"), source_key, caption_audio, video,
                     )
                     sidecar = caption_audio.with_suffix(".srt")
+                    words_side = _load_word_sidecar(caption_audio) or _load_word_sidecar(video)
                     srt = ""
                     if saved_word_srt:
                         srt = saved_word_srt
                         original = " ".join(text for _,_,text in parse_srt(srt))
                         chinese = str(self.settings.get("timeline_chinese", {}).get(source_key, "")).strip()
+                        try:
+                            _write_word_sidecar(caption_audio, srt)
+                            _write_word_sidecar(video, srt)
+                        except Exception:
+                            pass
                         self.log.emit(f"[{index + 1}/{len(self.videos)}] 复用已提取的词级时间轴：{caption_audio.name}")
+                    elif words_side:
+                        srt = words_side
+                        original = " ".join(text for _, _, text in parse_srt(srt))
+                        chinese = str(self.settings.get("timeline_chinese", {}).get(source_key, "")).strip()
+                        self.log.emit(
+                            f"[{index + 1}/{len(self.videos)}] 使用旁路词级轴（*.words.srt）："
+                            f"{Path(caption_audio).stem}.words.srt"
+                        )
                     elif sidecar.exists() and sidecar.stat().st_size:
                         srt = sidecar.read_text(encoding="utf-8-sig")
                         original = " ".join(text for _, _, text in parse_srt(srt))
@@ -5441,7 +5601,6 @@ class CaptionWorker(QObject):
                 # —— Qt 字幕烧录（预览同款绘制）——
                 if render_settings.pop("_qt_caption_pending", None):
                     try:
-                        from .caption_qt_burn import bake_qt_caption_overlay_mov
                         qt_caption_mov = bake_qt_caption_overlay_mov(
                             self.ffmpeg,
                             duration=float(output_duration or render_settings.get("_qt_duration") or 8),
@@ -5500,7 +5659,6 @@ class CaptionWorker(QObject):
                         graph += ";" + audio_graph
                     command += ["-filter_complex", graph, "-map", "[outv]"]
                 elif qt_caption_mov:
-                    from .caption_qt_burn import build_qt_caption_filter_complex
                     command += ["-an", "-i", str(qt_caption_mov)]
                     cap_input = sum(1 for x in command if x == "-i") - 1
                     graph = build_qt_caption_filter_complex(
@@ -10871,14 +11029,32 @@ class DynamicCaptionPage(QWidget):
 
     def _add(self, widget, paths, extensions):
         existing = {widget.item(i).text() for i in range(widget.count())}
+        added = []
         for path in collect_files(paths, extensions):
-            if path not in existing: widget.addItem(path); existing.add(path)
+            if path not in existing:
+                widget.addItem(path)
+                existing.add(path)
+                added.append(path)
         if widget.count() and widget.currentRow() < 0: widget.setCurrentRow(0)
+        # 换电脑后按文件名把旧字幕/词轴绑到新路径，并尝试加载 *.words.srt
+        if hasattr(self, "videos") and widget is self.videos:
+            for path in added:
+                try:
+                    self._rebind_caption_maps_for_path(path)
+                    word = _load_word_sidecar(path)
+                    if word and not self._caption_map_get(self.timeline_words, path):
+                        self._caption_map_put(self.timeline_words, path, word)
+                        if not self._caption_map_get(self.timeline_overrides, path):
+                            self._caption_map_put(
+                                self.timeline_overrides, path,
+                                self._group_words_for_current_layout(word),
+                            )
+                except Exception:
+                    pass
+            QTimer.singleShot(0, self._refresh_rename_title_match_table)
         if hasattr(self,"audios") and widget is self.audios and self.videos.currentItem():
             QTimer.singleShot(0,self._rematch_current_video)
         if hasattr(self,"task_queue"): QTimer.singleShot(0,self._refresh_task_queue)
-        if hasattr(self, "videos") and widget is self.videos:
-            QTimer.singleShot(0, self._refresh_rename_title_match_table)
 
     def _clear_media_queue(self, widget):
         widget.clear()
@@ -10900,14 +11076,14 @@ class DynamicCaptionPage(QWidget):
                 reason+=f"，起点 {self._clock(offset_ms)}"
             video_key=self._timeline_key(str(video))
             if hasattr(self,"caption_mode") and self.caption_mode.currentText()=="自由文案动画（不对口型）":
-                text_state="已填写" if self.free_texts.get(video_key,"").strip() else "待填写"
+                text_state="已填写" if self._caption_map_get(self.free_texts, video, video_key) else "待填写"
             else:
                 audio_key=self._timeline_key(str(audio))
                 has_caps = bool(
-                    (self.timeline_overrides.get(video_key, "") or "").strip()
-                    or (self.timeline_words.get(video_key, "") or "").strip()
-                    or (self.timeline_overrides.get(audio_key, "") or "").strip()
-                    or (self.timeline_words.get(audio_key, "") or "").strip()
+                    self._caption_map_get(self.timeline_overrides, video, video_key, audio, audio_key)
+                    or self._caption_map_get(self.timeline_words, video, video_key, audio, audio_key)
+                    or _load_word_sidecar(video)
+                    or _load_word_sidecar(audio)
                 )
                 text_state = "已提取" if has_caps else "待提取"
             values=(f"{row+1:02d}",video.name,f"{audio.name}（{reason}）",text_state)
@@ -11719,8 +11895,6 @@ class DynamicCaptionPage(QWidget):
         时钟必须与 _live_caption_data 一致（先扣 v_start，切片未对齐再映射到源时刻）。
         带 karaoke lead，避免高亮总比口播慢半拍。
         """
-        from .caption_qt_burn import resolve_lip_sync_cut
-
         n = len(tokens or [])
         if n <= 0:
             return 0, ""
@@ -13686,17 +13860,55 @@ class DynamicCaptionPage(QWidget):
             if need_map else self.timeline_overrides
         )
         word_srt = ""
-        for key in (source_key, video_key, preview_key):
-            if key and not word_srt:
-                word_srt = word_map.get(key, "") or ""
-                # 仅在「成片时钟」模式下允许回退到工作副本；源时刻模式禁止混用
-                if not word_srt and not need_map:
-                    word_srt = self.timeline_words.get(key, "") or ""
+        # 路径键 + 文件名键；换电脑后绝对路径失效仍能命中
+        lookup_paths = [
+            p for p in (
+                source,
+                video_item.text() if video_item else "",
+                getattr(self, "_preview_loaded_path", "") or "",
+                source_key, video_key, preview_key,
+            ) if p
+        ]
+        word_srt = self._caption_map_get(word_map, *lookup_paths)
+        if not word_srt and not need_map:
+            word_srt = self._caption_map_get(self.timeline_words, *lookup_paths)
+        # 旁路 .words.srt / 便携缓存：工程换电脑拷贝后仍可对口型
+        if not word_srt:
+            for p in lookup_paths:
+                try:
+                    if Path(p).is_file():
+                        word_srt = _load_word_sidecar(p)
+                        if word_srt:
+                            # 回写当前键，后续预览不再反复读盘
+                            bind = video_key or source_key or self._timeline_key(p)
+                            if bind:
+                                self._caption_map_put(self.timeline_words, bind, word_srt)
+                            break
+                except Exception:
+                    continue
+        if not word_srt:
+            try:
+                out_dir = self.output.text().strip() if hasattr(self, "output") else ""
+            except Exception:
+                out_dir = ""
+            if out_dir:
+                for p in lookup_paths:
+                    try:
+                        if Path(p).is_file():
+                            cached = _load_timeline_cache(out_dir, p)
+                            if cached and _srt_looks_word_level(cached):
+                                word_srt = cached
+                                bind = video_key or source_key or self._timeline_key(p)
+                                if bind:
+                                    self._caption_map_put(self.timeline_words, bind, word_srt)
+                                break
+                    except Exception:
+                        continue
         for key in (source_key, video_key, preview_key):
             if key and (not phrase_srt or "-->" not in phrase_srt):
-                phrase_srt = phrase_map.get(key, "") or ""
+                phrase_srt = self._caption_map_get(phrase_map, key, *lookup_paths) or phrase_srt
                 if (not phrase_srt or "-->" not in phrase_srt) and not need_map:
-                    phrase_srt = self.timeline_overrides.get(key, "") or phrase_srt
+                    phrase_srt = self._caption_map_get(self.timeline_overrides, key, *lookup_paths) or phrase_srt
         if self.caption_mode.currentText() == "自由文案动画（不对口型）":
             duration=max(8.0,(self.player.duration() or 0)/1000)
             settings=(self._live_caption_style_cache or {}).get("settings") or self._current_settings()
@@ -13707,6 +13919,22 @@ class DynamicCaptionPage(QWidget):
         if not phrase_srt and word_srt:
             phrase_srt = group_word_srt(word_srt, max_chars=max(18, self.line_length.value() * 2),
                                         max_words=self.max_words.value())
+        # 有句无词：跟读只能均分，明确提示（换电脑丢词轴的典型症状）
+        if (
+            phrase_srt and "-->" in phrase_srt
+            and not (word_srt and "-->" in word_srt)
+            and self.caption_mode.currentText() != "自由文案动画（不对口型）"
+            and not getattr(self, "_missing_word_timeline_logged", False)
+        ):
+            self._missing_word_timeline_logged = True
+            try:
+                self._append_run_log(
+                    "⚠ 未找到词级时间轴：跟读将按句内均分，容易出现卡住/飞快/对不上口型。"
+                    "请「重新提取」字幕，或把素材旁的 *.words.srt 一起拷到本机。"
+                )
+            except Exception:
+                pass
+            QTimer.singleShot(12000, lambda: setattr(self, "_missing_word_timeline_logged", False))
         # 时间轴紫色字幕条是成片时钟；仅在已对齐/无需源映射时可用。
         # 但若 SRT 编辑器已有完整轴（例如刚「文案校对」），优先编辑器，避免预览仍显示旧字。
         editor_srt = ""
@@ -16356,6 +16584,50 @@ class DynamicCaptionPage(QWidget):
         try: return str(Path(source).resolve())
         except Exception: return str(source)
 
+    def _caption_map_get(self, mapping, *paths_or_keys) -> str:
+        """读 timeline_words / overrides：绝对路径 → 规范化 → 文件名键（换电脑可找回）。"""
+        return _lookup_settings_map(mapping or {}, *paths_or_keys)
+
+    def _caption_map_put(self, mapping: dict, path_or_key: str, value: str):
+        """双写：绝对路径键 + name:文件名，方便跨盘符命中。"""
+        if mapping is None or not path_or_key:
+            return
+        text = str(value or "")
+        key = ""
+        try:
+            key = str(Path(path_or_key).resolve())
+        except Exception:
+            key = str(path_or_key)
+        mapping[key] = text
+        bk = _basename_caption_key(key or path_or_key)
+        if bk:
+            mapping[bk] = text
+
+    def _rebind_caption_maps_for_path(self, path: str):
+        """素材换盘符后：把旧绝对路径上的字幕/词轴绑到当前路径。"""
+        if not path:
+            return
+        try:
+            new_key = self._timeline_key(path)
+        except Exception:
+            return
+        if not new_key:
+            return
+        for mapping_name in (
+            "timeline_words", "timeline_overrides", "timeline_chinese",
+            "timeline_words_source", "timeline_overrides_source", "free_texts",
+        ):
+            mapping = getattr(self, mapping_name, None)
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            if mapping.get(new_key):
+                # 仍补文件名键
+                self._caption_map_put(mapping, new_key, mapping.get(new_key, ""))
+                continue
+            found = self._caption_map_get(mapping, path, new_key)
+            if found:
+                self._caption_map_put(mapping, new_key, found)
+
     def _current_video_key(self):
         item = self.videos.currentItem() if hasattr(self, "videos") else None
         return self._timeline_key(item.text()) if item else ""
@@ -16431,20 +16703,31 @@ class DynamicCaptionPage(QWidget):
                     self._active_caption_video_path = item.text()
             except Exception:
                 pass
-        # 优先：字幕源键 → 当前视频键（批量提取会双写，防止只写了一边）
-        text = ""
-        for candidate in (key, video_key):
-            if not candidate:
-                continue
-            text = str(self.timeline_overrides.get(candidate, "") or "")
-            if text.strip():
-                break
+        # 换电脑/换盘符：先按文件名把旧键绑到当前路径
+        try:
+            if source:
+                self._rebind_caption_maps_for_path(source)
+            if video_key:
+                item = self.videos.currentItem() if hasattr(self, "videos") else None
+                if item:
+                    self._rebind_caption_maps_for_path(item.text())
+        except Exception:
+            pass
+        # 优先：字幕源键 → 当前视频键（含 name: 文件名回退）
+        text = self._caption_map_get(self.timeline_overrides, source, key, video_key)
         if not text:
-            for candidate in (key, video_key):
-                if candidate and candidate in self.timeline_words:
-                    text = self._group_words_for_current_layout(self.timeline_words[candidate])
-                    if text.strip():
-                        break
+            word = self._caption_map_get(self.timeline_words, source, key, video_key)
+            if not word:
+                for p in (source, (self.videos.currentItem().text() if hasattr(self, "videos") and self.videos.currentItem() else "")):
+                    if p and Path(p).is_file():
+                        word = _load_word_sidecar(p)
+                        if word:
+                            bind = key or video_key or self._timeline_key(p)
+                            if bind:
+                                self._caption_map_put(self.timeline_words, bind, word)
+                            break
+            if word:
+                text = self._group_words_for_current_layout(word)
         self._loading_timeline=True
         try: self.override_text.setPlainText(text)
         finally: self._loading_timeline=False
@@ -17718,13 +18001,28 @@ class DynamicCaptionPage(QWidget):
                 keys.append(vk)
         for key in keys:
             if word_aligned:
-                self.timeline_words[key] = word_aligned
-            self.timeline_overrides[key] = phrase_srt
+                self._caption_map_put(self.timeline_words, key, word_aligned)
+            self._caption_map_put(self.timeline_overrides, key, phrase_srt)
             self._mark_captions_source_timed(key)
             if chinese:
-                self.timeline_chinese[key] = chinese
+                self._caption_map_put(self.timeline_chinese, key, chinese)
             if self.caption_mode.currentText() == "自由文案动画（不对口型）":
-                self.free_texts[key] = phrase_srt
+                self._caption_map_put(self.free_texts, key, phrase_srt)
+        # 旁路词级文件：换电脑拷贝素材目录即可带走对口型时钟
+        try:
+            if word_aligned:
+                side = _write_word_sidecar(source, word_aligned)
+                for video in self._videos_using_caption_source(source):
+                    if self._timeline_key(video) != source_key:
+                        _write_word_sidecar(video, word_aligned)
+                if side and not getattr(self, "_word_sidecar_logged", False):
+                    self._word_sidecar_logged = True
+                    self._append_run_log(
+                        f"已保存词级旁路：{side.name}（换电脑请连素材一起拷贝，跟读才对准口型）"
+                    )
+                    QTimer.singleShot(8000, lambda: setattr(self, "_word_sidecar_logged", False))
+        except Exception:
+            pass
         return keys
 
     def _batch_timeline_item_done(self,source,srt,chinese,index,total):
