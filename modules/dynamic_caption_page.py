@@ -404,7 +404,8 @@ STATIC_BOLD_FONT_FILES = {
     "Libre Baskerville": "LibreBaskerville-Bold.ttf",
 }
 
-CAPTION_RENDERER_VERSION = 19  # restore ASR lip-sync (no default lead / no %-stretch)
+CAPTION_RENDERER_VERSION = 20  # preset/color must not break ASR karaoke; span-map cut
+
 
 # Visual keys that must stay identical between batch snapshot / UI / export.
 _BATCH_STYLE_VISUAL_KEYS = (
@@ -12751,10 +12752,19 @@ class DynamicCaptionPage(QWidget):
                    "animation_speed":self.animation_speed,"outline_width":self.outline_width,
                    "margin_v":self.margin_v,"watermark_width":self.watermark_width,
                    "watermark_opacity":self.watermark_opacity,"watermark_margin":self.watermark_margin}
+            keep_phrase_layout = self._current_has_word_timeline()
             for key,control in combos.items():
-                if key in saved: control.setCurrentText(str(saved[key]))
+                if key not in saved:
+                    continue
+                # 有词轴时不要被模板切到自由文案（会丢掉跟读词钟）
+                if keep_phrase_layout and key == "caption_mode" and "自由文案" in str(saved[key]):
+                    continue
+                control.setCurrentText(str(saved[key]))
             for key,control in spins.items():
                 if key in saved:
+                    # 有词轴：保留每句词数/每行字符，避免模板重切句弄乱跟读
+                    if keep_phrase_layout and key in ("max_words", "line_length"):
+                        continue
                     try: control.setValue(int(saved[key]))
                     except (TypeError,ValueError): pass
             # 语义重点：跟读色按钮标签用「重点词」
@@ -18418,6 +18428,20 @@ class DynamicCaptionPage(QWidget):
                 pass
             self._save_style_preferences()
 
+    def _current_has_word_timeline(self) -> bool:
+        """当前视频是否已有词级轴（换预设时要保护对口型，勿乱改每句词数）。"""
+        try:
+            key = self._current_video_key() if hasattr(self, "_current_video_key") else ""
+            if key and str((self.timeline_words or {}).get(key, "") or "").count("-->") >= 1:
+                return True
+            src = self._timeline_source() if hasattr(self, "_timeline_source") else ""
+            sk = self._timeline_key(src) if src else ""
+            if sk and str((self.timeline_words or {}).get(sk, "") or "").count("-->") >= 1:
+                return True
+        except Exception:
+            pass
+        return False
+
     def apply_preset(self, name):
         preset = PRESETS[name]
         for button in self.preset_buttons:
@@ -18436,43 +18460,82 @@ class DynamicCaptionPage(QWidget):
             highlight_label = "重点词"
         else:
             highlight_label = "跟读背景"
-        self.text_color.setText(f"普通文字 {preset['text']}")
-        self.outline_color.setText(f"描边 {preset['outline']}")
-        self.highlight_color.setText(f"{highlight_label} {preset['highlight']}")
-        self.background_color.setText(
-            f"普通背景 {preset.get('background','#168AAD')}"
-        )
-        self.active_text_color.setText(
-            f"跟读文字 {preset.get('active_text','#FFFFFF')}"
-        )
+        # 批量改 UI 时屏蔽信号，避免中途用半套参数重绘导致跟读闪乱
+        layout_controls = [
+            self.font, self.font_size, self.line_length, self.line_width,
+            self.letter_spacing, self.word_spacing, self.line_spacing,
+            self.max_words, self.max_lines, self.highlight_padding,
+            self.highlight_padding_y, self.animation_speed, self.outline_width,
+            self.margin_v, self.position, self.caption_mode, self.free_animation,
+        ]
+        # 已有词级轴：保留「每句词数/每行字符」，避免换预设把句切乱 → 跟读均分飞掉
+        keep_phrase_layout = self._current_has_word_timeline()
+        for control in layout_controls:
+            try:
+                control.blockSignals(True)
+            except Exception:
+                pass
+        try:
+            self.text_color.setText(f"普通文字 {preset['text']}")
+            self.outline_color.setText(f"描边 {preset['outline']}")
+            self.highlight_color.setText(f"{highlight_label} {preset['highlight']}")
+            self.background_color.setText(
+                f"普通背景 {preset.get('background','#168AAD')}"
+            )
+            self.active_text_color.setText(
+                f"跟读文字 {preset.get('active_text','#FFFFFF')}"
+            )
+            self.outline_width.setValue(preset["outline_width"])
+            if "font" in preset: self.font.setCurrentText(preset["font"])
+            if "font_size" in preset: self.font_size.setValue(preset["font_size"])
+            if "line_width" in preset: self.line_width.setValue(preset["line_width"])
+            if "letter_spacing" in preset: self.letter_spacing.setValue(preset["letter_spacing"])
+            self.word_spacing.setValue(preset.get("word_spacing",0))
+            if "line_spacing" in preset: self.line_spacing.setValue(preset["line_spacing"])
+            if "margin_v" in preset: self.margin_v.setValue(preset["margin_v"])
+            # 无词轴时才套用预设的排版参数
+            if not keep_phrase_layout:
+                if "line_length" in preset: self.line_length.setValue(preset["line_length"])
+                if "max_words" in preset: self.max_words.setValue(preset["max_words"])
+            self.max_lines.setValue(preset.get("max_lines", 2))
+            if "highlight_padding" in preset: self.highlight_padding.setValue(preset["highlight_padding"])
+            self.highlight_padding_y.setValue(preset.get("highlight_padding_y",10))
+            if "animation_speed" in preset: self.animation_speed.setValue(preset["animation_speed"])
+            if hasattr(self, "position"):
+                self.position.setCurrentText(preset.get("position", "底部"))
+            # 出字方式：有词轴时禁止被预设切到「自由文案」（会清空词级跟读）
+            if "caption_mode" in preset and hasattr(self, "caption_mode"):
+                new_mode = preset["caption_mode"]
+                if keep_phrase_layout and "自由文案" in str(new_mode):
+                    pass
+                else:
+                    self.caption_mode.setCurrentText(new_mode)
+            if "free_animation" in preset and hasattr(self, "free_animation"):
+                if not (keep_phrase_layout and "自由文案" in str(self.caption_mode.currentText())):
+                    self.free_animation.setCurrentText(preset["free_animation"])
+            if hasattr(self, "preview_position_slider"):
+                self.preview_position_slider.blockSignals(True)
+                self.preview_position_slider.setValue(self.margin_v.value())
+                self.preview_position_slider.blockSignals(False)
+                self.preview_position_value.setText(f"距底部 {self.margin_v.value()}")
+        finally:
+            for control in layout_controls:
+                try:
+                    control.blockSignals(False)
+                except Exception:
+                    pass
         self._invalidate_live_style()
-        self.outline_width.setValue(preset["outline_width"])
-        if "font" in preset: self.font.setCurrentText(preset["font"])
-        if "font_size" in preset: self.font_size.setValue(preset["font_size"])
-        if "line_length" in preset: self.line_length.setValue(preset["line_length"])
-        if "line_width" in preset: self.line_width.setValue(preset["line_width"])
-        if "letter_spacing" in preset: self.letter_spacing.setValue(preset["letter_spacing"])
-        self.word_spacing.setValue(preset.get("word_spacing",0))
-        if "line_spacing" in preset: self.line_spacing.setValue(preset["line_spacing"])
-        if "margin_v" in preset: self.margin_v.setValue(preset["margin_v"])
-        if "max_words" in preset: self.max_words.setValue(preset["max_words"])
-        self.max_lines.setValue(preset.get("max_lines",2))
-        if "highlight_padding" in preset: self.highlight_padding.setValue(preset["highlight_padding"])
-        self.highlight_padding_y.setValue(preset.get("highlight_padding_y",10))
-        if "animation_speed" in preset: self.animation_speed.setValue(preset["animation_speed"])
-        if hasattr(self, "position"):
-            self.position.setCurrentText(preset.get("position", "底部"))
-        # 出字方式类预设：一并切换字幕模式（如语音同步）
-        if "caption_mode" in preset and hasattr(self, "caption_mode"):
-            self.caption_mode.setCurrentText(preset["caption_mode"])
-        if "free_animation" in preset and hasattr(self, "free_animation"):
-            self.free_animation.setCurrentText(preset["free_animation"])
-        if hasattr(self, "preview_position_slider"):
-            self.preview_position_slider.blockSignals(True)
-            self.preview_position_slider.setValue(self.margin_v.value())
-            self.preview_position_slider.blockSignals(False)
-            self.preview_position_value.setText(f"距底部 {self.margin_v.value()}")
+        # 时间轴缓存与词轴无关的样式刷新；切勿因换色/换预设丢掉词级钟
+        self._live_timeline_cache_key = None
         self.update_style_preview(); self._refresh_live_preview()
+        if keep_phrase_layout and preset.get("max_words") not in (None, self.max_words.value()):
+            try:
+                self._append_run_log(
+                    f"已切换「{name}」样式；保留当前每句词数={self.max_words.value()} "
+                    f"（避免重切句导致跟读不准）。如需按预设重排，请改「每句词数」后重新提取/分组。"
+                )
+            except Exception:
+                pass
         # 切换视频加载独立样式 / 恢复偏好时：只改 UI，禁止污染批量快照或清空其它视频独立样式
         if getattr(self, "_loading_video_style", False) or getattr(self, "_restoring_style", False):
             return

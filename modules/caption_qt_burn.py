@@ -78,21 +78,57 @@ def karaoke_lead_seconds(settings=None) -> float:
     return 0.0
 
 
-def fit_phrase_word_timings(start, end, n, phrase_words):
-    """句内词级 → 显示 token 时间。
+def _token_core(text: str) -> str:
+    return "".join(
+        ch for ch in str(text or "").strip().lower()
+        if ch.isalnum() or "\u3400" <= ch <= "\u9fff"
+    )
 
-    数量一致：原样使用 ASR 词轴（对口型）。
-    数量不一致：句内均分（旧逻辑）；禁止按百分比拉伸词轴（会「最后对齐、中间不对嘴」）。
+
+def fit_phrase_word_timings(start, end, n, phrase_words):
+    """句内词级 → 显示 token 时间窗（始终锚定 ASR，不对整句做假均分）。
+
+    - 数量一致：原样用每个 ASR 词的起止
+    - 数量不一致：按序把 ASR 词摊到显示 token 上，保留真实开口时间
+    - 完全无词级：才退回句内均分
     """
     start_f, end_f = float(start), float(end)
     n = int(n or 0)
     if n <= 0:
         return []
     words = list(phrase_words or [])
-    if len(words) == n:
+    m = len(words)
+    if m == n and m > 0:
         return [(float(words[i][0]), float(words[i][1])) for i in range(n)]
-    dur = max(0.08, (end_f - start_f) / n)
-    return [(start_f + dur * i, min(end_f, start_f + dur * (i + 1))) for i in range(n)]
+    if m <= 0:
+        dur = max(0.08, (end_f - start_f) / n)
+        return [(start_f + dur * i, min(end_f, start_f + dur * (i + 1))) for i in range(n)]
+    result = []
+    for i in range(n):
+        a = int(i * m / n)
+        b = max(a + 1, int((i + 1) * m / n))
+        b = min(m, b)
+        a = min(max(0, a), m - 1)
+        ts = float(words[a][0])
+        te = float(words[b - 1][1])
+        # 多个 token 分到同一词：切开该词时间窗，避免永远只亮第一个
+        if b == a + 1:
+            owners = [
+                j for j in range(n)
+                if int(j * m / n) == a
+            ]
+            if len(owners) > 1:
+                w_ts, w_te = float(words[a][0]), float(words[a][1])
+                if w_te <= w_ts:
+                    w_te = w_ts + 0.04
+                slot = (w_te - w_ts) / len(owners)
+                k = owners.index(i) if i in owners else 0
+                ts = w_ts + slot * k
+                te = w_ts + slot * (k + 1)
+        if te <= ts:
+            te = min(end_f, ts + 0.04)
+        result.append((ts, te))
+    return result
 
 
 def cut_from_word_timings(t_sec, timings, tokens, lead_sec=0.0):
@@ -117,8 +153,28 @@ def cut_from_word_timings(t_sec, timings, tokens, lead_sec=0.0):
     return cut, tokens[cut - 1]
 
 
+def _active_asr_word_index(t_sec, phrase_words) -> int:
+    """当前时刻对应的句内 ASR 词下标；间隙粘在已开始的一词。"""
+    words = list(phrase_words or [])
+    if not words:
+        return -1
+    t = float(t_sec or 0.0)
+    for i, w in enumerate(words):
+        if float(w[0]) <= t <= float(w[1]):
+            return i
+    wi = -1
+    for i, w in enumerate(words):
+        if t >= float(w[0]):
+            wi = i
+    return wi
+
+
 def resolve_lip_sync_cut(t_sec, tokens, phrase_words, start, end, settings=None):
-    """对口型 cut：优先词级 ASR 真时间；词数一致时一一对应。"""
+    """对口型 cut：永远先看词级 ASR，再映射到当前显示 token。
+
+    换预设/改描边只影响画法，不应改口型钟。词数不一致时也按 ASR 词序映射，
+    禁止「句长÷词数」假均分（那会造成有的句不跟、有的句飞快）。
+    """
     tokens = list(tokens or [])
     n = len(tokens)
     if n <= 0:
@@ -126,30 +182,25 @@ def resolve_lip_sync_cut(t_sec, tokens, phrase_words, start, end, settings=None)
     words = list(phrase_words or [])
     timings = fit_phrase_word_timings(start, end, n, words)
     lead = karaoke_lead_seconds(settings)
-    # 词数一致：直接按 ASR 词窗
-    if len(words) == n:
-        cut, active = cut_from_word_timings(t_sec, timings, tokens, lead)
-        return cut, active, timings
-    # 词数不一致：仍用均分 timings，但若能按当前 ASR 词文本对上显示 token，则跟该词真时间
     t = float(t_sec or 0.0) + lead
-    if words:
-        wi = None
-        for i, w in enumerate(words):
-            if float(w[0]) <= t <= float(w[1]):
-                wi = i
-                break
-        if wi is None:
-            for i, w in enumerate(words):
-                if t >= float(w[0]):
-                    wi = i
-        if wi is not None:
-            wtxt = str(words[wi][2] or "").strip().lower()
-            core = "".join(ch for ch in wtxt if ch.isalnum() or "\u3400" <= ch <= "\u9fff")
-            for ti, tok in enumerate(tokens):
-                tlow = str(tok or "").strip().lower()
-                tcore = "".join(ch for ch in tlow if ch.isalnum() or "\u3400" <= ch <= "\u9fff")
-                if tlow == wtxt or (core and tcore == core):
-                    return ti + 1, tokens[ti], timings
+    m = len(words)
+
+    if m > 0:
+        wi = _active_asr_word_index(t, words)
+        if wi >= 0:
+            if m == n:
+                return wi + 1, tokens[wi], timings
+            # 文本对齐（校对后用词）
+            wcore = _token_core(words[wi][2] if len(words[wi]) > 2 else "")
+            if wcore:
+                for ti, tok in enumerate(tokens):
+                    if _token_core(tok) == wcore:
+                        return ti + 1, tokens[ti], timings
+            # 序映射：跟 ASR 词进度，不跟句时长百分比
+            ti = int((wi + 1e-6) * n / m)
+            ti = max(0, min(n - 1, ti))
+            return ti + 1, tokens[ti], timings
+
     cut, active = cut_from_word_timings(t_sec, timings, tokens, lead)
     return cut, active, timings
 
