@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -466,7 +467,7 @@ def _paint_standard(
             left = item["left"]
             baseline = item["baseline"]
             is_active = cut > 0 and token_i == cut - 1
-            # word_color「逐词变色」：已读词保持跟读色（含当前），避免只闪一下像没高亮
+            # word_color_persist：已读保持跟读色；word_color（经典黄）：仅当前词，读完回原色
             is_spoken = cut > 0 and token_i < cut
             token_i += 1
             if effect == "dual_box":
@@ -531,8 +532,11 @@ def _paint_standard(
                     fill = active_text_color
                 elif effect in ("descript", "heygen", "highlight") and is_active:
                     fill = active_text_color
-                elif effect == "word_color":
+                elif effect == "word_color_persist":
                     fill = highlight if is_spoken else base_color
+                elif effect == "word_color":
+                    # 经典黄：只有正在读的词变黄，读完立刻回到普通文字色
+                    fill = highlight if is_active else base_color
                 elif is_active and effect in ("word_pop_color", "pop", "underline"):
                     fill = highlight
                 else:
@@ -627,9 +631,29 @@ def bake_qt_caption_overlay_mov(
     # Drop empty / tiny
     segments = [(a, b, k) for a, b, k in segments if b - a >= 0.02 and k and k[0]]
 
+    # 段数过多会写上千张全高清 PNG → 磁盘打满、内存爆、界面未响应甚至崩溃
+    max_segments = 320
+    if len(segments) > max_segments:
+        _log(f"Qt 字幕状态过多（{len(segments)}），合并为 ≤{max_segments} 段以保证稳定…")
+        step = max(1, int(math.ceil(len(segments) / max_segments)))
+        merged = []
+        for i in range(0, len(segments), step):
+            chunk = segments[i:i + step]
+            merged.append((chunk[0][0], chunk[-1][1], chunk[len(chunk) // 2][2]))
+        segments = merged
+
+    cue_count = str(phrase_srt or "").count("-->") + str(word_srt or "").count("-->")
+    if cue_count > 900 or duration > 900 or len(segments) > 480:
+        raise RuntimeError(
+            f"字幕过密/过长（cue≈{cue_count}, 段={len(segments)}, {duration:.0f}s），改用 ASS 烧录以保证不卡死"
+        )
+
+    # 几何按 1080×1920 排版；勿缩画布（会画到画外）。靠限段数 + 及时释放控内存。
+    paint_w, paint_h = 1080, 1920
+
     if not segments:
         # empty transparent still
-        blank = QImage(1080, 1920, QImage.Format.Format_ARGB32_Premultiplied)
+        blank = QImage(paint_w, paint_h, QImage.Format.Format_ARGB32_Premultiplied)
         blank.fill(Qt.GlobalColor.transparent)
         png = work / "blank.png"
         blank.save(str(png), "PNG")
@@ -637,17 +661,25 @@ def bake_qt_caption_overlay_mov(
         png_paths = [png]
     else:
         png_paths = []
-        _log(f"Qt 字幕烧录：{len(segments)} 个画面状态（与预览同一引擎）…")
+        _log(f"Qt 字幕烧录：{len(segments)} 个画面状态…")
         for idx, (t0, t1, _key) in enumerate(segments):
             mid = (t0 + t1) / 2.0
-            img = paint_caption_overlay_image(settings, phrase_srt, word_srt, mid)
+            img = paint_caption_overlay_image(
+                settings, phrase_srt, word_srt, mid, size=(paint_w, paint_h),
+            )
             png = work / f"c{idx:04d}.png"
             if not img.save(str(png), "PNG"):
                 raise RuntimeError(f"无法写入字幕帧：{png.name}")
             png_paths.append(png)
-            if idx and idx % 40 == 0:
+            # 尽快释放大图，避免批量合成时内存堆积崩溃
+            del img
+            if idx and idx % 30 == 0:
                 _log(f"  · Qt 字幕已绘制 {idx}/{len(segments)} …")
-
+                try:
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
     # concat demuxer list
     list_path = work / "list.txt"
     lines = []

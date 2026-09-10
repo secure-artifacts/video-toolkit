@@ -169,7 +169,8 @@ from .rename_page import clean_filename_part, safe_filename
 
 
 PRESETS = {
-    "Descript 经典黄": {"text": "#F8FAFC", "outline": "#222222", "highlight": "#FACC15", "outline_width": 5,
+    # 经典黄：仅当前词黄跟读，读完立刻回原色；描边深红棕
+    "Descript 经典黄": {"text": "#F8FAFC", "outline": "#7C2D12", "highlight": "#FACC15", "outline_width": 5,
                          "effect": "word_color", "font": "Arial", "font_size": 90, "line_length": 26,
                          "letter_spacing": -4, "line_spacing": 100, "margin_v": 500,
                          "max_words": 7, "highlight_padding": 16, "animation_speed": 90},
@@ -272,7 +273,8 @@ PRESETS = {
     },
     # —— 逐词变色系列 ——
     "卡拉OK 青蓝跟读": {"text": "#FFFFFF", "outline": "#1A1A3A", "highlight": "#00E5FF", "outline_width": 4, "effect": "word_color", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
-    "亮黄逐词变色": {"text": "#FFFFFF", "outline": "#222222", "highlight": "#FFEE00", "outline_width": 3, "effect": "word_color", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
+    # 逐词变色：已读保持黄（与经典黄「读完回原色」不同）
+    "亮黄逐词变色": {"text": "#FFFFFF", "outline": "#222222", "highlight": "#FFEE00", "outline_width": 3, "effect": "word_color_persist", "font": "Arial", "font_size": 70, "line_length": 26, "margin_v": 500, "max_words": 7},
     # —— Facebook 参考（Downloads/视频批量下载/Facebook）——
     # 参考1：夜间卡车 · 白字+当前词亮黄荧光 · 粗黑描边 · 居中偏上 · 逐词
     "FB 卡车黄字跟读": {
@@ -413,7 +415,7 @@ STATIC_BOLD_FONT_FILES = {
     "Libre Baskerville": "LibreBaskerville-Bold.ttf",
 }
 
-CAPTION_RENDERER_VERSION = 21  # portable word timeline (cross-machine basename + .words.srt)
+CAPTION_RENDERER_VERSION = 22  # classic yellow current-only + brown outline; bake/log stability
 
 
 # Visual keys that must stay identical between batch snapshot / UI / export.
@@ -825,7 +827,7 @@ class PresetPreviewButton(QPushButton):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(text_color)
             painter.drawPath(path)
-        elif effect == "word_color":
+        elif effect in ("word_color", "word_color_persist"):
             painter.setPen(text_color); painter.drawText(x,baseline,"字幕"); x2=x+metrics.horizontalAdvance("字幕")
             painter.setPen(highlight); painter.drawText(x2,baseline,"样式")
         elif effect == "word_pop_color":
@@ -4479,13 +4481,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     if effect in ("outline","glow","double_outline"): continue
 
                     active_style="Active"
-                    # word_color：跟读色铺到本页结束（逐词变色、已读保持）；其它效果仍只亮当前词窗口
+                    # word_color：仅当前词窗口（读完回原色）；word_color_persist：铺到页尾（已读保持）
                     color_end = token_end
                     if effect == "word_color":
-                        # 经典黄等：只变色跟读，不放大
+                        active_style="ActiveColor"
+                        color_end = token_end
+                        active_override=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fad(30,30)}}"
+                    elif effect == "word_color_persist":
                         active_style="ActiveColor"
                         color_end = page_end
-                        active_override=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fad(30,30)}}"
+                        active_override=fr"{{\an5\pos({x:.1f},{y:.1f}){fsp}\fad(30,0)}}"
                     elif effect == "word_pop_color":
                         # 当前词：红色 ActiveColor + 弹出缩放；读完后底层 Base 白字留下
                         active_style="ActiveColor"
@@ -10099,17 +10104,24 @@ class DynamicCaptionPage(QWidget):
     def _append_run_log(self,message):
         text=str(message or "").strip()
         if not text: return
-        # 构建 UI 早期可能尚未创建 self.log，避免启动崩溃
+        # 提取/合成时日志极密会拖死 UI（未响应）；节流刷新，完整内容仍写磁盘日志
+        now = time.monotonic()
+        last = float(getattr(self, "_run_log_ui_last", 0.0) or 0.0)
+        force_ui = any(
+            m in text for m in ("失败", "错误", "异常", "完成", "⚠", "Qt 字幕", "ASS")
+        )
+        update_ui = force_ui or (now - last) >= 0.18
         log_widget = getattr(self, "log", None)
-        if log_widget is not None:
+        if update_ui and log_widget is not None:
             try:
                 log_widget.appendPlainText(text)
                 scroll = log_widget.verticalScrollBar()
                 scroll.setValue(scroll.maximum())
+                self._run_log_ui_last = now
             except Exception:
                 pass
         write_app_log(text, "INFO", "Reels")
-        if hasattr(self,"run_status"):
+        if update_ui and hasattr(self,"run_status"):
             current=text.splitlines()[0]
             self.run_status.setText(current)
         error_markers=("失败","错误","异常","报错","[WinError","Traceback","Invalid argument","Error ")
@@ -10118,8 +10130,8 @@ class DynamicCaptionPage(QWidget):
             if hasattr(self,"log_status"):
                 self.log_status.setText("检测到错误，已写入软件日志和 reels_error.log")
                 self.log_status.setStyleSheet("color:#fca5a5;font-size:11px;font-weight:700;")
-        elif hasattr(self,"log_status"):
-            self.log_status.setText(current)
+        elif update_ui and hasattr(self,"log_status"):
+            self.log_status.setText(text.splitlines()[0])
 
     def _start_timeline_activity(self,label,base=2,cap=90):
         self._timeline_activity_label=str(label)
@@ -12946,7 +12958,7 @@ class DynamicCaptionPage(QWidget):
             if not effect and base in PRESETS:
                 effect = str(PRESETS[base].get("effect") or "")
             highlight_label = (
-                "跟读文字" if effect in ("semantic_karaoke", "word_color", "word_pop_color")
+                "跟读文字" if effect in ("semantic_karaoke", "word_color", "word_color_persist", "word_pop_color")
                 else "重点词" if effect in ("semantic_stack", "word_scale")
                 else "跟读背景"
             )
@@ -14489,7 +14501,7 @@ class DynamicCaptionPage(QWidget):
             for token,item in zip(line,line_geometry):
                 width=item["width"]; cursor=item["left"]; baseline=item["baseline"]
                 is_active = (cut > 0 and token_i == cut - 1)
-                # word_color「逐词变色」：已读词保持跟读色，避免只闪一下像没高亮
+                # word_color_persist：已读保持黄；word_color 经典黄：仅当前词
                 is_spoken = cut > 0 and token_i < cut
                 token_i += 1
                 if effect=="dual_box":
@@ -14546,8 +14558,10 @@ class DynamicCaptionPage(QWidget):
                         fill=active_text_color
                     elif effect in ("descript", "heygen", "highlight") and is_active:
                         fill = active_text_color
-                    elif effect == "word_color":
+                    elif effect == "word_color_persist":
                         fill = highlight if is_spoken else base_color
+                    elif effect == "word_color":
+                        fill = highlight if is_active else base_color
                     elif is_active and effect in ("word_pop_color", "pop", "underline"):
                         fill = highlight
                     else:
@@ -18752,7 +18766,7 @@ class DynamicCaptionPage(QWidget):
                 "semantic_max_lines", "semantic_small_words",
             ) if k in preset
         }
-        if preset["effect"] in ("word_color", "word_pop_color", "semantic_karaoke"):
+        if preset["effect"] in ("word_color", "word_color_persist", "word_pop_color", "semantic_karaoke"):
             highlight_label = "跟读文字"
         elif preset["effect"] in ("semantic_stack", "word_scale"):
             highlight_label = "重点词"
